@@ -121,10 +121,6 @@ MIT
 
 ---
 
-Made with [create-react-native-library](https://github.com/callstack/react-native-builder-bob)
-
----
-
 <p align="center">
   <a href="https://bricks.tools">
     <img width="90px" src="https://avatars.githubusercontent.com/u/17320237?s=200&v=4">
