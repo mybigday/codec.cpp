@@ -50,8 +50,7 @@ jobs:
       run: |
         python3 -m pip install --upgrade pip
         python3 -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
-        python3 -m pip install safetensors huggingface-hub transformers scipy
-        pip install -r requirements.txt
+        python3 -m pip install safetensors huggingface-hub transformers scipy descript-audio-codec
 
     - name: Build C++
       run: |
