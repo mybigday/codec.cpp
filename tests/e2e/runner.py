@@ -512,6 +512,7 @@ def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Pa
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
             "--input-dir", str(local_path),
             "--output", str(output_path),
+            "--model-type", converter,
         ]
 
     quantization = model_cfg.get("quantization")
