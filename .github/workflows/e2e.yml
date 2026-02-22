@@ -1,0 +1,95 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/ops/**'
+      - 'src/models/**'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e.yml'
+      - 'scripts/regression_*.sh'
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+    paths:
+      - 'src/ops/**'
+      - 'src/models/**'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e.yml'
+      - 'scripts/regression_*.sh'
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  e2e-test:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential pkg-config python3-pip
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+        pip install safetensors huggingface-hub transformers scipy
+    
+    - name: Build C++
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+        cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+    
+    - name: Verify CLI
+      run: |
+        test -f build/codec-cli
+        ./build/codec-cli --help
+    
+    - name: Download Mimi model from HF
+      run: |
+        mkdir -p models
+        echo "Converting Mimi from HuggingFace..."
+        python scripts/convert-to-gguf.py --model-id kyutai/mimi --output models/mimi.gguf
+        ls -lh models/
+    
+    - name: Run Mimi E2E test
+      run: |
+        if [ -f models/mimi.gguf ]; then
+          echo "Running Mimi regression test..."
+          bash scripts/regression_mimi.sh models/mimi.gguf
+        else
+          echo "Mimi model not available, skipping"
+          exit 1
+        fi
+    
+    - name: Run DAC E2E test (if model available)
+      run: |
+        if [ -f models/dac.gguf ]; then
+          echo "Running DAC regression test..."
+          bash scripts/regression_dac.sh models/dac.gguf
+        else
+          echo "DAC model not available, skipping"
+        fi
+      continue-on-error: true
+    
+    - name: Run WavTokenizer E2E test (if model available)
+      run: |
+        if [ -f models/wavtokenizer.gguf ]; then
+          echo "Running WavTokenizer regression test..."
+          bash scripts/regression_wavtokenizer.sh models/wavtokenizer.gguf
+        else
+          echo "WavTokenizer model not available, skipping"
+        fi
+      continue-on-error: true
