@@ -1,5 +1,0 @@
-torch>=2.0.0
-transformers>=4.35.0
-numpy>=1.24.0
-safetensors>=0.4.0
-progressbar2>=3.55.0

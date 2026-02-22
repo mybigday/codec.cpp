@@ -1,0 +1,6 @@
+Codec E2E Summary
+generated_at: 2026-02-22T16:05:04+00:00
+selected_models: mimi
+passed=1 failed=0 skipped=0
+
+- mimi: passed (209.90s) | mse=0.00003695 corr=0.996384 | log: /home/node/.openclaw/workspace/codec.cpp/tests/e2e/reports/mimi.log

@@ -2,111 +2,30 @@
   "models": [
     {
       "name": "mimi",
-      "enabled": true,
-      "required": true,
-      "artifacts": {
-        "mimi_dir": {
-          "required": true,
-          "kind": "dir",
-          "candidates": [
-            "models/mimi"
-          ],
-          "contains": [
-            "model.safetensors",
-            "config.json"
-          ]
-        },
-        "output_gguf": {
-          "required": false,
-          "default": "models/mimi.gguf"
-        }
-      },
-      "setup": {
-        "type": "hf_snapshot",
-        "repo_id": "kyutai/mimi",
-        "local_dir": "models/mimi",
-        "token_env": "HF_TOKEN"
-      },
-      "command": [
-        "bash",
-        "scripts/regression_mimi.sh",
-        "{mimi_dir}",
-        "{output_gguf}"
-      ]
+      "hf_repo_id": "kyutai/mimi",
+      "hf_file": null,
+      "class": "transformers:MimiModel",
+      "n_q": 32,
+      "gguf": "models/mimi/mimi.gguf",
+      "auto_convert": true
     },
     {
       "name": "dac",
-      "enabled": true,
-      "required": false,
-      "detect": [
-        "models/dac.gguf",
-        "models/dac_speech_v1.gguf",
-        "models/weights_24khz_3kbps_v1.0.pth"
-      ],
-      "artifacts": {
-        "gguf": {
-          "required": true,
-          "candidates": [
-            "models/dac.gguf",
-            "models/dac_speech_v1.gguf"
-          ]
-        },
-        "weights": {
-          "required": true,
-          "candidates": [
-            "models/weights_24khz_3kbps_v1.0.pth",
-            "models/dac/weights_24khz_3kbps_v1.0.pth",
-            "checkpoints/weights_24khz_3kbps_v1.0.pth"
-          ]
-        }
-      },
-      "command": [
-        "bash",
-        "scripts/regression_dac.sh",
-        "{gguf}",
-        "{weights}"
-      ]
+      "hf_repo_id": "ibm-research/DAC.speech.v1.0",
+      "hf_file": null,
+      "class": "transformers:DacModel",
+      "n_q": 4,
+      "gguf": "models/dac/dac.gguf",
+      "auto_convert": true
     },
     {
       "name": "wavtokenizer",
-      "enabled": true,
-      "required": false,
-      "detect": [
-        "models/wavtokenizer.gguf",
-        "models/wavtokenizer_v2.gguf",
-        "models/wavtokenizer_large_speech_320_24k_v2.ckpt"
-      ],
-      "artifacts": {
-        "gguf": {
-          "required": true,
-          "candidates": [
-            "models/wavtokenizer.gguf",
-            "models/wavtokenizer_v2.gguf"
-          ]
-        },
-        "ckpt": {
-          "required": true,
-          "candidates": [
-            "models/wavtokenizer_large_speech_320_24k_v2.ckpt",
-            "models/wavtokenizer.ckpt"
-          ]
-        },
-        "config": {
-          "required": true,
-          "candidates": [
-            "models/wavtokenizer_config.yaml",
-            "../WavTokenizer-source/configs/wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml"
-          ]
-        }
-      },
-      "command": [
-        "bash",
-        "scripts/regression_wavtokenizer.sh",
-        "{gguf}",
-        "input_audio/reference_10_2.mp3",
-        "{ckpt}",
-        "{config}"
-      ]
+      "hf_repo_id": "novateur/WavTokenizer-large-speech-75token",
+      "hf_file": null,
+      "class": "wavtokenizer",
+      "n_q": 1,
+      "gguf": "models/wavtokenizer/wavtokenizer.gguf",
+      "auto_convert": true
     }
   ]
 }

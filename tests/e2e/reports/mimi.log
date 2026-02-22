@@ -1,0 +1,18 @@
+$ /home/node/.openclaw/workspace/codec.cpp/.venv/bin/python /home/node/.openclaw/workspace/codec.cpp/scripts/convert-to-gguf.py --model-id kyutai/mimi --output /home/node/.openclaw/workspace/codec.cpp/models/mimi/mimi.gguf
+
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s]
+Fetching 2 files: 100%|██████████| 2/2 [00:00<00:00, 5660.33it/s]
+✓ Successfully converted to /home/node/.openclaw/workspace/codec.cpp/models/mimi/mimi.gguf
+  File size: 296.8 MB
+[exit=0]
+
+$ ffmpeg -hide_banner -loglevel error -y -i /home/node/.openclaw/workspace/codec.cpp/input_audio/reference_10_2.mp3 -ac 1 -ar 24000 /tmp/codec-e2e-mimi-ah73a6g_/input.wav
+[exit=0]
+
+[hf] loading model: kyutai/mimi (transformers:MimiModel)
+$ /home/node/.openclaw/workspace/codec.cpp/build/codec-cli decode --model /home/node/.openclaw/workspace/codec.cpp/models/mimi/mimi.gguf --codes /tmp/codec-e2e-mimi-ah73a6g_/hf_codes.npy --out /tmp/codec-e2e-mimi-ah73a6g_/cpp_decode.wav --nq 32
+model: Mimi (Mimi)
+decoded: input_n_q=32 use_n_q=32 n_frames=110 n_samples=211200 sr=24000
+wrote: /tmp/codec-e2e-mimi-ah73a6g_/cpp_decode.wav
+[exit=0]
+
