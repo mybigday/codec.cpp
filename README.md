@@ -1,3 +1,11 @@
+codec.cpp
+===
+
+Neural audio codec inference in C/C++
+
+The main goal of codec.cpp is to enable neural audio codec inference with minimal setup and state-of-the-art performance on a wide range of hardware — locally and in the cloud. Supports Mimi, DAC, WavTokenizer with quantization and multi-backend GPU acceleration.
+
+
 ## Quick Start
 
 ### 1. Convert Models to GGUF
@@ -106,3 +114,22 @@ cmake -B build
 cmake --build build -j
 ./build/codec-cli --model model.gguf --codes in.npy --out out.wav
 ```
+
+## License
+
+MIT
+
+---
+
+Made with [create-react-native-library](https://github.com/callstack/react-native-builder-bob)
+
+---
+
+<p align="center">
+  <a href="https://bricks.tools">
+    <img width="90px" src="https://avatars.githubusercontent.com/u/17320237?s=200&v=4">
+  </a>
+  <p align="center">
+    Built and maintained by <a href="https://bricks.tools">BRICKS</a>.
+  </p>
+</p>
