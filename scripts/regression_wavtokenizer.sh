@@ -3,27 +3,24 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_PATH="${1:-$ROOT_DIR/wavtokenizer_v2.gguf}"
-INPUT_WAV="${2:-}"
-
-if [[ -z "$INPUT_WAV" ]]; then
-    for candidate in \
-        "$ROOT_DIR/out_wavtokenizer_mp3/ref_24k.wav" \
-        "$ROOT_DIR/out_wavtokenizer/ref_24k.wav" \
-        "$ROOT_DIR/input_audio/ref_24k.wav"; do
-        if [[ -f "$candidate" ]]; then
-            INPUT_WAV="$candidate"
-            break
-        fi
-    done
-fi
+INPUT_AUDIO="${2:-$ROOT_DIR/input_audio/reference_10_2.mp3}"
+WT_CKPT="${3:-${WT_CKPT:-$HOME/.cache/huggingface/hub/models--novateur--WavTokenizer-large-speech-75token/snapshots/9ecf0f435d6f8a75390457f31c6ed8f5f0d1af1b/wavtokenizer_large_speech_320_24k_v2.ckpt}}"
+WT_CONFIG="${4:-${WT_CONFIG:-$ROOT_DIR/../WavTokenizer-source/configs/wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml}}"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
     echo "ERROR: model not found: $MODEL_PATH" >&2
     exit 1
 fi
-
-if [[ -z "$INPUT_WAV" || ! -f "$INPUT_WAV" ]]; then
-    echo "ERROR: input wav not found. Pass: scripts/regression_wavtokenizer.sh <model.gguf> <input.wav>" >&2
+if [[ ! -f "$INPUT_AUDIO" ]]; then
+    echo "ERROR: input audio not found: $INPUT_AUDIO" >&2
+    exit 1
+fi
+if [[ ! -f "$WT_CKPT" ]]; then
+    echo "ERROR: wavtokenizer ckpt not found: $WT_CKPT" >&2
+    exit 1
+fi
+if [[ ! -f "$WT_CONFIG" ]]; then
+    echo "ERROR: wavtokenizer config not found: $WT_CONFIG" >&2
     exit 1
 fi
 
@@ -34,113 +31,133 @@ if [[ ! -x "$INSPECT_BIN" || ! -x "$CODEC_CLI_BIN" ]]; then
     exit 1
 fi
 
-EXPECTED_FRAMES=659
-EXPECTED_NQ=1
-EXPECTED_TOKENS=659
-EXPECTED_SR=24000
-EXPECTED_CHANNELS=1
-N_THREADS="${N_THREADS:-4}"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ERROR: ffmpeg is required" >&2
+    exit 1
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+    if [[ -x "$ROOT_DIR/.audio-env/bin/python" ]]; then
+        PYTHON_BIN="$ROOT_DIR/.audio-env/bin/python"
+    else
+        PYTHON_BIN="python3"
+    fi
+fi
+
+MAX_MSE=0.0001
+MIN_CORR=0.99
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 INSPECT_LOG="$TMP_DIR/inspect.log"
-RUN_LOG="$TMP_DIR/run.log"
-OUT_WAV="$TMP_DIR/recon.wav"
+CPP_LOG="$TMP_DIR/cpp.log"
+INPUT_WAV="$TMP_DIR/input_24k_mono.wav"
+REF_WAV="$TMP_DIR/reference_wt_py.wav"
+OUT_WAV="$TMP_DIR/recon_wt_cpp.wav"
+COMPARE_JSON="$TMP_DIR/compare.json"
 
 "$INSPECT_BIN" "$MODEL_PATH" > "$INSPECT_LOG"
-"$CODEC_CLI_BIN" e2e --model "$MODEL_PATH" --in "$INPUT_WAV" --out "$OUT_WAV" --threads "$N_THREADS" > "$RUN_LOG"
+ffmpeg -hide_banner -loglevel error -y -i "$INPUT_AUDIO" -ac 1 -ar 24000 "$INPUT_WAV"
 
-encoded_line="$(grep -E '^encoded:' "$RUN_LOG" || true)"
-decoded_line="$(grep -E '^decoded:' "$RUN_LOG" || true)"
-if [[ -z "$encoded_line" || -z "$decoded_line" ]]; then
-    echo "ERROR: missing encoded/decoded line in run output" >&2
-    cat "$RUN_LOG" >&2
-    exit 1
-fi
+"$PYTHON_BIN" - "$ROOT_DIR" "$WT_CKPT" "$WT_CONFIG" "$INPUT_WAV" "$REF_WAV" <<'PY'
+import os
+import sys
+from pathlib import Path
+import numpy as np
+import torch
+from scipy.io import wavfile
 
-n_frames="$(echo "$encoded_line" | sed -E 's/.*n_frames=([0-9]+).*/\1/')"
-n_q="$(echo "$encoded_line" | sed -E 's/.*n_q=([0-9]+).*/\1/')"
-n_tokens="$(echo "$encoded_line" | sed -E 's/.*n_tokens=([0-9]+).*/\1/')"
+root_dir, ckpt, cfg, in_wav, out_wav = sys.argv[1:]
+repo_root = Path(root_dir).resolve().parent
+sys.path.append(str(repo_root / "WavTokenizer-source"))
+from decoder.pretrained import WavTokenizer
 
-decoded_samples="$(echo "$decoded_line" | sed -E 's/.*n_samples=([0-9]+).*/\1/')"
-decoded_sr="$(echo "$decoded_line" | sed -E 's/.*sr=([0-9]+).*/\1/')"
+sr, x = wavfile.read(in_wav)
+if x.ndim > 1:
+    x = x.mean(axis=1)
+if np.issubdtype(x.dtype, np.integer):
+    x = x.astype(np.float32) / 32768.0
+else:
+    x = x.astype(np.float32)
 
-hop_size="$(grep -E '^[[:space:]]*hop_size[[:space:]]+[0-9]+' "$INSPECT_LOG" | awk '{print $2}' || true)"
-if [[ -z "$hop_size" ]]; then
-    echo "ERROR: failed to read hop_size from inspect output" >&2
-    cat "$INSPECT_LOG" >&2
-    exit 1
-fi
+wav = torch.from_numpy(np.clip(x, -1.0, 1.0)).unsqueeze(0)
+model = WavTokenizer.from_pretrained0802(cfg, ckpt)
+model.eval()
+with torch.inference_mode():
+    bw = torch.tensor([0], dtype=torch.long)
+    feat, _ = model.encode(wav, bandwidth_id=bw)
+    y = model.decode(feat, bandwidth_id=bw)
 
-if [[ "$n_frames" -ne "$EXPECTED_FRAMES" || "$n_q" -ne "$EXPECTED_NQ" || "$n_tokens" -ne "$EXPECTED_TOKENS" ]]; then
-    echo "ERROR: token regression mismatch" >&2
-    echo "  expected: n_frames=$EXPECTED_FRAMES n_q=$EXPECTED_NQ n_tokens=$EXPECTED_TOKENS" >&2
-    echo "  actual:   n_frames=$n_frames n_q=$n_q n_tokens=$n_tokens" >&2
-    exit 1
-fi
+y = y[0].detach().cpu().numpy().astype(np.float32)
+y = np.clip(y, -1.0, 1.0)
+wavfile.write(out_wav, 24000, np.round(y * 32767.0).astype(np.int16))
+PY
 
-if [[ "$decoded_sr" -ne "$EXPECTED_SR" ]]; then
-    echo "ERROR: decoded sample_rate mismatch: expected $EXPECTED_SR, got $decoded_sr" >&2
-    exit 1
-fi
+"$CODEC_CLI_BIN" e2e --model "$MODEL_PATH" --in "$INPUT_WAV" --out "$OUT_WAV" > "$CPP_LOG"
 
-expected_samples=$(( n_frames * hop_size ))
-sample_diff=$(( decoded_samples - expected_samples ))
-abs_diff=$(( sample_diff < 0 ? -sample_diff : sample_diff ))
-if [[ "$abs_diff" -gt "$hop_size" ]]; then
-    echo "ERROR: decoded sample count mismatch (outside padding tolerance)" >&2
-    echo "  n_frames=$n_frames hop_size=$hop_size expected=$expected_samples actual=$decoded_samples diff=$sample_diff" >&2
-    exit 1
-fi
+"$PYTHON_BIN" - "$REF_WAV" "$OUT_WAV" "$MAX_MSE" "$MIN_CORR" "$COMPARE_JSON" <<'PY'
+import json
+import math
+import sys
+import wave
+from array import array
 
-if [[ ! -s "$OUT_WAV" ]]; then
-    echo "ERROR: output wav missing or empty: $OUT_WAV" >&2
-    exit 1
-fi
+ref_path, out_path, max_mse, min_corr, out_json = sys.argv[1:]
+max_mse = float(max_mse)
+min_corr = float(min_corr)
 
-le_u16() {
-    od -An -t u2 -N 2 -j "$2" "$1" | tr -d ' \n'
-}
+def read_wav(path):
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate(); ch = wf.getnchannels(); sw = wf.getsampwidth(); n = wf.getnframes(); d = wf.readframes(n)
+    if ch != 1 or sw != 2:
+        raise RuntimeError(f"{path}: expected mono PCM16")
+    a = array("h"); a.frombytes(d)
+    return sr, a
 
-le_u32() {
-    od -An -t u4 -N 4 -j "$2" "$1" | tr -d ' \n'
-}
+sr_a, a = read_wav(ref_path)
+sr_b, b = read_wav(out_path)
+if sr_a != sr_b:
+    raise RuntimeError("sample_rate mismatch")
 
-riff="$(dd if="$OUT_WAV" bs=1 count=4 2>/dev/null)"
-wave="$(dd if="$OUT_WAV" bs=1 skip=8 count=4 2>/dev/null)"
-fmt_id="$(dd if="$OUT_WAV" bs=1 skip=12 count=4 2>/dev/null)"
-if [[ "$riff" != "RIFF" || "$wave" != "WAVE" || "$fmt_id" != "fmt " ]]; then
-    echo "ERROR: invalid WAV header (RIFF/WAVE/fmt)" >&2
-    exit 1
-fi
+n = min(len(a), len(b))
+if n <= 0:
+    raise RuntimeError("empty wav")
 
-audio_format="$(le_u16 "$OUT_WAV" 20)"
-header_channels="$(le_u16 "$OUT_WAV" 22)"
-header_sr="$(le_u32 "$OUT_WAV" 24)"
-bits_per_sample="$(le_u16 "$OUT_WAV" 34)"
-if [[ "$audio_format" -ne 1 || "$header_channels" -ne "$EXPECTED_CHANNELS" || "$header_sr" -ne "$EXPECTED_SR" || "$bits_per_sample" -ne 16 ]]; then
-    echo "ERROR: WAV format mismatch" >&2
-    echo "  audio_format=$audio_format channels=$header_channels sample_rate=$header_sr bits=$bits_per_sample" >&2
-    exit 1
-fi
+aa = bb = ab = err = 0.0
+for i in range(n):
+    x = a[i] / 32768.0
+    y = b[i] / 32768.0
+    d = x - y
+    aa += x * x
+    bb += y * y
+    ab += x * y
+    err += d * d
+mse = err / n
+corr = ab / math.sqrt(max(1e-20, aa * bb))
+ok = mse <= max_mse and corr >= min_corr
+rep = {"mse": mse, "corr": corr, "ok": ok, "n_ref": len(a), "n_cpp": len(b)}
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(rep, f)
+if not ok:
+    raise SystemExit(f"mse={mse:.8f} corr={corr:.6f}")
+PY
 
-if command -v ffprobe >/dev/null 2>&1; then
-    if ! ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$OUT_WAV" >/dev/null 2>&1; then
-        echo "ERROR: ffprobe failed to read output wav" >&2
-        exit 1
-    fi
-    ffprobe_status="ok"
-else
-    ffprobe_status="skipped (ffprobe not found)"
-fi
+readarray -t fields < <("$PYTHON_BIN" - "$COMPARE_JSON" <<'PY'
+import json,sys
+j=json.load(open(sys.argv[1]))
+print(j['mse']); print(j['corr']); print(j['n_ref']); print(j['n_cpp'])
+PY
+)
 
 echo "Regression summary:"
-echo "  input:         $INPUT_WAV"
-echo "  encoded:       n_frames=$n_frames n_q=$n_q n_tokens=$n_tokens"
-echo "  decoded:       n_samples=$decoded_samples sample_rate=$decoded_sr channels=$header_channels"
-echo "  expected:      n_samples~=n_frames*hop_size ($expected_samples, tolerance +/-$hop_size)"
-echo "  wav header:    OK (PCM16 mono ${EXPECTED_SR}Hz)"
-echo "  ffprobe:       $ffprobe_status"
-echo "  note:          prefer unified CLI: build/codec-cli e2e ..."
-echo "  output wav:    $OUT_WAV"
+echo "  model:       $MODEL_PATH"
+echo "  input_audio: $INPUT_AUDIO"
+echo "  ckpt:        $WT_CKPT"
+echo "  config:      $WT_CONFIG"
+echo "  mse:         ${fields[0]}"
+echo "  corr:        ${fields[1]}"
+echo "  n_ref:       ${fields[2]}"
+echo "  n_cpp:       ${fields[3]}"
+echo "  target:      mse <= $MAX_MSE, corr >= $MIN_CORR"

@@ -18,7 +18,7 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 
 INSPECT_PY="$ROOT_DIR/scripts/inspect_mimi_hf.py"
-CONVERT_PY="$ROOT_DIR/scripts/convert-mimi-to-gguf.py"
+CONVERT_PY="$ROOT_DIR/scripts/convert-to-gguf.py"
 INSPECT_BIN="$ROOT_DIR/build/inspect-codec"
 CODEC_CLI_BIN="$ROOT_DIR/build/codec-cli"
 
@@ -55,7 +55,7 @@ if [[ ! -f "$CODES_NPY" || ! -f "$REF_WAV" ]]; then
 fi
 
 echo "Converting Mimi safetensors -> GGUF..."
-"$PYTHON_BIN" "$CONVERT_PY" --input-dir "$MIMI_DIR" --output "$OUT_GGUF"
+"$PYTHON_BIN" "$CONVERT_PY" --input-dir "$MIMI_DIR" --output "$OUT_GGUF" --model-type mimi
 
 "$INSPECT_BIN" "$OUT_GGUF" > "$INSPECT_LOG"
 arch="$(grep -E '^arch:' "$INSPECT_LOG" | awk '{print $2}' || true)"

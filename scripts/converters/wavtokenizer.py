@@ -69,6 +69,11 @@ def compress_name(name):
         (".kernel_size", ".ks"),
         (".upsample", ".up"),
         (".downsample", ".dn"),
+        # Additional compression for WavTokenizer
+        ("feature_extractor.", "feat."),
+        (".convnext.", ".cnx."),
+        ("backbone.", "bb."),
+        (".final_layer_norm.", ".fln."),
     )
     out = name
     for old, new in replacements:

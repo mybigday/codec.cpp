@@ -12,6 +12,7 @@
 #include <array>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -54,6 +55,30 @@ struct mimi_decode_build {
     int32_t t;
     int32_t q;
     int32_t hop;
+    int32_t n_sem;
+    int32_t codebook_dim;
+    int32_t hidden_size;
+    int32_t codebook_size;
+    int32_t upsample_kernel;
+    int32_t upsample_stride;
+    int32_t transformer_layers;
+    int32_t transformer_heads;
+    int32_t transformer_head_dim;
+    int32_t transformer_intermediate;
+    float rope_theta;
+    float rope_scaling_factor;
+    int32_t dec_l0_kernel;
+    int32_t dec_l0_out;
+    int32_t dec_l2_kernel;
+    int32_t dec_l2_out;
+    int32_t dec_l5_kernel;
+    int32_t dec_l5_out;
+    int32_t dec_l8_kernel;
+    int32_t dec_l8_out;
+    int32_t dec_l11_kernel;
+    int32_t dec_l11_out;
+    int32_t dec_l14_kernel;
+    int32_t dec_l14_out;
 };
 
 struct mimi_encode_frontend_conv_desc {
@@ -105,38 +130,6 @@ static constexpr std::array<const char *, 14> CODEC_MIMI_ENC_FRONTEND_BIAS_NAMES
 static constexpr std::array<int32_t, 14> CODEC_MIMI_ENC_FRONTEND_STRIDES = {
     1, 1, 1, 4, 1, 1, 5, 1, 1, 6, 1, 1, 8, 1,
 };
-
-static bool codec_mimi_load_kernel_f16(
-    struct codec_context * ctx,
-    const char * name,
-    int32_t hop,
-    std::vector<ggml_fp16_t> * kernel_f16,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || kernel_f16 == nullptr || name == nullptr || hop <= 0) {
-        if (err != nullptr) {
-            *err = "invalid Mimi kernel load arguments";
-        }
-        return false;
-    }
-
-    ggml_tensor * t_kernel = ggml_get_tensor(ctx->model->weights, name);
-    if (t_kernel == nullptr) {
-        if (err != nullptr) {
-            *err = std::string("missing model tensor: ") + name;
-        }
-        return false;
-    }
-    if (t_kernel->type != GGML_TYPE_F16 || ggml_nelements(t_kernel) != hop) {
-        if (err != nullptr) {
-            *err = std::string("invalid model kernel tensor: ") + name;
-        }
-        return false;
-    }
-
-    kernel_f16->assign((size_t) hop, 0);
-    return codec_runtime_read_tensor(t_kernel, kernel_f16->data(), kernel_f16->size() * sizeof(ggml_fp16_t), err);
-}
 
 static ggml_tensor * codec_mimi_get_tensor(codec_model * model, const std::string & name) {
     if (model == nullptr || model->weights == nullptr) {
@@ -1164,24 +1157,899 @@ static bool codec_mimi_write_encode_weights(
     return true;
 }
 
+static std::string codec_mimi_decode_codebook_tensor_name(int32_t layer) {
+    return "mimi.decode.rvq.l" + std::to_string(layer) + ".codebook";
+}
+
+static ggml_tensor * codec_mimi_sum_codebook_lookup(
+    ggml_context * ctx_eval,
+    ggml_tensor * t_tok,
+    int32_t codebook_dim,
+    int32_t codebook_size,
+    int32_t t,
+    int32_t q_begin,
+    int32_t q_end) {
+
+    ggml_tensor * sum = nullptr;
+    for (int32_t qi = q_begin; qi < q_end; ++qi) {
+        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, codebook_dim, codebook_size);
+        ggml_set_name(t_codebook, codec_mimi_decode_codebook_tensor_name(qi).c_str());
+
+        ggml_tensor * t_idx = ggml_view_1d(ctx_eval, t_tok, t, (size_t) qi * t_tok->nb[1]);
+        ggml_tensor * t_qi = ggml_get_rows(ctx_eval, t_codebook, t_idx); // [codebook_dim, t]
+        if (t_qi == nullptr) {
+            return nullptr;
+        }
+        sum = (sum == nullptr) ? t_qi : ggml_add(ctx_eval, sum, t_qi);
+    }
+    return sum;
+}
+
+static std::string codec_mimi_decode_transformer_tensor_name(int32_t layer, const char * suffix) {
+    return "mimi.decode_transformer.l" + std::to_string(layer) + "." + suffix;
+}
+
 static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     mimi_decode_build * p = static_cast<mimi_decode_build *>(user_data);
-    ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->t, p->q);
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->t <= 0 || p->q <= 0 || p->n_sem <= 0 ||
+        p->codebook_dim <= 0 || p->hidden_size <= 0 || p->codebook_size <= 1 || p->n_sem > p->q ||
+        p->upsample_kernel <= 0 || p->upsample_stride <= 0 || p->transformer_layers <= 0 ||
+        p->transformer_heads <= 0 || p->transformer_head_dim <= 0 || p->transformer_intermediate <= 0 ||
+        p->transformer_heads * p->transformer_head_dim != p->hidden_size) {
+        return false;
+    }
+
+    ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_I32, p->t, p->q);
     ggml_set_name(t_tok, "mimi.decode.tok");
 
-    ggml_tensor * t_feat = codec_op_tokens_to_features(ctx_eval, t_tok, 1);
-    ggml_tensor * t_alpha = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
-    ggml_set_name(t_alpha, "mimi.decode.alpha");
+    auto mul_mat_checked = [&](const char * tag, ggml_tensor * a, ggml_tensor * b) -> ggml_tensor * {
+        if (a == nullptr || b == nullptr) {
+            return nullptr;
+        }
+        if (a->ne[0] != b->ne[0] || (b->ne[2] % a->ne[2]) != 0 || (b->ne[3] % a->ne[3]) != 0) {
+            std::fprintf(
+                stderr,
+                "mimi decode mul_mat mismatch at %s: a=[%lld,%lld,%lld,%lld] b=[%lld,%lld,%lld,%lld]\n",
+                tag,
+                (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
+                (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+            return nullptr;
+        }
+        return ggml_mul_mat(ctx_eval, a, b);
+    };
 
-    ggml_tensor * t_snake = codec_op_snake(ctx_eval, t_feat, t_alpha, 1e-4f);
-    ggml_tensor * t_kernel = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F16, p->hop, 1, 1);
-    ggml_set_name(t_kernel, "mimi.decode.kernel");
+    // Per-layer RVQ decode: sum semantic/acoustic codebook vectors, then project each branch to hidden_size.
+    const int32_t n_acu = std::max(0, p->q - p->n_sem);
+    ggml_tensor * t_sem_sum = codec_mimi_sum_codebook_lookup(ctx_eval, t_tok, p->codebook_dim, p->codebook_size, p->t, 0, p->n_sem);
+    if (t_sem_sum == nullptr) {
+        return false;
+    }
+    ggml_tensor * t_sem_op_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->hidden_size);
+    ggml_set_name(t_sem_op_w, "mimi.decode.sem.op.w");
+    ggml_tensor * t_latent_ct = mul_mat_checked("rvq.sem_proj", t_sem_op_w, t_sem_sum); // [hidden, t]
+    if (t_latent_ct == nullptr) {
+        return false;
+    }
 
-    ggml_tensor * t_pcm = codec_convtr1d_causal(ctx_eval, t_snake, t_kernel, nullptr, p->hop, 1);
-    ggml_tensor * t_out = ggml_cont(ctx_eval, ggml_tanh(ctx_eval, t_pcm));
+    if (n_acu > 0) {
+        ggml_tensor * t_acu_sum = codec_mimi_sum_codebook_lookup(ctx_eval, t_tok, p->codebook_dim, p->codebook_size, p->t, p->n_sem, p->q);
+        if (t_acu_sum == nullptr) {
+            return false;
+        }
+        ggml_tensor * t_acu_op_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->hidden_size);
+        ggml_set_name(t_acu_op_w, "mimi.decode.acu.op.w");
+        ggml_tensor * t_acu_latent_ct = mul_mat_checked("rvq.acu_proj", t_acu_op_w, t_acu_sum); // [hidden, t]
+        if (t_acu_latent_ct == nullptr) {
+            return false;
+        }
+        t_latent_ct = ggml_add(ctx_eval, t_latent_ct, t_acu_latent_ct);
+    }
+
+    // Upsample (depthwise ConvTranspose1d via dense diagonal kernel).
+    ggml_tensor * t_up_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->upsample_kernel, p->hidden_size, p->hidden_size);
+    ggml_set_name(t_up_w, "mimi.decode.up.w");
+
+    ggml_tensor * x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_latent_ct)); // [t, c]
+    x = codec_convtr1d_causal(ctx_eval, x, t_up_w, nullptr, p->upsample_stride, 1);
+    if (x == nullptr) {
+        return false;
+    }
+
+    // Decoder transformer.
+    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [c, t]
+    const float freq_scale = p->rope_scaling_factor > 0.0f ? 1.0f / p->rope_scaling_factor : 1.0f;
+
+    for (int32_t li = 0; li < p->transformer_layers; ++li) {
+        ggml_tensor * inln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(inln_w, codec_mimi_decode_transformer_tensor_name(li, "inln.w").c_str());
+        ggml_tensor * inln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(inln_b, codec_mimi_decode_transformer_tensor_name(li, "inln.b").c_str());
+        ggml_tensor * paln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(paln_w, codec_mimi_decode_transformer_tensor_name(li, "paln.w").c_str());
+        ggml_tensor * paln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(paln_b, codec_mimi_decode_transformer_tensor_name(li, "paln.b").c_str());
+
+        ggml_tensor * q_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->hidden_size);
+        ggml_set_name(q_w, codec_mimi_decode_transformer_tensor_name(li, "attn.q_proj.w").c_str());
+        ggml_tensor * k_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->hidden_size);
+        ggml_set_name(k_w, codec_mimi_decode_transformer_tensor_name(li, "attn.k_proj.w").c_str());
+        ggml_tensor * v_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->hidden_size);
+        ggml_set_name(v_w, codec_mimi_decode_transformer_tensor_name(li, "attn.v_proj.w").c_str());
+        ggml_tensor * o_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->hidden_size);
+        ggml_set_name(o_w, codec_mimi_decode_transformer_tensor_name(li, "attn.o_proj.w").c_str());
+
+        ggml_tensor * fc1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->transformer_intermediate);
+        ggml_set_name(fc1_w, codec_mimi_decode_transformer_tensor_name(li, "mlp.fc1.w").c_str());
+        ggml_tensor * fc2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->transformer_intermediate, p->hidden_size);
+        ggml_set_name(fc2_w, codec_mimi_decode_transformer_tensor_name(li, "mlp.fc2.w").c_str());
+
+        ggml_tensor * sa_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(sa_scale, codec_mimi_decode_transformer_tensor_name(li, "sa_ls.scale").c_str());
+        ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
+        ggml_set_name(mlp_scale, codec_mimi_decode_transformer_tensor_name(li, "mlp_ls.scale").c_str());
+
+        ggml_tensor * h = codec_mimi_layer_norm_ct(ctx_eval, x_ct, inln_w, inln_b);
+        const int32_t t_cur = (int32_t) h->ne[1];
+
+        ggml_tensor * q = mul_mat_checked("dtr.q_proj", q_w, h);
+        ggml_tensor * k = mul_mat_checked("dtr.k_proj", k_w, h);
+        ggml_tensor * v = mul_mat_checked("dtr.v_proj", v_w, h);
+        if (q == nullptr || k == nullptr || v == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * q_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, q, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
+        ggml_tensor * k_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, k, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
+        ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
+
+        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer_head_dim, p->rope_theta, freq_scale);
+        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer_head_dim, p->rope_theta, freq_scale);
+        if (q_rope == nullptr || k_rope == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * attn_scores = mul_mat_checked("dtr.attn_scores", ggml_cont(ctx_eval, k_rope), q_rope);
+        if (attn_scores == nullptr) {
+            return false;
+        }
+        attn_scores = ggml_scale_inplace(ctx_eval, attn_scores, 1.0f / std::sqrt((float) p->transformer_head_dim));
+        attn_scores = ggml_diag_mask_inf_inplace(ctx_eval, attn_scores, 0);
+        ggml_tensor * attn_probs = ggml_soft_max(ctx_eval, attn_scores);
+
+        ggml_tensor * v_tdh = ggml_permute(ctx_eval, v_dth, 1, 0, 2, 3);
+        ggml_tensor * ctx_3d = mul_mat_checked("dtr.attn_ctx", ggml_cont(ctx_eval, v_tdh), attn_probs);
+        if (ctx_3d == nullptr) {
+            return false;
+        }
+        ggml_tensor * ctx_2d = ggml_reshape_2d(
+            ctx_eval,
+            ggml_cont(ctx_eval, ggml_permute(ctx_eval, ctx_3d, 0, 2, 1, 3)),
+            p->hidden_size,
+            t_cur);
+        ggml_tensor * attn_out = mul_mat_checked("dtr.o_proj", o_w, ctx_2d);
+        if (attn_out == nullptr) {
+            return false;
+        }
+        x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, attn_out, sa_scale));
+
+        ggml_tensor * m = codec_mimi_layer_norm_ct(ctx_eval, x_ct, paln_w, paln_b);
+        m = mul_mat_checked("dtr.fc1", fc1_w, m);
+        if (m == nullptr) {
+            return false;
+        }
+        m = ggml_gelu_erf(ctx_eval, m);
+        m = mul_mat_checked("dtr.fc2", fc2_w, m);
+        if (m == nullptr) {
+            return false;
+        }
+        x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, m, mlp_scale));
+    }
+
+    x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct)); // [t, c]
+
+    ggml_tensor * t_l0_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l0_kernel, p->hidden_size, p->dec_l0_out);
+    ggml_set_name(t_l0_w, "mimi.decode.dec.l0.conv.w");
+    ggml_tensor * t_l0_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l0_out);
+    ggml_set_name(t_l0_b, "mimi.decode.dec.l0.conv.b");
+
+    ggml_tensor * t_l2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l2_kernel, p->dec_l2_out, p->dec_l0_out);
+    ggml_set_name(t_l2_w, "mimi.decode.dec.l2.conv.w");
+    ggml_tensor * t_l2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l2_out);
+    ggml_set_name(t_l2_b, "mimi.decode.dec.l2.conv.b");
+
+    ggml_tensor * t_r0_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->dec_l2_out, p->dec_l2_out / 2);
+    ggml_set_name(t_r0_c1_w, "mimi.decode.dec.l3.block.1.conv.w");
+    ggml_tensor * t_r0_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l2_out / 2);
+    ggml_set_name(t_r0_c1_b, "mimi.decode.dec.l3.block.1.conv.b");
+    ggml_tensor * t_r0_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->dec_l2_out / 2, p->dec_l2_out);
+    ggml_set_name(t_r0_c2_w, "mimi.decode.dec.l3.block.3.conv.w");
+    ggml_tensor * t_r0_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l2_out);
+    ggml_set_name(t_r0_c2_b, "mimi.decode.dec.l3.block.3.conv.b");
+
+    ggml_tensor * t_l5_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l5_kernel, p->dec_l5_out, p->dec_l2_out);
+    ggml_set_name(t_l5_w, "mimi.decode.dec.l5.conv.w");
+    ggml_tensor * t_l5_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l5_out);
+    ggml_set_name(t_l5_b, "mimi.decode.dec.l5.conv.b");
+
+    ggml_tensor * t_r1_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->dec_l5_out, p->dec_l5_out / 2);
+    ggml_set_name(t_r1_c1_w, "mimi.decode.dec.l6.block.1.conv.w");
+    ggml_tensor * t_r1_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l5_out / 2);
+    ggml_set_name(t_r1_c1_b, "mimi.decode.dec.l6.block.1.conv.b");
+    ggml_tensor * t_r1_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->dec_l5_out / 2, p->dec_l5_out);
+    ggml_set_name(t_r1_c2_w, "mimi.decode.dec.l6.block.3.conv.w");
+    ggml_tensor * t_r1_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l5_out);
+    ggml_set_name(t_r1_c2_b, "mimi.decode.dec.l6.block.3.conv.b");
+
+    ggml_tensor * t_l8_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l8_kernel, p->dec_l8_out, p->dec_l5_out);
+    ggml_set_name(t_l8_w, "mimi.decode.dec.l8.conv.w");
+    ggml_tensor * t_l8_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l8_out);
+    ggml_set_name(t_l8_b, "mimi.decode.dec.l8.conv.b");
+
+    ggml_tensor * t_r2_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->dec_l8_out, p->dec_l8_out / 2);
+    ggml_set_name(t_r2_c1_w, "mimi.decode.dec.l9.block.1.conv.w");
+    ggml_tensor * t_r2_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l8_out / 2);
+    ggml_set_name(t_r2_c1_b, "mimi.decode.dec.l9.block.1.conv.b");
+    ggml_tensor * t_r2_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->dec_l8_out / 2, p->dec_l8_out);
+    ggml_set_name(t_r2_c2_w, "mimi.decode.dec.l9.block.3.conv.w");
+    ggml_tensor * t_r2_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l8_out);
+    ggml_set_name(t_r2_c2_b, "mimi.decode.dec.l9.block.3.conv.b");
+
+    ggml_tensor * t_l11_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l11_kernel, p->dec_l11_out, p->dec_l8_out);
+    ggml_set_name(t_l11_w, "mimi.decode.dec.l11.conv.w");
+    ggml_tensor * t_l11_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l11_out);
+    ggml_set_name(t_l11_b, "mimi.decode.dec.l11.conv.b");
+
+    ggml_tensor * t_r3_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->dec_l11_out, p->dec_l11_out / 2);
+    ggml_set_name(t_r3_c1_w, "mimi.decode.dec.l12.block.1.conv.w");
+    ggml_tensor * t_r3_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l11_out / 2);
+    ggml_set_name(t_r3_c1_b, "mimi.decode.dec.l12.block.1.conv.b");
+    ggml_tensor * t_r3_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->dec_l11_out / 2, p->dec_l11_out);
+    ggml_set_name(t_r3_c2_w, "mimi.decode.dec.l12.block.3.conv.w");
+    ggml_tensor * t_r3_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l11_out);
+    ggml_set_name(t_r3_c2_b, "mimi.decode.dec.l12.block.3.conv.b");
+
+    ggml_tensor * t_l14_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->dec_l14_kernel, p->dec_l11_out, p->dec_l14_out);
+    ggml_set_name(t_l14_w, "mimi.decode.dec.l14.conv.w");
+    ggml_tensor * t_l14_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dec_l14_out);
+    ggml_set_name(t_l14_b, "mimi.decode.dec.l14.conv.b");
+
+    x = codec_conv1d_causal(ctx_eval, x, t_l0_w, t_l0_b, 1, 1);
+    if (x == nullptr) {
+        return false;
+    }
+    x = ggml_elu(ctx_eval, x);
+    x = codec_convtr1d_causal(ctx_eval, x, t_l2_w, t_l2_b, 8, 1);
+    x = codec_mimi_resblock_ggml(ctx_eval, x, t_r0_c1_w, t_r0_c1_b, t_r0_c2_w, t_r0_c2_b);
+    if (x == nullptr) {
+        return false;
+    }
+    x = ggml_elu(ctx_eval, x);
+    x = codec_convtr1d_causal(ctx_eval, x, t_l5_w, t_l5_b, 6, 1);
+    x = codec_mimi_resblock_ggml(ctx_eval, x, t_r1_c1_w, t_r1_c1_b, t_r1_c2_w, t_r1_c2_b);
+    if (x == nullptr) {
+        return false;
+    }
+    x = ggml_elu(ctx_eval, x);
+    x = codec_convtr1d_causal(ctx_eval, x, t_l8_w, t_l8_b, 5, 1);
+    x = codec_mimi_resblock_ggml(ctx_eval, x, t_r2_c1_w, t_r2_c1_b, t_r2_c2_w, t_r2_c2_b);
+    if (x == nullptr) {
+        return false;
+    }
+    x = ggml_elu(ctx_eval, x);
+    x = codec_convtr1d_causal(ctx_eval, x, t_l11_w, t_l11_b, 4, 1);
+    x = codec_mimi_resblock_ggml(ctx_eval, x, t_r3_c1_w, t_r3_c1_b, t_r3_c2_w, t_r3_c2_b);
+    if (x == nullptr) {
+        return false;
+    }
+    x = ggml_elu(ctx_eval, x);
+    ggml_tensor * t_pcm = codec_conv1d_causal(ctx_eval, x, t_l14_w, t_l14_b, 1, 1);
+    if (t_pcm == nullptr) {
+        return false;
+    }
+    ggml_tensor * t_out = ggml_cont(ctx_eval, t_pcm);
     ggml_set_name(t_out, "mimi.decode.out");
 
     *out = t_out;
+    return true;
+}
+
+static bool codec_mimi_copy_linear_1x1_weight_to_2d(
+    codec_context * ctx,
+    const char * src_name,
+    ggml_tensor * dst,
+    int32_t expected_in,
+    int32_t expected_out,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || src_name == nullptr || dst == nullptr || expected_in <= 0 || expected_out <= 0) {
+        if (err != nullptr) {
+            *err = "invalid Mimi projection copy arguments";
+        }
+        return false;
+    }
+
+    ggml_tensor * src = codec_mimi_get_tensor(ctx->model, src_name);
+    if (src == nullptr) {
+        if (err != nullptr) {
+            *err = std::string("missing Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    std::vector<float> src_v;
+    if (!codec_mimi_tensor_to_f32(src, &src_v)) {
+        if (err != nullptr) {
+            *err = std::string("failed reading Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    std::vector<float> dst_v((size_t) expected_in * (size_t) expected_out, 0.0f);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    const int32_t n2 = (int32_t) std::max<int64_t>(1, codec_ne(src, 2));
+
+    if (n0 == expected_in && n1 == expected_out && n2 == 1) {
+        dst_v = src_v;
+    } else if (n0 == 1 && n1 == expected_out && n2 == expected_in) {
+        // Source layout [1, out, in] -> destination [in, out].
+        for (int32_t i = 0; i < expected_in; ++i) {
+            for (int32_t o = 0; o < expected_out; ++o) {
+                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) o + (size_t) n1 * (size_t) i);
+                dst_v[(size_t) i + (size_t) expected_in * (size_t) o] = src_v[src_idx];
+            }
+        }
+    } else if (n0 == 1 && n1 == expected_in && n2 == expected_out) {
+        // Source layout [1, in, out] -> destination [in, out].
+        for (int32_t i = 0; i < expected_in; ++i) {
+            for (int32_t o = 0; o < expected_out; ++o) {
+                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) i + (size_t) n1 * (size_t) o);
+                dst_v[(size_t) i + (size_t) expected_in * (size_t) o] = src_v[src_idx];
+            }
+        }
+    } else if (n0 == expected_in && n1 == expected_out && codec_ne(src, 2) == 0) {
+        dst_v = src_v;
+    } else {
+        if (err != nullptr) {
+            *err = std::string("unexpected Mimi projection shape at ") + src_name;
+        }
+        return false;
+    }
+
+    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+}
+
+static bool codec_mimi_copy_linear_weight_to_2d(
+    codec_context * ctx,
+    const char * src_name,
+    ggml_tensor * dst,
+    int32_t in_dim,
+    int32_t out_dim,
+    bool prefer_transpose_when_square,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || src_name == nullptr || dst == nullptr || in_dim <= 0 || out_dim <= 0) {
+        if (err != nullptr) {
+            *err = "invalid Mimi linear copy arguments";
+        }
+        return false;
+    }
+
+    ggml_tensor * src = codec_mimi_get_tensor(ctx->model, src_name);
+    if (src == nullptr) {
+        if (err != nullptr) {
+            *err = std::string("missing Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    std::vector<float> src_v;
+    if (!codec_mimi_tensor_to_f32(src, &src_v)) {
+        if (err != nullptr) {
+            *err = std::string("failed reading Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    std::vector<float> dst_v((size_t) in_dim * (size_t) out_dim, 0.0f);
+
+    const bool copy_as_is = n0 == in_dim && n1 == out_dim && !(prefer_transpose_when_square && in_dim == out_dim);
+    const bool transpose_io = (n0 == out_dim && n1 == in_dim) || (prefer_transpose_when_square && n0 == in_dim && n1 == out_dim && in_dim == out_dim);
+
+    if (copy_as_is) {
+        dst_v = src_v;
+    } else if (transpose_io) {
+        for (int32_t i = 0; i < in_dim; ++i) {
+            for (int32_t o = 0; o < out_dim; ++o) {
+                dst_v[(size_t) i + (size_t) in_dim * (size_t) o] = src_v[(size_t) o + (size_t) out_dim * (size_t) i];
+            }
+        }
+    } else {
+        if (err != nullptr) {
+            *err = std::string("unexpected Mimi linear shape at ") + src_name;
+        }
+        return false;
+    }
+
+    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+}
+
+static bool codec_mimi_copy_conv1d_weight_to_3d(
+    codec_context * ctx,
+    const char * src_name,
+    ggml_tensor * dst,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || src_name == nullptr || dst == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid Mimi conv1d copy arguments";
+        }
+        return false;
+    }
+
+    ggml_tensor * src = codec_mimi_get_tensor(ctx->model, src_name);
+    if (src == nullptr) {
+        if (err != nullptr) {
+            *err = std::string("missing Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    std::vector<float> src_v;
+    if (!codec_mimi_tensor_to_f32(src, &src_v)) {
+        if (err != nullptr) {
+            *err = std::string("failed reading Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    const int32_t dk = (int32_t) codec_ne(dst, 0);
+    const int32_t din = (int32_t) codec_ne(dst, 1);
+    const int32_t dout = (int32_t) codec_ne(dst, 2);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    const int32_t n2 = (int32_t) codec_ne(src, 2);
+    std::vector<float> dst_v((size_t) dk * (size_t) din * (size_t) dout, 0.0f);
+
+    if (n0 == dk && n1 == din && n2 == dout) {
+        dst_v = src_v;
+    } else if (n0 == dout && n1 == din && n2 == dk) {
+        for (int32_t k = 0; k < dk; ++k) {
+            for (int32_t i = 0; i < din; ++i) {
+                for (int32_t o = 0; o < dout; ++o) {
+                    const size_t src_idx = (size_t) o + (size_t) dout * ((size_t) i + (size_t) din * (size_t) k);
+                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) i + (size_t) din * (size_t) o);
+                    dst_v[dst_idx] = src_v[src_idx];
+                }
+            }
+        }
+    } else {
+        if (err != nullptr) {
+            *err = std::string("unexpected Mimi conv1d shape at ") + src_name;
+        }
+        return false;
+    }
+
+    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+}
+
+static bool codec_mimi_copy_convtr_weight_to_3d(
+    codec_context * ctx,
+    const char * src_name,
+    ggml_tensor * dst,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || src_name == nullptr || dst == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid Mimi convtr copy arguments";
+        }
+        return false;
+    }
+
+    ggml_tensor * src = codec_mimi_get_tensor(ctx->model, src_name);
+    if (src == nullptr) {
+        if (err != nullptr) {
+            *err = std::string("missing Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    std::vector<float> src_v;
+    if (!codec_mimi_tensor_to_f32(src, &src_v)) {
+        if (err != nullptr) {
+            *err = std::string("failed reading Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+
+    const int32_t dk = (int32_t) codec_ne(dst, 0);
+    const int32_t dout = (int32_t) codec_ne(dst, 1);
+    const int32_t din = (int32_t) codec_ne(dst, 2);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    const int32_t n2 = (int32_t) codec_ne(src, 2);
+    std::vector<float> dst_v((size_t) dk * (size_t) dout * (size_t) din, 0.0f);
+
+    if (n0 == dk && n1 == dout && n2 == din) {
+        dst_v = src_v;
+    } else if (n0 == din && n1 == dout && n2 == dk) {
+        for (int32_t k = 0; k < dk; ++k) {
+            for (int32_t o = 0; o < dout; ++o) {
+                for (int32_t i = 0; i < din; ++i) {
+                    const size_t src_idx = (size_t) i + (size_t) din * ((size_t) o + (size_t) dout * (size_t) k);
+                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) o + (size_t) dout * (size_t) i);
+                    dst_v[dst_idx] = src_v[src_idx];
+                }
+            }
+        }
+    } else {
+        if (err != nullptr) {
+            *err = std::string("unexpected Mimi convtr shape at ") + src_name;
+        }
+        return false;
+    }
+
+    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+}
+
+static bool codec_mimi_copy_bias_1d(codec_context * ctx, const char * src_name, ggml_tensor * dst, std::string * err) {
+    if (ctx == nullptr || ctx->model == nullptr || src_name == nullptr || dst == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid Mimi bias copy arguments";
+        }
+        return false;
+    }
+    ggml_tensor * src = codec_mimi_get_tensor(ctx->model, src_name);
+    if (src == nullptr) {
+        if (err != nullptr) {
+            *err = std::string("missing Mimi tensor: ") + src_name;
+        }
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_mimi_tensor_to_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
+        if (err != nullptr) {
+            *err = std::string("invalid Mimi bias tensor: ") + src_name;
+        }
+        return false;
+    }
+    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static bool codec_mimi_init_decode_build(
+    codec_context * ctx,
+    int32_t t,
+    int32_t q,
+    int32_t n_sem,
+    mimi_decode_build * build,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || build == nullptr || t <= 0 || q <= 0 || n_sem <= 0 || n_sem > q) {
+        if (err != nullptr) {
+            *err = "invalid Mimi decode build arguments";
+        }
+        return false;
+    }
+
+    const codec_mimi & mm = ctx->model->mimi;
+    build->t = t;
+    build->q = q;
+    build->hop = std::max(1, mm.hop_size);
+    build->n_sem = n_sem;
+    build->codebook_dim = std::max(1, mm.codebook_dim);
+    build->hidden_size = std::max(1, mm.hidden_size);
+    build->codebook_size = std::max(2, mm.codebook_size);
+    build->transformer_layers = std::max(1, mm.num_hidden_layers);
+    build->transformer_heads = std::max(1, mm.num_attention_heads);
+    build->transformer_head_dim = std::max(1, mm.head_dim);
+    build->transformer_intermediate = std::max(1, mm.intermediate_size);
+    build->rope_theta = mm.rope_theta;
+    build->rope_scaling_factor = mm.rope_scaling_factor;
+
+    auto require_w = [&](const char * name) -> ggml_tensor * {
+        ggml_tensor * t_w = codec_mimi_get_tensor(ctx->model, name);
+        if (t_w == nullptr && err != nullptr) {
+            *err = std::string("missing Mimi decoder tensor: ") + name;
+        }
+        return t_w;
+    };
+
+    ggml_tensor * up_w = require_w("up.cv.w");
+    ggml_tensor * l0_w = require_w("dec.l0.conv.w");
+    ggml_tensor * l0_b = require_w("dec.l0.conv.b");
+    ggml_tensor * l2_w = require_w("dec.l2.conv.w");
+    ggml_tensor * l2_b = require_w("dec.l2.conv.b");
+    ggml_tensor * l5_w = require_w("dec.l5.conv.w");
+    ggml_tensor * l5_b = require_w("dec.l5.conv.b");
+    ggml_tensor * l8_w = require_w("dec.l8.conv.w");
+    ggml_tensor * l8_b = require_w("dec.l8.conv.b");
+    ggml_tensor * l11_w = require_w("dec.l11.conv.w");
+    ggml_tensor * l11_b = require_w("dec.l11.conv.b");
+    ggml_tensor * l14_w = require_w("dec.l14.conv.w");
+    ggml_tensor * l14_b = require_w("dec.l14.conv.b");
+    if (up_w == nullptr || l0_w == nullptr || l0_b == nullptr || l2_w == nullptr || l2_b == nullptr ||
+        l5_w == nullptr || l5_b == nullptr || l8_w == nullptr || l8_b == nullptr || l11_w == nullptr ||
+        l11_b == nullptr || l14_w == nullptr || l14_b == nullptr) {
+        return false;
+    }
+
+    auto infer_conv1d = [&](ggml_tensor * w, ggml_tensor * b, int32_t * kernel, int32_t * in_c, int32_t * out_c) -> bool {
+        const int32_t n0 = (int32_t) codec_ne(w, 0);
+        const int32_t n1 = (int32_t) codec_ne(w, 1);
+        const int32_t n2 = (int32_t) codec_ne(w, 2);
+        const int32_t bo = (int32_t) codec_ne(b, 0);
+        if (n0 == bo) {
+            *out_c = n0;
+            *in_c = n1;
+            *kernel = n2;
+            return true;
+        }
+        if (n2 == bo) {
+            *out_c = n2;
+            *in_c = n1;
+            *kernel = n0;
+            return true;
+        }
+        return false;
+    };
+
+    auto infer_convtr = [&](ggml_tensor * w, ggml_tensor * b, int32_t * kernel, int32_t * in_c, int32_t * out_c) -> bool {
+        const int32_t n0 = (int32_t) codec_ne(w, 0);
+        const int32_t n1 = (int32_t) codec_ne(w, 1);
+        const int32_t n2 = (int32_t) codec_ne(w, 2);
+        const int32_t bo = (int32_t) codec_ne(b, 0);
+        if (n1 != bo) {
+            return false;
+        }
+        *out_c = bo;
+        if (n0 <= 64) {
+            *kernel = n0;
+            *in_c = n2;
+            return true;
+        }
+        *in_c = n0;
+        *kernel = n2;
+        return true;
+    };
+
+    const int32_t up0 = (int32_t) codec_ne(up_w, 0);
+    const int32_t up1 = (int32_t) codec_ne(up_w, 1);
+    const int32_t up2 = (int32_t) codec_ne(up_w, 2);
+    if (up1 != 1) {
+        if (err != nullptr) {
+            *err = "unexpected Mimi upsample tensor shape";
+        }
+        return false;
+    }
+    if (up2 == build->hidden_size) {
+        build->upsample_kernel = up0;
+    } else if (up0 == build->hidden_size) {
+        build->upsample_kernel = up2;
+    } else {
+        if (err != nullptr) {
+            *err = "unexpected Mimi upsample channel dimension";
+        }
+        return false;
+    }
+    build->upsample_stride = 2;
+    int32_t tmp_in = 0, tmp_out = 0;
+    if (!infer_conv1d(l0_w, l0_b, &build->dec_l0_kernel, &tmp_in, &build->dec_l0_out) ||
+        !infer_convtr(l2_w, l2_b, &build->dec_l2_kernel, &tmp_in, &build->dec_l2_out) ||
+        !infer_convtr(l5_w, l5_b, &build->dec_l5_kernel, &tmp_in, &build->dec_l5_out) ||
+        !infer_convtr(l8_w, l8_b, &build->dec_l8_kernel, &tmp_in, &build->dec_l8_out) ||
+        !infer_convtr(l11_w, l11_b, &build->dec_l11_kernel, &tmp_in, &build->dec_l11_out) ||
+        !infer_conv1d(l14_w, l14_b, &build->dec_l14_kernel, &tmp_in, &tmp_out)) {
+        if (err != nullptr) {
+            *err = "failed to infer Mimi decoder layer shapes";
+        }
+        return false;
+    }
+
+    build->dec_l14_out = (int32_t) codec_ne(l14_b, 0);
+    if (build->dec_l14_out != 1) {
+        if (err != nullptr) {
+            *err = "Mimi decoder output channels must be 1";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool codec_mimi_write_decode_transformer_weights(
+    codec_context * ctx,
+    codec_graph_cache_entry * entry,
+    const mimi_decode_build & build,
+    std::string * err) {
+
+    if (ctx == nullptr || ctx->model == nullptr || entry == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid Mimi decode transformer write arguments";
+        }
+        return false;
+    }
+
+    for (int32_t li = 0; li < build.transformer_layers; ++li) {
+        const std::string base = "dtr.l" + std::to_string(li);
+        auto copy_vec = [&](const char * suffix, int32_t expected) -> bool {
+            ggml_tensor * dst = codec_graph_get_tensor(ctx, entry, codec_mimi_decode_transformer_tensor_name(li, suffix).c_str());
+            if (dst == nullptr) {
+                if (err != nullptr) {
+                    *err = "missing Mimi decode transformer tensor at layer " + std::to_string(li);
+                }
+                return false;
+            }
+            ggml_tensor * src = codec_mimi_get_tensor(ctx->model, base + "." + suffix);
+            if (src == nullptr) {
+                if (err != nullptr) {
+                    *err = "missing Mimi decode transformer source tensor at layer " + std::to_string(li);
+                }
+                return false;
+            }
+            std::vector<float> v;
+            if (!codec_mimi_tensor_to_f32(src, &v) || (int32_t) v.size() != expected) {
+                if (err != nullptr) {
+                    *err = "invalid Mimi decode transformer vector tensor at layer " + std::to_string(li);
+                }
+                return false;
+            }
+            return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
+        };
+
+        if (!copy_vec("inln.w", build.hidden_size) ||
+            !copy_vec("inln.b", build.hidden_size) ||
+            !copy_vec("paln.w", build.hidden_size) ||
+            !copy_vec("paln.b", build.hidden_size) ||
+            !copy_vec("sa_ls.scale", build.hidden_size) ||
+            !copy_vec("mlp_ls.scale", build.hidden_size)) {
+            return false;
+        }
+
+        const struct {
+            const char * suffix;
+            int32_t in_dim;
+            int32_t out_dim;
+        } proj[] = {
+            { "attn.q_proj.w", build.hidden_size, build.hidden_size },
+            { "attn.k_proj.w", build.hidden_size, build.hidden_size },
+            { "attn.v_proj.w", build.hidden_size, build.hidden_size },
+            { "attn.o_proj.w", build.hidden_size, build.hidden_size },
+            { "mlp.fc1.w", build.hidden_size, build.transformer_intermediate },
+            { "mlp.fc2.w", build.transformer_intermediate, build.hidden_size },
+        };
+
+        for (const auto & p : proj) {
+            ggml_tensor * dst = codec_graph_get_tensor(ctx, entry, codec_mimi_decode_transformer_tensor_name(li, p.suffix).c_str());
+            if (dst == nullptr) {
+                if (err != nullptr) {
+                    *err = "missing Mimi decode transformer projection tensor at layer " + std::to_string(li);
+                }
+                return false;
+            }
+            if (!codec_mimi_copy_linear_weight_to_2d(
+                    ctx,
+                    (base + "." + p.suffix).c_str(),
+                    dst,
+                    p.in_dim,
+                    p.out_dim,
+                    /*prefer_transpose_when_square=*/false,
+                    err)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool codec_mimi_write_decode_decoder_weights(
+    codec_context * ctx,
+    codec_graph_cache_entry * entry,
+    const mimi_decode_build & build,
+    std::string * err) {
+
+    (void) build;
+
+    if (ctx == nullptr || ctx->model == nullptr || entry == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid Mimi decoder write arguments";
+        }
+        return false;
+    }
+
+    // upsample depthwise convtranspose: expand [k, 1, c] into dense diagonal [k, c, c].
+    ggml_tensor * t_up_dst = codec_graph_get_tensor(ctx, entry, "mimi.decode.up.w");
+    ggml_tensor * t_up_src = codec_mimi_get_tensor(ctx->model, "up.cv.w");
+    if (t_up_dst == nullptr || t_up_src == nullptr) {
+        if (err != nullptr) {
+            *err = "missing Mimi upsample tensor";
+        }
+        return false;
+    }
+    std::vector<float> up_src;
+    if (!codec_mimi_tensor_to_f32(t_up_src, &up_src)) {
+        if (err != nullptr) {
+            *err = "failed reading Mimi upsample tensor";
+        }
+        return false;
+    }
+    const int32_t up_k = (int32_t) codec_ne(t_up_dst, 0);
+    const int32_t up_c = (int32_t) codec_ne(t_up_dst, 1);
+    const int32_t src0 = (int32_t) codec_ne(t_up_src, 0);
+    const int32_t src1 = (int32_t) codec_ne(t_up_src, 1);
+    const int32_t src2 = (int32_t) codec_ne(t_up_src, 2);
+    std::vector<float> up_dst((size_t) up_k * (size_t) up_c * (size_t) up_c, 0.0f);
+    if (src0 == up_k && src1 == 1 && src2 == up_c) {
+        for (int32_t k = 0; k < up_k; ++k) {
+            for (int32_t c = 0; c < up_c; ++c) {
+                const size_t src_idx = (size_t) k + (size_t) up_k * ((size_t) 0 + (size_t) src1 * (size_t) c);
+                const size_t dst_idx = (size_t) k + (size_t) up_k * ((size_t) c + (size_t) up_c * (size_t) c);
+                up_dst[dst_idx] = up_src[src_idx];
+            }
+        }
+    } else if (src0 == up_c && src1 == 1 && src2 == up_k) {
+        for (int32_t k = 0; k < up_k; ++k) {
+            for (int32_t c = 0; c < up_c; ++c) {
+                const size_t src_idx = (size_t) c + (size_t) up_c * ((size_t) 0 + (size_t) src1 * (size_t) k);
+                const size_t dst_idx = (size_t) k + (size_t) up_k * ((size_t) c + (size_t) up_c * (size_t) c);
+                up_dst[dst_idx] = up_src[src_idx];
+            }
+        }
+    } else {
+        if (err != nullptr) {
+            *err = "unexpected Mimi upsample tensor shape";
+        }
+        return false;
+    }
+    if (!codec_runtime_write_tensor(t_up_dst, up_dst.data(), up_dst.size() * sizeof(float), err)) {
+        return false;
+    }
+
+    auto write_conv1d = [&](const char * model_w, const char * model_b, const char * graph_w, const char * graph_b) -> bool {
+        ggml_tensor * dst_w = codec_graph_get_tensor(ctx, entry, graph_w);
+        ggml_tensor * dst_b = codec_graph_get_tensor(ctx, entry, graph_b);
+        if (dst_w == nullptr || dst_b == nullptr) {
+            if (err != nullptr) {
+                *err = "missing Mimi decoder conv1d graph tensor";
+            }
+            return false;
+        }
+        return codec_mimi_copy_conv1d_weight_to_3d(ctx, model_w, dst_w, err) &&
+               codec_mimi_copy_bias_1d(ctx, model_b, dst_b, err);
+    };
+
+    auto write_convtr = [&](const char * model_w, const char * model_b, const char * graph_w, const char * graph_b) -> bool {
+        ggml_tensor * dst_w = codec_graph_get_tensor(ctx, entry, graph_w);
+        ggml_tensor * dst_b = codec_graph_get_tensor(ctx, entry, graph_b);
+        if (dst_w == nullptr || dst_b == nullptr) {
+            if (err != nullptr) {
+                *err = "missing Mimi decoder convtr graph tensor";
+            }
+            return false;
+        }
+        return codec_mimi_copy_convtr_weight_to_3d(ctx, model_w, dst_w, err) &&
+               codec_mimi_copy_bias_1d(ctx, model_b, dst_b, err);
+    };
+
+    if (!write_conv1d("dec.l0.conv.w", "dec.l0.conv.b", "mimi.decode.dec.l0.conv.w", "mimi.decode.dec.l0.conv.b") ||
+        !write_convtr("dec.l2.conv.w", "dec.l2.conv.b", "mimi.decode.dec.l2.conv.w", "mimi.decode.dec.l2.conv.b") ||
+        !write_conv1d("dec.l3.block.1.conv.w", "dec.l3.block.1.conv.b", "mimi.decode.dec.l3.block.1.conv.w", "mimi.decode.dec.l3.block.1.conv.b") ||
+        !write_conv1d("dec.l3.block.3.conv.w", "dec.l3.block.3.conv.b", "mimi.decode.dec.l3.block.3.conv.w", "mimi.decode.dec.l3.block.3.conv.b") ||
+        !write_convtr("dec.l5.conv.w", "dec.l5.conv.b", "mimi.decode.dec.l5.conv.w", "mimi.decode.dec.l5.conv.b") ||
+        !write_conv1d("dec.l6.block.1.conv.w", "dec.l6.block.1.conv.b", "mimi.decode.dec.l6.block.1.conv.w", "mimi.decode.dec.l6.block.1.conv.b") ||
+        !write_conv1d("dec.l6.block.3.conv.w", "dec.l6.block.3.conv.b", "mimi.decode.dec.l6.block.3.conv.w", "mimi.decode.dec.l6.block.3.conv.b") ||
+        !write_convtr("dec.l8.conv.w", "dec.l8.conv.b", "mimi.decode.dec.l8.conv.w", "mimi.decode.dec.l8.conv.b") ||
+        !write_conv1d("dec.l9.block.1.conv.w", "dec.l9.block.1.conv.b", "mimi.decode.dec.l9.block.1.conv.w", "mimi.decode.dec.l9.block.1.conv.b") ||
+        !write_conv1d("dec.l9.block.3.conv.w", "dec.l9.block.3.conv.b", "mimi.decode.dec.l9.block.3.conv.w", "mimi.decode.dec.l9.block.3.conv.b") ||
+        !write_convtr("dec.l11.conv.w", "dec.l11.conv.b", "mimi.decode.dec.l11.conv.w", "mimi.decode.dec.l11.conv.b") ||
+        !write_conv1d("dec.l12.block.1.conv.w", "dec.l12.block.1.conv.b", "mimi.decode.dec.l12.block.1.conv.w", "mimi.decode.dec.l12.block.1.conv.b") ||
+        !write_conv1d("dec.l12.block.3.conv.w", "dec.l12.block.3.conv.b", "mimi.decode.dec.l12.block.3.conv.w", "mimi.decode.dec.l12.block.3.conv.b") ||
+        !write_conv1d("dec.l14.conv.w", "dec.l14.conv.b", "mimi.decode.dec.l14.conv.w", "mimi.decode.dec.l14.conv.b")) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1211,16 +2079,20 @@ enum codec_status codec_mimi_decode(
 
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
-    const int32_t hop = std::max(1, mm.hop_size);
 
     const size_t mem = 48 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
-    mimi_decode_build build = { t, q, hop };
-    codec_graph_cache_entry * entry = nullptr;
+    const int32_t n_sem = std::max(1, std::min(mm.num_semantic_quantizers, q));
+    mimi_decode_build build = {};
     std::string err;
+    if (!codec_mimi_init_decode_build(ctx, t, q, n_sem, &build, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
             ctx,
-            { CODEC_GRAPH_MIMI_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/0 },
+            { CODEC_GRAPH_MIMI_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/build.hop, /*n_in=*/0, /*latent_dim=*/0 },
             mem,
             codec_mimi_build_decode,
             &build,
@@ -1232,10 +2104,9 @@ enum codec_status codec_mimi_decode(
     }
 
     ggml_tensor * t_tok = codec_graph_get_tensor(ctx, entry, "mimi.decode.tok");
-    ggml_tensor * t_alpha = codec_graph_get_tensor(ctx, entry, "mimi.decode.alpha");
-    ggml_tensor * t_kernel = codec_graph_get_tensor(ctx, entry, "mimi.decode.kernel");
+    ggml_tensor * t_sem_op_w = codec_graph_get_tensor(ctx, entry, "mimi.decode.sem.op.w");
     ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "mimi.decode.out");
-    if (t_tok == nullptr || t_alpha == nullptr || t_kernel == nullptr || t_out == nullptr) {
+    if (t_tok == nullptr || t_sem_op_w == nullptr || t_out == nullptr) {
         codec_context_set_error(ctx, "cached Mimi decode graph is invalid");
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -1245,22 +2116,83 @@ enum codec_status codec_mimi_decode(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    std::vector<float> tok_f32((size_t) t * (size_t) q, 0.0f);
+    std::vector<int32_t> tok_i32((size_t) t * (size_t) q, 0);
     for (int32_t ti = 0; ti < t; ++ti) {
         for (int32_t qi = 0; qi < q; ++qi) {
-            tok_f32[(size_t) qi * (size_t) t + (size_t) ti] = (float) tokens->data[(size_t) ti * (size_t) tokens->n_q + (size_t) qi];
+            int32_t tok = tokens->data[(size_t) ti * (size_t) tokens->n_q + (size_t) qi];
+            tok = std::max(0, std::min(build.codebook_size - 1, tok));
+            tok_i32[(size_t) qi * (size_t) t + (size_t) ti] = tok;
         }
     }
-    std::vector<ggml_fp16_t> kernel_f16;
-    if (!codec_mimi_load_kernel_f16(ctx, "mimi.decode.kernel", hop, &kernel_f16, &err)) {
+
+    if (!codec_mimi_copy_linear_1x1_weight_to_2d(ctx, "q.s.op.w", t_sem_op_w, build.codebook_dim, build.hidden_size, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
-    const float alpha = 0.35f;
+    if (q > n_sem) {
+        ggml_tensor * t_acu_op_w = codec_graph_get_tensor(ctx, entry, "mimi.decode.acu.op.w");
+        if (t_acu_op_w == nullptr ||
+            !codec_mimi_copy_linear_1x1_weight_to_2d(ctx, "q.a.op.w", t_acu_op_w, build.codebook_dim, build.hidden_size, &err)) {
+            codec_context_set_error(ctx, err.empty() ? "missing Mimi acoustic projection tensor" : err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
 
-    if (!codec_runtime_write_tensor(t_tok, tok_f32.data(), tok_f32.size() * sizeof(float), &err) ||
-        !codec_runtime_write_tensor(t_alpha, &alpha, sizeof(float), &err) ||
-        !codec_runtime_write_tensor(t_kernel, kernel_f16.data(), kernel_f16.size() * sizeof(ggml_fp16_t), &err)) {
+    for (int32_t qi = 0; qi < q; ++qi) {
+        const bool is_sem = qi < n_sem;
+        const int32_t group_layer = is_sem ? qi : (qi - n_sem);
+        const std::string model_name = is_sem
+            ? ("q.s.layers." + std::to_string(group_layer) + ".codebook.embed")
+            : ("q.a.layers." + std::to_string(group_layer) + ".codebook.embed");
+        const std::string model_name_alt = is_sem
+            ? ("q.s.layers." + std::to_string(group_layer) + ".cb.embed")
+            : ("q.a.layers." + std::to_string(group_layer) + ".cb.embed");
+
+        ggml_tensor * src = codec_mimi_get_tensor(ctx->model, model_name);
+        if (src == nullptr) {
+            src = codec_mimi_get_tensor(ctx->model, model_name_alt);
+        }
+        ggml_tensor * dst = codec_graph_get_tensor(ctx, entry, codec_mimi_decode_codebook_tensor_name(qi).c_str());
+        if (src == nullptr || dst == nullptr) {
+            codec_context_set_error(ctx, "missing Mimi RVQ codebook tensor");
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+
+        std::vector<float> cb;
+        if (!codec_mimi_tensor_to_f32(src, &cb)) {
+            codec_context_set_error(ctx, "failed reading Mimi RVQ codebook tensor");
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        const int32_t n0 = (int32_t) codec_ne(src, 0);
+        const int32_t n1 = (int32_t) codec_ne(src, 1);
+        std::vector<float> dst_cb((size_t) build.codebook_dim * (size_t) build.codebook_size, 0.0f);
+        if (n0 == build.codebook_dim && n1 == build.codebook_size) {
+            dst_cb = cb;
+        } else if (n0 == build.codebook_size && n1 == build.codebook_dim) {
+            for (int32_t i = 0; i < build.codebook_dim; ++i) {
+                for (int32_t j = 0; j < build.codebook_size; ++j) {
+                    dst_cb[(size_t) i + (size_t) build.codebook_dim * (size_t) j] =
+                        cb[(size_t) j + (size_t) build.codebook_size * (size_t) i];
+                }
+            }
+        } else {
+            codec_context_set_error(ctx, "unexpected Mimi RVQ codebook shape");
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+
+        if (!codec_runtime_write_tensor(dst, dst_cb.data(), dst_cb.size() * sizeof(float), &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    if (!codec_mimi_write_decode_transformer_weights(ctx, entry, build, &err) ||
+        !codec_mimi_write_decode_decoder_weights(ctx, entry, build, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    if (!codec_runtime_write_tensor(t_tok, tok_i32.data(), tok_i32.size() * sizeof(int32_t), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

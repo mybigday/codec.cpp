@@ -71,8 +71,12 @@ def map_key(key: str) -> str | None:
         return "enc." + key[len("encoder.") :]
     if key.startswith("quantizer.quantizers."):
         return "vq.q" + key[len("quantizer.quantizers.") :]
-    if key.startswith("decoder."):
+    if key.startswith("decoder.model."):
+        # Keep full path for decoder: dec.model.N.*
         return "dec." + key[len("decoder.") :]
+    if key.startswith("decoder."):
+        # Legacy naming - remap to dec.model.*
+        return "dec.model." + key[len("decoder.") :]
     return None
 
 

@@ -66,7 +66,9 @@ def _normalize_rvq_codebook_embed_layout(key: str, arr: np.ndarray) -> np.ndarra
         return arr
     if arr.ndim != 2:
         raise ValueError(f"RVQ codebook embed must be rank-2: {key} shape={arr.shape}")
-    return np.transpose(arr, (1, 0)).copy() if arr.shape[0] > arr.shape[1] else arr
+    # Keep HF logical layout [codebook_size, codebook_dim].
+    # GGUF writer handles ggml dimension order when serializing.
+    return arr
 
 
 def transform_tensor_for_codec(key: str, arr: np.ndarray, weight_transforms: Dict[str, str]) -> np.ndarray:

@@ -154,9 +154,12 @@ class GGUFWriter:
         tensor_meta = []
         cur_off = 0
         
-        for name, st_dtype, shape_rev, data in self.tensors:
+        for name, st_dtype, shape, data in self.tensors:
             ggml_type = TENSOR_TYPE_MAP[st_dtype]
             data_off = _align_up(cur_off, ALIGNMENT)
+            # GGUF tensor dims follow ggml layout order (ne0, ne1, ...),
+            # which is the reverse of NumPy row-major shape.
+            shape_rev = list(reversed(shape))
             tensor_meta.append((name, ggml_type, shape_rev, data_off, data))
             cur_off = data_off + len(data)
 

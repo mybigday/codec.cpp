@@ -130,9 +130,17 @@ ggml_tensor * codec_op_tokens_to_features(ggml_context * ctx, ggml_tensor * toke
     }
 
     ggml_tensor * x = ggml_scale(ctx, tokens, 1.0f / 1024.0f);
-    ggml_tensor * base = ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], 0);
+    ggml_tensor * base = nullptr;
+    if (x->ne[1] <= 1) {
+        base = ggml_cont(ctx, ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], 0));
+    } else {
+        // Aggregate all quantizers instead of only using q=0.
+        ggml_tensor * x_qt = ggml_cont(ctx, ggml_transpose(ctx, x)); // [q, t]
+        ggml_tensor * mean_1t = ggml_scale(ctx, ggml_sum_rows(ctx, x_qt), 1.0f / (float) x_qt->ne[0]); // [1, t]
+        base = ggml_cont(ctx, ggml_transpose(ctx, mean_1t));         // [t, 1]
+    }
     if (out_channels == 1) {
-        return ggml_cont(ctx, base);
+        return base;
     }
     return ggml_repeat(ctx, base, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], out_channels));
 }
