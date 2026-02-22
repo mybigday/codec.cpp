@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # C++ Build Test
+  build-cpp:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential pkg-config
+    
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+    
+    - name: Build
+      run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+    
+    - name: Test CLI exists
+      run: |
+        test -f build/codec-cli
+        ./build/codec-cli --help || true
+
+  # Python Converter Tests
+  test-converters:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+        pip install safetensors huggingface-hub
+    
+    - name: Test converter imports
+      run: |
+        cd scripts
+        python -c "from converters import get_converter_for_model, list_supported_models; print('Supported:', list_supported_models())"
+        python -c "from converters import MimiConverter, DacConverter, WavTokenizerConverter; print('All converters imported successfully')"
+        python -c "from utils import GGUFWriter, quantize_tensor_q8_0; print('Utils imported successfully')"
+    
+    - name: Test syntax of all Python files
+      run: |
+        cd scripts
+        python -m py_compile convert-to-gguf.py
+        python -m py_compile converters/__init__.py
+        python -m py_compile converters/base.py
+        python -m py_compile converters/mimi.py
+        python -m py_compile converters/dac.py
+        python -m py_compile converters/wavtokenizer.py
+        python -m py_compile utils/__init__.py
+        python -m py_compile utils/gguf_writer.py
+        python -m py_compile utils/quantization.py
+        echo "All Python files compiled successfully"
+    
+    - name: Test unified entry point
+      run: |
+        cd scripts
+        python convert-to-gguf.py --help
+
+  # Code Quality Checks
+  lint-python:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install linting tools
+      run: |
+        pip install flake8 black --quiet
+    
+    - name: Run flake8
+      run: |
+        cd scripts
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+      continue-on-error: true
+    
+    - name: Check black formatting
+      run: |
+        cd scripts
+        black --check . || true
+      continue-on-error: true
+
+  # Gitignore Verification
+  check-gitignore:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check for files that should be ignored
+      run: |
+        # Check if any gguf, npy, npz, bin files are tracked
+        GGUF_COUNT=$(git ls-files | grep -c '\.gguf$' || true)
+        NPY_COUNT=$(git ls-files | grep -c '\.npy$' || true)
+        NPZ_COUNT=$(git ls-files | grep -c '\.npz$' || true)
+        BIN_COUNT=$(git ls-files | grep -E '\.bin$|\.raw$' | wc -l || true)
+        
+        echo "Tracked files check:"
+        echo "  .gguf files: $GGUF_COUNT"
+        echo "  .npy files: $NPY_COUNT"
+        echo "  .npz files: $NPZ_COUNT"
+        echo "  .bin/.raw files: $BIN_COUNT"
+        
+        if [ "$GGUF_COUNT" -gt 0 ] || [ "$NPY_COUNT" -gt 0 ] || [ "$NPZ_COUNT" -gt 0 ]; then
+          echo "ERROR: Large binary files should not be tracked in git!"
+          exit 1
+        fi
+        
+        echo "✓ Gitignore verification passed"

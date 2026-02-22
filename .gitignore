@@ -1,0 +1,48 @@
+# Build outputs
+build/
+build-*/
+dist/
+
+# Compiled artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Models
+*.gguf
+
+# Python environments and caches
+.venv/
+.audio-env/
+__pycache__/
+*.pyc
+
+# Checkpoints
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Arrays and binary/debug artifacts
+*.npy
+*.npz
+*.bin
+*.raw
+
+# Generated audio outputs (keep demo/test WAVs)
+*.wav
+!/input_audio/*
+
+# Editor / OS
+*.swp
+.DS_Store
+
+# Notes and scratch
+/*.md
+!/README.md
+!/AGENT.md
+!/CLAUDE.md
+
