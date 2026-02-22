@@ -463,29 +463,56 @@ def encode_decode_hf(
     save_wav_pcm16(ref_out, decoded_audio, sample_rate)
 
 
+def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: str) -> Path:
+    """Download HF model snapshot to local cache using huggingface_hub"""
+    from huggingface_hub import snapshot_download
+    
+    repo_id = model_cfg["hf_repo_id"]
+    local_path = REPO_ROOT / model_cfg.get("local_path", f"models/{model_name}")
+    
+    # Use HF cache dir
+    cache_dir = REPO_ROOT / "models" / "hf"
+    
+    print(f"[{model_name}] Downloading HF snapshot: {repo_id}")
+    
+    try:
+        downloaded_path = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=str(cache_dir),
+            local_dir=str(local_path),
+            local_dir_use_symlinks=False,
+        )
+        print(f"[{model_name}] Downloaded to: {downloaded_path}")
+        return Path(downloaded_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to download HF snapshot: {e}")
+
+
 def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Path, model_name: str) -> Path:
     """Auto-convert HF model to GGUF using scripts/convert-to-gguf.py"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
-        "--model-id", model_cfg["hf_repo_id"],
-        "--output", str(output_path),
-    ]
-
-    # Handle special cases for local checkpoints
-    hf_file = model_cfg.get("hf_file")
-    if hf_file:
-        # If hf_file points to a checkpoint, use --input-dir instead
-        local_path = REPO_ROOT / model_cfg.get("local_path", "")
-        if (local_path / hf_file).exists():
-            cmd = [
-                sys.executable,
-                str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
-                "--input-dir", str(local_path),
-                "--output", str(output_path),
-            ]
+    class_spec = model_cfg.get("class", "")
+    
+    # For transformers models, use direct HF conversion
+    if class_spec.startswith("transformers:") and model_cfg.get("converter") is None:
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
+            "--model-id", model_cfg["hf_repo_id"],
+            "--output", str(output_path),
+        ]
+    else:
+        # For non-transformers models (dac, wavtokenizer), download first then convert
+        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
+        
+        converter = model_cfg.get("converter", model_name)
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
+            "--input-dir", str(local_path),
+            "--output", str(output_path),
+        ]
 
     quantization = model_cfg.get("quantization")
     if quantization:

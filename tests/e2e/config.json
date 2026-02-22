@@ -13,9 +13,11 @@
       "name": "dac",
       "hf_repo_id": "ibm-research/DAC.speech.v1.0",
       "hf_file": null,
-      "class": "transformers:DacModel",
+      "class": "dac",
       "n_q": 4,
       "gguf": "models/dac/dac.gguf",
+      "local_path": "models/dac",
+      "converter": "dac",
       "auto_convert": true
     },
     {
@@ -25,6 +27,8 @@
       "class": "wavtokenizer",
       "n_q": 1,
       "gguf": "models/wavtokenizer/wavtokenizer.gguf",
+      "local_path": "models/wavtokenizer",
+      "converter": "wavtokenizer",
       "auto_convert": true
     }
   ]
