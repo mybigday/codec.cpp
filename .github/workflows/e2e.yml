@@ -44,12 +44,14 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+        cache: 'pip'
 
     - name: Install Python dependencies
       run: |
         python3 -m pip install --upgrade pip
         python3 -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
         python3 -m pip install safetensors huggingface-hub transformers scipy
+        pip install -r requirements.txt
 
     - name: Build C++
       run: |
