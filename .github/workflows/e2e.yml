@@ -25,85 +25,54 @@ env:
 jobs:
   e2e-test:
     runs-on: ubuntu-22.04
-    
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [mimi, dac, wavtokenizer]
+
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
-    
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential pkg-config python3-pip ffmpeg ffmpeg
-    
+        sudo apt-get install -y cmake build-essential pkg-config python3-pip ffmpeg
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
     - name: Install Python dependencies
       run: |
         python3 -m pip install --upgrade pip
         python3 -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
         python3 -m pip install safetensors huggingface-hub transformers scipy
-    
+
     - name: Build C++
       run: |
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
         cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
-    
+
     - name: Verify CLI
       run: |
         test -f build/codec-cli
-        # codec-cli doesn't support --help, just verify it exists and is executable
         ./build/codec-cli 2>&1 | head -5 || true
-    
-    - name: Download Mimi checkpoint from HF
+
+    - name: Run unified E2E runner
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        mkdir -p models
-        echo "Downloading Mimi checkpoint snapshot..."
-        python3 - <<'PY'
-        import os
-        from huggingface_hub import snapshot_download
+        python3 tests/e2e/runner.py \
+          --model "${{ matrix.model }}" \
+          --report-dir "tests/e2e/reports/${{ matrix.model }}"
 
-        token = os.environ.get("HF_TOKEN") or None
-        snapshot_download(
-            repo_id="kyutai/mimi",
-            local_dir="models/mimi",
-            local_dir_use_symlinks=False,
-            token=token,
-        )
-        PY
-        ls -lah models/mimi/
-    
-    - name: Run Mimi E2E test
-      run: |
-        if [ -f models/mimi/model.safetensors ] && [ -f models/mimi/config.json ]; then
-          echo "Running Mimi regression test..."
-          bash scripts/regression_mimi.sh models/mimi models/mimi.gguf
-        else
-          echo "Mimi checkpoint not available, failing"
-          exit 1
-        fi
-    
-    - name: Run DAC E2E test (if model available)
-      run: |
-        if [ -f models/dac.gguf ]; then
-          echo "Running DAC regression test..."
-          bash scripts/regression_dac.sh models/dac.gguf
-        else
-          echo "DAC model not available, skipping"
-        fi
-      continue-on-error: true
-    
-    - name: Run WavTokenizer E2E test (if model available)
-      run: |
-        if [ -f models/wavtokenizer.gguf ]; then
-          echo "Running WavTokenizer regression test..."
-          bash scripts/regression_wavtokenizer.sh models/wavtokenizer.gguf
-        else
-          echo "WavTokenizer model not available, skipping"
-        fi
-      continue-on-error: true
+    - name: Upload E2E reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-report-${{ matrix.model }}
+        path: tests/e2e/reports/${{ matrix.model }}/
+        if-no-files-found: error
