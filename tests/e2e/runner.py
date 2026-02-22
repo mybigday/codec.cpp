@@ -34,6 +34,7 @@ DEFAULT_THRESHOLDS = {
 @dataclass
 class ModelResult:
     name: str
+    mode: str
     status: str
     duration_sec: float
     log_path: str
@@ -211,12 +212,15 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     if not spec:
         raise RuntimeError("empty class spec")
 
+    if spec.lower() == "dac":
+        return "dac", ""
+
     if spec.lower() == "wavtokenizer":
         return "wavtokenizer", ""
 
     if ":" not in spec:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName' or 'wavtokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', or 'wavtokenizer'"
         )
 
     module_name, class_name = spec.split(":", 1)
@@ -224,13 +228,16 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     class_name = class_name.strip()
     if module_name != "transformers" or not class_name:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName' or 'wavtokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', or 'wavtokenizer'"
         )
     return module_name, class_name
 
 
-def load_model_for_config(model_cfg: dict[str, Any]):
+def load_hf_model(model_cfg: dict[str, Any]):
     module_name, class_name = parse_model_class(model_cfg["class"])
+    if module_name in {"dac", "wavtokenizer"}:
+        return None
+
     cache_dir = str(REPO_ROOT / "models" / "hf")
     kwargs: dict[str, Any] = {
         "cache_dir": cache_dir,
@@ -238,12 +245,7 @@ def load_model_for_config(model_cfg: dict[str, Any]):
     hf_file = model_cfg.get("hf_file")
     if hf_file:
         kwargs["filename"] = hf_file
-    if module_name == "wavtokenizer":
-        # WavTokenizer is loaded via remote code and is not a native transformers class.
-        module = importlib.import_module("transformers")
-        model_cls = getattr(module, "AutoModel")
-        model = model_cls.from_pretrained(model_cfg["hf_repo_id"], trust_remote_code=True, **kwargs)
-    elif module_name == "transformers":
+    if module_name == "transformers":
         module = importlib.import_module("transformers")
         model_cls = getattr(module, class_name)
         model = model_cls.from_pretrained(model_cfg["hf_repo_id"], **kwargs)
@@ -335,6 +337,8 @@ def call_with_fallback(func, call_args: list[tuple[tuple[Any, ...], dict[str, An
 
 def class_family(class_spec: str) -> str:
     module_name, class_name = parse_model_class(class_spec)
+    if module_name == "dac":
+        return "dac"
     if module_name == "wavtokenizer":
         return "wavtokenizer"
     return class_name.lower().replace("model", "")
@@ -347,6 +351,7 @@ def encode_decode_hf(
     ref_out: Path,
     sample_rate: int,
     log_path: Path,
+    model: Any,
 ) -> None:
     import torch
 
@@ -355,8 +360,6 @@ def encode_decode_hf(
         raise RuntimeError(f"expected {sample_rate} Hz input wav, got {sr}")
 
     class_alias = class_family(model_cfg["class"])
-
-    model = load_model_for_config(model_cfg)
 
     with log_path.open("a", encoding="utf-8") as lf:
         lf.write(f"[hf] loading model: {model_cfg['hf_repo_id']} ({model_cfg['class']})\n")
@@ -572,6 +575,8 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
     name = model_cfg["name"]
     start = time.monotonic()
     log_path = report_dir / f"{name}.log"
+    hf_model = load_hf_model(model_cfg)
+    mode = "full" if hf_model is not None else "conversion-only"
 
     report_dir.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
@@ -590,13 +595,25 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
             else:
                 raise RuntimeError(f"GGUF model not found: {gguf_path}")
 
+        if mode == "conversion-only":
+            duration = time.monotonic() - start
+            return ModelResult(
+                name=name,
+                mode=mode,
+                status="passed",
+                duration_sec=duration,
+                log_path=str(log_path),
+            )
+
         input_wav = tmpdir / "input.wav"
         hf_codes = tmpdir / "hf_codes.npy"
         hf_ref_wav = tmpdir / "hf_reference.wav"
         cpp_out_wav = tmpdir / "cpp_decode.wav"
+        if hf_model is None:
+            raise RuntimeError("internal error: full mode selected without an HF model")
 
         ffmpeg_to_mono_wav(input_audio, input_wav, sample_rate, log_path, name)
-        encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, sample_rate, log_path)
+        encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, sample_rate, log_path, hf_model)
 
         n_q = int(model_cfg.get("n_q", 0))
         run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
@@ -619,6 +636,7 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         if failures:
             return ModelResult(
                 name=name,
+                mode=mode,
                 status="failed",
                 duration_sec=duration,
                 log_path=str(log_path),
@@ -629,6 +647,7 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
 
         return ModelResult(
             name=name,
+            mode=mode,
             status="passed",
             duration_sec=duration,
             log_path=str(log_path),
@@ -638,6 +657,7 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         duration = time.monotonic() - start
         return ModelResult(
             name=name,
+            mode=mode,
             status="failed",
             duration_sec=duration,
             log_path=str(log_path),
@@ -664,6 +684,7 @@ def write_reports(report_dir: Path, selected_models: list[str], results: list[Mo
         "results": [
             {
                 "name": r.name,
+                "mode": r.mode,
                 "status": r.status,
                 "duration_sec": round(r.duration_sec, 3),
                 "log_path": r.log_path,
@@ -697,7 +718,7 @@ def write_reports(report_dir: Path, selected_models: list[str], results: list[Mo
         if mse is not None and corr is not None:
             metric_txt = f" | mse={float(mse):.8f} corr={float(corr):.6f}"
         lines.append(
-            f"- {r.name}: {r.status} ({r.duration_sec:.2f}s)"
+            f"- {r.name}: {r.status} [{r.mode}] ({r.duration_sec:.2f}s)"
             + metric_txt
             + (f" | reason: {r.reason}" if r.reason else "")
             + f" | log: {r.log_path}"
