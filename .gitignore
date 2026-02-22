@@ -46,4 +46,6 @@ checkpoints/
 !/AGENT.md
 !/CLAUDE.md
 
-models/hf/
+# E2E files
+/models/
+/tests/e2e/reports/
