@@ -11,7 +11,7 @@
     },
     {
       "name": "dac",
-      "hf_repo_id": "ibm-research/DAC.speech.v1.0",
+      "hf_repo_id": "hance-ai/descript-audio-codec-24khz",
       "hf_file": null,
       "class": "dac",
       "n_q": 4,

@@ -17,6 +17,7 @@ from array import array
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -25,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("config.json")
 DEFAULT_INPUT_AUDIO = REPO_ROOT / "input_audio/reference_10_2.mp3"
 DEFAULT_SAMPLE_RATE = 24000
+PRIMARY_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_THRESHOLDS = {
     "corr_min": 0.99,
     "mse_max": 0.0001,
@@ -233,10 +235,318 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     return module_name, class_name
 
 
+def preferred_python_executable() -> str:
+    if PRIMARY_PYTHON.is_file():
+        return str(PRIMARY_PYTHON)
+    return sys.executable
+
+
+def resolve_model_local_path(model_cfg: dict[str, Any]) -> Path:
+    local_path = model_cfg.get("local_path")
+    if not local_path:
+        return REPO_ROOT / "models" / model_cfg["name"]
+    path = Path(local_path)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+class NativeDacAdapter:
+    def __init__(self, model: Any):
+        self.model = model
+
+    def eval(self):
+        if hasattr(self.model, "eval"):
+            self.model.eval()
+        return self
+
+    def encode(self, *args, **kwargs):
+        import torch
+
+        audio = kwargs.pop("input_values", None)
+        if audio is None:
+            audio = kwargs.pop("audio_values", None)
+        if audio is None and args:
+            audio = args[0]
+        if audio is None:
+            raise TypeError("missing audio input")
+
+        n_quantizers = kwargs.pop("n_quantizers", None)
+        if kwargs:
+            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
+
+        x = audio
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32, copy=False))
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+
+        encode_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = [((x,), {})]
+        if n_quantizers is not None:
+            encode_calls.insert(0, ((x,), {"n_quantizers": int(n_quantizers)}))
+
+        out = call_with_fallback(self.model.encode, encode_calls, "dac.native.encode")
+        if isinstance(out, tuple):
+            # Common DAC output: (latents, codes, ...)
+            if len(out) < 2:
+                raise RuntimeError("dac native encode returned tuple without codes")
+            codes = out[1]
+        elif hasattr(out, "audio_codes"):
+            codes = out.audio_codes
+        else:
+            raise RuntimeError("dac native encode output does not expose codes")
+        return SimpleNamespace(audio_codes=codes)
+
+    def decode(self, *args, **kwargs):
+        audio_codes = kwargs.pop("audio_codes", None)
+        if audio_codes is None and args:
+            audio_codes = args[0]
+        if audio_codes is None:
+            raise TypeError("missing audio codes")
+        if kwargs:
+            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
+
+        if hasattr(self.model, "quantizer") and hasattr(self.model.quantizer, "from_codes"):
+            latent = self.model.quantizer.from_codes(audio_codes)
+            if isinstance(latent, tuple):
+                latent = latent[0]
+            decoded = call_with_fallback(
+                self.model.decode,
+                [((latent,), {})],
+                "dac.native.decode(latent)",
+            )
+        else:
+            decoded = call_with_fallback(
+                self.model.decode,
+                [((audio_codes,), {})],
+                "dac.native.decode(codes)",
+            )
+        return SimpleNamespace(audio_values=decoded)
+
+
+class NativeWavTokenizerAdapter:
+    def __init__(self, model: Any, default_bandwidth_id: int):
+        self.model = model
+        self.default_bandwidth_id = int(default_bandwidth_id)
+
+    def eval(self):
+        if hasattr(self.model, "eval"):
+            self.model.eval()
+        return self
+
+    def encode(self, *args, **kwargs):
+        import torch
+
+        audio = kwargs.pop("input_values", None)
+        if audio is None:
+            audio = kwargs.pop("audio_values", None)
+        if audio is None and args:
+            audio = args[0]
+        if audio is None:
+            raise TypeError("missing audio input")
+
+        bandwidth_id = kwargs.pop("bandwidth_id", None)
+        if kwargs:
+            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
+        if bandwidth_id is None:
+            bandwidth_id = torch.tensor([self.default_bandwidth_id], dtype=torch.long)
+
+        x = audio
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32, copy=False))
+        if x.ndim == 3 and x.shape[1] == 1:
+            x = x[:, 0, :]
+        if x.ndim == 1:
+            x = x.view(1, -1)
+
+        if hasattr(self.model, "encode_infer"):
+            return call_with_fallback(
+                self.model.encode_infer,
+                [
+                    ((x,), {"bandwidth_id": bandwidth_id}),
+                    ((x,), {}),
+                ],
+                "wavtokenizer.native.encode_infer",
+            )
+
+        return call_with_fallback(
+            self.model.encode,
+            [
+                ((x,), {"bandwidth_id": bandwidth_id}),
+                ((x,), {}),
+            ],
+            "wavtokenizer.native.encode",
+        )
+
+    def decode(self, *args, **kwargs):
+        if not args:
+            raise TypeError("missing features/tokens for decode")
+        return call_with_fallback(
+            self.model.decode,
+            [
+                (args, kwargs),
+                (args, {}),
+            ],
+            "wavtokenizer.native.decode",
+        )
+
+
+def load_native_dac_model(model_cfg: dict[str, Any]):
+    try:
+        dac = importlib.import_module("dac")
+    except Exception as exc:
+        raise RuntimeError(
+            "dac model requires descript-audio-codec package in the active Python env"
+        ) from exc
+
+    local_path = resolve_model_local_path(model_cfg)
+    repo_id = model_cfg.get("hf_repo_id")
+    errors: list[str] = []
+
+    if local_path.exists():
+        load_fn = getattr(getattr(dac, "DAC", None), "load", None)
+        if callable(load_fn):
+            candidate_paths: list[Path] = []
+            if local_path.is_file():
+                candidate_paths.append(local_path)
+            elif local_path.is_dir():
+                candidate_paths.extend(sorted(local_path.rglob("*.pt")))
+                candidate_paths.extend(sorted(local_path.rglob("*.ckpt")))
+
+            for ckpt in candidate_paths:
+                try:
+                    return NativeDacAdapter(load_fn(str(ckpt))).eval()
+                except Exception as exc:
+                    errors.append(f"DAC.load({ckpt}) failed: {exc}")
+
+    from_pretrained_fn = getattr(getattr(dac, "DAC", None), "from_pretrained", None)
+    if callable(from_pretrained_fn) and repo_id:
+        try:
+            return NativeDacAdapter(from_pretrained_fn(repo_id)).eval()
+        except Exception as exc:
+            errors.append(f"DAC.from_pretrained({repo_id}) failed: {exc}")
+
+    raise RuntimeError(
+        "failed to load dac model via descript-audio-codec; "
+        f"local_path={local_path}, hf_repo_id={repo_id}, errors={errors}"
+    )
+
+
+def ensure_wavtokenizer_source() -> Path:
+    """Clone WavTokenizer official repo to models/wavtokenizer-src/ if not exists."""
+    src_path = REPO_ROOT / "models" / "wavtokenizer-src"
+    
+    if src_path.exists() and (src_path / "decoder" / "pretrained.py").is_file():
+        return src_path
+    
+    # Clone the official repo
+    print(f"[wavtokenizer] Cloning official source to {src_path}...")
+    src_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    cmd = [
+        "git", "clone",
+        "--depth", "1",
+        "https://github.com/jishengpeng/WavTokenizer.git",
+        str(src_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to clone WavTokenizer repo: {result.stderr}")
+    
+    if not (src_path / "decoder" / "pretrained.py").is_file():
+        raise RuntimeError(f"WavTokenizer source cloned but decoder/pretrained.py not found in {src_path}")
+    
+    print(f"[wavtokenizer] Source cloned to {src_path}")
+    return src_path
+
+
+def load_native_wavtokenizer_model(model_cfg: dict[str, Any]):
+    """Load WavTokenizer model using official source code from models/wavtokenizer-src/."""
+    # 1. Ensure official source is cloned
+    src_path = ensure_wavtokenizer_source()
+    
+    # 2. Model weights/checkpoints are in local_path (downloaded from HF)
+    local_path = resolve_model_local_path(model_cfg)
+    
+    # 3. Add source path to sys.path for importing
+    src_path_str = str(src_path)
+    if src_path_str not in sys.path:
+        sys.path.insert(0, src_path_str)
+    
+    # Also need the repo root for other imports like encoder/decoder
+    repo_path_str = str(src_path)
+    if repo_path_str not in sys.path:
+        sys.path.insert(0, repo_path_str)
+
+    try:
+        module = importlib.import_module("decoder.pretrained")
+        wavtokenizer_cls = getattr(module, "WavTokenizer")
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to import WavTokenizer from source path={src_path}"
+        ) from exc
+
+    # Find config file (in local_path which contains HF downloaded files)
+    config_candidates: list[Path] = []
+    explicit_config = model_cfg.get("config_path")
+    if explicit_config:
+        config_path = Path(explicit_config)
+        config_candidates.append(config_path if config_path.is_absolute() else local_path / config_path)
+    config_candidates.extend(
+        [
+            local_path / "checkpoints" / "config.yaml",
+            local_path / "config.yaml",
+        ]
+    )
+    config_path = next((p for p in config_candidates if p.is_file()), None)
+    if config_path is None:
+        raise RuntimeError(
+            f"wavtokenizer config not found under local_path={local_path}; "
+            "set model config_path or place checkpoints/config.yaml"
+        )
+
+    # Find checkpoint file (in local_path)
+    ckpt_candidates: list[Path] = []
+    explicit_ckpt = model_cfg.get("checkpoint")
+    if explicit_ckpt:
+        ckpt_path = Path(explicit_ckpt)
+        ckpt_candidates.append(ckpt_path if ckpt_path.is_absolute() else local_path / ckpt_path)
+    ckpt_candidates.extend(sorted((local_path / "checkpoints").glob("*.ckpt")))
+    ckpt_candidates.extend(sorted(local_path.glob("*.ckpt")))
+    checkpoint_path = next((p for p in ckpt_candidates if p.is_file()), None)
+
+    load_errors: list[str] = []
+    model = None
+
+    # Use from_pretrained0802(config_path, checkpoint_path) as specified
+    if checkpoint_path is not None and hasattr(wavtokenizer_cls, "from_pretrained0802"):
+        try:
+            model = wavtokenizer_cls.from_pretrained0802(str(config_path), str(checkpoint_path))
+        except Exception as exc:
+            load_errors.append(f"from_pretrained0802({config_path}, {checkpoint_path}) failed: {exc}")
+
+    if model is None and hasattr(wavtokenizer_cls, "from_hparams0802"):
+        try:
+            model = wavtokenizer_cls.from_hparams0802(str(config_path))
+        except Exception as exc:
+            load_errors.append(f"from_hparams0802({config_path}) failed: {exc}")
+
+    if model is None:
+        raise RuntimeError(
+            "failed to construct WavTokenizer model; "
+            f"src_path={src_path}, local_path={local_path}, config={config_path}, checkpoint={checkpoint_path}, "
+            f"errors={load_errors}"
+        )
+
+    return NativeWavTokenizerAdapter(model, int(model_cfg.get("bandwidth_id", 0))).eval()
+
+
 def load_hf_model(model_cfg: dict[str, Any]):
     module_name, class_name = parse_model_class(model_cfg["class"])
-    if module_name in {"dac", "wavtokenizer"}:
-        return None
+    if module_name == "dac":
+        return load_native_dac_model(model_cfg)
+    if module_name == "wavtokenizer":
+        return load_native_wavtokenizer_model(model_cfg)
 
     cache_dir = str(REPO_ROOT / "models" / "hf")
     kwargs: dict[str, Any] = {
@@ -500,7 +810,7 @@ def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Pa
     # For transformers models, use direct HF conversion
     if class_spec.startswith("transformers:") and model_cfg.get("converter") is None:
         cmd = [
-            sys.executable,
+            preferred_python_executable(),
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
             "--model-id", model_cfg["hf_repo_id"],
             "--output", str(output_path),
@@ -511,7 +821,7 @@ def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Pa
         
         converter = model_cfg.get("converter", model_name)
         cmd = [
-            sys.executable,
+            preferred_python_executable(),
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
             "--input-dir", str(local_path),
             "--output", str(output_path),
@@ -586,14 +896,14 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         if not input_audio.is_file():
             raise RuntimeError(f"input audio not found: {input_audio}")
 
-        gguf_path = resolve_gguf_path(model_cfg)
-        if not gguf_path.is_file():
-            # Auto-convert from HF if GGUF doesn't exist
-            if model_cfg.get("auto_convert", True):
-                print(f"[{name}] GGUF not found, auto-converting from HF...")
-                gguf_path = auto_convert_gguf(model_cfg, gguf_path, log_path, name)
-            else:
-                raise RuntimeError(f"GGUF model not found: {gguf_path}")
+        expected_gguf = resolve_gguf_path(model_cfg)
+        if model_cfg.get("auto_convert", True):
+            print(f"[{name}] Always regenerating GGUF from HF...")
+            gguf_path = auto_convert_gguf(model_cfg, expected_gguf, log_path, name)
+        else:
+            gguf_path = expected_gguf
+            if not gguf_path.is_file():
+                raise RuntimeError(f"GGUF model not found and auto_convert disabled: {gguf_path}")
 
         if mode == "conversion-only":
             duration = time.monotonic() - start
