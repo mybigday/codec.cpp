@@ -14,6 +14,11 @@ except ImportError:
     torch = None
 
 try:
+    from safetensors import safe_open
+except ImportError:
+    safe_open = None
+
+try:
     from transformers import AutoModel
 except ImportError:
     AutoModel = None
@@ -194,25 +199,41 @@ class DacConverter(BaseConverter):
         return "dac"
 
     def load_from_checkpoint(self, checkpoint_dir: Path) -> None:
-        if torch is None:
-            raise RuntimeError("torch is required for DAC checkpoint conversion")
-
         checkpoint_dir = Path(checkpoint_dir)
-        model_file = checkpoint_dir / "pytorch_model.bin"
-        if not model_file.is_file():
-            candidates = sorted(checkpoint_dir.glob("*.bin")) + sorted(checkpoint_dir.glob("*.pt")) + sorted(checkpoint_dir.glob("*.pth"))
-            if not candidates:
-                raise FileNotFoundError(f"No DAC checkpoint file found in {checkpoint_dir}")
-            model_file = candidates[0]
+        st_candidates = sorted(checkpoint_dir.glob("*.safetensors"))
+        if st_candidates:
+            if safe_open is None:
+                raise RuntimeError("safetensors is required for DAC .safetensors checkpoint conversion")
+            model_file = st_candidates[0]
+            state = OrderedDict()
+            with safe_open(str(model_file), framework="np", device="cpu") as handle:
+                for key in handle.keys():
+                    state[key] = handle.get_tensor(key)
+            self.state_dict = state
+        else:
+            if torch is None:
+                raise RuntimeError("torch is required for DAC checkpoint conversion")
 
-        state = torch.load(model_file, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
+            model_file = checkpoint_dir / "pytorch_model.bin"
+            if not model_file.is_file():
+                candidates = (
+                    sorted(checkpoint_dir.glob("*.bin"))
+                    + sorted(checkpoint_dir.glob("*.pt"))
+                    + sorted(checkpoint_dir.glob("*.pth"))
+                )
+                if not candidates:
+                    raise FileNotFoundError(f"No DAC checkpoint file found in {checkpoint_dir}")
+                model_file = candidates[0]
 
-        if not isinstance(state, dict):
-            raise RuntimeError(f"Unsupported checkpoint format at {model_file}")
+            state = torch.load(model_file, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
 
-        self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in state.items())
+            if not isinstance(state, dict):
+                raise RuntimeError(f"Unsupported checkpoint format at {model_file}")
+
+            self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in state.items())
+
         self.config = {
             "sample_rate": 24000,
             "hop_size": 512,
