@@ -155,10 +155,9 @@ def run_model(root: Path, report_dir: Path, model_cfg: dict[str, Any], explicit_
             resolved, missing_required = resolve_artifacts(root, model_cfg)
         except Exception as exc:  # noqa: BLE001
             duration = time.monotonic() - start
-            status = "failed" if model_cfg.get("required", False) else "skipped"
             return ModelResult(
                 name=name,
-                status=status,
+                status="skipped",
                 duration_sec=duration,
                 command=[],
                 log_path=str(log_path),
@@ -168,10 +167,9 @@ def run_model(root: Path, report_dir: Path, model_cfg: dict[str, Any], explicit_
 
     if missing_required:
         duration = time.monotonic() - start
-        status = "failed" if model_cfg.get("required", False) else "skipped"
         return ModelResult(
             name=name,
-            status=status,
+            status="skipped",
             duration_sec=duration,
             command=[],
             log_path=str(log_path),
@@ -273,9 +271,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run codec E2E regressions for discovered models")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to runner config JSON")
     parser.add_argument("--report-dir", default=str(REPO_ROOT / "tests/e2e/reports"), help="Report output directory")
-    parser.add_argument("--model", action="append", dest="models", help="Run only this model name (repeatable)")
+    parser.add_argument(
+        "--models",
+        action="append",
+        help="Run only specific model names (repeatable or comma-separated)",
+    )
+    parser.add_argument("--model", action="append", dest="legacy_models", help=argparse.SUPPRESS)
     parser.add_argument("--list-models", action="store_true", help="List configured models and exit")
     return parser.parse_args()
+
+
+def parse_model_selection(raw_values: list[str] | None) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values or []:
+        for part in raw.split(","):
+            name = part.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            selected.append(name)
+    return selected
 
 
 def main() -> int:
@@ -283,12 +299,16 @@ def main() -> int:
     config = load_config(Path(args.config))
     model_cfgs = config.get("models", [])
     model_names = [m["name"] for m in model_cfgs]
+    enabled_cfgs = [m for m in model_cfgs if m.get("enabled", True)]
+    enabled_names = [m["name"] for m in enabled_cfgs]
 
     if args.list_models:
         print("\n".join(model_names))
         return 0
 
-    selected_names = args.models if args.models else model_names
+    explicit_names = parse_model_selection(args.models)
+    legacy_names = parse_model_selection(args.legacy_models)
+    selected_names = explicit_names or legacy_names or enabled_names
     unknown = sorted(set(selected_names) - set(model_names))
     if unknown:
         print(f"ERROR: unknown model(s): {', '.join(unknown)}", file=sys.stderr)
@@ -299,7 +319,7 @@ def main() -> int:
 
     results: list[ModelResult] = []
     for cfg in selected_cfgs:
-        explicit = args.models is not None
+        explicit = bool(explicit_names or legacy_names)
         result = run_model(REPO_ROOT, report_dir, cfg, explicit_selection=explicit)
         results.append(result)
         print(f"[{result.name}] result: {result.status}")

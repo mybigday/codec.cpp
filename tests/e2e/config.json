@@ -2,6 +2,7 @@
   "models": [
     {
       "name": "mimi",
+      "enabled": true,
       "required": true,
       "artifacts": {
         "mimi_dir": {
@@ -35,6 +36,7 @@
     },
     {
       "name": "dac",
+      "enabled": true,
       "required": false,
       "detect": [
         "models/dac.gguf",
@@ -67,6 +69,7 @@
     },
     {
       "name": "wavtokenizer",
+      "enabled": true,
       "required": false,
       "detect": [
         "models/wavtokenizer.gguf",

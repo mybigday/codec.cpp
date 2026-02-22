@@ -25,10 +25,6 @@ env:
 jobs:
   e2e-test:
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        model: [mimi, dac, wavtokenizer]
 
     steps:
     - uses: actions/checkout@v4
@@ -61,18 +57,16 @@ jobs:
         test -f build/codec-cli
         ./build/codec-cli 2>&1 | head -5 || true
 
-    - name: Run unified E2E runner
+    - name: Run E2E tests
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        python3 tests/e2e/runner.py \
-          --model "${{ matrix.model }}" \
-          --report-dir "tests/e2e/reports/${{ matrix.model }}"
+        python3 tests/e2e/runner.py --report-dir tests/e2e/reports
 
     - name: Upload E2E reports
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: e2e-report-${{ matrix.model }}
-        path: tests/e2e/reports/${{ matrix.model }}/
+        name: e2e-reports
+        path: tests/e2e/reports/
         if-no-files-found: error
