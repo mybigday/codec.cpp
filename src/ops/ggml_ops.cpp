@@ -97,6 +97,33 @@ ggml_tensor * codec_op_pad_1d(ggml_context * ctx, ggml_tensor * x, int32_t pad_l
     return ggml_pad_ext(ctx, x, pad_left, pad_right, 0, 0, 0, 0, 0, 0);
 }
 
+ggml_tensor * codec_op_pad_1d_replicate(ggml_context * ctx, ggml_tensor * x, int32_t pad_left, int32_t pad_right) {
+    if (ctx == nullptr || x == nullptr || pad_left < 0 || pad_right < 0) {
+        return nullptr;
+    }
+    if (pad_left == 0 && pad_right == 0) {
+        return x;
+    }
+
+    ggml_tensor * out = x;
+    if (pad_left > 0) {
+        ggml_tensor * left = ggml_view_2d(ctx, x, 1, x->ne[1], x->nb[1], 0);
+        ggml_tensor * left_target = ggml_new_tensor_2d(ctx, x->type, pad_left, x->ne[1]);
+        ggml_tensor * left_rep = ggml_repeat(ctx, left, left_target);
+        out = ggml_concat(ctx, left_rep, out, 0);
+    }
+
+    if (pad_right > 0) {
+        const size_t offset = (size_t) (x->ne[0] - 1) * (size_t) x->nb[0];
+        ggml_tensor * right = ggml_view_2d(ctx, x, 1, x->ne[1], x->nb[1], offset);
+        ggml_tensor * right_target = ggml_new_tensor_2d(ctx, x->type, pad_right, x->ne[1]);
+        ggml_tensor * right_rep = ggml_repeat(ctx, right, right_target);
+        out = ggml_concat(ctx, out, right_rep, 0);
+    }
+
+    return ggml_cont(ctx, out);
+}
+
 ggml_tensor * codec_op_crop_1d(ggml_context * ctx, ggml_tensor * x, int32_t crop_left, int32_t crop_right) {
     if (ctx == nullptr || x == nullptr || crop_left < 0 || crop_right < 0) {
         return nullptr;

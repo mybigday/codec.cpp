@@ -133,7 +133,12 @@ bool codec_graph_cache_get_or_build(
         return false;
     }
 
-    ctx->eval_graph = ggml_new_graph(ctx->eval_ctx);
+    size_t graph_size = GGML_DEFAULT_GRAPH_SIZE;
+    if (key.kind == CODEC_GRAPH_WT_ENCODE || key.kind == CODEC_GRAPH_WT_DECODE) {
+        graph_size = GGML_DEFAULT_GRAPH_SIZE * 32;
+    }
+
+    ctx->eval_graph = ggml_new_graph_custom(ctx->eval_ctx, graph_size, false);
     ggml_build_forward_expand(ctx->eval_graph, out);
     ctx->eval_output = out;
     ctx->eval_entry = cached;

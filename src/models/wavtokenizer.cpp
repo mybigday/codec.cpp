@@ -3,6 +3,7 @@
 #include "../ops/conv1d.h"
 #include "../ops/convtr1d.h"
 #include "../ops/ggml_ops.h"
+#include "../ops/rvq.h"
 #include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
 
@@ -61,6 +62,7 @@ struct wt_decode_build {
     int32_t n_convnext;
     int32_t head_out_dim;
     int32_t use_adanorm;
+    int32_t use_pos_net;
 };
 
 static std::string codec_wt_decode_codebook_tensor_name(int32_t qi) {
@@ -112,6 +114,10 @@ static std::string codec_wt_decode_final_ln_b_name() { return "wt.decode.bb.fina
 static std::string codec_wt_decode_head_w_name() { return "wt.decode.head.out.w"; }
 static std::string codec_wt_decode_head_b_name() { return "wt.decode.head.out.b"; }
 
+static std::string codec_wt_decode_pos_name(int32_t li, const char * suffix) {
+    return "wt.decode.bb.pos_net." + std::to_string(li) + "." + suffix;
+}
+
 static std::string codec_wt_decode_blk_dw_w_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".dw.w"; }
 static std::string codec_wt_decode_blk_dw_b_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".dw.b"; }
 static std::string codec_wt_decode_blk_ln_w_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".ln.w"; }
@@ -121,6 +127,108 @@ static std::string codec_wt_decode_blk_pw1_b_name(int32_t li) { return "wt.decod
 static std::string codec_wt_decode_blk_pw2_w_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".pw2.w"; }
 static std::string codec_wt_decode_blk_pw2_b_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".pw2.b"; }
 static std::string codec_wt_decode_blk_gamma_name(int32_t li) { return "wt.decode.bb.l" + std::to_string(li) + ".gamma"; }
+
+static ggml_tensor * codec_wt_pos_group_norm(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    ggml_tensor * gamma,
+    ggml_tensor * beta) {
+
+    return codec_op_group_norm(ctx_eval, x, 32, 1e-6f, gamma, beta);
+}
+
+static ggml_tensor * codec_wt_pos_resblock(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    ggml_tensor * n1_w,
+    ggml_tensor * n1_b,
+    ggml_tensor * c1_w,
+    ggml_tensor * c1_b,
+    ggml_tensor * n2_w,
+    ggml_tensor * n2_b,
+    ggml_tensor * c2_w,
+    ggml_tensor * c2_b) {
+
+    ggml_tensor * h = codec_wt_pos_group_norm(ctx_eval, x, n1_w, n1_b);
+    if (h == nullptr) {
+        return nullptr;
+    }
+    h = codec_op_unary(ctx_eval, h, CODEC_UNARY_SILU);
+    h = codec_conv1d(ctx_eval, h, c1_w, c1_b, 1, 1, 1);
+    if (h == nullptr) {
+        return nullptr;
+    }
+    h = codec_wt_pos_group_norm(ctx_eval, h, n2_w, n2_b);
+    if (h == nullptr) {
+        return nullptr;
+    }
+    h = codec_op_unary(ctx_eval, h, CODEC_UNARY_SILU);
+    h = codec_conv1d(ctx_eval, h, c2_w, c2_b, 1, 1, 1);
+    if (h == nullptr) {
+        return nullptr;
+    }
+    return ggml_add(ctx_eval, x, h);
+}
+
+static ggml_tensor * codec_wt_pos_attn(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    ggml_tensor * n_w,
+    ggml_tensor * n_b,
+    ggml_tensor * q_w,
+    ggml_tensor * q_b,
+    ggml_tensor * k_w,
+    ggml_tensor * k_b,
+    ggml_tensor * v_w,
+    ggml_tensor * v_b,
+    ggml_tensor * o_w,
+    ggml_tensor * o_b,
+    int32_t dim) {
+
+    ggml_tensor * h = codec_wt_pos_group_norm(ctx_eval, x, n_w, n_b);
+    if (h == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * q = codec_conv1d(ctx_eval, h, q_w, q_b, 1, 1, 0);
+    ggml_tensor * k = codec_conv1d(ctx_eval, h, k_w, k_b, 1, 1, 0);
+    ggml_tensor * v = codec_conv1d(ctx_eval, h, v_w, v_b, 1, 1, 0);
+    if (q == nullptr || k == nullptr || v == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * q_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, q));
+    ggml_tensor * k_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, k));
+    if (q_ct == nullptr || k_ct == nullptr || v == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * scores = ggml_mul_mat(ctx_eval, k_ct, q_ct); // [t, t]
+    if (scores == nullptr) {
+        return nullptr;
+    }
+    const float scale = dim > 0 ? (1.0f / std::sqrt((float) dim)) : 1.0f;
+    scores = ggml_scale(ctx_eval, scores, scale);
+    ggml_tensor * probs = ggml_soft_max(ctx_eval, scores);
+    if (probs == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * v_tc = ggml_cont(ctx_eval, v); // [t, c]
+    ggml_tensor * ctx_ct = ggml_mul_mat(ctx_eval, v_tc, probs); // [c, t]
+    if (ctx_ct == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * ctx_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, ctx_ct));
+    if (ctx_tc == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * proj = codec_conv1d(ctx_eval, ctx_tc, o_w, o_b, 1, 1, 0);
+    if (proj == nullptr) {
+        return nullptr;
+    }
+    return ggml_add(ctx_eval, x, proj);
+}
 
 static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     wt_decode_build * p = static_cast<wt_decode_build *>(user_data);
@@ -147,6 +255,88 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
         return false;
     }
 
+    if (p->use_pos_net) {
+        for (int32_t li = 0; li < 2; ++li) {
+            ggml_tensor * n1_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n1_w, codec_wt_decode_pos_name(li, "norm1.w").c_str());
+            ggml_tensor * n1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n1_b, codec_wt_decode_pos_name(li, "norm1.b").c_str());
+            ggml_tensor * c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->backbone_dim, p->backbone_dim);
+            ggml_set_name(c1_w, codec_wt_decode_pos_name(li, "conv1.w").c_str());
+            ggml_tensor * c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(c1_b, codec_wt_decode_pos_name(li, "conv1.b").c_str());
+            ggml_tensor * n2_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n2_w, codec_wt_decode_pos_name(li, "norm2.w").c_str());
+            ggml_tensor * n2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n2_b, codec_wt_decode_pos_name(li, "norm2.b").c_str());
+            ggml_tensor * c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->backbone_dim, p->backbone_dim);
+            ggml_set_name(c2_w, codec_wt_decode_pos_name(li, "conv2.w").c_str());
+            ggml_tensor * c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(c2_b, codec_wt_decode_pos_name(li, "conv2.b").c_str());
+            x = codec_wt_pos_resblock(ctx_eval, x, n1_w, n1_b, c1_w, c1_b, n2_w, n2_b, c2_w, c2_b);
+            if (x == nullptr) {
+                return false;
+            }
+        }
+
+        ggml_tensor * attn_n_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(attn_n_w, codec_wt_decode_pos_name(2, "norm.w").c_str());
+        ggml_tensor * attn_n_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(attn_n_b, codec_wt_decode_pos_name(2, "norm.b").c_str());
+        ggml_tensor * q_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->backbone_dim, p->backbone_dim);
+        ggml_set_name(q_w, codec_wt_decode_pos_name(2, "q.w").c_str());
+        ggml_tensor * q_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(q_b, codec_wt_decode_pos_name(2, "q.b").c_str());
+        ggml_tensor * k_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->backbone_dim, p->backbone_dim);
+        ggml_set_name(k_w, codec_wt_decode_pos_name(2, "k.w").c_str());
+        ggml_tensor * k_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(k_b, codec_wt_decode_pos_name(2, "k.b").c_str());
+        ggml_tensor * v_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->backbone_dim, p->backbone_dim);
+        ggml_set_name(v_w, codec_wt_decode_pos_name(2, "v.w").c_str());
+        ggml_tensor * v_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(v_b, codec_wt_decode_pos_name(2, "v.b").c_str());
+        ggml_tensor * o_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->backbone_dim, p->backbone_dim);
+        ggml_set_name(o_w, codec_wt_decode_pos_name(2, "proj_out.w").c_str());
+        ggml_tensor * o_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(o_b, codec_wt_decode_pos_name(2, "proj_out.b").c_str());
+        x = codec_wt_pos_attn(ctx_eval, x, attn_n_w, attn_n_b, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b, p->backbone_dim);
+        if (x == nullptr) {
+            return false;
+        }
+
+        for (int32_t li = 3; li < 5; ++li) {
+            ggml_tensor * n1_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n1_w, codec_wt_decode_pos_name(li, "norm1.w").c_str());
+            ggml_tensor * n1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n1_b, codec_wt_decode_pos_name(li, "norm1.b").c_str());
+            ggml_tensor * c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->backbone_dim, p->backbone_dim);
+            ggml_set_name(c1_w, codec_wt_decode_pos_name(li, "conv1.w").c_str());
+            ggml_tensor * c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(c1_b, codec_wt_decode_pos_name(li, "conv1.b").c_str());
+            ggml_tensor * n2_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n2_w, codec_wt_decode_pos_name(li, "norm2.w").c_str());
+            ggml_tensor * n2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(n2_b, codec_wt_decode_pos_name(li, "norm2.b").c_str());
+            ggml_tensor * c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->backbone_dim, p->backbone_dim);
+            ggml_set_name(c2_w, codec_wt_decode_pos_name(li, "conv2.w").c_str());
+            ggml_tensor * c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+            ggml_set_name(c2_b, codec_wt_decode_pos_name(li, "conv2.b").c_str());
+            x = codec_wt_pos_resblock(ctx_eval, x, n1_w, n1_b, c1_w, c1_b, n2_w, n2_b, c2_w, c2_b);
+            if (x == nullptr) {
+                return false;
+            }
+        }
+
+        ggml_tensor * gn_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(gn_w, codec_wt_decode_pos_name(5, "w").c_str());
+        ggml_tensor * gn_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
+        ggml_set_name(gn_b, codec_wt_decode_pos_name(5, "b").c_str());
+        x = codec_wt_pos_group_norm(ctx_eval, x, gn_w, gn_b);
+        if (x == nullptr) {
+            return false;
+        }
+    }
+
     ggml_tensor * t_inln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
     ggml_set_name(t_inln_w, codec_wt_decode_norm_w_name().c_str());
     ggml_tensor * t_inln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
@@ -161,7 +351,7 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
     for (int32_t li = 0; li < p->n_convnext; ++li) {
         ggml_tensor * res_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct));
 
-        ggml_tensor * t_dw_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, p->backbone_dim, 1);
+        ggml_tensor * t_dw_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 1, p->backbone_dim);
         ggml_set_name(t_dw_w, codec_wt_decode_blk_dw_w_name(li).c_str());
         ggml_tensor * t_dw_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
         ggml_set_name(t_dw_b, codec_wt_decode_blk_dw_b_name(li).c_str());
@@ -234,38 +424,269 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
 struct wt_encode_build {
     int32_t n_in;
     int32_t hop;
+    int32_t n_q;
+    int32_t codebook_dim;
+    int32_t codebook_size;
 };
 
-static bool codec_wt_load_kernel_f16(
-    struct codec_context * ctx,
-    const char * name,
-    int32_t hop,
-    std::vector<ggml_fp16_t> * kernel_f16,
-    std::string * err) {
+static std::string codec_wt_encode_pad_left_name(int32_t id) {
+    return "wt.encode.pad." + std::to_string(id) + ".left";
+}
 
-    if (ctx == nullptr || ctx->model == nullptr || kernel_f16 == nullptr || name == nullptr || hop <= 0) {
-        if (err != nullptr) {
-            *err = "invalid WavTokenizer kernel load arguments";
-        }
-        return false;
+static std::string codec_wt_encode_pad_right_name(int32_t id) {
+    return "wt.encode.pad." + std::to_string(id) + ".right";
+}
+
+static int32_t codec_wt_extra_padding_for_conv1d(int32_t length, int32_t kernel_eff, int32_t stride, int32_t padding_total) {
+    const double n_frames = ((double) (length - kernel_eff + padding_total)) / (double) stride + 1.0;
+    const int32_t n_frames_ceil = (int32_t) std::ceil(n_frames);
+    const int32_t ideal_length = (n_frames_ceil - 1) * stride + (kernel_eff - padding_total);
+    return ideal_length - length;
+}
+
+static ggml_tensor * codec_wt_pad1d_reflect(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    int32_t pad_left,
+    int32_t pad_right,
+    int32_t pad_id) {
+
+    if (ctx_eval == nullptr || x == nullptr || pad_left < 0 || pad_right < 0) {
+        return nullptr;
+    }
+    if (pad_left == 0 && pad_right == 0) {
+        return x;
     }
 
-    ggml_tensor * t_kernel = ggml_get_tensor(ctx->model->weights, name);
-    if (t_kernel == nullptr) {
-        if (err != nullptr) {
-            *err = std::string("missing model tensor: ") + name;
+    int32_t t = (int32_t) x->ne[0];
+    int32_t extra_reflect = 0;
+    const int32_t max_pad = std::max(pad_left, pad_right);
+    if (t <= max_pad) {
+        extra_reflect = max_pad - t + 1;
+        x = codec_op_pad_1d(ctx_eval, x, 0, extra_reflect);
+        if (x == nullptr) {
+            return nullptr;
         }
-        return false;
-    }
-    if (t_kernel->type != GGML_TYPE_F16 || ggml_nelements(t_kernel) != hop) {
-        if (err != nullptr) {
-            *err = std::string("invalid model kernel tensor: ") + name;
-        }
-        return false;
+        t += extra_reflect;
     }
 
-    kernel_f16->assign((size_t) hop, 0);
-    return codec_runtime_read_tensor(t_kernel, kernel_f16->data(), kernel_f16->size() * sizeof(ggml_fp16_t), err);
+    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [c, t]
+    if (x_ct == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * out = x;
+
+    if (pad_left > 0) {
+        ggml_tensor * idx_left = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, pad_left);
+        ggml_set_name(idx_left, codec_wt_encode_pad_left_name(pad_id).c_str());
+        ggml_tensor * left_ct = ggml_get_rows(ctx_eval, x_ct, idx_left); // [c, pad_left]
+        if (left_ct == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor * left_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, left_ct));
+        out = ggml_concat(ctx_eval, left_tc, out, 0);
+    }
+
+    if (pad_right > 0) {
+        ggml_tensor * idx_right = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, pad_right);
+        ggml_set_name(idx_right, codec_wt_encode_pad_right_name(pad_id).c_str());
+        ggml_tensor * right_ct = ggml_get_rows(ctx_eval, x_ct, idx_right); // [c, pad_right]
+        if (right_ct == nullptr) {
+            return nullptr;
+        }
+        ggml_tensor * right_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, right_ct));
+        out = ggml_concat(ctx_eval, out, right_tc, 0);
+    }
+
+    if (extra_reflect > 0) {
+        out = codec_op_crop_1d(ctx_eval, out, 0, extra_reflect);
+    }
+
+    return out == nullptr ? nullptr : ggml_cont(ctx_eval, out);
+}
+
+static ggml_tensor * codec_wt_sconv1d(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    int32_t in_ch,
+    int32_t out_ch,
+    int32_t kernel,
+    int32_t stride,
+    int32_t dilation,
+    int32_t * pad_id,
+    const std::string & w_name,
+    const std::string & b_name) {
+
+    if (ctx_eval == nullptr || x == nullptr || pad_id == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * t_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, kernel, in_ch, out_ch);
+    ggml_set_name(t_w, w_name.c_str());
+    ggml_tensor * t_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_ch);
+    ggml_set_name(t_b, b_name.c_str());
+
+    const int32_t kernel_eff = (kernel - 1) * dilation + 1;
+    const int32_t padding_total = kernel_eff - stride;
+    const int32_t extra_padding = codec_wt_extra_padding_for_conv1d((int32_t) x->ne[0], kernel_eff, stride, padding_total);
+    int32_t pad_right = padding_total / 2;
+    int32_t pad_left = padding_total - pad_right;
+    pad_right += extra_padding;
+
+    const int32_t id = (*pad_id)++;
+    ggml_tensor * x_pad = codec_wt_pad1d_reflect(ctx_eval, x, pad_left, pad_right, id);
+    if (x_pad == nullptr) {
+        return nullptr;
+    }
+    return codec_conv1d(ctx_eval, x_pad, t_w, t_b, stride, dilation, 0);
+}
+
+static std::string codec_wt_encode_conv_w_name(int32_t li, const char * suffix) {
+    return "wt.encode.l" + std::to_string(li) + "." + suffix;
+}
+
+static std::string codec_wt_encode_resblock_name(int32_t ri, const char * suffix) {
+    return "wt.encode.rb" + std::to_string(ri) + "." + suffix;
+}
+
+static std::string codec_wt_encode_down_w_name(int32_t di, const char * suffix) {
+    return "wt.encode.ds" + std::to_string(di) + "." + suffix;
+}
+
+static std::string codec_wt_encode_lstm_name(int32_t li, const char * suffix) {
+    return "wt.encode.lstm" + std::to_string(li) + "." + suffix;
+}
+
+static ggml_tensor * codec_wt_encode_resblock(
+    ggml_context * ctx_eval,
+    ggml_tensor * x,
+    int32_t dim,
+    int32_t res_id,
+    int32_t * pad_id) {
+
+    if (ctx_eval == nullptr || x == nullptr || pad_id == nullptr) {
+        return nullptr;
+    }
+    const int32_t hidden = dim / 2;
+    ggml_tensor * h = ggml_elu(ctx_eval, x);
+    h = codec_wt_sconv1d(
+        ctx_eval,
+        h,
+        dim,
+        hidden,
+        /*kernel=*/3,
+        /*stride=*/1,
+        /*dilation=*/1,
+        pad_id,
+        codec_wt_encode_resblock_name(res_id, "c1.w"),
+        codec_wt_encode_resblock_name(res_id, "c1.b"));
+    if (h == nullptr) {
+        return nullptr;
+    }
+    h = ggml_elu(ctx_eval, h);
+    h = codec_wt_sconv1d(
+        ctx_eval,
+        h,
+        hidden,
+        dim,
+        /*kernel=*/1,
+        /*stride=*/1,
+        /*dilation=*/1,
+        pad_id,
+        codec_wt_encode_resblock_name(res_id, "c2.w"),
+        codec_wt_encode_resblock_name(res_id, "c2.b"));
+    if (h == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * sc = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        dim,
+        dim,
+        /*kernel=*/1,
+        /*stride=*/1,
+        /*dilation=*/1,
+        pad_id,
+        codec_wt_encode_resblock_name(res_id, "sc.w"),
+        codec_wt_encode_resblock_name(res_id, "sc.b"));
+    if (sc == nullptr) {
+        return nullptr;
+    }
+
+    return ggml_add(ctx_eval, sc, h);
+}
+
+static ggml_tensor * codec_wt_encode_lstm_layer(
+    ggml_context * ctx_eval,
+    ggml_tensor * x_tc,
+    int32_t dim,
+    int32_t layer,
+    bool skip) {
+
+    if (ctx_eval == nullptr || x_tc == nullptr || dim <= 0) {
+        return nullptr;
+    }
+    const int32_t t = (int32_t) x_tc->ne[0];
+    if (t <= 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * w_ih = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
+    ggml_set_name(w_ih, codec_wt_encode_lstm_name(layer, "w_ih").c_str());
+    ggml_tensor * w_hh = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
+    ggml_set_name(w_hh, codec_wt_encode_lstm_name(layer, "w_hh").c_str());
+    ggml_tensor * b_ih = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
+    ggml_set_name(b_ih, codec_wt_encode_lstm_name(layer, "b_ih").c_str());
+    ggml_tensor * b_hh = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
+    ggml_set_name(b_hh, codec_wt_encode_lstm_name(layer, "b_hh").c_str());
+
+    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc)); // [dim, t]
+    ggml_tensor * y_ct = nullptr;
+    ggml_tensor * h_prev = nullptr;
+    ggml_tensor * c_prev = nullptr;
+
+    for (int32_t ti = 0; ti < t; ++ti) {
+        const size_t offset = (size_t) ti * (size_t) x_ct->nb[1];
+        ggml_tensor * x_t = ggml_view_2d(ctx_eval, x_ct, dim, 1, x_ct->nb[1], offset); // [dim, 1]
+        x_t = ggml_cont(ctx_eval, x_t);
+        if (h_prev == nullptr) {
+            h_prev = ggml_scale(ctx_eval, x_t, 0.0f);
+            c_prev = ggml_scale(ctx_eval, x_t, 0.0f);
+        }
+
+        ggml_tensor * gates = ggml_add(
+            ctx_eval,
+            ggml_mul_mat(ctx_eval, w_ih, x_t),
+            ggml_mul_mat(ctx_eval, w_hh, h_prev));
+        ggml_tensor * b_ih2 = ggml_reshape_2d(ctx_eval, b_ih, 4 * dim, 1);
+        ggml_tensor * b_hh2 = ggml_reshape_2d(ctx_eval, b_hh, 4 * dim, 1);
+        gates = ggml_add(ctx_eval, ggml_add(ctx_eval, gates, b_ih2), b_hh2);
+
+        const size_t gate_stride = (size_t) dim * gates->nb[0];
+        ggml_tensor * gate_i = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 0);
+        ggml_tensor * gate_f = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], gate_stride);
+        ggml_tensor * gate_g = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 2 * gate_stride);
+        ggml_tensor * gate_o = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 3 * gate_stride);
+
+        ggml_tensor * i = ggml_sigmoid(ctx_eval, gate_i);
+        ggml_tensor * f = ggml_sigmoid(ctx_eval, gate_f);
+        ggml_tensor * g = ggml_tanh(ctx_eval, gate_g);
+        ggml_tensor * o = ggml_sigmoid(ctx_eval, gate_o);
+
+        ggml_tensor * c_t = ggml_add(ctx_eval, ggml_mul(ctx_eval, f, c_prev), ggml_mul(ctx_eval, i, g));
+        ggml_tensor * h_t = ggml_mul(ctx_eval, o, ggml_tanh(ctx_eval, c_t));
+
+        y_ct = (y_ct == nullptr) ? h_t : ggml_concat(ctx_eval, y_ct, h_t, 1);
+        h_prev = h_t;
+        c_prev = c_t;
+    }
+
+    ggml_tensor * y_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, y_ct));
+    if (skip) {
+        y_tc = ggml_add(ctx_eval, y_tc, x_tc);
+    }
+    return y_tc;
 }
 
 static bool codec_wt_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
@@ -273,17 +694,396 @@ static bool codec_wt_build_encode(ggml_context * ctx_eval, void * user_data, ggm
     ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->n_in, 1);
     ggml_set_name(t_pcm, "wt.encode.pcm");
 
-    ggml_tensor * t_kernel = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F16, p->hop, 1, 1);
-    ggml_set_name(t_kernel, "wt.encode.kernel");
+    int32_t pad_id = 0;
 
-    ggml_tensor * t_feat = codec_conv1d(ctx_eval, t_pcm, t_kernel, nullptr, p->hop, 1, 0);
-    ggml_tensor * t_alpha = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
-    ggml_set_name(t_alpha, "wt.encode.alpha");
+    ggml_tensor * x = codec_wt_sconv1d(
+        ctx_eval,
+        t_pcm,
+        /*in_ch=*/1,
+        /*out_ch=*/32,
+        /*kernel=*/7,
+        /*stride=*/1,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_conv_w_name(0, "w"),
+        codec_wt_encode_conv_w_name(0, "b"));
+    if (x == nullptr) {
+        return false;
+    }
 
-    ggml_tensor * t_snake = ggml_cont(ctx_eval, codec_op_snake(ctx_eval, t_feat, t_alpha, 1e-4f));
-    ggml_set_name(t_snake, "wt.encode.out");
+    x = codec_wt_encode_resblock(ctx_eval, x, /*dim=*/32, /*res_id=*/0, &pad_id);
+    x = ggml_elu(ctx_eval, x);
+    x = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        /*in_ch=*/32,
+        /*out_ch=*/64,
+        /*kernel=*/4,
+        /*stride=*/2,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_down_w_name(0, "w"),
+        codec_wt_encode_down_w_name(0, "b"));
+    if (x == nullptr) {
+        return false;
+    }
 
-    *out = t_snake;
+    x = codec_wt_encode_resblock(ctx_eval, x, /*dim=*/64, /*res_id=*/1, &pad_id);
+    x = ggml_elu(ctx_eval, x);
+    x = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        /*in_ch=*/64,
+        /*out_ch=*/128,
+        /*kernel=*/8,
+        /*stride=*/4,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_down_w_name(1, "w"),
+        codec_wt_encode_down_w_name(1, "b"));
+    if (x == nullptr) {
+        return false;
+    }
+
+    x = codec_wt_encode_resblock(ctx_eval, x, /*dim=*/128, /*res_id=*/2, &pad_id);
+    x = ggml_elu(ctx_eval, x);
+    x = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        /*in_ch=*/128,
+        /*out_ch=*/256,
+        /*kernel=*/10,
+        /*stride=*/5,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_down_w_name(2, "w"),
+        codec_wt_encode_down_w_name(2, "b"));
+    if (x == nullptr) {
+        return false;
+    }
+
+    x = codec_wt_encode_resblock(ctx_eval, x, /*dim=*/256, /*res_id=*/3, &pad_id);
+    x = ggml_elu(ctx_eval, x);
+    x = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        /*in_ch=*/256,
+        /*out_ch=*/512,
+        /*kernel=*/16,
+        /*stride=*/8,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_down_w_name(3, "w"),
+        codec_wt_encode_down_w_name(3, "b"));
+    if (x == nullptr) {
+        return false;
+    }
+
+    x = codec_wt_encode_lstm_layer(ctx_eval, x, /*dim=*/512, /*layer=*/0, /*skip=*/true);
+    x = codec_wt_encode_lstm_layer(ctx_eval, x, /*dim=*/512, /*layer=*/1, /*skip=*/true);
+    if (x == nullptr) {
+        return false;
+    }
+
+    x = ggml_elu(ctx_eval, x);
+    x = codec_wt_sconv1d(
+        ctx_eval,
+        x,
+        /*in_ch=*/512,
+        /*out_ch=*/512,
+        /*kernel=*/7,
+        /*stride=*/1,
+        /*dilation=*/1,
+        &pad_id,
+        codec_wt_encode_conv_w_name(15, "w"),
+        codec_wt_encode_conv_w_name(15, "b"));
+    if (x == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * residual = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [dim, t]
+    ggml_tensor * tokens = nullptr;
+    for (int32_t qi = 0; qi < p->n_q; ++qi) {
+        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->codebook_size);
+        ggml_set_name(t_codebook, ("wt.encode.vq.q" + std::to_string(qi) + ".codebook").c_str());
+        codec_rvq_layer_result_ggml layer = {};
+        if (!codec_rvq_build_layer_ggml(ctx_eval, residual, t_codebook, &layer)) {
+            return false;
+        }
+        residual = layer.residual;
+
+        ggml_tensor * idx2d = ggml_reshape_2d(ctx_eval, layer.indices, layer.indices->ne[0], 1);
+        tokens = (tokens == nullptr) ? idx2d : ggml_concat(ctx_eval, tokens, idx2d, 1);
+    }
+
+    ggml_tensor * t_out = ggml_cont(ctx_eval, tokens);
+    ggml_set_name(t_out, "wt.encode.out");
+    *out = t_out;
+    return true;
+}
+
+struct wt_encode_pad_info {
+    int32_t id;
+    int32_t length;
+    int32_t pad_left;
+    int32_t pad_right;
+};
+
+static bool codec_wt_copy_conv1d_weight_to_3d(
+    codec_context * ctx,
+    const std::string & src_name,
+    ggml_tensor * dst,
+    std::string * err);
+
+static bool codec_wt_copy_linear_weight_to_2d(
+    codec_context * ctx,
+    const std::string & src_name,
+    ggml_tensor * dst,
+    std::string * err);
+
+static bool codec_wt_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err);
+
+static int32_t codec_wt_encode_pad_for_sconv(
+    int32_t length,
+    int32_t kernel,
+    int32_t stride,
+    int32_t dilation,
+    int32_t * pad_id,
+    std::vector<wt_encode_pad_info> * pads) {
+
+    const int32_t kernel_eff = (kernel - 1) * dilation + 1;
+    const int32_t padding_total = kernel_eff - stride;
+    const int32_t extra_padding = codec_wt_extra_padding_for_conv1d(length, kernel_eff, stride, padding_total);
+    int32_t pad_right = padding_total / 2;
+    int32_t pad_left = padding_total - pad_right;
+    pad_right += extra_padding;
+
+    if (pads != nullptr) {
+        pads->push_back({ *pad_id, length, pad_left, pad_right });
+    }
+    (*pad_id)++;
+
+    const int32_t padded = length + pad_left + pad_right;
+    return (padded - kernel_eff) / stride + 1;
+}
+
+static void codec_wt_encode_collect_pad_info(int32_t n_in, std::vector<wt_encode_pad_info> * pads) {
+    if (pads == nullptr) {
+        return;
+    }
+    pads->clear();
+    int32_t pad_id = 0;
+    int32_t t = n_in;
+
+    t = codec_wt_encode_pad_for_sconv(t, 7, 1, 1, &pad_id, pads);
+    // Resblock 0 (dim=32): conv1 k=3, conv2 k=1, shortcut k=1
+    t = codec_wt_encode_pad_for_sconv(t, 3, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 4, 2, 1, &pad_id, pads);
+
+    // Resblock 1 (dim=64)
+    t = codec_wt_encode_pad_for_sconv(t, 3, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 8, 4, 1, &pad_id, pads);
+
+    // Resblock 2 (dim=128)
+    t = codec_wt_encode_pad_for_sconv(t, 3, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 10, 5, 1, &pad_id, pads);
+
+    // Resblock 3 (dim=256)
+    t = codec_wt_encode_pad_for_sconv(t, 3, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 1, 1, 1, &pad_id, pads);
+    t = codec_wt_encode_pad_for_sconv(t, 16, 8, 1, &pad_id, pads);
+
+    // Final conv
+    t = codec_wt_encode_pad_for_sconv(t, 7, 1, 1, &pad_id, pads);
+
+    (void) t;
+}
+
+static bool codec_wt_write_encode_pad_indices(
+    codec_context * ctx,
+    codec_graph_cache_entry * entry,
+    int32_t n_in,
+    std::string * err) {
+
+    if (ctx == nullptr || entry == nullptr || n_in <= 0) {
+        if (err != nullptr) {
+            *err = "invalid WavTokenizer encode pad arguments";
+        }
+        return false;
+    }
+
+    std::vector<wt_encode_pad_info> pads;
+    codec_wt_encode_collect_pad_info(n_in, &pads);
+
+    for (const auto & pad : pads) {
+        if (pad.pad_left == 0 && pad.pad_right == 0) {
+            continue;
+        }
+
+        int32_t t = pad.length;
+        int32_t extra_reflect = 0;
+        const int32_t max_pad = std::max(pad.pad_left, pad.pad_right);
+        if (t <= max_pad) {
+            extra_reflect = max_pad - t + 1;
+            t += extra_reflect;
+        }
+
+        if (pad.pad_left > 0) {
+            ggml_tensor * t_left = codec_graph_get_tensor(ctx, entry, codec_wt_encode_pad_left_name(pad.id).c_str());
+            if (t_left == nullptr) {
+                if (err != nullptr) {
+                    *err = "missing WavTokenizer encode pad left tensor";
+                }
+                return false;
+            }
+            std::vector<int32_t> idx_left((size_t) pad.pad_left, 0);
+            for (int32_t i = 0; i < pad.pad_left; ++i) {
+                idx_left[(size_t) i] = pad.pad_left - i;
+            }
+            if (!codec_runtime_write_tensor(t_left, idx_left.data(), idx_left.size() * sizeof(int32_t), err)) {
+                return false;
+            }
+        }
+
+        if (pad.pad_right > 0) {
+            ggml_tensor * t_right = codec_graph_get_tensor(ctx, entry, codec_wt_encode_pad_right_name(pad.id).c_str());
+            if (t_right == nullptr) {
+                if (err != nullptr) {
+                    *err = "missing WavTokenizer encode pad right tensor";
+                }
+                return false;
+            }
+            std::vector<int32_t> idx_right((size_t) pad.pad_right, 0);
+            for (int32_t i = 0; i < pad.pad_right; ++i) {
+                idx_right[(size_t) i] = (t - 2) - i;
+            }
+            if (!codec_runtime_write_tensor(t_right, idx_right.data(), idx_right.size() * sizeof(int32_t), err)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool codec_wt_write_encode_weights(
+    codec_context * ctx,
+    codec_graph_cache_entry * entry,
+    const wt_encode_build & build,
+    std::string * err) {
+
+    if (ctx == nullptr || entry == nullptr) {
+        if (err != nullptr) {
+            *err = "invalid WavTokenizer encode weight arguments";
+        }
+        return false;
+    }
+    auto graph = [ctx, entry](const std::string & name) {
+        return codec_graph_get_tensor(ctx, entry, name.c_str());
+    };
+
+    if (!codec_wt_copy_conv1d_weight_to_3d(ctx, "enc.model.0.conv.conv.weight", graph(codec_wt_encode_conv_w_name(0, "w")), err) ||
+        !codec_wt_copy_bias_1d(ctx, "enc.model.0.conv.conv.bias", graph(codec_wt_encode_conv_w_name(0, "b")), err)) {
+        return false;
+    }
+
+    const char * const res_blocks[] = { "enc.model.1", "enc.model.4", "enc.model.7", "enc.model.10" };
+    for (int32_t ri = 0; ri < 4; ++ri) {
+        const std::string p = std::string(res_blocks[ri]) + ".";
+        if (!codec_wt_copy_conv1d_weight_to_3d(ctx, p + "block.1.conv.conv.weight", graph(codec_wt_encode_resblock_name(ri, "c1.w")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "block.1.conv.conv.bias", graph(codec_wt_encode_resblock_name(ri, "c1.b")), err) ||
+            !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "block.3.conv.conv.weight", graph(codec_wt_encode_resblock_name(ri, "c2.w")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "block.3.conv.conv.bias", graph(codec_wt_encode_resblock_name(ri, "c2.b")), err) ||
+            !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "shortcut.conv.conv.weight", graph(codec_wt_encode_resblock_name(ri, "sc.w")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "shortcut.conv.conv.bias", graph(codec_wt_encode_resblock_name(ri, "sc.b")), err)) {
+            return false;
+        }
+    }
+
+    const char * const downs[] = { "enc.model.3", "enc.model.6", "enc.model.9", "enc.model.12" };
+    for (int32_t di = 0; di < 4; ++di) {
+        const std::string p = std::string(downs[di]) + ".";
+        if (!codec_wt_copy_conv1d_weight_to_3d(ctx, p + "conv.conv.weight", graph(codec_wt_encode_down_w_name(di, "w")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "conv.conv.bias", graph(codec_wt_encode_down_w_name(di, "b")), err)) {
+            return false;
+        }
+    }
+
+    for (int32_t li = 0; li < 2; ++li) {
+        const std::string p = "enc.model.13.lstm.";
+        const std::string suffix = "_l" + std::to_string(li);
+        if (!codec_wt_copy_linear_weight_to_2d(ctx, p + "weight_ih" + suffix, graph(codec_wt_encode_lstm_name(li, "w_ih")), err) ||
+            !codec_wt_copy_linear_weight_to_2d(ctx, p + "weight_hh" + suffix, graph(codec_wt_encode_lstm_name(li, "w_hh")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "bias_ih" + suffix, graph(codec_wt_encode_lstm_name(li, "b_ih")), err) ||
+            !codec_wt_copy_bias_1d(ctx, p + "bias_hh" + suffix, graph(codec_wt_encode_lstm_name(li, "b_hh")), err)) {
+            return false;
+        }
+    }
+
+    if (!codec_wt_copy_conv1d_weight_to_3d(ctx, "enc.model.15.conv.conv.weight", graph(codec_wt_encode_conv_w_name(15, "w")), err) ||
+        !codec_wt_copy_bias_1d(ctx, "enc.model.15.conv.conv.bias", graph(codec_wt_encode_conv_w_name(15, "b")), err)) {
+        return false;
+    }
+
+    for (int32_t qi = 0; qi < build.n_q; ++qi) {
+        ggml_tensor * t_codebook = graph(std::string("wt.encode.vq.q") + std::to_string(qi) + ".codebook");
+        if (t_codebook == nullptr) {
+            if (err != nullptr) {
+                *err = "missing WavTokenizer encode codebook tensor";
+            }
+            return false;
+        }
+
+        const std::string n0 = "vq.vq.layers." + std::to_string(qi) + "._codebook.embed";
+        const std::string n1 = "vq.vq.layers." + std::to_string(qi) + ".codebook.embed";
+        ggml_tensor * src = ggml_get_tensor(ctx->model->weights, n0.c_str());
+        if (src == nullptr) {
+            src = ggml_get_tensor(ctx->model->weights, n1.c_str());
+        }
+        if (src == nullptr) {
+            if (err != nullptr) {
+                *err = "missing WavTokenizer codebook tensor";
+            }
+            return false;
+        }
+        std::vector<float> cb;
+        if (!codec_tensor_as_vec_f32(src, &cb)) {
+            if (err != nullptr) {
+                *err = "failed reading WavTokenizer codebook tensor";
+            }
+            return false;
+        }
+        const int32_t ncb0 = (int32_t) codec_ne(src, 0);
+        const int32_t ncb1 = (int32_t) codec_ne(src, 1);
+        std::vector<float> cb_dst((size_t) build.codebook_dim * (size_t) build.codebook_size, 0.0f);
+        if (ncb0 == build.codebook_dim && ncb1 == build.codebook_size) {
+            cb_dst = cb;
+        } else if (ncb0 == build.codebook_size && ncb1 == build.codebook_dim) {
+            for (int32_t i = 0; i < build.codebook_dim; ++i) {
+                for (int32_t j = 0; j < build.codebook_size; ++j) {
+                    cb_dst[(size_t) i + (size_t) build.codebook_dim * (size_t) j] =
+                        cb[(size_t) j + (size_t) build.codebook_size * (size_t) i];
+                }
+            }
+        } else {
+            if (err != nullptr) {
+                *err = "unexpected WavTokenizer codebook shape";
+            }
+            return false;
+        }
+
+        if (!codec_runtime_write_tensor(t_codebook, cb_dst.data(), cb_dst.size() * sizeof(float), err)) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -453,8 +1253,8 @@ static bool codec_wt_init_decode_build(codec_context * ctx, int32_t t, int32_t q
     build->codebook_dim = std::max(1, wt.codebook_dim);
     build->codebook_size = std::max(2, wt.codebook_size);
 
-    ggml_tensor * embed_w = codec_wt_get_tensor(ctx->model, "dec.backbone.embed.weight");
-    ggml_tensor * embed_b = codec_wt_get_tensor(ctx->model, "dec.backbone.embed.bias");
+    ggml_tensor * embed_w = codec_wt_get_tensor(ctx->model, "dec.bb.embed.weight");
+    ggml_tensor * embed_b = codec_wt_get_tensor(ctx->model, "dec.bb.embed.bias");
     if (embed_w == nullptr || embed_b == nullptr) {
         if (err != nullptr) {
             *err = "missing WavTokenizer backbone embed tensors";
@@ -480,7 +1280,7 @@ static bool codec_wt_init_decode_build(codec_context * ctx, int32_t t, int32_t q
 
     build->n_convnext = 0;
     for (int32_t li = 0; li < 64; ++li) {
-        if (codec_wt_get_tensor(ctx->model, "dec.backbone.convnext." + std::to_string(li) + ".dwconv.weight") == nullptr) {
+        if (codec_wt_get_tensor(ctx->model, "dec.bb.cnx." + std::to_string(li) + ".dwconv.weight") == nullptr) {
             break;
         }
         build->n_convnext = li + 1;
@@ -492,7 +1292,7 @@ static bool codec_wt_init_decode_build(codec_context * ctx, int32_t t, int32_t q
         return false;
     }
 
-    ggml_tensor * pw1 = codec_wt_get_tensor(ctx->model, "dec.backbone.convnext.0.pwconv1.weight");
+    ggml_tensor * pw1 = codec_wt_get_tensor(ctx->model, "dec.bb.cnx.0.pwconv1.weight");
     if (pw1 == nullptr) {
         if (err != nullptr) {
             *err = "missing WavTokenizer pwconv1 tensor";
@@ -509,32 +1309,84 @@ static bool codec_wt_init_decode_build(codec_context * ctx, int32_t t, int32_t q
         return false;
     }
     build->head_out_dim = (int32_t) codec_ne(head_b, 0);
-    build->use_adanorm = codec_wt_get_tensor(ctx->model, "dec.backbone.norm.scale.weight") != nullptr ? 1 : 0;
+    build->use_adanorm = codec_wt_get_tensor(ctx->model, "dec.bb.norm.scale.weight") != nullptr ? 1 : 0;
+    build->use_pos_net = codec_wt_get_tensor(ctx->model, "dec.bb.pos_net.0.conv1.weight") != nullptr ? 1 : 0;
     return true;
 }
 
 static bool codec_wt_write_decode_weights(codec_context * ctx, codec_graph_cache_entry * entry, const wt_decode_build & build, std::string * err) {
     auto graph = [&](const std::string & n) { return codec_graph_get_tensor(ctx, entry, n.c_str()); };
 
-    if (!codec_wt_copy_conv1d_weight_to_3d(ctx, "dec.backbone.embed.weight", graph(codec_wt_decode_embed_w_name()), err) ||
-        !codec_wt_copy_bias_1d(ctx, "dec.backbone.embed.bias", graph(codec_wt_decode_embed_b_name()), err)) {
+    if (!codec_wt_copy_conv1d_weight_to_3d(ctx, "dec.bb.embed.weight", graph(codec_wt_decode_embed_w_name()), err) ||
+        !codec_wt_copy_bias_1d(ctx, "dec.bb.embed.bias", graph(codec_wt_decode_embed_b_name()), err)) {
         return false;
     }
 
+    if (build.use_pos_net) {
+        for (int32_t li = 0; li < 2; ++li) {
+            const std::string p = "dec.bb.pos_net." + std::to_string(li) + ".";
+            if (!codec_wt_copy_bias_1d(ctx, p + "norm1.weight", graph(codec_wt_decode_pos_name(li, "norm1.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm1.bias", graph(codec_wt_decode_pos_name(li, "norm1.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "conv1.weight", graph(codec_wt_decode_pos_name(li, "conv1.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "conv1.bias", graph(codec_wt_decode_pos_name(li, "conv1.b")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm2.weight", graph(codec_wt_decode_pos_name(li, "norm2.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm2.bias", graph(codec_wt_decode_pos_name(li, "norm2.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "conv2.weight", graph(codec_wt_decode_pos_name(li, "conv2.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "conv2.bias", graph(codec_wt_decode_pos_name(li, "conv2.b")), err)) {
+                return false;
+            }
+        }
+
+        {
+            const std::string p = "dec.bb.pos_net.2.";
+            if (!codec_wt_copy_bias_1d(ctx, p + "norm.weight", graph(codec_wt_decode_pos_name(2, "norm.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm.bias", graph(codec_wt_decode_pos_name(2, "norm.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "q.weight", graph(codec_wt_decode_pos_name(2, "q.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "q.bias", graph(codec_wt_decode_pos_name(2, "q.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "k.weight", graph(codec_wt_decode_pos_name(2, "k.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "k.bias", graph(codec_wt_decode_pos_name(2, "k.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "v.weight", graph(codec_wt_decode_pos_name(2, "v.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "v.bias", graph(codec_wt_decode_pos_name(2, "v.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "proj_out.weight", graph(codec_wt_decode_pos_name(2, "proj_out.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "proj_out.bias", graph(codec_wt_decode_pos_name(2, "proj_out.b")), err)) {
+                return false;
+            }
+        }
+
+        for (int32_t li = 3; li < 5; ++li) {
+            const std::string p = "dec.bb.pos_net." + std::to_string(li) + ".";
+            if (!codec_wt_copy_bias_1d(ctx, p + "norm1.weight", graph(codec_wt_decode_pos_name(li, "norm1.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm1.bias", graph(codec_wt_decode_pos_name(li, "norm1.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "conv1.weight", graph(codec_wt_decode_pos_name(li, "conv1.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "conv1.bias", graph(codec_wt_decode_pos_name(li, "conv1.b")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm2.weight", graph(codec_wt_decode_pos_name(li, "norm2.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "norm2.bias", graph(codec_wt_decode_pos_name(li, "norm2.b")), err) ||
+                !codec_wt_copy_conv1d_weight_to_3d(ctx, p + "conv2.weight", graph(codec_wt_decode_pos_name(li, "conv2.w")), err) ||
+                !codec_wt_copy_bias_1d(ctx, p + "conv2.bias", graph(codec_wt_decode_pos_name(li, "conv2.b")), err)) {
+                return false;
+            }
+        }
+
+        if (!codec_wt_copy_bias_1d(ctx, "dec.bb.pos_net.5.weight", graph(codec_wt_decode_pos_name(5, "w")), err) ||
+            !codec_wt_copy_bias_1d(ctx, "dec.bb.pos_net.5.bias", graph(codec_wt_decode_pos_name(5, "b")), err)) {
+            return false;
+        }
+    }
+
     if (build.use_adanorm) {
-        if (!codec_wt_copy_embedding_row0(ctx, "dec.backbone.norm.scale.weight", graph(codec_wt_decode_norm_w_name()), err) ||
-            !codec_wt_copy_embedding_row0(ctx, "dec.backbone.norm.shift.weight", graph(codec_wt_decode_norm_b_name()), err)) {
+        if (!codec_wt_copy_embedding_row0(ctx, "dec.bb.norm.scale.weight", graph(codec_wt_decode_norm_w_name()), err) ||
+            !codec_wt_copy_embedding_row0(ctx, "dec.bb.norm.shift.weight", graph(codec_wt_decode_norm_b_name()), err)) {
             return false;
         }
     } else {
-        if (!codec_wt_copy_bias_1d(ctx, "dec.backbone.norm.weight", graph(codec_wt_decode_norm_w_name()), err) ||
-            !codec_wt_copy_bias_1d(ctx, "dec.backbone.norm.bias", graph(codec_wt_decode_norm_b_name()), err)) {
+        if (!codec_wt_copy_bias_1d(ctx, "dec.bb.norm.weight", graph(codec_wt_decode_norm_w_name()), err) ||
+            !codec_wt_copy_bias_1d(ctx, "dec.bb.norm.bias", graph(codec_wt_decode_norm_b_name()), err)) {
             return false;
         }
     }
 
     for (int32_t li = 0; li < build.n_convnext; ++li) {
-        const std::string p = "dec.backbone.convnext." + std::to_string(li) + ".";
+        const std::string p = "dec.bb.cnx." + std::to_string(li) + ".";
         if (!codec_wt_copy_conv1d_weight_to_3d(ctx, p + "dwconv.weight", graph(codec_wt_decode_blk_dw_w_name(li)), err) ||
             !codec_wt_copy_bias_1d(ctx, p + "dwconv.bias", graph(codec_wt_decode_blk_dw_b_name(li)), err) ||
             !codec_wt_copy_linear_weight_to_2d(ctx, p + "pwconv1.weight", graph(codec_wt_decode_blk_pw1_w_name(li)), err) ||
@@ -557,8 +1409,8 @@ static bool codec_wt_write_decode_weights(codec_context * ctx, codec_graph_cache
         }
     }
 
-    if (!codec_wt_copy_bias_1d(ctx, "dec.backbone.final_layer_norm.weight", graph(codec_wt_decode_final_ln_w_name()), err) ||
-        !codec_wt_copy_bias_1d(ctx, "dec.backbone.final_layer_norm.bias", graph(codec_wt_decode_final_ln_b_name()), err) ||
+    if (!codec_wt_copy_bias_1d(ctx, "dec.bb.fln.weight", graph(codec_wt_decode_final_ln_w_name()), err) ||
+        !codec_wt_copy_bias_1d(ctx, "dec.bb.fln.bias", graph(codec_wt_decode_final_ln_b_name()), err) ||
         !codec_wt_copy_linear_weight_to_2d(ctx, "dec.head.out.weight", graph(codec_wt_decode_head_w_name()), err) ||
         !codec_wt_copy_bias_1d(ctx, "dec.head.out.bias", graph(codec_wt_decode_head_b_name()), err)) {
         return false;
@@ -602,12 +1454,23 @@ static bool codec_wt_istft_from_head(
     for (int32_t ti = 0; ti < n_frames; ++ti) {
         for (int32_t n = 0; n < n_fft; ++n) {
             float sum = 0.0f;
-            const float re0 = std::exp(std::min(100.0f, head[(size_t) 0 + (size_t) out_dim * (size_t) ti])) * std::cos(head[(size_t) n_bins + (size_t) out_dim * (size_t) ti]);
+            float mag0 = std::exp(head[(size_t) 0 + (size_t) out_dim * (size_t) ti]);
+            if (mag0 > 1e2f) {
+                mag0 = 1e2f;
+            }
+            const float re0 = mag0 * std::cos(head[(size_t) n_bins + (size_t) out_dim * (size_t) ti]);
             sum += re0;
-            const float ren = std::exp(std::min(100.0f, head[(size_t) (n_bins - 1) + (size_t) out_dim * (size_t) ti])) * std::cos(head[(size_t) (2 * n_bins - 1) + (size_t) out_dim * (size_t) ti]);
+            float magn = std::exp(head[(size_t) (n_bins - 1) + (size_t) out_dim * (size_t) ti]);
+            if (magn > 1e2f) {
+                magn = 1e2f;
+            }
+            const float ren = magn * std::cos(head[(size_t) (2 * n_bins - 1) + (size_t) out_dim * (size_t) ti]);
             sum += ren * ((n & 1) ? -1.0f : 1.0f);
             for (int32_t k = 1; k < n_bins - 1; ++k) {
-                const float mag = std::exp(std::min(100.0f, head[(size_t) k + (size_t) out_dim * (size_t) ti]));
+                float mag = std::exp(head[(size_t) k + (size_t) out_dim * (size_t) ti]);
+                if (mag > 1e2f) {
+                    mag = 1e2f;
+                }
                 const float ph = head[(size_t) (n_bins + k) + (size_t) out_dim * (size_t) ti];
                 const float re = mag * std::cos(ph);
                 const float im = mag * std::sin(ph);
@@ -828,12 +1691,14 @@ enum codec_status codec_wavtokenizer_encode(
 
     const size_t mem = 32 * 1024 * 1024 + (size_t) n_in * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
-    wt_encode_build build = { n_in, hop };
+    const int32_t codebook_dim = std::max(1, wt.codebook_dim);
+    const int32_t codebook_size = std::max(2, wt.codebook_size);
+    wt_encode_build build = { n_in, hop, use_n_q, codebook_dim, codebook_size };
     codec_graph_cache_entry * entry = nullptr;
     std::string err;
     if (!codec_graph_cache_get_or_build(
             ctx,
-            { CODEC_GRAPH_WT_ENCODE, /*n_frames=*/0, /*n_q=*/0, /*hop=*/hop, /*n_in=*/n_in, /*latent_dim=*/0 },
+            { CODEC_GRAPH_WT_ENCODE, /*n_frames=*/0, /*n_q=*/use_n_q, /*hop=*/hop, /*n_in=*/n_in, /*latent_dim=*/codebook_dim },
             mem,
             codec_wt_build_encode,
             &build,
@@ -845,10 +1710,8 @@ enum codec_status codec_wavtokenizer_encode(
     }
 
     ggml_tensor * t_pcm = codec_graph_get_tensor(ctx, entry, "wt.encode.pcm");
-    ggml_tensor * t_alpha = codec_graph_get_tensor(ctx, entry, "wt.encode.alpha");
-    ggml_tensor * t_kernel = codec_graph_get_tensor(ctx, entry, "wt.encode.kernel");
     ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "wt.encode.out");
-    if (t_pcm == nullptr || t_alpha == nullptr || t_kernel == nullptr || t_out == nullptr) {
+    if (t_pcm == nullptr || t_out == nullptr) {
         codec_context_set_error(ctx, "cached WavTokenizer encode graph is invalid");
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -858,15 +1721,13 @@ enum codec_status codec_wavtokenizer_encode(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    std::vector<ggml_fp16_t> kernel_f16;
-    if (!codec_wt_load_kernel_f16(ctx, "wt.encode.kernel", hop, &kernel_f16, &err)) {
+    if (!codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
-    const float alpha = 0.5f;
-    if (!codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err) ||
-        !codec_runtime_write_tensor(t_kernel, kernel_f16.data(), kernel_f16.size() * sizeof(ggml_fp16_t), &err) ||
-        !codec_runtime_write_tensor(t_alpha, &alpha, sizeof(float), &err)) {
+
+    if (!codec_wt_write_encode_pad_indices(ctx, entry, n_in, &err) ||
+        !codec_wt_write_encode_weights(ctx, entry, build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -878,32 +1739,25 @@ enum codec_status codec_wavtokenizer_encode(
     }
 
     const int32_t n_frames = (int32_t) t_out->ne[0];
-    std::vector<float> feat((size_t) n_frames, 0.0f);
-    if (!codec_runtime_read_tensor(t_out, feat.data(), feat.size() * sizeof(float), &err)) {
+    const int32_t n_q = (int32_t) t_out->ne[1];
+    std::vector<int32_t> tok((size_t) n_frames * (size_t) n_q, 0);
+    if (!codec_runtime_read_tensor(t_out, tok.data(), tok.size() * sizeof(int32_t), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    int32_t * data = static_cast<int32_t *>(std::malloc((size_t) n_frames * (size_t) use_n_q * sizeof(int32_t)));
+    int32_t * data = static_cast<int32_t *>(std::malloc((size_t) n_frames * (size_t) n_q * sizeof(int32_t)));
     if (data == nullptr) {
         codec_context_set_error(ctx, "failed to allocate token output");
         return CODEC_STATUS_INTERNAL_ERROR;
     }
-
-    const int32_t codebook_size = std::max(2, wt.codebook_size);
-    for (int32_t t = 0; t < n_frames; ++t) {
-        const float x = std::max(-1.0f, std::min(1.0f, feat[(size_t) t]));
-        const int32_t tok = std::max(0, std::min(codebook_size - 1, (int32_t) std::llround((x * 0.5f + 0.5f) * (codebook_size - 1))));
-        for (int32_t q = 0; q < use_n_q; ++q) {
-            data[(size_t) t * (size_t) use_n_q + (size_t) q] = tok;
-        }
-    }
+    std::memcpy(data, tok.data(), tok.size() * sizeof(int32_t));
 
     codec_token_buffer_reset(out_tokens);
     out_tokens->data = data;
-    out_tokens->n_tokens = n_frames * use_n_q;
+    out_tokens->n_tokens = n_frames * n_q;
     out_tokens->n_frames = n_frames;
-    out_tokens->n_q = use_n_q;
+    out_tokens->n_q = n_q;
     out_tokens->codebook_size = codebook_size;
     out_tokens->sample_rate = wt.sample_rate;
     out_tokens->hop_size = hop;

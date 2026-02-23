@@ -13,6 +13,9 @@ dist/
 # Models
 *.gguf
 
+# Cache
+.cache/
+
 # Python environments and caches
 .venv/
 .audio-env/
@@ -49,3 +52,5 @@ checkpoints/
 # E2E files
 /models/
 /tests/e2e/reports/
+
+/.model-src

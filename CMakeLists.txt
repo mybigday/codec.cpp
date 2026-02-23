@@ -46,8 +46,6 @@ add_library(codec STATIC
     src/ops/rvq.cpp
     src/ops/conv1d.cpp
     src/ops/convtr1d.cpp
-    src/debug/stages.cpp
-    src/debug/dump.cpp
     src/batch/batch.cpp
     src/models/wavtokenizer.cpp
     src/models/dac.cpp

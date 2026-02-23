@@ -106,6 +106,26 @@ def to_numpy(tensor):
     return tensor
 
 
+def apply_weight_norm(weight_v: np.ndarray, weight_g: np.ndarray) -> np.ndarray:
+    if weight_v.ndim < 2:
+        raise ValueError(f"weight_norm expects ndim >= 2, got {weight_v.ndim}")
+    out_channels = weight_v.shape[0]
+    v_flat = weight_v.reshape(out_channels, -1)
+    norm = np.linalg.norm(v_flat, axis=1)
+    norm = np.maximum(norm, 1e-12)
+    scale = weight_g.reshape(out_channels) / norm
+    reshape = (out_channels,) + (1,) * (weight_v.ndim - 1)
+    return weight_v * scale.reshape(reshape)
+
+
+def maybe_transpose_lstm_weight(key: str, arr: np.ndarray) -> np.ndarray:
+    if ".lstm.weight_ih_" in key or ".lstm.weight_hh_" in key:
+        if arr.ndim != 2:
+            raise ValueError(f"lstm weight must be rank-2: {key} shape={arr.shape}")
+        return arr.T.copy()
+    return arr
+
+
 def _construct_state_dict_key(module_name, param_name):
     return f"{module_name}.{param_name}" if module_name else param_name
 
@@ -125,7 +145,7 @@ def build_conv_transforms(model):
     for module_name, module in model.named_modules():
         transform = None
         if isinstance(module, nn.Conv1d):
-            transform = "transpose_2_0_1" if _is_depthwise_conv(module) else "keep"
+            transform = "keep"
         elif isinstance(module, nn.ConvTranspose1d):
             transform = "transpose_2_0_1" if _is_depthwise_conv(module) else "transpose_2_1_0"
         if transform is None:
@@ -363,11 +383,39 @@ class WavTokenizerConverter(BaseConverter):
         writer.add_bool("codec.has_decoder", bool(self.config["has_decoder"]))
 
         used_names = set()
+        handled = set()
         for src_key in sorted(self.state_dict):
+            if src_key in handled:
+                continue
+
             mapped, value = self.state_dict[src_key]
+
+            if src_key.endswith(".weight_g"):
+                v_key = src_key[: -len(".weight_g")] + ".weight_v"
+                if v_key in self.state_dict:
+                    mapped_v, value_v = self.state_dict[v_key]
+                    weight_v = to_numpy(value_v).astype(np.float32, copy=False)
+                    weight_g = to_numpy(value).astype(np.float32, copy=False)
+                    arr = apply_weight_norm(weight_v, weight_g)
+                    arr = transform_tensor_for_codec(v_key, arr, self.conv_transforms)
+                    out_mapped = mapped_v.replace(".weight_v", ".weight")
+                    out_name = shorten_tensor_name(out_mapped, used_names)
+                    print(f"add_tensor {v_key}/{src_key} -> {out_name} {arr.shape} {self._get_target_dtype(out_name, arr)}")
+                    writer.add_tensor(out_name, arr, self._get_target_dtype(out_name, arr))
+                    handled.add(src_key)
+                    handled.add(v_key)
+                    continue
+
+            if src_key.endswith(".weight_v"):
+                g_key = src_key[: -len(".weight_v")] + ".weight_g"
+                if g_key in self.state_dict:
+                    continue
+
             arr = to_numpy(value)
+            arr = maybe_transpose_lstm_weight(src_key, arr)
             arr = transform_tensor_for_codec(src_key, arr, self.conv_transforms)
             out_name = shorten_tensor_name(mapped, used_names)
+            print(f"add_tensor {src_key} -> {out_name} {arr.shape} {self._get_target_dtype(out_name, arr)}")
             writer.add_tensor(out_name, arr, self._get_target_dtype(out_name, arr))
 
         add_kernel_tensors(writer, int(self.config["hop_size"]))

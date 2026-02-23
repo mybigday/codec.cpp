@@ -29,35 +29,26 @@ RE_NEVER_Q_CODEBOOK = re.compile(r"^q\..*\.embed$")
 RE_NEVER_Q_CODEBOOK_CB = re.compile(r"^q\..*\.cb\.embed$")
 
 
-def _is_mimi_encoder_conv1d_weight_key(key: str) -> bool:
-    if key == "downsample.conv.weight":
-        return True
-    return bool(re.match(r"^encoder\.layers\.\d+(?:\.block\.[13])?\.conv\.weight$", key))
-
-
-def _is_mimi_encoder_transformer_linear_weight_key(key: str) -> bool:
-    return bool(
-        re.match(
-            r"^encoder_transformer\.layers\.\d+\."
-            r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|mlp\.(?:fc1|fc2))\.weight$",
-            key,
-        )
+def _is_mimi_rvq_input_proj_weight_key(key: str) -> bool:
+    return key in (
+        "quantizer.semantic_residual_vector_quantizer.input_proj.weight",
+        "quantizer.acoustic_residual_vector_quantizer.input_proj.weight",
     )
 
-
-def _is_mimi_convtranspose1d_weight_key(key: str) -> bool:
-    return key == "upsample.conv.weight"
+def _is_mimi_rvq_output_proj_weight_key(key: str) -> bool:
+    return key in (
+        "quantizer.semantic_residual_vector_quantizer.output_proj.weight",
+        "quantizer.acoustic_residual_vector_quantizer.output_proj.weight",
+    )
 
 
 def build_weight_transforms(keys: List[str]) -> Dict[str, str]:
     weight_transforms: Dict[str, str] = {}
     for key in keys:
-        if _is_mimi_convtranspose1d_weight_key(key):
-            weight_transforms[key] = "transpose_2_1_0"
-        elif _is_mimi_encoder_conv1d_weight_key(key):
-            weight_transforms[key] = "transpose_2_1_0"
-        elif _is_mimi_encoder_transformer_linear_weight_key(key):
-            weight_transforms[key] = "transpose_1_0"
+        if _is_mimi_rvq_input_proj_weight_key(key):
+            weight_transforms[key] = "squeeze_2d"
+        elif _is_mimi_rvq_output_proj_weight_key(key):
+            weight_transforms[key] = "squeeze_2d"
     return weight_transforms
 
 
@@ -80,6 +71,8 @@ def transform_tensor_for_codec(key: str, arr: np.ndarray, weight_transforms: Dic
     if transform_op == "keep":
         return _normalize_rvq_codebook_embed_layout(key, arr)
     if transform_op == "transpose_1_0":
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr.squeeze(-1)
         if arr.ndim != 2:
             raise ValueError(f"Linear weight must be rank-2: {key} shape={arr.shape}")
         arr = np.transpose(arr, (1, 0)).copy()
@@ -88,6 +81,12 @@ def transform_tensor_for_codec(key: str, arr: np.ndarray, weight_transforms: Dic
         if arr.ndim != 3:
             raise ValueError(f"Conv/ConvTranspose1d weight must be rank-3: {key} shape={arr.shape}")
         arr = np.transpose(arr, (2, 1, 0)).copy()
+        return _normalize_rvq_codebook_embed_layout(key, arr)
+    if transform_op == "squeeze_2d":
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr.squeeze(-1)
+        if arr.ndim != 2:
+            raise ValueError(f"Expected rank-2 RVQ projection weight: {key} shape={arr.shape}")
         return _normalize_rvq_codebook_embed_layout(key, arr)
     raise ValueError(f"unknown transform op: {transform_op} for {key}")
 

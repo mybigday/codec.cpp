@@ -1,6 +1,7 @@
 #include "graph_exec.h"
 
 #include <ggml-alloc.h>
+#include <ggml.h>
 
 #include <array>
 #include <cstdlib>
@@ -43,6 +44,48 @@ static void codec_backend_set_n_threads(ggml_backend_t backend, int32_t n_thread
     }
 }
 
+static bool codec_sched_ensure_capacity(codec_context * ctx, int32_t required, std::string * error) {
+    if (ctx == nullptr || ctx->backend == nullptr) {
+        if (error != nullptr) {
+            *error = "invalid scheduler context";
+        }
+        return false;
+    }
+    if (required <= 0) {
+        return true;
+    }
+
+    const size_t min_size = (size_t) required;
+    const size_t base_size = GGML_DEFAULT_GRAPH_SIZE * 8;
+    size_t target = std::max(base_size, min_size * 2);
+    if ((int32_t) target <= ctx->sched_reserved_graph_size && ctx->sched != nullptr) {
+        return true;
+    }
+
+    if (ctx->sched != nullptr) {
+        ggml_backend_sched_free(ctx->sched);
+        ctx->sched = nullptr;
+    }
+
+    std::array<ggml_backend_t, 2> backends = { ctx->backend, nullptr };
+    int n_backends = 1;
+    if (!codec_backend_is_cpu(ctx->backend) && ctx->cpu_backend != nullptr) {
+        backends[1] = ctx->cpu_backend;
+        n_backends = 2;
+    }
+
+    ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, n_backends, target, false, true);
+    if (ctx->sched == nullptr) {
+        if (error != nullptr) {
+            *error = "failed to recreate backend scheduler";
+        }
+        return false;
+    }
+
+    ctx->sched_reserved_graph_size = (int32_t) target;
+    return true;
+}
+
 bool codec_runtime_init(codec_context * ctx, std::string * error) {
     if (ctx == nullptr || ctx->model == nullptr) {
         if (error != nullptr) {
@@ -79,7 +122,8 @@ bool codec_runtime_init(codec_context * ctx, std::string * error) {
         }
     }
 
-    ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    const size_t sched_graph_size = GGML_DEFAULT_GRAPH_SIZE * 8;
+    ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, n_backends, sched_graph_size, false, true);
     if (ctx->sched == nullptr) {
         if (ctx->cpu_backend != nullptr) {
             ggml_backend_free(ctx->cpu_backend);
@@ -90,6 +134,7 @@ bool codec_runtime_init(codec_context * ctx, std::string * error) {
         }
         return false;
     }
+    ctx->sched_reserved_graph_size = (int32_t) sched_graph_size;
 
     return true;
 }
@@ -162,6 +207,12 @@ bool codec_graph_compute(
     }
 
     if (!codec_graph_prepare_io(ctx, entry, error)) {
+        return false;
+    }
+
+    const int32_t n_nodes = ggml_graph_n_nodes(ctx->eval_graph);
+    const int32_t required = n_nodes > 0 ? n_nodes * 2 : 0;
+    if (!codec_sched_ensure_capacity(ctx, required, error)) {
         return false;
     }
 

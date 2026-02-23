@@ -6,30 +6,29 @@
       "hf_file": null,
       "class": "transformers:MimiModel",
       "n_q": 32,
-      "gguf": "models/mimi/mimi.gguf",
-      "auto_convert": true
+      "gguf": "models/mimi/mimi.gguf"
     },
     {
       "name": "dac",
-      "hf_repo_id": "hance-ai/descript-audio-codec-24khz",
+      "hf_repo_id": "descript/dac_16khz",
       "hf_file": null,
-      "class": "dac",
-      "n_q": 4,
+      "class": "transformers:DacModel",
+      "n_q": 12,
       "gguf": "models/dac/dac.gguf",
+      "sample_rate": 16000,
       "local_path": "models/dac",
-      "converter": "dac",
-      "auto_convert": true
+      "converter": "dac"
     },
     {
       "name": "wavtokenizer",
-      "hf_repo_id": "novateur/WavTokenizer-large-speech-75token",
-      "hf_file": null,
+      "hf_repo_id": "novateur/WavTokenizer",
+      "hf_file": "WavTokenizer_small_320_24k_4096.ckpt",
+      "config_path": "wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml",
       "class": "wavtokenizer",
       "n_q": 1,
       "gguf": "models/wavtokenizer/wavtokenizer.gguf",
       "local_path": "models/wavtokenizer",
-      "converter": "wavtokenizer",
-      "auto_convert": true
+      "converter": "wavtokenizer"
     }
   ]
 }

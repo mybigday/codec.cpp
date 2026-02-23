@@ -125,7 +125,9 @@ def build_conv_transforms(model):
         if isinstance(module, nn.Conv1d):
             transform = "transpose_2_0_1" if _is_depthwise_conv(module) else "keep"
         elif isinstance(module, nn.ConvTranspose1d):
-            transform = "transpose_2_0_1" if _is_depthwise_conv(module) else "transpose_2_1_0"
+            # Keep torch layout [in, out, k]. GGUF stores reversed dims so ggml sees [k, out, in].
+            # Depthwise conv_transpose is not supported by ggml; keep layout to avoid extra transposes.
+            transform = "keep"
         if transform is None:
             continue
 
@@ -198,14 +200,25 @@ class DacConverter(BaseConverter):
             raise RuntimeError("torch is required for DAC checkpoint conversion")
 
         checkpoint_dir = Path(checkpoint_dir)
+        config_path = checkpoint_dir / "config.json"
         model_file = checkpoint_dir / "pytorch_model.bin"
         if not model_file.is_file():
-            candidates = sorted(checkpoint_dir.glob("*.bin")) + sorted(checkpoint_dir.glob("*.pt")) + sorted(checkpoint_dir.glob("*.pth"))
+            candidates = (
+                sorted(checkpoint_dir.glob("*.safetensors"))
+                + sorted(checkpoint_dir.glob("*.bin"))
+                + sorted(checkpoint_dir.glob("*.pt"))
+                + sorted(checkpoint_dir.glob("*.pth"))
+            )
             if not candidates:
                 raise FileNotFoundError(f"No DAC checkpoint file found in {checkpoint_dir}")
             model_file = candidates[0]
 
-        state = torch.load(model_file, map_location="cpu")
+        if model_file.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state = load_file(model_file)
+        else:
+            state = torch.load(model_file, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
 
@@ -213,16 +226,32 @@ class DacConverter(BaseConverter):
             raise RuntimeError(f"Unsupported checkpoint format at {model_file}")
 
         self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in state.items())
-        self.config = {
-            "sample_rate": 24000,
-            "hop_size": 512,
-            "n_q": 4,
-            "codebook_size": 1024,
-            "latent_dim": 1024,
-            "codebook_dim": 8,
-            "has_encoder": True,
-            "has_decoder": True,
-        }
+        if config_path.is_file():
+            import json
+
+            with config_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.config = {
+                "sample_rate": int(cfg.get("sampling_rate", cfg.get("sample_rate", 24000))),
+                "hop_size": int(cfg.get("hop_length", cfg.get("hop_size", 320))),
+                "n_q": int(cfg.get("n_codebooks", cfg.get("n_q", 12))),
+                "codebook_size": int(cfg.get("codebook_size", 1024)),
+                "latent_dim": int(cfg.get("hidden_size", cfg.get("latent_dim", 1024))),
+                "codebook_dim": int(cfg.get("codebook_dim", 8)),
+                "has_encoder": True,
+                "has_decoder": True,
+            }
+        else:
+            self.config = {
+                "sample_rate": 24000,
+                "hop_size": 320,
+                "n_q": 12,
+                "codebook_size": 1024,
+                "latent_dim": 1024,
+                "codebook_dim": 8,
+                "has_encoder": True,
+                "has_decoder": True,
+            }
         self.conv_transforms = {}
 
     def load_from_huggingface(self, model_id: str) -> None:
@@ -231,13 +260,14 @@ class DacConverter(BaseConverter):
 
         self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in model.state_dict().items())
         self.conv_transforms = build_conv_transforms(model)
+        cfg = model.config
         self.config = {
-            "sample_rate": 24000,
-            "hop_size": 512,
-            "n_q": 4,
-            "codebook_size": 1024,
-            "latent_dim": 1024,
-            "codebook_dim": 8,
+            "sample_rate": int(getattr(cfg, "sampling_rate", getattr(cfg, "sample_rate", 24000))),
+            "hop_size": int(getattr(cfg, "hop_length", getattr(cfg, "hop_size", 320))),
+            "n_q": int(getattr(cfg, "n_codebooks", getattr(cfg, "n_q", 12))),
+            "codebook_size": int(getattr(cfg, "codebook_size", 1024)),
+            "latent_dim": int(getattr(cfg, "hidden_size", getattr(cfg, "latent_dim", 1024))),
+            "codebook_dim": int(getattr(cfg, "codebook_dim", 8)),
             "has_encoder": True,
             "has_decoder": True,
         }

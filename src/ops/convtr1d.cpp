@@ -17,10 +17,13 @@ ggml_tensor * codec_convtr1d(
         return nullptr;
     }
 
-    ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, padding, dilation);
+    ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
         y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+    }
+    if (padding > 0) {
+        y = codec_op_crop_1d(ctx, y, padding, padding);
     }
     return ggml_cont(ctx, y);
 }

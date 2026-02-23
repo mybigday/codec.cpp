@@ -1009,20 +1009,19 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
 
     ggml_tensor * t_downsample_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->downsample.kernel, p->downsample.in_c, p->downsample.out_c);
     ggml_set_name(t_downsample_w, "mimi.encode_downsample.w");
-    ggml_tensor * x_downsample_pad = codec_op_pad_1d(ctx_eval, x, p->downsample.kernel - p->downsample.stride, 0);
-    x = ggml_conv_1d(ctx_eval, ggml_cast(ctx_eval, t_downsample_w, GGML_TYPE_F16), x_downsample_pad, p->downsample.stride, 0, 1);
+    x = codec_conv1d_causal(ctx_eval, x, t_downsample_w, nullptr, p->downsample.stride, 1);
+    if (x == nullptr) {
+        return false;
+    }
 
-    ggml_tensor * t_qs_ip_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->downsample.out_c);
+    ggml_tensor * t_qs_ip_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->downsample.out_c, p->codebook_dim);
     ggml_set_name(t_qs_ip_w, CODEC_MIMI_ENCODE_RVQ_SEM_IP_TENSOR);
-    ggml_tensor * t_qa_ip_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->downsample.out_c);
+    ggml_tensor * t_qa_ip_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->downsample.out_c, p->codebook_dim);
     ggml_set_name(t_qa_ip_w, CODEC_MIMI_ENCODE_RVQ_ACU_IP_TENSOR);
 
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [downsample.out_c, t]
-    ggml_tensor * qs_ip_oi = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_qs_ip_w)); // [downsample.out_c, codebook_dim]
-    ggml_tensor * qa_ip_oi = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_qa_ip_w)); // [downsample.out_c, codebook_dim]
-
-    ggml_tensor * sem_residual = ggml_mul_mat(ctx_eval, qs_ip_oi, x_ct);
-    ggml_tensor * acu_residual = ggml_mul_mat(ctx_eval, qa_ip_oi, x_ct);
+    ggml_tensor * sem_residual = ggml_mul_mat(ctx_eval, t_qs_ip_w, x_ct);
+    ggml_tensor * acu_residual = ggml_mul_mat(ctx_eval, t_qa_ip_w, x_ct);
     if (sem_residual == nullptr || acu_residual == nullptr) {
         return false;
     }
@@ -1099,8 +1098,8 @@ static bool codec_mimi_write_encode_weights(
             }
             return false;
         }
-        if ((int32_t) src->ne[0] != build.codebook_dim || (int32_t) src->ne[1] != build.downsample.out_c ||
-            (int32_t) dst->ne[0] != build.codebook_dim || (int32_t) dst->ne[1] != build.downsample.out_c ||
+        if ((int32_t) src->ne[0] != build.downsample.out_c || (int32_t) src->ne[1] != build.codebook_dim ||
+            (int32_t) dst->ne[0] != build.downsample.out_c || (int32_t) dst->ne[1] != build.codebook_dim ||
             (int64_t) w.size() != (int64_t) build.codebook_dim * build.downsample.out_c) {
             if (err != nullptr) {
                 *err = std::string("Mimi RVQ projection shape mismatch: ") + src_name;
@@ -1484,39 +1483,18 @@ static bool codec_mimi_copy_linear_1x1_weight_to_2d(
         return false;
     }
 
-    std::vector<float> dst_v((size_t) expected_in * (size_t) expected_out, 0.0f);
     const int32_t n0 = (int32_t) codec_ne(src, 0);
     const int32_t n1 = (int32_t) codec_ne(src, 1);
     const int32_t n2 = (int32_t) std::max<int64_t>(1, codec_ne(src, 2));
 
-    if (n0 == expected_in && n1 == expected_out && n2 == 1) {
-        dst_v = src_v;
-    } else if (n0 == 1 && n1 == expected_out && n2 == expected_in) {
-        // Source layout [1, out, in] -> destination [in, out].
-        for (int32_t i = 0; i < expected_in; ++i) {
-            for (int32_t o = 0; o < expected_out; ++o) {
-                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) o + (size_t) n1 * (size_t) i);
-                dst_v[(size_t) i + (size_t) expected_in * (size_t) o] = src_v[src_idx];
-            }
-        }
-    } else if (n0 == 1 && n1 == expected_in && n2 == expected_out) {
-        // Source layout [1, in, out] -> destination [in, out].
-        for (int32_t i = 0; i < expected_in; ++i) {
-            for (int32_t o = 0; o < expected_out; ++o) {
-                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) i + (size_t) n1 * (size_t) o);
-                dst_v[(size_t) i + (size_t) expected_in * (size_t) o] = src_v[src_idx];
-            }
-        }
-    } else if (n0 == expected_in && n1 == expected_out && codec_ne(src, 2) == 0) {
-        dst_v = src_v;
-    } else {
+    if (n0 != expected_in || n1 != expected_out || n2 != 1) {
         if (err != nullptr) {
             *err = std::string("unexpected Mimi projection shape at ") + src_name;
         }
         return false;
     }
 
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
 }
 
 static bool codec_mimi_copy_linear_weight_to_2d(
@@ -1553,27 +1531,16 @@ static bool codec_mimi_copy_linear_weight_to_2d(
 
     const int32_t n0 = (int32_t) codec_ne(src, 0);
     const int32_t n1 = (int32_t) codec_ne(src, 1);
-    std::vector<float> dst_v((size_t) in_dim * (size_t) out_dim, 0.0f);
+    (void) prefer_transpose_when_square;
 
-    const bool copy_as_is = n0 == in_dim && n1 == out_dim && !(prefer_transpose_when_square && in_dim == out_dim);
-    const bool transpose_io = (n0 == out_dim && n1 == in_dim) || (prefer_transpose_when_square && n0 == in_dim && n1 == out_dim && in_dim == out_dim);
-
-    if (copy_as_is) {
-        dst_v = src_v;
-    } else if (transpose_io) {
-        for (int32_t i = 0; i < in_dim; ++i) {
-            for (int32_t o = 0; o < out_dim; ++o) {
-                dst_v[(size_t) i + (size_t) in_dim * (size_t) o] = src_v[(size_t) o + (size_t) out_dim * (size_t) i];
-            }
-        }
-    } else {
+    if (n0 != in_dim || n1 != out_dim) {
         if (err != nullptr) {
             *err = std::string("unexpected Mimi linear shape at ") + src_name;
         }
         return false;
     }
 
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
 }
 
 static bool codec_mimi_copy_conv1d_weight_to_3d(
@@ -1611,28 +1578,14 @@ static bool codec_mimi_copy_conv1d_weight_to_3d(
     const int32_t n0 = (int32_t) codec_ne(src, 0);
     const int32_t n1 = (int32_t) codec_ne(src, 1);
     const int32_t n2 = (int32_t) codec_ne(src, 2);
-    std::vector<float> dst_v((size_t) dk * (size_t) din * (size_t) dout, 0.0f);
-
-    if (n0 == dk && n1 == din && n2 == dout) {
-        dst_v = src_v;
-    } else if (n0 == dout && n1 == din && n2 == dk) {
-        for (int32_t k = 0; k < dk; ++k) {
-            for (int32_t i = 0; i < din; ++i) {
-                for (int32_t o = 0; o < dout; ++o) {
-                    const size_t src_idx = (size_t) o + (size_t) dout * ((size_t) i + (size_t) din * (size_t) k);
-                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) i + (size_t) din * (size_t) o);
-                    dst_v[dst_idx] = src_v[src_idx];
-                }
-            }
-        }
-    } else {
+    if (n0 != dk || n1 != din || n2 != dout) {
         if (err != nullptr) {
             *err = std::string("unexpected Mimi conv1d shape at ") + src_name;
         }
         return false;
     }
 
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
 }
 
 static bool codec_mimi_copy_convtr_weight_to_3d(
@@ -1670,28 +1623,14 @@ static bool codec_mimi_copy_convtr_weight_to_3d(
     const int32_t n0 = (int32_t) codec_ne(src, 0);
     const int32_t n1 = (int32_t) codec_ne(src, 1);
     const int32_t n2 = (int32_t) codec_ne(src, 2);
-    std::vector<float> dst_v((size_t) dk * (size_t) dout * (size_t) din, 0.0f);
-
-    if (n0 == dk && n1 == dout && n2 == din) {
-        dst_v = src_v;
-    } else if (n0 == din && n1 == dout && n2 == dk) {
-        for (int32_t k = 0; k < dk; ++k) {
-            for (int32_t o = 0; o < dout; ++o) {
-                for (int32_t i = 0; i < din; ++i) {
-                    const size_t src_idx = (size_t) i + (size_t) din * ((size_t) o + (size_t) dout * (size_t) k);
-                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) o + (size_t) dout * (size_t) i);
-                    dst_v[dst_idx] = src_v[src_idx];
-                }
-            }
-        }
-    } else {
+    if (n0 != dk || n1 != dout || n2 != din) {
         if (err != nullptr) {
             *err = std::string("unexpected Mimi convtr shape at ") + src_name;
         }
         return false;
     }
 
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
+    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
 }
 
 static bool codec_mimi_copy_bias_1d(codec_context * ctx, const char * src_name, ggml_tensor * dst, std::string * err) {
@@ -2251,6 +2190,8 @@ enum codec_status codec_mimi_encode(
 
     std::string err;
     const int32_t n_in = (int32_t) pcm.size();
+    const float * pcm_data = pcm.data();
+    size_t pcm_bytes = pcm.size() * sizeof(float);
     mimi_encode_build build = {};
     if (!codec_mimi_init_encode_build(ctx, n_in, &build, &err)) {
         codec_context_set_error(ctx, err);
@@ -2281,7 +2222,7 @@ enum codec_status codec_mimi_encode(
     }
 
     if (!codec_graph_prepare_io(ctx, entry, &err) ||
-        !codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err) ||
+        !codec_runtime_write_tensor(t_pcm, pcm_data, pcm_bytes, &err) ||
         !codec_mimi_write_encode_weights(ctx, entry, build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;

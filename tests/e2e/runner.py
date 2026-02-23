@@ -17,8 +17,10 @@ from array import array
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import torch
+import traceback
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -26,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("config.json")
 DEFAULT_INPUT_AUDIO = REPO_ROOT / "input_audio/reference_10_2.mp3"
 DEFAULT_SAMPLE_RATE = 24000
-PRIMARY_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_THRESHOLDS = {
     "corr_min": 0.99,
     "mse_max": 0.0001,
@@ -36,7 +37,6 @@ DEFAULT_THRESHOLDS = {
 @dataclass
 class ModelResult:
     name: str
-    mode: str
     status: str
     duration_sec: float
     log_path: str
@@ -141,6 +141,22 @@ def read_wav_mono_i16(path: Path) -> tuple[int, array]:
     pcm.frombytes(payload)
     return sr, pcm
 
+def compare_codes(ref_codes: Path, out_codes: Path) -> dict[str, Any]:
+    ref_codes = np.load(ref_codes)
+    out_codes = np.load(out_codes)
+    codebook_len_diff = abs(ref_codes.shape[0] - out_codes.shape[0])
+    feature_len_diff = abs(ref_codes.shape[1] - out_codes.shape[1])
+    corr = float("-inf")
+    mse = float("inf")
+    if codebook_len_diff == 0:
+        corr = np.corrcoef(ref_codes[:, :-feature_len_diff], out_codes[:, :-feature_len_diff])[0, 1]
+        mse = np.mean((ref_codes[:, :-feature_len_diff] - out_codes[:, :-feature_len_diff]) ** 2)
+    return {
+        "codebook_diff": codebook_len_diff,
+        "length_diff": feature_len_diff,
+        "corr": corr,
+        "mse": mse,
+    }
 
 def compare_wav(ref_wav: Path, out_wav: Path) -> dict[str, Any]:
     sr_ref, a = read_wav_mono_i16(ref_wav)
@@ -187,24 +203,38 @@ def merge_thresholds(model_cfg: dict[str, Any]) -> dict[str, Any]:
 def assert_metric(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size: int | None = None) -> list[str]:
     failures: list[str] = []
 
-    if int(metrics["sample_rate_ref"]) != int(metrics["sample_rate_out"]):
+    if int(metrics["decode"]["sample_rate_ref"]) != int(metrics["decode"]["sample_rate_out"]):
         failures.append(
-            f"sample_rate mismatch ref={metrics['sample_rate_ref']} out={metrics['sample_rate_out']}"
+            f"decode sample_rate mismatch ref={metrics['decode']['sample_rate_ref']} out={metrics['decode']['sample_rate_out']}"
         )
 
-    corr_min = thresholds.get("corr_min")
-    if corr_min is not None and float(metrics["corr"]) < float(corr_min):
-        failures.append(f"corr {metrics['corr']:.6f} < {float(corr_min):.6f}")
+    if metrics.get("encode", {}).get("codebook_diff", float("inf")) > 0:
+        failures.append(f"encode n_codebook diff {metrics['encode']['codebook_diff']}")
 
-    mse_max = thresholds.get("mse_max")
-    if mse_max is not None and float(metrics["mse"]) > float(mse_max):
-        failures.append(f"mse {metrics['mse']:.8f} > {float(mse_max):.8f}")
+    if metrics.get("encode", {}).get("length_diff", float("inf")) > 0:
+        failures.append(f"encode length_diff {metrics['encode']['length_diff']}")
+
+    corr_min = thresholds.get("corr_min")
+    for key in ["decode", "encode"]:
+        metric = metrics.get(key, {})
+        if not metric:
+            continue
+        if corr_min is not None and float(metric["corr"]) < float(corr_min):
+            failures.append(f"{key} corr {metric['corr']:.6f} < {float(corr_min):.6f}")
+
+        mse_max = thresholds.get("mse_max")
+        if mse_max is not None and float(metric["mse"]) > float(mse_max):
+            failures.append(f"{key} mse {metric['mse']:.8f} > {float(mse_max):.8f}")
 
     len_diff_max = thresholds.get("length_diff_max")
     if len_diff_max is None and hop_size is not None:
         len_diff_max = hop_size
-    if len_diff_max is not None and int(metrics["length_diff"]) > int(len_diff_max):
-        failures.append(f"length_diff {metrics['length_diff']} > {int(len_diff_max)}")
+    for key in ["decode", "encode"]:
+        metric = metrics.get(key, {})
+        if not metric:
+            continue
+        if len_diff_max is not None and int(metric["length_diff"]) > int(len_diff_max):
+            failures.append(f"{key} length_diff {metric['length_diff']} > {int(len_diff_max)}")
 
     return failures
 
@@ -235,12 +265,6 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     return module_name, class_name
 
 
-def preferred_python_executable() -> str:
-    if PRIMARY_PYTHON.is_file():
-        return str(PRIMARY_PYTHON)
-    return sys.executable
-
-
 def resolve_model_local_path(model_cfg: dict[str, Any]) -> Path:
     local_path = model_cfg.get("local_path")
     if not local_path:
@@ -251,320 +275,50 @@ def resolve_model_local_path(model_cfg: dict[str, Any]) -> Path:
     return path.resolve()
 
 
-class NativeDacAdapter:
-    def __init__(self, model: Any):
-        self.model = model
-
-    def eval(self):
-        if hasattr(self.model, "eval"):
-            self.model.eval()
-        return self
-
-    def encode(self, *args, **kwargs):
-        import torch
-
-        audio = kwargs.pop("input_values", None)
-        if audio is None:
-            audio = kwargs.pop("audio_values", None)
-        if audio is None and args:
-            audio = args[0]
-        if audio is None:
-            raise TypeError("missing audio input")
-
-        n_quantizers = kwargs.pop("n_quantizers", None)
-        if kwargs:
-            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
-
-        x = audio
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x.astype(np.float32, copy=False))
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-
-        encode_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = [((x,), {})]
-        if n_quantizers is not None:
-            encode_calls.insert(0, ((x,), {"n_quantizers": int(n_quantizers)}))
-
-        out = call_with_fallback(self.model.encode, encode_calls, "dac.native.encode")
-        if isinstance(out, tuple):
-            # Common DAC output: (latents, codes, ...)
-            if len(out) < 2:
-                raise RuntimeError("dac native encode returned tuple without codes")
-            codes = out[1]
-        elif hasattr(out, "audio_codes"):
-            codes = out.audio_codes
-        else:
-            raise RuntimeError("dac native encode output does not expose codes")
-        return SimpleNamespace(audio_codes=codes)
-
-    def decode(self, *args, **kwargs):
-        audio_codes = kwargs.pop("audio_codes", None)
-        if audio_codes is None and args:
-            audio_codes = args[0]
-        if audio_codes is None:
-            raise TypeError("missing audio codes")
-        if kwargs:
-            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
-
-        if hasattr(self.model, "quantizer") and hasattr(self.model.quantizer, "from_codes"):
-            latent = self.model.quantizer.from_codes(audio_codes)
-            if isinstance(latent, tuple):
-                latent = latent[0]
-            decoded = call_with_fallback(
-                self.model.decode,
-                [((latent,), {})],
-                "dac.native.decode(latent)",
-            )
-        else:
-            decoded = call_with_fallback(
-                self.model.decode,
-                [((audio_codes,), {})],
-                "dac.native.decode(codes)",
-            )
-        return SimpleNamespace(audio_values=decoded)
-
-
-class NativeWavTokenizerAdapter:
-    def __init__(self, model: Any, default_bandwidth_id: int):
-        self.model = model
-        self.default_bandwidth_id = int(default_bandwidth_id)
-
-    def eval(self):
-        if hasattr(self.model, "eval"):
-            self.model.eval()
-        return self
-
-    def encode(self, *args, **kwargs):
-        import torch
-
-        audio = kwargs.pop("input_values", None)
-        if audio is None:
-            audio = kwargs.pop("audio_values", None)
-        if audio is None and args:
-            audio = args[0]
-        if audio is None:
-            raise TypeError("missing audio input")
-
-        bandwidth_id = kwargs.pop("bandwidth_id", None)
-        if kwargs:
-            raise TypeError(f"unexpected kwargs: {sorted(kwargs.keys())}")
-        if bandwidth_id is None:
-            bandwidth_id = torch.tensor([self.default_bandwidth_id], dtype=torch.long)
-
-        x = audio
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x.astype(np.float32, copy=False))
-        if x.ndim == 3 and x.shape[1] == 1:
-            x = x[:, 0, :]
-        if x.ndim == 1:
-            x = x.view(1, -1)
-
-        if hasattr(self.model, "encode_infer"):
-            return call_with_fallback(
-                self.model.encode_infer,
-                [
-                    ((x,), {"bandwidth_id": bandwidth_id}),
-                    ((x,), {}),
-                ],
-                "wavtokenizer.native.encode_infer",
-            )
-
-        return call_with_fallback(
-            self.model.encode,
-            [
-                ((x,), {"bandwidth_id": bandwidth_id}),
-                ((x,), {}),
-            ],
-            "wavtokenizer.native.encode",
-        )
-
-    def decode(self, *args, **kwargs):
-        if not args:
-            raise TypeError("missing features/tokens for decode")
-        return call_with_fallback(
-            self.model.decode,
-            [
-                (args, kwargs),
-                (args, {}),
-            ],
-            "wavtokenizer.native.decode",
-        )
-
-
-def load_native_dac_model(model_cfg: dict[str, Any]):
-    try:
-        dac = importlib.import_module("dac")
-    except Exception as exc:
-        raise RuntimeError(
-            "dac model requires descript-audio-codec package in the active Python env"
-        ) from exc
-
-    local_path = resolve_model_local_path(model_cfg)
-    repo_id = model_cfg.get("hf_repo_id")
-    errors: list[str] = []
-
-    if local_path.exists():
-        load_fn = getattr(getattr(dac, "DAC", None), "load", None)
-        if callable(load_fn):
-            candidate_paths: list[Path] = []
-            if local_path.is_file():
-                candidate_paths.append(local_path)
-            elif local_path.is_dir():
-                candidate_paths.extend(sorted(local_path.rglob("*.pt")))
-                candidate_paths.extend(sorted(local_path.rglob("*.ckpt")))
-
-            for ckpt in candidate_paths:
-                try:
-                    return NativeDacAdapter(load_fn(str(ckpt))).eval()
-                except Exception as exc:
-                    errors.append(f"DAC.load({ckpt}) failed: {exc}")
-
-    from_pretrained_fn = getattr(getattr(dac, "DAC", None), "from_pretrained", None)
-    if callable(from_pretrained_fn) and repo_id:
-        try:
-            return NativeDacAdapter(from_pretrained_fn(repo_id)).eval()
-        except Exception as exc:
-            errors.append(f"DAC.from_pretrained({repo_id}) failed: {exc}")
-
-    raise RuntimeError(
-        "failed to load dac model via descript-audio-codec; "
-        f"local_path={local_path}, hf_repo_id={repo_id}, errors={errors}"
-    )
-
-
-def ensure_wavtokenizer_source() -> Path:
-    """Clone WavTokenizer official repo to models/wavtokenizer-src/ if not exists."""
-    src_path = REPO_ROOT / "models" / "wavtokenizer-src"
-    
-    if src_path.exists() and (src_path / "decoder" / "pretrained.py").is_file():
-        return src_path
-    
-    # Clone the official repo
-    print(f"[wavtokenizer] Cloning official source to {src_path}...")
-    src_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    cmd = [
-        "git", "clone",
-        "--depth", "1",
-        "https://github.com/jishengpeng/WavTokenizer.git",
-        str(src_path)
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to clone WavTokenizer repo: {result.stderr}")
-    
-    if not (src_path / "decoder" / "pretrained.py").is_file():
-        raise RuntimeError(f"WavTokenizer source cloned but decoder/pretrained.py not found in {src_path}")
-    
-    print(f"[wavtokenizer] Source cloned to {src_path}")
-    return src_path
-
-
-def load_native_wavtokenizer_model(model_cfg: dict[str, Any]):
-    """Load WavTokenizer model using official source code from models/wavtokenizer-src/."""
-    # 1. Ensure official source is cloned
-    src_path = ensure_wavtokenizer_source()
-    
-    # 2. Model weights/checkpoints are in local_path (downloaded from HF)
-    local_path = resolve_model_local_path(model_cfg)
-    
-    # 3. Add source path to sys.path for importing
-    src_path_str = str(src_path)
-    if src_path_str not in sys.path:
-        sys.path.insert(0, src_path_str)
-    
-    # Also need the repo root for other imports like encoder/decoder
-    repo_path_str = str(src_path)
-    if repo_path_str not in sys.path:
-        sys.path.insert(0, repo_path_str)
-
-    try:
-        module = importlib.import_module("decoder.pretrained")
-        wavtokenizer_cls = getattr(module, "WavTokenizer")
-    except Exception as exc:
-        raise RuntimeError(
-            f"failed to import WavTokenizer from source path={src_path}"
-        ) from exc
-
-    # Find config file (in local_path which contains HF downloaded files)
-    config_candidates: list[Path] = []
-    explicit_config = model_cfg.get("config_path")
-    if explicit_config:
-        config_path = Path(explicit_config)
-        config_candidates.append(config_path if config_path.is_absolute() else local_path / config_path)
-    config_candidates.extend(
-        [
-            local_path / "checkpoints" / "config.yaml",
-            local_path / "config.yaml",
-        ]
-    )
-    config_path = next((p for p in config_candidates if p.is_file()), None)
-    if config_path is None:
-        raise RuntimeError(
-            f"wavtokenizer config not found under local_path={local_path}; "
-            "set model config_path or place checkpoints/config.yaml"
-        )
-
-    # Find checkpoint file (in local_path)
-    ckpt_candidates: list[Path] = []
-    explicit_ckpt = model_cfg.get("checkpoint")
-    if explicit_ckpt:
-        ckpt_path = Path(explicit_ckpt)
-        ckpt_candidates.append(ckpt_path if ckpt_path.is_absolute() else local_path / ckpt_path)
-    ckpt_candidates.extend(sorted((local_path / "checkpoints").glob("*.ckpt")))
-    ckpt_candidates.extend(sorted(local_path.glob("*.ckpt")))
-    checkpoint_path = next((p for p in ckpt_candidates if p.is_file()), None)
-
-    load_errors: list[str] = []
-    model = None
-
-    # Use from_pretrained0802(config_path, checkpoint_path) as specified
-    if checkpoint_path is not None and hasattr(wavtokenizer_cls, "from_pretrained0802"):
-        try:
-            model = wavtokenizer_cls.from_pretrained0802(str(config_path), str(checkpoint_path))
-        except Exception as exc:
-            load_errors.append(f"from_pretrained0802({config_path}, {checkpoint_path}) failed: {exc}")
-
-    if model is None and hasattr(wavtokenizer_cls, "from_hparams0802"):
-        try:
-            model = wavtokenizer_cls.from_hparams0802(str(config_path))
-        except Exception as exc:
-            load_errors.append(f"from_hparams0802({config_path}) failed: {exc}")
-
-    if model is None:
-        raise RuntimeError(
-            "failed to construct WavTokenizer model; "
-            f"src_path={src_path}, local_path={local_path}, config={config_path}, checkpoint={checkpoint_path}, "
-            f"errors={load_errors}"
-        )
-
-    return NativeWavTokenizerAdapter(model, int(model_cfg.get("bandwidth_id", 0))).eval()
-
-
-def load_hf_model(model_cfg: dict[str, Any]):
-    module_name, class_name = parse_model_class(model_cfg["class"])
-    if module_name == "dac":
-        return load_native_dac_model(model_cfg)
-    if module_name == "wavtokenizer":
-        return load_native_wavtokenizer_model(model_cfg)
-
+# return (model, encoder_fn, decoder_fn)
+# encoder_fn = (audio_frames, **kwargs) -> audio_codes
+# decoder_fn = (audio_codes, **kwargs) -> audio_frames
+def load_native_model(model_cfg: dict[str, Any]):
+    hf_repo_id = model_cfg.get("hf_repo_id")
+    class_name = model_cfg.get("class")
     cache_dir = str(REPO_ROOT / "models" / "hf")
     kwargs: dict[str, Any] = {
         "cache_dir": cache_dir,
+        "trust_remote_code": True,
     }
-    hf_file = model_cfg.get("hf_file")
-    if hf_file:
-        kwargs["filename"] = hf_file
-    if module_name == "transformers":
+    if class_name.startswith("transformers:"):
         module = importlib.import_module("transformers")
-        model_cls = getattr(module, class_name)
-        model = model_cls.from_pretrained(model_cfg["hf_repo_id"], **kwargs)
-    else:
-        raise RuntimeError(f"unsupported class family '{model_cfg['class']}'")
-
-    model.eval()
-    return model
-
+        model_cls = getattr(module, class_name.split(":")[1])
+        model = model_cls.from_pretrained(hf_repo_id, **kwargs)
+        model = model.eval()
+        return (
+            model,
+            lambda audio_frames, **kwargs: model.encode(audio_frames),
+            lambda audio_codes, **kwargs: model.decode(audio_codes)
+        )
+    if class_name == "wavtokenizer":
+        model_name = model_cfg["name"]
+        log_path = REPO_ROOT / "models" / model_name / f"{model_name}.log"
+        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
+        # Pull wavtokenizer src
+        wavtokenizer_source = REPO_ROOT / "models" / "wavtokenizer-source"
+        if not wavtokenizer_source.is_dir():
+            subprocess.run(["git", "clone", "https://github.com/jishengpeng/WavTokenizer.git", wavtokenizer_source], check=True)
+        sys.path.insert(0, str(wavtokenizer_source))
+        decoder_mod = importlib.import_module("decoder.pretrained")
+        # build config
+        # config_path = wavtokenizer_source / "configs" / "wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml"
+        config_path = local_path / model_cfg.get("config_path")
+        model_path = local_path / model_cfg.get("hf_file")
+        model = getattr(decoder_mod, "WavTokenizer").from_pretrained0802(str(config_path), str(model_path))
+        model = model.eval()
+        bandwidth_id = torch.tensor([0])
+        return (
+            model,
+            lambda audio_frames, **kwargs: model.encode_infer(audio_frames.squeeze(0), bandwidth_id=bandwidth_id)[1],
+            lambda audio_codes, **kwargs: model.decode(model.codes_to_features(audio_codes), bandwidth_id=bandwidth_id)
+        )
+    raise RuntimeError(f"unsupported class family '{class_name}'")
 
 def to_torch_audio(wav: np.ndarray, channels: bool = True):
     import torch
@@ -632,7 +386,7 @@ def extract_audio_values(decoded) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def call_with_fallback(func, call_args: list[tuple[tuple[Any, ...], dict[str, Any]]], op_name: str):
+def call_with_fallback(func: Callable[..., Any], call_args: list[tuple[tuple[Any, ...], dict[str, Any]]], op_name: str) -> Any:
     last_exc: Exception | None = None
     for args, kwargs in call_args:
         try:
@@ -662,6 +416,8 @@ def encode_decode_hf(
     sample_rate: int,
     log_path: Path,
     model: Any,
+    encoder_fn: Callable[[np.ndarray, Any], Any],
+    decoder_fn: Callable[[np.ndarray, Any], Any],
 ) -> None:
     import torch
 
@@ -675,99 +431,37 @@ def encode_decode_hf(
         lf.write(f"[hf] loading model: {model_cfg['hf_repo_id']} ({model_cfg['class']})\n")
 
     with torch.no_grad():
-        if class_alias == "mimi":
-            audio = to_torch_audio(mono, channels=True)
-            encoded = call_with_fallback(
-                model.encode,
-                [
-                    ((), {"input_values": audio}),
-                    ((), {"audio_values": audio}),
-                    ((audio,), {}),
-                ],
-                "mimi.encode",
-            )
-            codes_raw = encoded.audio_codes
-            decoded = call_with_fallback(
-                model.decode,
-                [
-                    ((), {"audio_codes": codes_raw}),
-                    ((codes_raw,), {}),
-                ],
-                "mimi.decode",
-            )
-
-        elif class_alias == "dac":
-            audio = to_torch_audio(mono, channels=True)
-            n_q = model_cfg.get("n_q")
-            encode_calls = [
+        audio = to_torch_audio(mono, channels=True)
+        encoded = call_with_fallback(
+            encoder_fn,
+            [
                 ((), {"input_values": audio}),
                 ((), {"audio_values": audio}),
                 ((audio,), {}),
-            ]
-            if n_q is not None:
-                n_q_int = int(n_q)
-                encode_calls = [
-                    (args, {**kwargs, "n_quantizers": n_q_int}) for args, kwargs in encode_calls
-                ] + encode_calls
-            encoded = call_with_fallback(model.encode, encode_calls, "dac.encode")
+            ],
+            "encode",
+        )
+        features = None
+        if hasattr(encoded, "quantized_representation"):
             codes_raw = encoded.audio_codes
-            decoded = call_with_fallback(
-                model.decode,
-                [
-                    ((), {"audio_codes": codes_raw}),
-                    ((codes_raw,), {}),
-                ],
-                "dac.decode",
-            )
-
-        elif class_alias == "wavtokenizer":
-            audio_bt = to_torch_audio(mono, channels=False)
-            bandwidth_id = int(model_cfg.get("bandwidth_id", 0))
-            bw_tensor = torch.tensor([bandwidth_id], dtype=torch.long)
-
-            encode_out = None
-            encode_last_exc: Exception | None = None
-            for args, kwargs in [
-                ((), {"input_values": audio_bt}),
-                ((), {"audio_values": audio_bt}),
-                ((audio_bt,), {}),
-                ((audio_bt,), {"bandwidth_id": bw_tensor}),
-            ]:
-                try:
-                    encode_out = model.encode(*args, **kwargs)
-                    break
-                except TypeError as exc:
-                    encode_last_exc = exc
-            if encode_out is None:
-                raise RuntimeError(f"wavtokenizer.encode signature mismatch: {encode_last_exc}")
-
-            if isinstance(encode_out, tuple) and len(encode_out) == 2:
-                feats, tokens = encode_out
-                codes_raw = tokens
-                decode_out = call_with_fallback(
-                    model.decode,
-                    [
-                        ((feats,), {"bandwidth_id": bw_tensor}),
-                        ((feats,), {}),
-                    ],
-                    "wavtokenizer.decode(feats)",
-                )
-                decoded = decode_out
-            elif hasattr(encode_out, "audio_codes"):
-                codes_raw = encode_out.audio_codes
-                decoded = call_with_fallback(
-                    model.decode,
-                    [
-                        ((), {"audio_codes": codes_raw}),
-                        ((codes_raw,), {}),
-                    ],
-                    "wavtokenizer.decode(audio_codes)",
-                )
-            else:
-                raise RuntimeError("wavtokenizer encode output does not expose codes")
-
+            features = encoded.quantized_representation
+        elif hasattr(encoded, "audio_codes"):
+            features = codes_raw = encoded.audio_codes
+        elif isinstance(encoded, tuple):
+            codes_raw, _ = encoded
+            features = codes_raw
+        elif isinstance(encoded, torch.Tensor):
+            features = codes_raw = encoded
         else:
-            raise RuntimeError(f"unsupported class '{model_cfg['class']}'")
+            raise RuntimeError(f"unsupported encoded type: {type(encoded)}")
+        decoded = call_with_fallback(
+            decoder_fn,
+            [
+                ((), {"audio_codes": features}),
+                ((features,), {}),
+            ],
+            "decode",
+        )
 
     codes_2d = normalize_codes_2d(codes_raw)
     np.save(codes_out, codes_2d)
@@ -801,31 +495,27 @@ def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: 
         raise RuntimeError(f"Failed to download HF snapshot: {e}")
 
 
-def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Path, model_name: str) -> Path:
+def convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Path, model_name: str) -> Path:
     """Auto-convert HF model to GGUF using scripts/convert-to-gguf.py"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    class_spec = model_cfg.get("class", "")
+    hf_file = model_cfg.get("hf_file")
     
     # For transformers models, use direct HF conversion
-    if class_spec.startswith("transformers:") and model_cfg.get("converter") is None:
+    if not hf_file:
         cmd = [
-            preferred_python_executable(),
+            sys.executable,
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
             "--model-id", model_cfg["hf_repo_id"],
             "--output", str(output_path),
         ]
     else:
-        # For non-transformers models (dac, wavtokenizer), download first then convert
-        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
-        
-        converter = model_cfg.get("converter", model_name)
         cmd = [
-            preferred_python_executable(),
+            sys.executable,
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
-            "--input-dir", str(local_path),
+            "--input-dir", str(REPO_ROOT / "models" / model_name / hf_file),
             "--output", str(output_path),
-            "--model-type", converter,
+            "--model-type", model_name,
         ]
 
     quantization = model_cfg.get("quantization")
@@ -834,10 +524,10 @@ def auto_convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Pa
 
     ret = run_and_log(cmd, log_path, model_name)
     if ret != 0:
-        raise RuntimeError(f"auto-convert failed (exit={ret})")
+        raise RuntimeError(f"convert to gguf failed (exit={ret})")
 
     if not output_path.is_file():
-        raise RuntimeError(f"auto-convert did not produce: {output_path}")
+        raise RuntimeError(f"convert to gguf did not produce: {output_path}")
 
     return output_path
 
@@ -880,16 +570,41 @@ def run_decode(gguf_path: Path, codes_npy: Path, out_wav: Path, n_q: int, log_pa
     if ret != 0:
         raise RuntimeError(f"codec-cli decode failed (exit={ret})")
 
+def run_encode(
+    gguf_path: Path,
+    input_wav: Path,
+    out_codes: Path,
+    n_q: int,
+    log_path: Path,
+    model_name: str,
+) -> None:
+    cmd = [
+        str(REPO_ROOT / "build/codec-cli"),
+        "encode",
+        "--model",
+        str(gguf_path),
+        "--in",
+        str(input_wav),
+        "--out",
+        str(out_codes),
+    ]
+    if n_q > 0:
+        cmd.extend(["--nq", str(n_q)])
+
+    ret = run_and_log(cmd, log_path, model_name)
+    if ret != 0:
+        raise RuntimeError(f"codec-cli encode failed (exit={ret})")
 
 def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sample_rate: int) -> ModelResult:
     name = model_cfg["name"]
     start = time.monotonic()
     log_path = report_dir / f"{name}.log"
-    hf_model = load_hf_model(model_cfg)
-    mode = "full" if hf_model is not None else "conversion-only"
+    model, encoder_fn, decoder_fn = load_native_model(model_cfg)
 
     report_dir.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
+
+    model_sample_rate = int(model_cfg.get("sample_rate", sample_rate))
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f"codec-e2e-{name}-"))
     try:
@@ -897,38 +612,28 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
             raise RuntimeError(f"input audio not found: {input_audio}")
 
         expected_gguf = resolve_gguf_path(model_cfg)
-        if model_cfg.get("auto_convert", True):
-            print(f"[{name}] Always regenerating GGUF from HF...")
-            gguf_path = auto_convert_gguf(model_cfg, expected_gguf, log_path, name)
-        else:
-            gguf_path = expected_gguf
-            if not gguf_path.is_file():
-                raise RuntimeError(f"GGUF model not found and auto_convert disabled: {gguf_path}")
-
-        if mode == "conversion-only":
-            duration = time.monotonic() - start
-            return ModelResult(
-                name=name,
-                mode=mode,
-                status="passed",
-                duration_sec=duration,
-                log_path=str(log_path),
-            )
+        gguf_path = convert_gguf(model_cfg, expected_gguf, log_path, name)
 
         input_wav = tmpdir / "input.wav"
         hf_codes = tmpdir / "hf_codes.npy"
         hf_ref_wav = tmpdir / "hf_reference.wav"
         cpp_out_wav = tmpdir / "cpp_decode.wav"
-        if hf_model is None:
-            raise RuntimeError("internal error: full mode selected without an HF model")
+        cpp_out_codes = tmpdir / "cpp_encode.npy"
 
-        ffmpeg_to_mono_wav(input_audio, input_wav, sample_rate, log_path, name)
-        encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, sample_rate, log_path, hf_model)
+        ffmpeg_to_mono_wav(input_audio, input_wav, model_sample_rate, log_path, name)
+        encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, model_sample_rate, log_path, model, encoder_fn, decoder_fn)
 
         n_q = int(model_cfg.get("n_q", 0))
-        run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
+        if model_cfg.get("decode_only"):
+            run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
+        else:
+            run_encode(gguf_path, input_wav, cpp_out_codes, n_q, log_path, name)
+            run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
 
-        metrics = compare_wav(hf_ref_wav, cpp_out_wav)
+        metrics = {}
+        metrics["decode"] = compare_wav(hf_ref_wav, cpp_out_wav)
+        if not  model_cfg.get("decode_only"):
+            metrics["encode"] = compare_codes(hf_codes, cpp_out_codes)
         thresholds = merge_thresholds(model_cfg)
         hop_size = thresholds.get("length_diff_hop_size")
         failures = assert_metric(metrics, thresholds, hop_size=int(hop_size) if hop_size is not None else None)
@@ -946,7 +651,6 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         if failures:
             return ModelResult(
                 name=name,
-                mode=mode,
                 status="failed",
                 duration_sec=duration,
                 log_path=str(log_path),
@@ -957,17 +661,16 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
 
         return ModelResult(
             name=name,
-            mode=mode,
             status="passed",
             duration_sec=duration,
             log_path=str(log_path),
             metrics=metrics,
         )
     except Exception as exc:  # noqa: BLE001
+        print(traceback.format_exc())
         duration = time.monotonic() - start
         return ModelResult(
             name=name,
-            mode=mode,
             status="failed",
             duration_sec=duration,
             log_path=str(log_path),
@@ -994,7 +697,6 @@ def write_reports(report_dir: Path, selected_models: list[str], results: list[Mo
         "results": [
             {
                 "name": r.name,
-                "mode": r.mode,
                 "status": r.status,
                 "duration_sec": round(r.duration_sec, 3),
                 "log_path": r.log_path,
@@ -1028,7 +730,7 @@ def write_reports(report_dir: Path, selected_models: list[str], results: list[Mo
         if mse is not None and corr is not None:
             metric_txt = f" | mse={float(mse):.8f} corr={float(corr):.6f}"
         lines.append(
-            f"- {r.name}: {r.status} [{r.mode}] ({r.duration_sec:.2f}s)"
+            f"- {r.name}: {r.status} ({r.duration_sec:.2f}s)"
             + metric_txt
             + (f" | reason: {r.reason}" if r.reason else "")
             + f" | log: {r.log_path}"

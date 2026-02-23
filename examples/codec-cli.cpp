@@ -21,8 +21,9 @@ static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s e2e --model <gguf> --in <wav> --out <wav> [--threads N] [--nq N] [--use-gpu]\n"
+        "  %s encode --model <gguf> --in <wav> --out <codes.npy> [--threads N] [--nq N] [--use-gpu]\n"
         "  %s decode --model <gguf> --codes <codes.npy> --out <wav> [--threads N] [--nq N] [--use-gpu]\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 static bool parse_i32(const char * value, int32_t * out) {
@@ -298,6 +299,69 @@ static bool load_npy_i32_2d(const char * path, std::vector<int32_t> * out, int32
     return true;
 }
 
+static bool save_npy_i32_2d(
+    const char * path,
+    const int32_t * data_tq,
+    int32_t n_q,
+    int32_t n_frames,
+    std::string * err) {
+    if (path == nullptr || data_tq == nullptr || n_q <= 0 || n_frames <= 0) {
+        if (err != nullptr) {
+            *err = "invalid npy save args";
+        }
+        return false;
+    }
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        if (err != nullptr) {
+            *err = "failed to open output npy file";
+        }
+        return false;
+    }
+
+    const char magic[] = "\x93NUMPY";
+    ofs.write(magic, 6);
+    const uint8_t major = 1;
+    const uint8_t minor = 0;
+    ofs.put((char)major);
+    ofs.put((char)minor);
+
+    char header[256];
+    std::snprintf(
+        header,
+        sizeof(header),
+        "{'descr': '<i4', 'fortran_order': False, 'shape': (%d, %d), }",
+        n_q,
+        n_frames);
+    std::string hdr = header;
+    const size_t preamble = 6 + 2 + 2;
+    const size_t total = preamble + hdr.size();
+    const size_t pad = (16 - (total % 16)) % 16;
+    hdr.append(pad, ' ');
+    hdr.push_back('\n');
+
+    const uint16_t hlen = (uint16_t) hdr.size();
+    ofs.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
+    ofs.write(hdr.data(), (std::streamsize) hdr.size());
+
+    for (int32_t q = 0; q < n_q; ++q) {
+        for (int32_t t = 0; t < n_frames; ++t) {
+            const int32_t v = data_tq[(size_t) t * (size_t) n_q + (size_t) q];
+            ofs.write(reinterpret_cast<const char *>(&v), sizeof(v));
+        }
+    }
+
+    if (!ofs.good()) {
+        if (err != nullptr) {
+            *err = "failed to write npy data";
+        }
+        return false;
+    }
+
+    return true;
+}
+
 struct e2e_args {
     const char * model_path = nullptr;
     const char * input_wav = nullptr;
@@ -311,6 +375,15 @@ struct decode_args {
     const char * model_path = nullptr;
     const char * codes_npy = nullptr;
     const char * out_wav = nullptr;
+    int32_t n_threads = 4;
+    int32_t n_q = 0;
+    bool use_gpu = false;
+};
+
+struct encode_args {
+    const char * model_path = nullptr;
+    const char * input_wav = nullptr;
+    const char * out_codes = nullptr;
     int32_t n_threads = 4;
     int32_t n_q = 0;
     bool use_gpu = false;
@@ -408,6 +481,55 @@ static bool parse_decode_args(int argc, char ** argv, decode_args * out) {
 
     if (out->model_path == nullptr || out->codes_npy == nullptr || out->out_wav == nullptr) {
         std::fprintf(stderr, "decode requires --model, --codes and --out\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool parse_encode_args(int argc, char ** argv, encode_args * out) {
+    for (int i = 2; i < argc; ++i) {
+        const char * arg = argv[i];
+        if (std::strcmp(arg, "--model") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value after --model\n");
+                return false;
+            }
+            out->model_path = argv[++i];
+        } else if (std::strcmp(arg, "--in") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value after --in\n");
+                return false;
+            }
+            out->input_wav = argv[++i];
+        } else if (std::strcmp(arg, "--out") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value after --out\n");
+                return false;
+            }
+            out->out_codes = argv[++i];
+        } else if (std::strcmp(arg, "--threads") == 0) {
+            if (i + 1 >= argc || !parse_i32(argv[i + 1], &out->n_threads) || out->n_threads < 1) {
+                std::fprintf(stderr, "invalid value for --threads\n");
+                return false;
+            }
+            ++i;
+        } else if (std::strcmp(arg, "--nq") == 0) {
+            if (i + 1 >= argc || !parse_i32(argv[i + 1], &out->n_q) || out->n_q < 0) {
+                std::fprintf(stderr, "invalid value for --nq\n");
+                return false;
+            }
+            ++i;
+        } else if (std::strcmp(arg, "--use-gpu") == 0) {
+            out->use_gpu = true;
+        } else {
+            std::fprintf(stderr, "unknown argument for encode: %s\n", arg);
+            return false;
+        }
+    }
+
+    if (out->model_path == nullptr || out->input_wav == nullptr || out->out_codes == nullptr) {
+        std::fprintf(stderr, "encode requires --model, --in and --out\n");
         return false;
     }
 
@@ -583,6 +705,80 @@ static int cmd_decode(const decode_args & args) {
     return 0;
 }
 
+static int cmd_encode(const encode_args & args) {
+    struct codec_model_params mparams = codec_model_default_params();
+    mparams.n_threads = args.n_threads;
+    mparams.use_gpu = args.use_gpu;
+
+    struct codec_model * model = codec_model_load_from_file(args.model_path, mparams);
+    if (model == nullptr) {
+        std::fprintf(stderr, "failed to load model: %s\n", args.model_path);
+        return 2;
+    }
+
+    if (!codec_model_has_encoder(model)) {
+        std::fprintf(stderr, "model does not support encode: arch=%s\n", codec_arch_name(codec_model_arch(model)));
+        codec_model_free(model);
+        return 3;
+    }
+
+    struct codec_context * ctx = codec_init_from_model(model, codec_context_default_params());
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "failed to create context\n");
+        codec_model_free(model);
+        return 4;
+    }
+
+    wav_data wav;
+    std::string wav_err;
+    if (!load_wav_pcm16(args.input_wav, &wav, &wav_err)) {
+        std::fprintf(stderr, "failed to load wav: %s (%s)\n", args.input_wav, wav_err.c_str());
+        codec_free(ctx);
+        codec_model_free(model);
+        return 5;
+    }
+
+    struct codec_audio in_audio = {
+        /*.data =*/ wav.pcm_i16.data(),
+        /*.n_samples =*/ (int32_t)(wav.pcm_i16.size() / (size_t)wav.n_channels),
+        /*.sample_rate =*/ wav.sample_rate,
+        /*.n_channels =*/ wav.n_channels,
+        /*.pcm_type =*/ CODEC_PCM_TYPE_I16,
+    };
+
+    struct codec_token_buffer tokens = {};
+    struct codec_encode_params eparams = codec_encode_default_params();
+    eparams.n_threads = args.n_threads;
+    eparams.n_q = args.n_q;
+
+    enum codec_status st = codec_encode(ctx, &in_audio, &tokens, eparams);
+    if (st != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "codec_encode failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
+        codec_token_buffer_free(&tokens);
+        codec_free(ctx);
+        codec_model_free(model);
+        return 6;
+    }
+
+    std::string npy_err;
+    if (!save_npy_i32_2d(args.out_codes, tokens.data, tokens.n_q, tokens.n_frames, &npy_err)) {
+        std::fprintf(stderr, "failed to write codes npy: %s (%s)\n", args.out_codes, npy_err.c_str());
+        codec_token_buffer_free(&tokens);
+        codec_free(ctx);
+        codec_model_free(model);
+        return 7;
+    }
+
+    std::printf("model: %s (%s)\n", codec_model_name(model), codec_arch_name(codec_model_arch(model)));
+    std::printf("encoded: n_frames=%d n_q=%d n_tokens=%d\n", tokens.n_frames, tokens.n_q, tokens.n_tokens);
+    std::printf("wrote: %s\n", args.out_codes);
+
+    codec_token_buffer_free(&tokens);
+    codec_free(ctx);
+    codec_model_free(model);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -597,6 +793,15 @@ int main(int argc, char ** argv) {
             return 1;
         }
         return cmd_e2e(args);
+    }
+
+    if (std::strcmp(cmd, "encode") == 0) {
+        encode_args args;
+        if (!parse_encode_args(argc, argv, &args)) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        return cmd_encode(args);
     }
 
     if (std::strcmp(cmd, "decode") == 0) {
