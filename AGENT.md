@@ -112,8 +112,52 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 
 - Keep encode/decode numerics stable (unit/regression tests where possible).
 - Avoid introducing new CPU-only intermediate buffers; build everything as ggml tensors.
+- **Never reshape/transpose weights at runtime.** If weights need reshape, do it in the GGUF converter or via gguf transpose ops during conversion.
 - When touching graph execution / backend scheduler: be careful with allocation lifetimes (`eval_ctx`, scheduler reset semantics).
 - Prefer small, reviewable commits.
+
+---
+
+## Model/Op Implementation Playbook (condensed)
+
+### New model (encode/decode)
+1. **GGUF converter first**
+   - Add converter in `scripts/converters/`.
+   - Bake all needed weights/metadata into GGUF. No runtime weight transforms.
+   - Confirm tensor layout: ggml expects `[k, in, out]` for conv1d and `[k, out, in]` for conv_transpose_1d (see `ggml_conv_transpose_1d` constraints).
+2. **Runtime model struct**
+   - Add metadata fields in `codec_*` struct and initialize in `codec_*_init`.
+   - Read GGUF keys with sane defaults but validate shapes early.
+3. **Graph build**
+   - Build encode/decode forward graphs using ggml ops only.
+   - Cache graph with a compact key (kind, n_frames, n_q, hop, n_in, latent_dim).
+   - If graph is large, ensure graph size + backend scheduler capacity are adequate (see `src/runtime/graph.cpp` and `src/runtime/graph_exec.cpp`).
+4. **Weights and IO**
+   - Use `codec_*_copy_*` helpers to map GGUF tensors into graph tensors.
+   - Avoid any CPU-only math or bespoke tensor loops unless absolutely necessary.
+5. **E2E tests**
+   - Add/update model entry in `tests/e2e/config.json` (sample rate, n_q, gguf path).
+   - Ensure HF reference runs with the same sample rate/hop.
+   - Run `python tests/e2e/runner.py --models <name>`.
+
+### New op (ggml)
+1. **Prefer ggml primitives**
+   - Implement as a composition in `src/ops/ggml_ops.cpp` when possible.
+2. **If a custom op is needed**
+   - Implement in ggml backend (CPU + optional GPU stubs).
+   - Keep API minimal and add a small targeted test.
+3. **Respect ggml constraints**
+   - Many ops impose shape/stride constraints; confirm in `ggml/` sources.
+   - Example: `ggml_conv_transpose_1d` enforces `p0==0` and `d0==1`; use crop for padding.
+
+---
+
+## Common pitfalls
+
+- **Graph size assertions**: if you hit `GGML_ASSERT(cgraph->n_nodes < cgraph->size)` or scheduler hash-set asserts, increase graph/scheduler capacity.
+- **Sample rate mismatches**: ensure model `sample_rate` in GGUF and E2E config match HF reference.
+- **Silent tensor layout mistakes**: verify tensor shapes against ggml expectations and PyTorch definitions.
+- **Runtime weight fixes**: do not reshape/transpose weights at runtime; fix converter instead.
 
 ---
 
@@ -131,9 +175,7 @@ If you need to add/replace an op:
 
 ---
 
-## Mimi Encoder Migration Status
+## Local skills
 
-- Mimi encode path is consolidated into one canonical graph kind: `CODEC_GRAPH_MIMI_ENCODE`.
-- The unified graph builder is the only Mimi encode graph path (`frontend -> transformer -> downsample -> unrolled RVQ`).
-- Split/legacy graph kinds for Mimi encode stages are removed from runtime graph enums.
-- Mimi encode weight writing now targets only the canonical encode graph path.
+- `codec-model-dev` — end-to-end guide for adding a model (converter → ggml graphs → tests).
+- `codec-op-dev` — guidance for adding/adjusting ggml ops safely.
