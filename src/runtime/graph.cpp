@@ -43,7 +43,7 @@ static bool codec_graph_ensure_eval_arena(codec_context * ctx, size_t required_s
     void * new_buf = std::realloc(ctx->eval_arena_buf, min_size);
     if (new_buf == nullptr) {
         if (error != nullptr) {
-            *error = "failed to grow eval arena";
+            *error = "failed to grow eval arena, required size: " + std::to_string(required_size);
         }
         return false;
     }
