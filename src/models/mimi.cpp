@@ -2198,7 +2198,12 @@ enum codec_status codec_mimi_encode(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    const size_t mem = 512 * 1024 * 1024 + (size_t) n_in * (size_t) build.transformer.c * sizeof(float) * 64;
+    // Eval arena only needs to hold ggml tensor metadata (no_alloc=true), which scales
+    // with graph size, not tensor element counts. Avoid huge allocations for long inputs.
+    const size_t mem =
+        256 * 1024 * 1024 +
+        (size_t) build.transformer.n_layers * 16 * 1024 * 1024 +
+        (size_t) build.frontend.conv.size() * 4 * 1024 * 1024;
     codec_graph_eval_guard eval_guard(ctx);
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
