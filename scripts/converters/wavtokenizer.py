@@ -161,6 +161,37 @@ def build_conv_transforms(model):
     return conv_transforms
 
 
+def build_conv_transforms_from_state_dict(state_dict: Dict[str, tuple]) -> Dict[str, str]:
+    conv_transforms: Dict[str, str] = {}
+    for raw_key, item in state_dict.items():
+        key = normalize_key(raw_key)
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        _, value = item
+        arr = to_numpy(value)
+        if arr is None or not hasattr(arr, "ndim") or arr.ndim != 3:
+            continue
+
+        low = key.lower()
+        transform = None
+        if "convtr" in low or "conv_transpose" in low:
+            # PyTorch ConvTranspose1d uses [out, in, k]
+            # ggml expects [k, out, in]
+            transform = "transpose_2_1_0"
+            if arr.shape[1] == 1:
+                # depthwise conv_transpose keeps channel in dim 0
+                transform = "transpose_2_0_1"
+        elif ".conv" in low or ".dwconv" in low:
+            transform = "keep"
+
+        if transform is None:
+            continue
+        conv_transforms[raw_key] = transform
+        conv_transforms[key] = transform
+
+    return conv_transforms
+
+
 def transform_tensor_for_codec(key, arr, conv_transforms):
     transform = conv_transforms.get(key)
     if transform is None:
@@ -318,7 +349,7 @@ class WavTokenizerConverter(BaseConverter):
                 merged_state[key] = (mapped, value)
             
             self.state_dict = merged_state
-            self.conv_transforms = {}
+            self.conv_transforms = build_conv_transforms_from_state_dict(self.state_dict)
             self.config = {
                 "sample_rate": 24000,
                 "hop_size": 320,
@@ -348,8 +379,12 @@ class WavTokenizerConverter(BaseConverter):
                 f"No checkpoint found in {checkpoint_dir}. Expected encoder.ckpt and/or decoder.ckpt"
             )
 
-        model_for_transforms = load_wavtokenizer_model_for_transforms(self.config_path, self.wavtokenizer_source)
-        self.conv_transforms = build_conv_transforms(model_for_transforms)
+        try:
+            model_for_transforms = load_wavtokenizer_model_for_transforms(self.config_path, self.wavtokenizer_source)
+            self.conv_transforms = build_conv_transforms(model_for_transforms)
+        except Exception as exc:
+            self.log(f"WavTokenizer source import failed, falling back to shape-based conv transforms: {exc}")
+            self.conv_transforms = {}
 
         merged_state = {}
         if encoder.is_file():
@@ -358,6 +393,8 @@ class WavTokenizerConverter(BaseConverter):
             collect_weights("decoder", str(decoder), self.allow_unmapped, merged_state)
 
         self.state_dict = merged_state
+        if not self.conv_transforms:
+            self.conv_transforms = build_conv_transforms_from_state_dict(self.state_dict)
         self.config = {
             "sample_rate": 24000,
             "hop_size": 320,

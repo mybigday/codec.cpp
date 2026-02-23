@@ -1,0 +1,6 @@
+numpy
+scipy
+pyyaml
+transformers
+huggingface_hub
+safetensors
