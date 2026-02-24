@@ -12,11 +12,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
 enum codec_status codec_dac_init(struct codec_model * model) {
-    codec_dac & dac = model->dac;
+    codec_dac & dac = *static_cast<codec_dac *>(model->impl);
 
     dac.sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 24000);
     dac.hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 512);
@@ -730,7 +731,7 @@ static bool codec_dac_init_decode_build(
         return false;
     }
 
-    const codec_dac & dac = ctx->model->dac;
+    const codec_dac & dac = *static_cast<const codec_dac *>(ctx->model->impl);
     build->t = t;
     build->q = q;
     build->hop = std::max(1, dac.hop_size);
@@ -824,7 +825,7 @@ static bool codec_dac_init_encode_build(
         return false;
     }
 
-    const codec_dac & dac = ctx->model->dac;
+    const codec_dac & dac = *static_cast<const codec_dac *>(ctx->model->impl);
     build->n_in = n_in;
     build->hop = std::max(1, dac.hop_size);
     build->n_q = n_q;
@@ -1425,7 +1426,7 @@ enum codec_status codec_dac_decode_latent(
 
     (void) params;
 
-    codec_dac & dac = ctx->model->dac;
+    codec_dac & dac = *static_cast<codec_dac *>(ctx->model->impl);
     if (!dac.has_decoder) {
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -1503,13 +1504,62 @@ enum codec_status codec_dac_decode_latent(
     return CODEC_STATUS_SUCCESS;
 }
 
+static void * codec_dac_create_impl() {
+    return new (std::nothrow) codec_dac();
+}
+
+static void codec_dac_destroy_impl(void * ptr) {
+    delete static_cast<codec_dac *>(ptr);
+}
+
+static enum codec_status codec_dac_encode_wrap(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * out_latent,
+    struct codec_encode_params params) {
+    return codec_dac_encode(ctx, pcm, out_tokens, out_latent, params);
+}
+
+static enum codec_status codec_dac_decode_wrap(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_dac_decode(ctx, tokens, out_pcm, params);
+}
+
+static enum codec_status codec_dac_decode_latent_wrap(
+    struct codec_context * ctx,
+    const float * quantized_representation,
+    int32_t latent_dim,
+    int32_t n_frames,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_dac_decode_latent(ctx, quantized_representation, latent_dim, n_frames, out_pcm, params);
+}
+
+const struct codec_model_vtable * codec_dac_vtable() {
+    static const codec_model_vtable vtable = {
+        CODEC_ARCH_DAC,
+        "DAC",
+        codec_dac_create_impl,
+        codec_dac_destroy_impl,
+        codec_dac_init,
+        codec_dac_encode_wrap,
+        codec_dac_decode_wrap,
+        codec_dac_decode_latent_wrap,
+    };
+    return &vtable;
+}
+
 enum codec_status codec_dac_decode(
     struct codec_context * ctx,
     const struct codec_token_buffer * tokens,
     struct codec_pcm_buffer * out_pcm,
     struct codec_decode_params params) {
 
-    codec_dac & dac = ctx->model->dac;
+    codec_dac & dac = *static_cast<codec_dac *>(ctx->model->impl);
     if (!dac.has_decoder) {
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -1538,7 +1588,7 @@ enum codec_status codec_dac_encode(
     struct codec_latent_buffer * out_latent,
     struct codec_encode_params params) {
 
-    codec_dac & dac = ctx->model->dac;
+    codec_dac & dac = *static_cast<codec_dac *>(ctx->model->impl);
     if (!dac.has_encoder) {
         codec_context_set_error(ctx, "model metadata indicates no encoder");
         return CODEC_STATUS_INVALID_STATE;

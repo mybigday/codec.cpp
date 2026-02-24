@@ -15,11 +15,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
 enum codec_status codec_mimi_init(struct codec_model * model) {
-    codec_mimi & mimi = model->mimi;
+    codec_mimi & mimi = *static_cast<codec_mimi *>(model->impl);
 
     mimi.sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 24000);
     mimi.hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 1920);
@@ -333,18 +334,19 @@ static const char * CODEC_MIMI_ENCODE_RVQ_ACU_IP_TENSOR = "mimi.encode_unified.r
 
 static bool codec_mimi_init_encode_build(
     codec_context * ctx,
+    const codec_mimi * mimi,
     int32_t n_in,
     mimi_encode_build * build,
     std::string * err) {
 
-    if (ctx == nullptr || ctx->model == nullptr || build == nullptr || n_in <= 0) {
+    if (ctx == nullptr || ctx->model == nullptr || mimi == nullptr || build == nullptr || n_in <= 0) {
         if (err != nullptr) {
             *err = "invalid Mimi encode build arguments";
         }
         return false;
     }
 
-    codec_mimi & mm = ctx->model->mimi;
+    const codec_mimi & mm = *mimi;
     if (!codec_mimi_init_encode_frontend_build(ctx, n_in, &build->frontend, err)) {
         return false;
     }
@@ -1659,20 +1661,22 @@ static bool codec_mimi_copy_bias_1d(codec_context * ctx, const char * src_name, 
 
 static bool codec_mimi_init_decode_build(
     codec_context * ctx,
+    const codec_mimi * mimi,
     int32_t t,
     int32_t q,
     int32_t n_sem,
     mimi_decode_build * build,
     std::string * err) {
 
-    if (ctx == nullptr || ctx->model == nullptr || build == nullptr || t <= 0 || q <= 0 || n_sem <= 0 || n_sem > q) {
+    if (ctx == nullptr || ctx->model == nullptr || mimi == nullptr || build == nullptr ||
+        t <= 0 || q <= 0 || n_sem <= 0 || n_sem > q) {
         if (err != nullptr) {
             *err = "invalid Mimi decode build arguments";
         }
         return false;
     }
 
-    const codec_mimi & mm = ctx->model->mimi;
+    const codec_mimi & mm = *mimi;
     build->t = t;
     build->q = q;
     build->hop = std::max(1, mm.hop_size);
@@ -1992,13 +1996,18 @@ static bool codec_mimi_write_decode_decoder_weights(
     return true;
 }
 
-enum codec_status codec_mimi_decode(
+enum codec_status codec_mimi_decode_with(
     struct codec_context * ctx,
+    struct codec_mimi * mimi,
     const struct codec_token_buffer * tokens,
     struct codec_pcm_buffer * out_pcm,
     struct codec_decode_params params) {
 
-    codec_mimi & mm = ctx->model->mimi;
+    if (mimi == nullptr) {
+        codec_context_set_error(ctx, "invalid Mimi metadata");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_mimi & mm = *mimi;
     if (!mm.has_decoder) {
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -2024,7 +2033,7 @@ enum codec_status codec_mimi_decode(
     const int32_t n_sem = std::max(1, std::min(mm.num_semantic_quantizers, q));
     mimi_decode_build build = {};
     std::string err;
-    if (!codec_mimi_init_decode_build(ctx, t, q, n_sem, &build, &err)) {
+    if (!codec_mimi_init_decode_build(ctx, &mm, t, q, n_sem, &build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -2164,13 +2173,31 @@ enum codec_status codec_mimi_decode(
     return CODEC_STATUS_SUCCESS;
 }
 
-enum codec_status codec_mimi_encode(
+enum codec_status codec_mimi_decode(
     struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+
+    if (ctx == nullptr || ctx->model == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_mimi & mm = *static_cast<codec_mimi *>(ctx->model->impl);
+    return codec_mimi_decode_with(ctx, &mm, tokens, out_pcm, params);
+}
+
+enum codec_status codec_mimi_encode_with(
+    struct codec_context * ctx,
+    struct codec_mimi * mimi,
     const std::vector<float> & pcm,
     struct codec_token_buffer * out_tokens,
     struct codec_encode_params params) {
 
-    codec_mimi & mm = ctx->model->mimi;
+    if (mimi == nullptr) {
+        codec_context_set_error(ctx, "invalid Mimi metadata");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_mimi & mm = *mimi;
     if (!mm.has_encoder) {
         codec_context_set_error(ctx, "model metadata indicates no encoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -2193,7 +2220,7 @@ enum codec_status codec_mimi_encode(
     const float * pcm_data = pcm.data();
     size_t pcm_bytes = pcm.size() * sizeof(float);
     mimi_encode_build build = {};
-    if (!codec_mimi_init_encode_build(ctx, n_in, &build, &err)) {
+    if (!codec_mimi_init_encode_build(ctx, &mm, n_in, &build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -2275,4 +2302,56 @@ enum codec_status codec_mimi_encode(
     out_tokens->hop_size = std::max(1, mm.hop_size);
 
     return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status codec_mimi_encode(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_encode_params params) {
+
+    if (ctx == nullptr || ctx->model == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_mimi & mm = *static_cast<codec_mimi *>(ctx->model->impl);
+    return codec_mimi_encode_with(ctx, &mm, pcm, out_tokens, params);
+}
+
+static void * codec_mimi_create_impl() {
+    return new (std::nothrow) codec_mimi();
+}
+
+static void codec_mimi_destroy_impl(void * ptr) {
+    delete static_cast<codec_mimi *>(ptr);
+}
+
+static enum codec_status codec_mimi_encode_wrap(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * /*out_latent*/,
+    struct codec_encode_params params) {
+    return codec_mimi_encode(ctx, pcm, out_tokens, params);
+}
+
+static enum codec_status codec_mimi_decode_wrap(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_mimi_decode(ctx, tokens, out_pcm, params);
+}
+
+const struct codec_model_vtable * codec_mimi_vtable() {
+    static const codec_model_vtable vtable = {
+        CODEC_ARCH_MIMI,
+        "Mimi",
+        codec_mimi_create_impl,
+        codec_mimi_destroy_impl,
+        codec_mimi_init,
+        codec_mimi_encode_wrap,
+        codec_mimi_decode_wrap,
+        nullptr,
+    };
+    return &vtable;
 }

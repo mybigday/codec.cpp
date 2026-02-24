@@ -40,6 +40,8 @@ Preferred steps:
 3. If someone asks for a CPU kernel in `ggml/src/ggml-cpu/`, explain that it requires a submodule bump (no direct edits).
 4. Add a focused test in `tests/` or a local harness within this repo.
 
+Note: ops changes should not touch the model registry (vtable) in `src/codec.cpp` unless a new model is being added.
+
 ---
 
 ## Constraints to check

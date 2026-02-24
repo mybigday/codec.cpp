@@ -1,6 +1,6 @@
 # codec.cpp
 
-This repository is a C/C++ library + CLI that runs several neural audio codecs (currently WavTokenizer-Large, DAC, Mimi) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.).
+This repository is a C/C++ library + CLI that runs several neural audio codecs (currently WavTokenizer-Large, DAC, Mimi, Qwen3-TTS-Tokenizer) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.).
 
 The intended architecture is **llama.cpp-style**:
 - Build model forward passes as **ggml graphs (ops)**.
@@ -17,6 +17,7 @@ The intended architecture is **llama.cpp-style**:
   - `wavtokenizer.cpp/.h`
   - `dac.cpp/.h`
   - `mimi.cpp/.h`
+  - `qwen3_tts_tokenizer.cpp/.h`
 - `src/runtime/` — graph cache + execution runtime
   - `graph.cpp/.h` — graph cache keyed by (kind, n_frames, n_q, hop, etc.)
   - `graph_exec.cpp` — ggml_backend scheduler init + graph compute
@@ -221,3 +222,21 @@ If you need to add/replace an op:
 - `codec-op-dev` — guidance for adding/adjusting ggml ops safely.
 
 Use the skill files for step-by-step workflows; they encode the preferred design constraints for this repo.
+## Model registry (vtable architecture)
+
+Models are wired via a **switch-based vtable registry** in `src/codec.cpp`. `codec_model` stores:
+- shared/core metadata fields (sample rate, hop, n_q, etc.)
+- `impl` (opaque model-specific struct)
+- `vtable` (init/encode/decode/decode_latent)
+
+Model-specific structs live in `src/models/<model>.h` and are **not** defined in `src/codec_internal.h`. Core code must not cast `impl`; only model files cast their own `impl`.
+
+### Adding a new model
+1. Define the model struct in `src/models/<model>.h`.
+2. Implement model graph + init in `src/models/<model>.cpp`.
+3. Provide a `codec_<model>_vtable()` with `create_impl/destroy_impl/init/encode/decode`.
+4. Register it in the switch in `codec_model_vtable_for_arch()` in `src/codec.cpp`.
+
+## Reuse / composite models
+
+If a model reuses another model’s encoder (e.g. Qwen3 reuses Mimi), put both configs in a model-specific `impl` struct and call the shared encoder helpers (`codec_mimi_encode_with(...)`).

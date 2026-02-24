@@ -11,11 +11,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
 enum codec_status codec_wavtokenizer_init(struct codec_model * model) {
-    codec_wavtokenizer_large & wt = model->wavtokenizer_large;
+    codec_wavtokenizer_large & wt = *static_cast<codec_wavtokenizer_large *>(model->impl);
 
     wt.sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 24000);
     wt.hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 320);
@@ -1246,7 +1247,7 @@ static bool codec_wt_init_decode_build(codec_context * ctx, int32_t t, int32_t q
         }
         return false;
     }
-    const codec_wavtokenizer_large & wt = ctx->model->wavtokenizer_large;
+    const codec_wavtokenizer_large & wt = *static_cast<const codec_wavtokenizer_large *>(ctx->model->impl);
     build->t = t;
     build->q = q;
     build->hop = std::max(1, wt.hop_size);
@@ -1502,7 +1503,7 @@ static enum codec_status codec_wt_decode_graph(
     int32_t use_n_q,
     struct codec_pcm_buffer * out_pcm) {
 
-    codec_wavtokenizer_large & wt = ctx->model->wavtokenizer_large;
+    codec_wavtokenizer_large & wt = *static_cast<codec_wavtokenizer_large *>(ctx->model->impl);
     if (tokens == nullptr || tokens->data == nullptr || tokens->n_frames <= 0 || tokens->n_q < use_n_q) {
         codec_context_set_error(ctx, "invalid WavTokenizer token buffer");
         return CODEC_STATUS_INVALID_ARG;
@@ -1647,7 +1648,7 @@ enum codec_status codec_wavtokenizer_decode(
     struct codec_pcm_buffer * out_pcm,
     struct codec_decode_params params) {
 
-    codec_wavtokenizer_large & wt = ctx->model->wavtokenizer_large;
+    codec_wavtokenizer_large & wt = *static_cast<codec_wavtokenizer_large *>(ctx->model->impl);
     if (!wt.has_decoder) {
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -1669,7 +1670,7 @@ enum codec_status codec_wavtokenizer_encode(
     struct codec_token_buffer * out_tokens,
     struct codec_encode_params params) {
 
-    codec_wavtokenizer_large & wt = ctx->model->wavtokenizer_large;
+    codec_wavtokenizer_large & wt = *static_cast<codec_wavtokenizer_large *>(ctx->model->impl);
     if (!wt.has_encoder) {
         codec_context_set_error(ctx, "model metadata indicates no encoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -1763,4 +1764,43 @@ enum codec_status codec_wavtokenizer_encode(
     out_tokens->hop_size = hop;
 
     return CODEC_STATUS_SUCCESS;
+}
+
+static void * codec_wavtokenizer_create_impl() {
+    return new (std::nothrow) codec_wavtokenizer_large();
+}
+
+static void codec_wavtokenizer_destroy_impl(void * ptr) {
+    delete static_cast<codec_wavtokenizer_large *>(ptr);
+}
+
+static enum codec_status codec_wavtokenizer_encode_wrap(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * /*out_latent*/,
+    struct codec_encode_params params) {
+    return codec_wavtokenizer_encode(ctx, pcm, out_tokens, params);
+}
+
+static enum codec_status codec_wavtokenizer_decode_wrap(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_wavtokenizer_decode(ctx, tokens, out_pcm, params);
+}
+
+const struct codec_model_vtable * codec_wavtokenizer_vtable() {
+    static const codec_model_vtable vtable = {
+        CODEC_ARCH_WAVTOKENIZER_LARGE,
+        "WavTokenizer-Large",
+        codec_wavtokenizer_create_impl,
+        codec_wavtokenizer_destroy_impl,
+        codec_wavtokenizer_init,
+        codec_wavtokenizer_encode_wrap,
+        codec_wavtokenizer_decode_wrap,
+        nullptr,
+    };
+    return &vtable;
 }

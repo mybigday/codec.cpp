@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -278,8 +279,9 @@ static bool codec_q3t_dump_model_tensor(
 }
 
 enum codec_status codec_qwen3_tts_tokenizer_init(struct codec_model * model) {
-    codec_qwen3_tts_tokenizer & q3 = model->qwen3_tts_tokenizer;
-    codec_mimi & mimi = model->mimi;
+    codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(model->impl);
+    codec_qwen3_tts_tokenizer & q3 = impl.q3;
+    codec_mimi & mimi = impl.mimi;
 
     q3.sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 24000);
     q3.hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 1920);
@@ -929,7 +931,8 @@ static bool codec_q3t_init_decode_build(codec_context * ctx, int32_t t, int32_t 
         }
         return false;
     }
-    codec_qwen3_tts_tokenizer & q3 = ctx->model->qwen3_tts_tokenizer;
+    codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(ctx->model->impl);
+    codec_qwen3_tts_tokenizer & q3 = impl.q3;
     build->t = t;
     build->q = q;
     build->n_sem = 1;
@@ -1112,7 +1115,8 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
         return CODEC_STATUS_INVALID_ARG;
     }
 
-    codec_qwen3_tts_tokenizer & q3 = ctx->model->qwen3_tts_tokenizer;
+    codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(ctx->model->impl);
+    codec_qwen3_tts_tokenizer & q3 = impl.q3;
     if (!q3.has_decoder) {
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
@@ -1251,4 +1255,56 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
     out_pcm->n_channels = 1;
 
     return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status codec_qwen3_tts_tokenizer_encode(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_encode_params params) {
+
+    if (ctx == nullptr || ctx->model == nullptr || ctx->model->impl == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(ctx->model->impl);
+    return codec_mimi_encode_with(ctx, &impl.mimi, pcm, out_tokens, params);
+}
+
+static void * codec_qwen3_tts_tokenizer_create_impl() {
+    return new (std::nothrow) codec_qwen3_tts_tokenizer_impl();
+}
+
+static void codec_qwen3_tts_tokenizer_destroy_impl(void * ptr) {
+    delete static_cast<codec_qwen3_tts_tokenizer_impl *>(ptr);
+}
+
+static enum codec_status codec_qwen3_tts_tokenizer_encode_wrap(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * /*out_latent*/,
+    struct codec_encode_params params) {
+    return codec_qwen3_tts_tokenizer_encode(ctx, pcm, out_tokens, params);
+}
+
+static enum codec_status codec_qwen3_tts_tokenizer_decode_wrap(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_qwen3_tts_tokenizer_decode(ctx, tokens, out_pcm, params);
+}
+
+const struct codec_model_vtable * codec_qwen3_tts_tokenizer_vtable() {
+    static const codec_model_vtable vtable = {
+        CODEC_ARCH_QWEN3_TTS_TOKENIZER,
+        "Qwen3-TTS-Tokenizer",
+        codec_qwen3_tts_tokenizer_create_impl,
+        codec_qwen3_tts_tokenizer_destroy_impl,
+        codec_qwen3_tts_tokenizer_init,
+        codec_qwen3_tts_tokenizer_encode_wrap,
+        codec_qwen3_tts_tokenizer_decode_wrap,
+        nullptr,
+    };
+    return &vtable;
 }

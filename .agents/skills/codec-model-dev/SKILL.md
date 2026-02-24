@@ -9,7 +9,7 @@ Use this skill when adding a **new model architecture** or a large variant that 
 
 ## Checklist (short)
 1. Converter + GGUF metadata
-2. Runtime model struct + init
+2. Runtime model struct + vtable init
 3. Graph build (encode/decode)
 4. Weight copy + IO wiring
 5. E2E test + HF parity
@@ -35,16 +35,19 @@ Use this skill when adding a **new model architecture** or a large variant that 
 
 ---
 
-## 2) Runtime model struct + init
+## 2) Runtime model struct + vtable init
 
 Files:
-- `src/codec_internal.h` (model struct)
-- `src/models/<model>.cpp` (init)
+- `src/models/<model>.h` (model struct + vtable declaration)
+- `src/models/<model>.cpp` (init + vtable)
+- `src/codec.cpp` (register in switch-based vtable registry)
 
 Actions:
-- Add model struct fields for metadata + any fixed architectural constants.
+- Add model struct fields for metadata + any fixed architectural constants in `src/models/<model>.h`.
+- Implement `codec_<model>_vtable()` (create_impl/destroy_impl/init/encode/decode).
 - In `codec_<model>_init`, load GGUF keys with safe defaults and sanity checks.
 - Propagate model-level fields to `codec_model` (sample_rate, hop_size, n_q, etc.).
+- Register the vtable in `codec_model_vtable_for_arch()` in `src/codec.cpp`.
 
 ---
 

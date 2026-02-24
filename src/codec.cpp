@@ -100,6 +100,22 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     return CODEC_ARCH_UNKNOWN;
 }
 
+static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch arch) {
+    switch (arch) {
+        case CODEC_ARCH_WAVTOKENIZER_LARGE:
+            return codec_wavtokenizer_vtable();
+        case CODEC_ARCH_DAC:
+            return codec_dac_vtable();
+        case CODEC_ARCH_MIMI:
+            return codec_mimi_vtable();
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
+            return codec_qwen3_tts_tokenizer_vtable();
+        case CODEC_ARCH_UNKNOWN:
+        default:
+            return nullptr;
+    }
+}
+
 const char * codec_arch_name(enum codec_arch arch) {
     switch (arch) {
         case CODEC_ARCH_WAVTOKENIZER_LARGE: return "WavTokenizer-Large";
@@ -112,29 +128,26 @@ const char * codec_arch_name(enum codec_arch arch) {
 }
 
 enum codec_status codec_model_init_arch(struct codec_model * model) {
-    switch (model->arch) {
-        case CODEC_ARCH_WAVTOKENIZER_LARGE:
-            return codec_wavtokenizer_init(model);
-        case CODEC_ARCH_DAC:
-            return codec_dac_init(model);
-        case CODEC_ARCH_MIMI:
-            return codec_mimi_init(model);
-        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
-            return codec_qwen3_tts_tokenizer_init(model);
-        case CODEC_ARCH_UNKNOWN:
-        default:
-            model->sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 0);
-            model->has_encoder = codec_read_bool_kv(model->gguf, "codec.has_encoder", false);
-            model->has_decoder = codec_read_bool_kv(model->gguf, "codec.has_decoder", false);
-            model->hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 0);
-            model->n_q = codec_read_i32_kv(model->gguf, "codec.n_q", 0);
-            model->codebook_size = codec_read_i32_kv(model->gguf, "codec.codebook_size", 0);
-            model->n_fft = codec_read_i32_kv(model->gguf, "codec.n_fft", -1);
-            model->win_length = codec_read_i32_kv(model->gguf, "codec.win_length", -1);
-            model->n_mels = codec_read_i32_kv(model->gguf, "codec.n_mels", -1);
-            model->latent_dim = codec_read_i32_kv(model->gguf, "codec.latent_dim", -1);
-            return CODEC_STATUS_SUCCESS;
+    if (model == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
     }
+    if (model->vtable == nullptr) {
+        model->vtable = codec_model_vtable_for_arch(model->arch);
+    }
+    if (model->vtable != nullptr && model->vtable->init != nullptr) {
+        return model->vtable->init(model);
+    }
+    model->sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 0);
+    model->has_encoder = codec_read_bool_kv(model->gguf, "codec.has_encoder", false);
+    model->has_decoder = codec_read_bool_kv(model->gguf, "codec.has_decoder", false);
+    model->hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 0);
+    model->n_q = codec_read_i32_kv(model->gguf, "codec.n_q", 0);
+    model->codebook_size = codec_read_i32_kv(model->gguf, "codec.codebook_size", 0);
+    model->n_fft = codec_read_i32_kv(model->gguf, "codec.n_fft", -1);
+    model->win_length = codec_read_i32_kv(model->gguf, "codec.win_length", -1);
+    model->n_mels = codec_read_i32_kv(model->gguf, "codec.n_mels", -1);
+    model->latent_dim = codec_read_i32_kv(model->gguf, "codec.latent_dim", -1);
+    return CODEC_STATUS_SUCCESS;
 }
 static enum codec_status codec_dispatch_encode(
     struct codec_context * ctx,
@@ -142,21 +155,12 @@ static enum codec_status codec_dispatch_encode(
     struct codec_token_buffer * out_tokens,
     struct codec_latent_buffer * out_latent,
     struct codec_encode_params params) {
-
-    switch (ctx->model->arch) {
-        case CODEC_ARCH_WAVTOKENIZER_LARGE:
-            return codec_wavtokenizer_encode(ctx, pcm, out_tokens, params);
-        case CODEC_ARCH_DAC:
-            return codec_dac_encode(ctx, pcm, out_tokens, out_latent, params);
-        case CODEC_ARCH_MIMI:
-            return codec_mimi_encode(ctx, pcm, out_tokens, params);
-        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
-            return codec_mimi_encode(ctx, pcm, out_tokens, params);
-        case CODEC_ARCH_UNKNOWN:
-        default:
-            codec_context_set_error(ctx, "codec_encode not implemented for this architecture");
-            return CODEC_STATUS_NOT_SUPPORTED;
+    if (ctx == nullptr || ctx->model == nullptr || ctx->model->vtable == nullptr ||
+        ctx->model->vtable->encode == nullptr) {
+        codec_context_set_error(ctx, "codec_encode not implemented for this architecture");
+        return CODEC_STATUS_NOT_SUPPORTED;
     }
+    return ctx->model->vtable->encode(ctx, pcm, out_tokens, out_latent, params);
 }
 
 static enum codec_status codec_dispatch_decode(
@@ -164,21 +168,12 @@ static enum codec_status codec_dispatch_decode(
     const struct codec_token_buffer * tokens,
     struct codec_pcm_buffer * out_pcm,
     struct codec_decode_params params) {
-
-    switch (ctx->model->arch) {
-        case CODEC_ARCH_WAVTOKENIZER_LARGE:
-            return codec_wavtokenizer_decode(ctx, tokens, out_pcm, params);
-        case CODEC_ARCH_DAC:
-            return codec_dac_decode(ctx, tokens, out_pcm, params);
-        case CODEC_ARCH_MIMI:
-            return codec_mimi_decode(ctx, tokens, out_pcm, params);
-        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
-            return codec_qwen3_tts_tokenizer_decode(ctx, tokens, out_pcm, params);
-        case CODEC_ARCH_UNKNOWN:
-        default:
-            codec_context_set_error(ctx, "codec_decode not implemented for this architecture");
-            return CODEC_STATUS_NOT_SUPPORTED;
+    if (ctx == nullptr || ctx->model == nullptr || ctx->model->vtable == nullptr ||
+        ctx->model->vtable->decode == nullptr) {
+        codec_context_set_error(ctx, "codec_decode not implemented for this architecture");
+        return CODEC_STATUS_NOT_SUPPORTED;
     }
+    return ctx->model->vtable->decode(ctx, tokens, out_pcm, params);
 }
 
 struct codec_model_params codec_model_default_params(void) {
@@ -338,6 +333,15 @@ struct codec_model * codec_model_load_from_file(const char * path_model, struct 
         }
     }
 
+    model->vtable = codec_model_vtable_for_arch(model->arch);
+    if (model->vtable != nullptr && model->vtable->create_impl != nullptr) {
+        model->impl = model->vtable->create_impl();
+        if (model->impl == nullptr) {
+            codec_model_free(model);
+            return nullptr;
+        }
+    }
+
     const int name_id = gguf_find_key(gf, "general.name");
     if (name_id >= 0 && gguf_get_kv_type(gf, name_id) == GGUF_TYPE_STRING) {
         const char * name = gguf_get_val_str(gf, name_id);
@@ -362,6 +366,11 @@ void codec_model_free(struct codec_model * model) {
     }
 
     codec_metadata_free(&model->metadata);
+
+    if (model->vtable != nullptr && model->vtable->destroy_impl != nullptr && model->impl != nullptr) {
+        model->vtable->destroy_impl(model->impl);
+        model->impl = nullptr;
+    }
 
     if (model->weights_buffer != nullptr) {
         ggml_backend_buffer_free(model->weights_buffer);
@@ -520,12 +529,12 @@ enum codec_status codec_decode_quantized_representation(
         params.n_threads = ctx->model->n_threads;
     }
 
-    if (ctx->model->arch != CODEC_ARCH_DAC) {
-        codec_context_set_error(ctx, "codec_decode_quantized_representation is only implemented for DAC");
+    if (ctx->model->vtable == nullptr || ctx->model->vtable->decode_latent == nullptr) {
+        codec_context_set_error(ctx, "codec_decode_quantized_representation is not implemented for this architecture");
         return CODEC_STATUS_NOT_SUPPORTED;
     }
 
-    return codec_dac_decode_latent(ctx, quantized_representation, latent_dim, n_frames, out_pcm, params);
+    return ctx->model->vtable->decode_latent(ctx, quantized_representation, latent_dim, n_frames, out_pcm, params);
 }
 
 enum codec_status codec_decode_batch(
