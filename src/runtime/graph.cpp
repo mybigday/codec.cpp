@@ -136,6 +136,8 @@ bool codec_graph_cache_get_or_build(
     size_t graph_size = GGML_DEFAULT_GRAPH_SIZE;
     if (key.kind == CODEC_GRAPH_WT_ENCODE || key.kind == CODEC_GRAPH_WT_DECODE) {
         graph_size = GGML_DEFAULT_GRAPH_SIZE * 32;
+    } else if (key.kind == CODEC_GRAPH_Q3T_DECODE) {
+        graph_size = GGML_DEFAULT_GRAPH_SIZE * 64;
     }
 
     ctx->eval_graph = ggml_new_graph_custom(ctx->eval_ctx, graph_size, false);

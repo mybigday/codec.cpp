@@ -29,6 +29,16 @@
       "gguf": "models/wavtokenizer/wavtokenizer.gguf",
       "local_path": "models/wavtokenizer",
       "converter": "wavtokenizer"
+    },
+    {
+      "name": "qwen3_tts_tokenizer",
+      "hf_repo_id": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+      "hf_file": null,
+      "class": "qwen3_tts_tokenizer",
+      "n_q": 16,
+      "gguf": "models/qwen3_tts_tokenizer/qwen3_tts_tokenizer.gguf",
+      "local_path": "models/qwen3_tts_tokenizer",
+      "converter": "qwen3_tts_tokenizer"
     }
   ]
 }

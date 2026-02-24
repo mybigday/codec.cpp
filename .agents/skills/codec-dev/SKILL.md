@@ -15,6 +15,7 @@ Implement the Audio Encoder/Decoder framework following 'llama.cpp' backbone pat
 5. **Implementation**: 
    - Support 'WavTokenizer-Large', 'DAC', and 'Mimi'.
    - If an operator is missing in GGML, implement it as a custom operator using existing GGML primitives where possible.
+6. **Submodule**: `ggml/` is a submodule; do not edit it directly unless explicitly asked to update the submodule.
 
 ## Reference:
 - Always refer to the latest 'llama.h' and 'ggml.h' patterns from the llama.cpp repository.

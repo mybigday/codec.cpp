@@ -50,6 +50,7 @@ add_library(codec STATIC
     src/models/wavtokenizer.cpp
     src/models/dac.cpp
     src/models/mimi.cpp
+    src/models/qwen3_tts_tokenizer.cpp
 )
 
 target_include_directories(codec

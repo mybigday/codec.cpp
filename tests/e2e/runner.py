@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import wave
+import os
 from array import array
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -250,9 +251,12 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     if spec.lower() == "wavtokenizer":
         return "wavtokenizer", ""
 
+    if spec.lower() in {"qwen3_tts_tokenizer", "qwen3"}:
+        return "qwen3_tts_tokenizer", ""
+
     if ":" not in spec:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', or 'wavtokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', or 'qwen3_tts_tokenizer'"
         )
 
     module_name, class_name = spec.split(":", 1)
@@ -260,7 +264,7 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     class_name = class_name.strip()
     if module_name != "transformers" or not class_name:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', or 'wavtokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', or 'qwen3_tts_tokenizer'"
         )
     return module_name, class_name
 
@@ -318,6 +322,46 @@ def load_native_model(model_cfg: dict[str, Any]):
             lambda audio_frames, **kwargs: model.encode_infer(audio_frames.squeeze(0), bandwidth_id=bandwidth_id)[1],
             lambda audio_codes, **kwargs: model.decode(model.codes_to_features(audio_codes), bandwidth_id=bandwidth_id)
         )
+    if class_name == "qwen3_tts_tokenizer":
+        model_name = model_cfg["name"]
+        log_path = REPO_ROOT / "models" / model_name / f"{model_name}.log"
+        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
+        qwen_source = REPO_ROOT / ".model-src" / "Qwen3-TTS"
+        if not qwen_source.is_dir():
+            raise RuntimeError(f"missing Qwen3-TTS source at {qwen_source}")
+        sys.path.insert(0, str(qwen_source))
+        qwen_mod = importlib.import_module("qwen_tts")
+        tokenizer = getattr(qwen_mod, "Qwen3TTSTokenizer").from_pretrained(str(local_path))
+        tokenizer.model = tokenizer.model.eval()
+        sample_rate = int(model_cfg.get("sample_rate", DEFAULT_SAMPLE_RATE))
+
+        def _encode(audio_frames=None, **kwargs):
+            audio = audio_frames
+            if audio is None:
+                audio = kwargs.get("input_values")
+            if audio is None:
+                audio = kwargs.get("audio_values")
+            if audio is None:
+                raise RuntimeError("missing audio input for Qwen3 encode")
+            if isinstance(audio, torch.Tensor):
+                t = audio.detach().to(torch.float32).cpu()
+                if t.ndim == 3 and t.shape[1] == 1:
+                    t = t[0, 0]
+                elif t.ndim == 2:
+                    t = t[0]
+                audio = t.numpy()
+            return tokenizer.encode(audio, sr=sample_rate)
+
+        def _decode(audio_codes=None, **kwargs):
+            codes = audio_codes
+            if codes is None:
+                codes = kwargs.get("audio_codes")
+            if codes is None:
+                raise RuntimeError("missing audio_codes for Qwen3 decode")
+            wavs, _ = tokenizer.decode({"audio_codes": codes})
+            return SimpleNamespace(audio_values=np.asarray(wavs[0], dtype=np.float32))
+
+        return (tokenizer, _encode, _decode)
     raise RuntimeError(f"unsupported class family '{class_name}'")
 
 def to_torch_audio(wav: np.ndarray, channels: bool = True):
@@ -405,6 +449,8 @@ def class_family(class_spec: str) -> str:
         return "dac"
     if module_name == "wavtokenizer":
         return "wavtokenizer"
+    if module_name == "qwen3_tts_tokenizer":
+        return "qwen3_tts_tokenizer"
     return class_name.lower().replace("model", "")
 
 
@@ -464,6 +510,11 @@ def encode_decode_hf(
         )
 
     codes_2d = normalize_codes_2d(codes_raw)
+    if class_alias == "qwen3_tts_tokenizer":
+        expected_n_q = int(model_cfg.get("n_q", 0))
+        if expected_n_q > 0 and codes_2d.shape[0] != expected_n_q and codes_2d.shape[1] == expected_n_q:
+            # HF returns (n_frames, n_q); codec expects (n_q, n_frames).
+            codes_2d = np.ascontiguousarray(codes_2d.T)
     np.save(codes_out, codes_2d)
 
     decoded_audio = extract_audio_values(decoded)

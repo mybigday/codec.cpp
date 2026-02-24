@@ -90,6 +90,23 @@ ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * 
     return ggml_add(ctx, x, frac);
 }
 
+ggml_tensor * codec_op_snake_beta(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha, ggml_tensor * inv_beta, float eps) {
+    if (ctx == nullptr || x == nullptr || alpha == nullptr || inv_beta == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * alpha_2d = ggml_reshape_2d(ctx, alpha, 1, x->ne[1]);
+    ggml_tensor * alpha_rep = ggml_repeat(ctx, alpha_2d, x);
+    ggml_tensor * alpha_clamped = ggml_clamp(ctx, alpha_rep, eps, FLT_MAX);
+    ggml_tensor * ax = ggml_mul(ctx, alpha_clamped, x);
+    ggml_tensor * s = ggml_sin(ctx, ax);
+    ggml_tensor * s2 = ggml_mul(ctx, s, s);
+    ggml_tensor * invb_2d = ggml_reshape_2d(ctx, inv_beta, 1, x->ne[1]);
+    ggml_tensor * invb_rep = ggml_repeat(ctx, invb_2d, x);
+    ggml_tensor * frac = ggml_mul(ctx, s2, invb_rep);
+    return ggml_add(ctx, x, frac);
+}
+
 ggml_tensor * codec_op_pad_1d(ggml_context * ctx, ggml_tensor * x, int32_t pad_left, int32_t pad_right) {
     if (ctx == nullptr || x == nullptr || pad_left < 0 || pad_right < 0) {
         return nullptr;

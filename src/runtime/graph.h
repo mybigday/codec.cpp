@@ -11,6 +11,7 @@ enum codec_graph_kind {
     CODEC_GRAPH_DAC_DECODE_LATENT = 5,
     CODEC_GRAPH_MIMI_DECODE = 6,
     CODEC_GRAPH_MIMI_ENCODE = 7,
+    CODEC_GRAPH_Q3T_DECODE = 8,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

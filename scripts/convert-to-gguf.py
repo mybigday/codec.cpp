@@ -2,7 +2,7 @@
 """
 Unified GGUF converter for audio codec models.
 
-Supports Mimi, DAC, and WavTokenizer models from HuggingFace or local checkpoints.
+Supports Mimi, DAC, WavTokenizer, and Qwen3-TTS-Tokenizer models from HuggingFace or local checkpoints.
 
 Usage:
     # From HuggingFace
@@ -40,6 +40,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
         return "dac"
     elif "wavtokenizer" in model_type:
         return "wavtokenizer"
+    elif "qwen3" in model_type or "qwen" in model_type:
+        return "qwen3_tts_tokenizer"
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
@@ -49,6 +51,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
             return "dac"
         elif "wavtokenizer" in arch:
             return "wavtokenizer"
+        elif "qwen3" in arch or "qwen" in arch:
+            return "qwen3_tts_tokenizer"
     
     raise ValueError(f"Unknown model type: {model_type}. Cannot auto-detect.")
 
@@ -62,6 +66,8 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         return 'mimi'
     elif 'dac' in name_lower:
         return 'dac'
+    elif 'qwen' in name_lower:
+        return 'qwen3_tts_tokenizer'
     return None
 
 
@@ -83,7 +89,7 @@ Examples:
   # With quantization
   python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantization Q4_K_M
   
-Supported models: mimi, dac, wavtokenizer
+Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer
         """
     )
     

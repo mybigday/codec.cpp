@@ -6,12 +6,14 @@ from .base import BaseConverter
 from .mimi import MimiConverter
 from .dac import DacConverter
 from .wavtokenizer import WavTokenizerConverter
+from .qwen3_tts_tokenizer import Qwen3TTSTokenizerConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
     'mimi': MimiConverter,
     'dac': DacConverter,
     'wavtokenizer': WavTokenizerConverter,
+    'qwen3_tts_tokenizer': Qwen3TTSTokenizerConverter,
 }
 
 

@@ -98,6 +98,16 @@ If a needed op is missing in ggml:
 
 ---
 
+## ggml constraints (quick list)
+
+- `ggml_conv_transpose_1d` requires `p0 == 0` and `d0 == 1`; use crop for padding.
+- `conv1d` weight layout is `[k, in, out]`.
+- `conv_transpose_1d` weight layout is `[k, out, in]`.
+- Prefer `ggml_cont` only when needed; many ops require contiguous tensors.
+- Keep all math inside ggml; do not add CPU-only tensor math paths.
+
+---
+
 ## Model files / GGUF
 
 Models are loaded from `.gguf`.
@@ -108,6 +118,26 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 
 ---
 
+## Model source code (local)
+
+If a model’s original PyTorch code is needed during conversion or reference:
+- Put the upstream source under `.model-src/` (local-only).
+- Converters should read from `.model-src/<repo>/...` rather than importing from the network.
+- Runtime must not depend on the original Python source.
+
+---
+
+## ggml submodule constraints
+
+`ggml/` is a submodule. Do **not** edit it directly unless explicitly asked to update the submodule.
+
+If an op is missing:
+- Prefer composition in `src/ops/`.
+- If a true kernel is required, plan a **submodule update** (upstream or fork) rather than editing files in-place.
+- Avoid CPU-only fallbacks; keep the path compatible with ggml backends.
+
+---
+
 ## Conventions / guardrails for changes
 
 - Keep encode/decode numerics stable (unit/regression tests where possible).
@@ -115,6 +145,16 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 - **Never reshape/transpose weights at runtime.** If weights need reshape, do it in the GGUF converter or via gguf transpose ops during conversion.
 - When touching graph execution / backend scheduler: be careful with allocation lifetimes (`eval_ctx`, scheduler reset semantics).
 - Prefer small, reviewable commits.
+
+---
+
+## Python dependencies
+
+We track Python deps in two files:
+- `requirements.txt` for conversion/build utilities.
+- `requirements-e2e.txt` for end-to-end tests (HF refs + audio).
+
+Keep them minimal and deterministic (pin versions when CI is sensitive).
 
 ---
 
@@ -179,3 +219,5 @@ If you need to add/replace an op:
 
 - `codec-model-dev` — end-to-end guide for adding a model (converter → ggml graphs → tests).
 - `codec-op-dev` — guidance for adding/adjusting ggml ops safely.
+
+Use the skill files for step-by-step workflows; they encode the preferred design constraints for this repo.

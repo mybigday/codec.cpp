@@ -21,13 +21,15 @@ Use this skill when adding a **new model architecture** or a large variant that 
 **Goal:** all weight transforms happen *during conversion*, never at runtime.
 
 - Add a converter in `scripts/converters/`.
+- If you need upstream source, place it under `.model-src/` and import locally.
 - Add GGUF keys for:
   - `codec.sample_rate`, `codec.hop_size`, `codec.n_q`, `codec.codebook_size`, `codec.latent_dim`, `codec.codebook_dim`
   - `codec.has_encoder`, `codec.has_decoder`
 - Ensure tensor layout is compatible with ggml:
   - `conv1d` weights: ggml expects `[k, in, out]`.
   - `conv_transpose_1d` weights: ggml expects `[k, out, in]` and **p0==0, d0==1**; use crop for padding.
-- If weight needs transpose/reshape: do it in converter or use GGUF transpose op during conversion.
+- If weight needs transpose/reshape: do it in converter or use a GGUF transpose op during conversion.
+- Never reshape/transpose weights at runtime.
 
 **Validate** with a small inspection script (shape + basic stats).
 
@@ -85,4 +87,3 @@ Actions:
 If mismatch:
 - Compare HF vs ggml outputs step-by-step.
 - Check padding/stride and tensor layouts first.
-

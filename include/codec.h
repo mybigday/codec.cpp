@@ -16,6 +16,7 @@ enum codec_arch {
     CODEC_ARCH_WAVTOKENIZER_LARGE = 1,
     CODEC_ARCH_DAC = 2,
     CODEC_ARCH_MIMI = 3,
+    CODEC_ARCH_QWEN3_TTS_TOKENIZER = 4,
 };
 
 enum codec_status {

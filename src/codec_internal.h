@@ -52,6 +52,34 @@ struct codec_mimi {
     bool has_decoder = false;
 };
 
+static constexpr int32_t CODEC_Q3T_MAX_UPSAMPLE = 8;
+
+struct codec_qwen3_tts_tokenizer {
+    int32_t sample_rate = 24000;
+    int32_t hop_size = 1920;
+    int32_t n_q = 16;
+    int32_t codebook_size = 2048;
+    int32_t codebook_dim = 1024;
+    int32_t latent_dim = 1024;
+    bool has_encoder = false;
+    bool has_decoder = false;
+
+    int32_t hidden_size = 1024;
+    int32_t num_hidden_layers = 8;
+    int32_t num_attention_heads = 16;
+    int32_t num_key_value_heads = 16;
+    int32_t head_dim = 64;
+    int32_t intermediate_size = 3072;
+    float rope_theta = 10000.0f;
+    int32_t sliding_window = 72;
+    int32_t decoder_dim = 1536;
+
+    int32_t n_upsample_rates = 0;
+    int32_t n_upsampling_ratios = 0;
+    int32_t upsample_rates[CODEC_Q3T_MAX_UPSAMPLE] = {};
+    int32_t upsampling_ratios[CODEC_Q3T_MAX_UPSAMPLE] = {};
+};
+
 struct codec_model {
     struct gguf_context * gguf;
     struct ggml_context * weights;
@@ -81,6 +109,7 @@ struct codec_model {
     struct codec_wavtokenizer_large wavtokenizer_large;
     struct codec_dac dac;
     struct codec_mimi mimi;
+    struct codec_qwen3_tts_tokenizer qwen3_tts_tokenizer;
 };
 
 // Graph cache key with named fields to avoid ambiguous p0..p3 usage.
@@ -145,6 +174,9 @@ enum codec_status codec_dac_decode_latent(codec_context * ctx, const float * qr,
 enum codec_status codec_mimi_init(codec_model * model);
 enum codec_status codec_mimi_decode(codec_context * ctx, const codec_token_buffer * tokens, codec_pcm_buffer * out_pcm, codec_decode_params params);
 enum codec_status codec_mimi_encode(codec_context * ctx, const std::vector<float> & pcm, codec_token_buffer * out_tokens, codec_encode_params params);
+
+enum codec_status codec_qwen3_tts_tokenizer_init(codec_model * model);
+enum codec_status codec_qwen3_tts_tokenizer_decode(codec_context * ctx, const codec_token_buffer * tokens, codec_pcm_buffer * out_pcm, codec_decode_params params);
 
 void codec_context_set_error(codec_context * ctx, const std::string & error);
 bool codec_prepare_mono_f32(const codec_audio * audio, std::vector<float> * mono, std::string * error);

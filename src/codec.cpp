@@ -3,6 +3,7 @@
 #include "batch/batch.h"
 #include "models/dac.h"
 #include "models/mimi.h"
+#include "models/qwen3_tts_tokenizer.h"
 #include "models/wavtokenizer.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
@@ -92,6 +93,10 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
         return CODEC_ARCH_MIMI;
     }
 
+    if (arch == "qwen3_tts_tokenizer" || arch == "qwen3-tts-tokenizer" || arch == "qwen3") {
+        return CODEC_ARCH_QWEN3_TTS_TOKENIZER;
+    }
+
     return CODEC_ARCH_UNKNOWN;
 }
 
@@ -100,6 +105,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_WAVTOKENIZER_LARGE: return "WavTokenizer-Large";
         case CODEC_ARCH_DAC:                return "DAC";
         case CODEC_ARCH_MIMI:               return "Mimi";
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:return "Qwen3-TTS-Tokenizer";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }
@@ -113,6 +119,8 @@ enum codec_status codec_model_init_arch(struct codec_model * model) {
             return codec_dac_init(model);
         case CODEC_ARCH_MIMI:
             return codec_mimi_init(model);
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
+            return codec_qwen3_tts_tokenizer_init(model);
         case CODEC_ARCH_UNKNOWN:
         default:
             model->sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 0);
@@ -142,6 +150,8 @@ static enum codec_status codec_dispatch_encode(
             return codec_dac_encode(ctx, pcm, out_tokens, out_latent, params);
         case CODEC_ARCH_MIMI:
             return codec_mimi_encode(ctx, pcm, out_tokens, params);
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
+            return codec_mimi_encode(ctx, pcm, out_tokens, params);
         case CODEC_ARCH_UNKNOWN:
         default:
             codec_context_set_error(ctx, "codec_encode not implemented for this architecture");
@@ -162,6 +172,8 @@ static enum codec_status codec_dispatch_decode(
             return codec_dac_decode(ctx, tokens, out_pcm, params);
         case CODEC_ARCH_MIMI:
             return codec_mimi_decode(ctx, tokens, out_pcm, params);
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
+            return codec_qwen3_tts_tokenizer_decode(ctx, tokens, out_pcm, params);
         case CODEC_ARCH_UNKNOWN:
         default:
             codec_context_set_error(ctx, "codec_decode not implemented for this architecture");

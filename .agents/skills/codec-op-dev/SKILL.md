@@ -29,15 +29,16 @@ Guidelines:
 
 ## Custom op approach (only if needed)
 
-Important: `ggml/` is a submodule in this repo and may not be directly editable for commits.
+Important: `ggml/` is a submodule in this repo and must not be edited directly for commits.
 
 Preferred steps:
 1. Try to implement the op as a composition in `src/ops/ggml_ops.cpp`.
 2. If true custom op is required:
-   - Implement it **in this repo** as a custom op wrapper using existing ggml primitives, or
-   - Vendor a minimal copy in `src/ops/` with clear boundaries, or
-   - Propose a ggml upstream patch and apply it as a submodule update (do not edit submodule files directly unless explicitly asked).
-3. Add a focused test in `tests/` or a local harness within this repo.
+   - First, verify there is no composition possible with existing ggml ops.
+   - If a new kernel is unavoidable, **plan a ggml submodule update** (upstream or fork) that adds the op in `ggml/`.
+   - Do not add CPU-only fallbacks; keep ops backend-compatible.
+3. If someone asks for a CPU kernel in `ggml/src/ggml-cpu/`, explain that it requires a submodule bump (no direct edits).
+4. Add a focused test in `tests/` or a local harness within this repo.
 
 ---
 

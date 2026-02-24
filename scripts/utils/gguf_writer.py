@@ -13,8 +13,11 @@ from typing import List, Tuple, Union, Dict, Any
 # GGUF constants
 MAX_TENSOR_NAME = 63
 KV_UINT32 = 4
+KV_INT32 = 5
+KV_FLOAT32 = 6
 KV_BOOL = 7
 KV_STRING = 8
+KV_ARRAY = 9
 ALIGNMENT = 32
 
 # GGML type mapping (matches ggml.h)
@@ -76,6 +79,10 @@ class GGUFWriter:
     def add_uint32(self, key: str, val: int):
         """Add uint32 metadata."""
         self.kv.append((key, KV_UINT32, int(val)))
+
+    def add_float32(self, key: str, val: float):
+        """Add float32 metadata."""
+        self.kv.append((key, KV_FLOAT32, float(val)))
         
     def add_bool(self, key: str, val: bool):
         """Add boolean metadata."""
@@ -84,6 +91,26 @@ class GGUFWriter:
     def add_string(self, key: str, val: str):
         """Add string metadata."""
         self.kv.append((key, KV_STRING, str(val)))
+
+    def add_array(self, key: str, values):
+        """Add array metadata (int32/uint32/float32)."""
+        if not isinstance(values, (list, tuple, np.ndarray)):
+            raise ValueError("values must be list/tuple/ndarray")
+        arr = np.asarray(values)
+        if arr.size == 0:
+            raise ValueError("values must be non-empty")
+        if np.issubdtype(arr.dtype, np.floating):
+            elem_type = KV_FLOAT32
+            payload = [float(x) for x in arr.tolist()]
+        else:
+            min_val = int(arr.min())
+            if min_val < 0:
+                elem_type = KV_INT32
+                payload = [int(x) for x in arr.tolist()]
+            else:
+                elem_type = KV_UINT32
+                payload = [int(x) for x in arr.tolist()]
+        self.kv.append((key, KV_ARRAY, (elem_type, payload)))
         
     def add_tensor(self, name: str, arr: np.ndarray, st_dtype: str = None):
         """
@@ -98,6 +125,18 @@ class GGUFWriter:
         if not isinstance(arr, np.ndarray):
             arr = np.array(arr)
         arr = np.ascontiguousarray(arr)
+
+        if st_dtype is not None and not isinstance(st_dtype, str):
+            if st_dtype is np.float16 or st_dtype == np.dtype("float16"):
+                st_dtype = "F16"
+            elif st_dtype is np.float32 or st_dtype == np.dtype("float32"):
+                st_dtype = "F32"
+            elif hasattr(st_dtype, "name") and st_dtype.name in TENSOR_TYPE_MAP:
+                st_dtype = st_dtype.name
+            elif hasattr(st_dtype, "__name__") and st_dtype.__name__ in TENSOR_TYPE_MAP:
+                st_dtype = st_dtype.__name__
+            else:
+                raise ValueError(f"Unsupported tensor type: {st_dtype} ({name})")
 
         # Determine storage type
         if st_dtype is None:
@@ -202,8 +241,31 @@ class GGUFWriter:
             out += _str_bytes(str(v))
         elif t == KV_UINT32:
             out += _u32(int(v))
+        elif t == KV_INT32:
+            out += _i32(int(v))
+        elif t == KV_FLOAT32:
+            out += struct.pack("<f", float(v))
         elif t == KV_BOOL:
             out += struct.pack("<b", 1 if v else 0)
-        else:
-            raise ValueError(f"Unsupported KV type: {t}")
+        elif t == KV_ARRAY:
+            elem_type, payload = v
+            out += _i32(int(elem_type))
+            out += _u64(len(payload))
+            if elem_type == KV_UINT32:
+                for item in payload:
+                    out += _u32(int(item))
+            elif elem_type == KV_INT32:
+                for item in payload:
+                    out += _i32(int(item))
+            elif elem_type == KV_FLOAT32:
+                for item in payload:
+                    out += struct.pack("<f", float(item))
+                else:
+                    raise ValueError(f"Unsupported array element type: {elem_type}")
+            else:
+                raise ValueError(f"Unsupported KV type: {t}")
         return bytes(out)
+
+    def write_all(self):
+        """Compatibility shim for older converter code."""
+        self.write()
