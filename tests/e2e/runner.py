@@ -326,10 +326,6 @@ def load_native_model(model_cfg: dict[str, Any]):
         model_name = model_cfg["name"]
         log_path = REPO_ROOT / "models" / model_name / f"{model_name}.log"
         local_path = download_hf_snapshot(model_cfg, log_path, model_name)
-        qwen_source = REPO_ROOT / ".model-src" / "Qwen3-TTS"
-        if not qwen_source.is_dir():
-            raise RuntimeError(f"missing Qwen3-TTS source at {qwen_source}")
-        sys.path.insert(0, str(qwen_source))
         qwen_mod = importlib.import_module("qwen_tts")
         tokenizer = getattr(qwen_mod, "Qwen3TTSTokenizer").from_pretrained(str(local_path))
         tokenizer.model = tokenizer.model.eval()
