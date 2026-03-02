@@ -57,6 +57,55 @@ def load_config(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _read_proc_mem() -> dict[str, int]:
+    """Read memory stats from /proc (Linux only). Returns values in MB."""
+    info: dict[str, int] = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmPeak:", "VmSize:")):
+                    key, val = line.split(":")
+                    info[key.strip()] = int(val.split()[0]) // 1024
+    except OSError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
+                    key, val = line.split(":")
+                    info[key.strip()] = int(val.split()[0]) // 1024
+    except OSError:
+        pass
+    return info
+
+
+class MemTracker:
+    """Silently records RSS snapshots, then prints a compact summary table."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.snaps: list[tuple[str, int, int]] = []
+
+    def snap(self, label: str) -> None:
+        m = _read_proc_mem()
+        self.snaps.append((label, m.get("VmRSS", 0), m.get("MemAvailable", 0)))
+
+    def report(self) -> None:
+        m = _read_proc_mem()
+        peak = m.get("VmPeak", 0)
+        total = m.get("MemTotal", 0)
+        print(f"\n[mem] === {self.name} === peak RSS: {peak} MB  (system total: {total} MB)")
+        print(f"[mem]   {'step':<25s} {'RSS':>7s} {'delta':>7s} {'sys avail':>10s}")
+        print(f"[mem]   {'-'*25} {'-'*7} {'-'*7} {'-'*10}")
+        prev_rss = 0
+        for label, rss, avail in self.snaps:
+            delta = rss - prev_rss
+            sign = "+" if delta >= 0 else ""
+            print(f"[mem]   {label:<25s} {rss:>6d}M {sign}{delta:>5d}M {avail:>9d}M")
+            prev_rss = rss
+        print()
+
+
 def require_tools() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required")
@@ -646,9 +695,9 @@ def run_encode(
 
 def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sample_rate: int) -> ModelResult:
     name = model_cfg["name"]
+    mt = MemTracker(name)
     start = time.monotonic()
     log_path = report_dir / f"{name}.log"
-    model, encoder_fn, decoder_fn = load_native_model(model_cfg)
 
     report_dir.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
@@ -661,7 +710,13 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
             raise RuntimeError(f"input audio not found: {input_audio}")
 
         expected_gguf = resolve_gguf_path(model_cfg)
+        mt.snap("before convert_gguf")
         gguf_path = convert_gguf(model_cfg, expected_gguf, log_path, name)
+        mt.snap("after convert_gguf")
+
+        mt.snap("before load_native_model")
+        model, encoder_fn, decoder_fn = load_native_model(model_cfg)
+        mt.snap("after load_native_model")
 
         input_wav = tmpdir / "input.wav"
         hf_codes = tmpdir / "hf_codes.npy"
@@ -670,10 +725,13 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         cpp_out_codes = tmpdir / "cpp_encode.npy"
 
         ffmpeg_to_mono_wav(input_audio, input_wav, model_sample_rate, log_path, name)
+        mt.snap("before encode_decode_hf")
         encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, model_sample_rate, log_path, model, encoder_fn, decoder_fn)
+        mt.snap("after encode_decode_hf")
 
         del model, encoder_fn, decoder_fn
         gc.collect()
+        mt.snap("after gc.collect")
 
         n_q = int(model_cfg.get("n_q", 0))
         if model_cfg.get("decode_only"):
@@ -681,6 +739,7 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         else:
             run_encode(gguf_path, input_wav, cpp_out_codes, n_q, log_path, name)
             run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
+        mt.snap("after codec-cli")
 
         metrics = {}
         metrics["decode"] = compare_wav(hf_ref_wav, cpp_out_wav)
@@ -730,6 +789,7 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
             return_code=1,
         )
     finally:
+        mt.report()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
