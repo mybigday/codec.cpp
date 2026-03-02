@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import json
 import math
+import multiprocessing
 import shutil
 import subprocess
 import sys
@@ -670,6 +672,9 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         ffmpeg_to_mono_wav(input_audio, input_wav, model_sample_rate, log_path, name)
         encode_decode_hf(model_cfg, input_wav, hf_codes, hf_ref_wav, model_sample_rate, log_path, model, encoder_fn, decoder_fn)
 
+        del model, encoder_fn, decoder_fn
+        gc.collect()
+
         n_q = int(model_cfg.get("n_q", 0))
         if model_cfg.get("decode_only"):
             run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name)
@@ -817,6 +822,46 @@ def parse_model_selection(raw_values: list[str] | None) -> list[str]:
     return selected
 
 
+def _run_model_worker(
+    result_queue: multiprocessing.Queue,
+    report_dir: Path,
+    model_cfg: dict[str, Any],
+    input_audio: Path,
+    sample_rate: int,
+) -> None:
+    result = run_model(report_dir, model_cfg, input_audio, sample_rate)
+    result_queue.put(result)
+
+
+def _run_model_isolated(
+    report_dir: Path,
+    model_cfg: dict[str, Any],
+    input_audio: Path,
+    sample_rate: int,
+) -> ModelResult:
+    """Run a single model test in an isolated subprocess so all memory
+    (PyTorch allocator pools, imported modules, HF caches) is reclaimed
+    by the OS when the child exits."""
+    q: multiprocessing.Queue = multiprocessing.Queue()
+    p = multiprocessing.Process(
+        target=_run_model_worker,
+        args=(q, report_dir, model_cfg, input_audio, sample_rate),
+    )
+    p.start()
+    p.join()
+    if not q.empty():
+        return q.get_nowait()
+    name = model_cfg["name"]
+    return ModelResult(
+        name=name,
+        status="failed",
+        duration_sec=0.0,
+        log_path=str(report_dir / f"{name}.log"),
+        reason=f"worker process died (exit code {p.exitcode})",
+        return_code=p.exitcode,
+    )
+
+
 def main() -> int:
     args = parse_args()
     require_tools()
@@ -842,7 +887,7 @@ def main() -> int:
 
     results: list[ModelResult] = []
     for model_cfg in selected_cfgs:
-        result = run_model(report_dir, model_cfg, input_audio, int(args.sample_rate))
+        result = _run_model_isolated(report_dir, model_cfg, input_audio, int(args.sample_rate))
         results.append(result)
         print(f"[{result.name}] result: {result.status}")
         if result.reason:

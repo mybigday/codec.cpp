@@ -315,6 +315,25 @@ class WavTokenizerConverter(BaseConverter):
     def architecture(self) -> str:
         return "wavtokenizer_large"
 
+    def should_quantize_tensor(self, name: str, arr: np.ndarray) -> bool:
+        if self.quantization not in ("Q4_K_M", "Q5_K_M", "Q8_0"):
+            return False
+
+        if arr.ndim < 2:
+            return False
+
+        # WavTokenizer keeps ".weight" (and may compress ".weight_v" -> ".wv")
+        is_weight = name.endswith(".weight") or name.endswith(".w") or name.endswith(".wv")
+        if not is_weight:
+            return False
+
+        ne0 = int(arr.shape[0])
+        if self.quantization in ("Q4_K_M", "Q5_K_M"):
+            return (ne0 % 256) == 0
+        if self.quantization == "Q8_0":
+            return (ne0 % 32) == 0
+        return False
+
     def load_from_checkpoint(self, checkpoint_dir: Path) -> None:
         checkpoint_path = Path(checkpoint_dir)
         
