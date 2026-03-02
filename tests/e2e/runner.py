@@ -333,7 +333,7 @@ def resolve_model_local_path(model_cfg: dict[str, Any]) -> Path:
 # return (model, encoder_fn, decoder_fn)
 # encoder_fn = (audio_frames, **kwargs) -> audio_codes
 # decoder_fn = (audio_codes, **kwargs) -> audio_frames
-def load_native_model(model_cfg: dict[str, Any]):
+def load_native_model(model_cfg: dict[str, Any], local_path: Path):
     hf_repo_id = model_cfg.get("hf_repo_id")
     class_name = model_cfg.get("class")
     cache_dir = str(REPO_ROOT / "models" / "hf")
@@ -352,9 +352,6 @@ def load_native_model(model_cfg: dict[str, Any]):
             lambda audio_codes, **kwargs: model.decode(audio_codes)
         )
     if class_name == "wavtokenizer":
-        model_name = model_cfg["name"]
-        log_path = REPO_ROOT / "models" / model_name / f"{model_name}.log"
-        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
         # Pull wavtokenizer src
         wavtokenizer_source = REPO_ROOT / "models" / "wavtokenizer-source"
         if not wavtokenizer_source.is_dir():
@@ -374,9 +371,6 @@ def load_native_model(model_cfg: dict[str, Any]):
             lambda audio_codes, **kwargs: model.decode(model.codes_to_features(audio_codes), bandwidth_id=bandwidth_id)
         )
     if class_name == "qwen3_tts_tokenizer":
-        model_name = model_cfg["name"]
-        log_path = REPO_ROOT / "models" / model_name / f"{model_name}.log"
-        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
         qwen_mod = importlib.import_module("qwen_tts")
         tokenizer = getattr(qwen_mod, "Qwen3TTSTokenizer").from_pretrained(str(local_path))
         tokenizer.model = tokenizer.model.eval()
@@ -593,7 +587,7 @@ def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: 
         raise RuntimeError(f"Failed to download HF snapshot: {e}")
 
 
-def convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Path, model_name: str) -> Path:
+def convert_gguf(model_cfg: dict[str, Any], local_path: Path, output_path: Path, log_path: Path, model_name: str) -> Path:
     """Auto-convert HF model to GGUF using scripts/convert-to-gguf.py"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -611,7 +605,7 @@ def convert_gguf(model_cfg: dict[str, Any], output_path: Path, log_path: Path, m
         cmd = [
             sys.executable,
             str(REPO_ROOT / "scripts" / "convert-to-gguf.py"),
-            "--input-dir", str(REPO_ROOT / "models" / model_name / hf_file),
+            "--input-dir", str(local_path / hf_file),
             "--output", str(output_path),
             "--model-type", model_name,
         ]
@@ -709,13 +703,16 @@ def run_model(report_dir: Path, model_cfg: dict[str, Any], input_audio: Path, sa
         if not input_audio.is_file():
             raise RuntimeError(f"input audio not found: {input_audio}")
 
+        model_name = model_cfg["name"]
+        local_path = download_hf_snapshot(model_cfg, log_path, model_name)
+
         expected_gguf = resolve_gguf_path(model_cfg)
         mt.snap("before convert_gguf")
-        gguf_path = convert_gguf(model_cfg, expected_gguf, log_path, name)
+        gguf_path = convert_gguf(model_cfg, local_path, expected_gguf, log_path, name)
         mt.snap("after convert_gguf")
 
         mt.snap("before load_native_model")
-        model, encoder_fn, decoder_fn = load_native_model(model_cfg)
+        model, encoder_fn, decoder_fn = load_native_model(model_cfg, local_path)
         mt.snap("after load_native_model")
 
         input_wav = tmpdir / "input.wav"

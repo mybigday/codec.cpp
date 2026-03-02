@@ -25,6 +25,10 @@ env:
 jobs:
   e2e-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+      cancel-in-progress: true
 
     steps:
     - uses: actions/checkout@v4
