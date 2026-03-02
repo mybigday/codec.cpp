@@ -18,6 +18,11 @@ on:
       - 'requirements-e2e.txt'
       - '.github/workflows/e2e.yml'
   workflow_dispatch:
+    inputs:
+      models:
+        description: "Comma-separated list of models to test"
+        required: false
+        default: "mimi,dac,wavtokenizer"
 
 env:
   BUILD_TYPE: Release
@@ -25,7 +30,6 @@ env:
 jobs:
   e2e-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
     concurrency:
       group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
       cancel-in-progress: true
@@ -72,7 +76,7 @@ jobs:
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        python3 tests/e2e/runner.py --report-dir tests/e2e/reports
+        python3 tests/e2e/runner.py --report-dir tests/e2e/reports --models ${{ github.event.inputs.models || 'mimi,dac,wavtokenizer' }}
 
     - name: Upload E2E reports
       if: always()
