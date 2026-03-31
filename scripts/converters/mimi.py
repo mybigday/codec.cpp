@@ -271,7 +271,7 @@ class MimiConverter(BaseConverter):
                 embed = _normalize_rvq_codebook_embed_layout(embed_key, embed)
                 mapped = map_tensor_name_primary(embed_key)
                 short = shorten_tensor_name(mapped, used_names)
-                writer.add_tensor(short, embed)
+                self._add_tensor(writer, short, embed)
                 n_added += 1
 
         return n_added
@@ -280,8 +280,8 @@ class MimiConverter(BaseConverter):
         if hop_size <= 0:
             raise ValueError(f"invalid hop_size: {hop_size}")
         kernel = np.full((hop_size, 1, 1), 1.0 / float(hop_size), dtype=np.float16)
-        writer.add_tensor("mimi.decode.kernel", kernel)
-        writer.add_tensor("mimi.encode.kernel", kernel)
+        self._add_tensor(writer, "mimi.decode.kernel", kernel)
+        self._add_tensor(writer, "mimi.encode.kernel", kernel)
 
     def convert_and_save(self, output_path: Path) -> None:
         if self.state_dict is None or self.config is None:
@@ -291,6 +291,7 @@ class MimiConverter(BaseConverter):
         weight_transforms = build_weight_transforms(keys)
 
         writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
         writer.add_name("Mimi")
         sr = int(self.config.get("sampling_rate", 24000))
         hop_size = int(round(sr / float(self.config.get("frame_rate", 12.5))))
@@ -314,9 +315,10 @@ class MimiConverter(BaseConverter):
             arr = transform_tensor_for_codec(key, self.state_dict[key], weight_transforms)
             for mapped in map_tensor_names(key):
                 short = shorten_tensor_name(mapped, used_names)
-                writer.add_tensor(short, arr, self._get_target_dtype(short, arr))
+                self._add_tensor(writer, short, arr)
 
         self._add_codebook_embed_tensors(writer, used_names)
         self._add_kernel_tensors(writer, hop_size)
+        self._warn_if_no_quantized()
         writer.write()
         self.log(f"Wrote Mimi GGUF to {output_path}")

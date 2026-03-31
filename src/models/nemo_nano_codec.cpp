@@ -1,0 +1,1027 @@
+#include "nemo_nano_codec.h"
+
+#include "../ops/conv1d.h"
+#include "../ops/convtr1d.h"
+#include "../ops/ggml_ops.h"
+#include "../runtime/graph.h"
+#include "../runtime/tensor_utils.h"
+
+#include <ggml-cpu.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+static const char * nemo_dump_dir() {
+    static const char * dir = std::getenv("NEMO_DUMP_DIR");
+    return dir;
+}
+
+static bool nemo_write_npy_f32(
+    const char * path,
+    const float * data,
+    const int64_t * shape,
+    int32_t n_dims,
+    std::string * err) {
+
+    if (path == nullptr || data == nullptr || shape == nullptr || n_dims <= 0) {
+        if (err) *err = "invalid npy write args";
+        return false;
+    }
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        if (err) *err = "failed to open npy file";
+        return false;
+    }
+
+    const char magic[] = "\x93NUMPY";
+    ofs.write(magic, 6);
+    const uint8_t major = 1;
+    const uint8_t minor = 0;
+    ofs.put((char) major);
+    ofs.put((char) minor);
+
+    std::string shape_str = "(";
+    for (int32_t i = 0; i < n_dims; ++i) {
+        shape_str += std::to_string(shape[i]);
+        if (i + 1 < n_dims) {
+            shape_str += ", ";
+        }
+    }
+    if (n_dims == 1) {
+        shape_str += ",";
+    }
+    shape_str += ")";
+
+    char header[256];
+    std::snprintf(
+        header,
+        sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }",
+        shape_str.c_str());
+    std::string hdr = header;
+    const size_t preamble = 6 + 2 + 2;
+    const size_t total = preamble + hdr.size();
+    const size_t pad = (16 - (total % 16)) % 16;
+    hdr.append(pad, ' ');
+    hdr.push_back('\n');
+
+    const uint16_t hlen = (uint16_t) hdr.size();
+    ofs.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
+    ofs.write(hdr.data(), (std::streamsize) hdr.size());
+
+    int64_t n_elems = 1;
+    for (int32_t i = 0; i < n_dims; ++i) {
+        n_elems *= shape[i];
+    }
+    ofs.write(reinterpret_cast<const char *>(data), (std::streamsize) (n_elems * (int64_t) sizeof(float)));
+    if (!ofs.good()) {
+        if (err) *err = "failed to write npy data";
+        return false;
+    }
+    return true;
+}
+
+static bool nemo_dump_tensor(
+    codec_context * ctx,
+    codec_graph_cache_entry * entry,
+    const std::string & name,
+    std::string * err) {
+
+    const char * dir = nemo_dump_dir();
+    if (dir == nullptr || dir[0] == '\0') {
+        return true;
+    }
+    ggml_tensor * t = codec_graph_get_tensor(ctx, entry, name.c_str());
+    if (t == nullptr) {
+        if (err) *err = "missing tensor for dump: " + name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(t, &v)) {
+        if (err) *err = "failed reading tensor for dump: " + name;
+        return false;
+    }
+    const int n_dims = ggml_n_dims(t);
+    int64_t shape[4] = { 1, 1, 1, 1 };
+    for (int i = 0; i < n_dims; ++i) {
+        shape[i] = (int64_t) t->ne[i];
+    }
+    std::string path = std::string(dir) + "/" + name + ".npy";
+    return nemo_write_npy_f32(path.c_str(), v.data(), shape, n_dims, err);
+}
+
+static ggml_tensor * nemo_get_tensor(ggml_context * ctx, const std::string & name) {
+    return ggml_get_tensor(ctx, name.c_str());
+}
+
+static bool nemo_write_tensor(codec_context * ctx, ggml_tensor * dst, const float * data, size_t n_bytes, std::string * err) {
+    return codec_runtime_write_tensor(dst, data, n_bytes, err);
+}
+
+static bool nemo_copy_conv1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
+    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
+    if (src == nullptr) {
+        if (err) *err = "missing tensor: " + src_name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(src, &v)) {
+        if (err) *err = "failed reading tensor: " + src_name;
+        return false;
+    }
+    const int32_t dk = (int32_t) codec_ne(dst, 0);
+    const int32_t din = (int32_t) codec_ne(dst, 1);
+    const int32_t dout = (int32_t) codec_ne(dst, 2);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    const int32_t n2 = (int32_t) codec_ne(src, 2);
+
+    if (n0 != dk || n1 != din || n2 != dout) {
+        if (err) *err = "unexpected conv1d shape: " + src_name;
+        return false;
+    }
+
+    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static bool nemo_copy_convtr1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
+    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
+    if (src == nullptr) {
+        if (err) *err = "missing tensor: " + src_name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(src, &v)) {
+        if (err) *err = "failed reading tensor: " + src_name;
+        return false;
+    }
+    const int32_t dk = (int32_t) codec_ne(dst, 0);
+    const int32_t dout = (int32_t) codec_ne(dst, 1);
+    const int32_t din = (int32_t) codec_ne(dst, 2);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+    const int32_t n2 = (int32_t) codec_ne(src, 2);
+
+    if (n0 != dk || n1 != dout || n2 != din) {
+        if (err) *err = "unexpected convtr1d shape: " + src_name;
+        return false;
+    }
+
+    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static bool nemo_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
+    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
+    if (src == nullptr) {
+        if (err) *err = "missing tensor: " + src_name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
+        if (err) *err = "invalid bias tensor: " + src_name;
+        return false;
+    }
+    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static bool nemo_copy_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
+    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
+    if (src == nullptr) {
+        if (err) *err = "missing tensor: " + src_name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
+        if (err) *err = "invalid 1d tensor: " + src_name;
+        return false;
+    }
+    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static bool nemo_copy_codebook(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
+    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
+    if (src == nullptr) {
+        if (err) *err = "missing tensor: " + src_name;
+        return false;
+    }
+    std::vector<float> v;
+    if (!codec_tensor_as_vec_f32(src, &v)) {
+        if (err) *err = "failed reading tensor: " + src_name;
+        return false;
+    }
+    const int32_t emb_dim = (int32_t) codec_ne(dst, 0);
+    const int32_t cb = (int32_t) codec_ne(dst, 1);
+    const int32_t n0 = (int32_t) codec_ne(src, 0);
+    const int32_t n1 = (int32_t) codec_ne(src, 1);
+
+    if (n0 != emb_dim || n1 != cb) {
+        if (err) *err = "unexpected codebook shape: " + src_name;
+        return false;
+    }
+
+    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+}
+
+static ggml_tensor * nemo_conv1d_replicate(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * w,
+    ggml_tensor * b,
+    int32_t stride,
+    int32_t dilation,
+    int32_t padding) {
+
+    if (ctx == nullptr || x == nullptr || w == nullptr || stride <= 0 || dilation <= 0 || padding < 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * x_pad = codec_op_pad_1d_replicate(ctx, x, padding, padding);
+    if (x_pad == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * w_f32 = w->type == GGML_TYPE_F32 ? w : ggml_cast(ctx, w, GGML_TYPE_F32);
+    ggml_tensor * im2col = ggml_im2col(ctx, w_f32, x_pad, stride, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1]));
+    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_f32, (w_f32->ne[0] * w_f32->ne[1]), w_f32->ne[2]);
+    ggml_tensor * y = ggml_mul_mat(ctx, im2col_2d, w_2d);
+    y = ggml_reshape_3d(ctx, y, im2col->ne[1], w_f32->ne[2], im2col->ne[2]);
+    if (b != nullptr) {
+        ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
+        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+    }
+    return ggml_cont(ctx, y);
+}
+
+static std::string nemo_enc_down_w_name(int32_t i) { return "nemo.enc.down." + std::to_string(i) + ".w"; }
+static std::string nemo_enc_down_b_name(int32_t i) { return "nemo.enc.down." + std::to_string(i) + ".b"; }
+
+static std::string nemo_enc_res_in_w(int32_t l, int32_t b, int32_t r) {
+    return "nemo.enc.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".in.w";
+}
+static std::string nemo_enc_res_in_b(int32_t l, int32_t b, int32_t r) {
+    return "nemo.enc.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".in.b";
+}
+static std::string nemo_enc_res_sk_w(int32_t l, int32_t b, int32_t r) {
+    return "nemo.enc.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".sk.w";
+}
+static std::string nemo_enc_res_sk_b(int32_t l, int32_t b, int32_t r) {
+    return "nemo.enc.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".sk.b";
+}
+
+static std::string nemo_dec_up_w_name(int32_t i) { return "nemo.dec.up." + std::to_string(i) + ".w"; }
+static std::string nemo_dec_up_b_name(int32_t i) { return "nemo.dec.up." + std::to_string(i) + ".b"; }
+static std::string nemo_dec_act_name(int32_t i) { return "nemo.dec.act." + std::to_string(i) + ".a"; }
+static std::string nemo_dec_res_in_w(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".in.w";
+}
+static std::string nemo_dec_res_in_b(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".in.b";
+}
+static std::string nemo_dec_res_sk_w(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".sk.w";
+}
+static std::string nemo_dec_res_sk_b(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".sk.b";
+}
+static std::string nemo_dec_res_in_a(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".in.a";
+}
+static std::string nemo_dec_res_sk_a(int32_t l, int32_t b, int32_t r) {
+    return "nemo.dec.res.l" + std::to_string(l) + ".b" + std::to_string(b) + ".r" + std::to_string(r) + ".sk.a";
+}
+
+static std::string nemo_fsq_name(const std::string & suffix) { return "nemo.fsq." + suffix; }
+
+struct nemo_encode_build {
+    int32_t n_in = 0;
+    int32_t hop = 0;
+    int32_t n_q = 0;
+    int32_t codebook_dim = 0;
+    int32_t codebook_size = 0;
+};
+
+struct nemo_decode_build {
+    int32_t t = 0;
+    int32_t q = 0;
+    int32_t codebook_dim = 0;
+    int32_t codebook_size = 0;
+};
+
+static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
+    nemo_encode_build * p = static_cast<nemo_encode_build *>(user_data);
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->n_in <= 0 || p->n_q <= 0) {
+        return false;
+    }
+
+    ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->n_in, 1);
+    ggml_set_name(t_pcm, "nemo.encode.pcm");
+
+    ggml_tensor * x = t_pcm;
+
+    ggml_tensor * t_pre_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 1, 24);
+    ggml_set_name(t_pre_w, "nemo.enc.pre.w");
+    ggml_tensor * t_pre_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 24);
+    ggml_set_name(t_pre_b, "nemo.enc.pre.b");
+    // inline pre-conv to capture padding/conv outputs for parity debugging
+    ggml_tensor * pre_pad = codec_op_pad_1d_replicate(ctx_eval, x, 3, 3);
+    if (pre_pad == nullptr) {
+        return false;
+    }
+    ggml_set_name(pre_pad, "nemo.enc.pre.pad");
+    ggml_tensor * pre_out = nemo_conv1d_replicate(ctx_eval, pre_pad, t_pre_w, nullptr, 1, 1, 0);
+    if (nemo_dump_dir() != nullptr) {
+        ggml_tensor * pre_w_f32 = t_pre_w->type == GGML_TYPE_F32 ? t_pre_w : ggml_cast(ctx_eval, t_pre_w, GGML_TYPE_F32);
+        ggml_tensor * pre_im2col = ggml_im2col(ctx_eval, pre_w_f32, pre_pad, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+        pre_im2col = ggml_cont(ctx_eval, pre_im2col);
+        ggml_set_name(pre_im2col, "nemo.enc.pre.im2col");
+        ggml_tensor * sum = ggml_sum(ctx_eval, pre_im2col);
+        ggml_tensor * sum_f32 = sum->type == GGML_TYPE_F32 ? sum : ggml_cast(ctx_eval, sum, GGML_TYPE_F32);
+        ggml_tensor * zero = ggml_scale(ctx_eval, sum_f32, 0.0f);
+        ggml_tensor * zero2d = ggml_reshape_2d(ctx_eval, zero, 1, 1);
+        ggml_tensor * zeros = ggml_repeat(ctx_eval, zero2d, pre_out);
+        pre_out = ggml_add(ctx_eval, pre_out, zeros);
+    }
+    if (t_pre_b != nullptr) {
+        ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, t_pre_b, 1, pre_out->ne[1]);
+        pre_out = ggml_add(ctx_eval, pre_out, ggml_repeat(ctx_eval, b2, pre_out));
+    }
+    x = ggml_cont(ctx_eval, pre_out);
+    if (x == nullptr) {
+        return false;
+    }
+    ggml_set_name(x, "nemo.enc.pre.out");
+
+    const int32_t down_rates[5] = { 2, 3, 6, 7, 7 };
+    int32_t in_channels = 24;
+
+    for (int32_t li = 0; li < 5; ++li) {
+        ggml_tensor * res_sum = nullptr;
+        for (int32_t bi = 0; bi < 3; ++bi) {
+            ggml_tensor * x_block = x;
+            const int32_t k = (bi == 1) ? 7 : (bi == 2 ? 11 : 3);
+            const int32_t dilations[3] = { 1, 3, 5 };
+            for (int32_t ri = 0; ri < 3; ++ri) {
+                ggml_tensor * t_in_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, k, in_channels, in_channels);
+                ggml_set_name(t_in_w, nemo_enc_res_in_w(li, bi, ri).c_str());
+                ggml_tensor * t_in_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels);
+                ggml_set_name(t_in_b, nemo_enc_res_in_b(li, bi, ri).c_str());
+                ggml_tensor * t_sk_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, k, in_channels, in_channels);
+                ggml_set_name(t_sk_w, nemo_enc_res_sk_w(li, bi, ri).c_str());
+                ggml_tensor * t_sk_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels);
+                ggml_set_name(t_sk_b, nemo_enc_res_sk_b(li, bi, ri).c_str());
+
+                ggml_tensor * h = ggml_leaky_relu(ctx_eval, x_block, 0.01f, false);
+                const int32_t pad_in = (k * dilations[ri] - dilations[ri]) / 2;
+                const int32_t pad_sk = k / 2;
+                h = nemo_conv1d_replicate(ctx_eval, h, t_in_w, t_in_b, 1, dilations[ri], pad_in);
+                h = ggml_leaky_relu(ctx_eval, h, 0.01f, false);
+                h = nemo_conv1d_replicate(ctx_eval, h, t_sk_w, t_sk_b, 1, 1, pad_sk);
+                x_block = ggml_add(ctx_eval, x_block, h);
+                ggml_set_name(x_block, ("nemo.enc.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out").c_str());
+            }
+            res_sum = res_sum == nullptr ? x_block : ggml_add(ctx_eval, res_sum, x_block);
+        }
+
+        x = ggml_scale(ctx_eval, res_sum, 1.0f / 3.0f);
+        x = ggml_leaky_relu(ctx_eval, x, 0.01f, false);
+
+        const int32_t out_channels = in_channels * 2;
+        const int32_t stride = down_rates[li];
+        const int32_t kernel = 2 * stride;
+        const int32_t padding = (kernel - stride + 1) / 2;
+
+        ggml_tensor * t_dw_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, kernel, in_channels, out_channels);
+        ggml_set_name(t_dw_w, nemo_enc_down_w_name(li).c_str());
+        ggml_tensor * t_dw_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_channels);
+        ggml_set_name(t_dw_b, nemo_enc_down_b_name(li).c_str());
+        x = nemo_conv1d_replicate(ctx_eval, x, t_dw_w, t_dw_b, stride, 1, padding);
+        if (x == nullptr) {
+            return false;
+        }
+        ggml_set_name(x, ("nemo.enc.down." + std::to_string(li) + ".out").c_str());
+        in_channels = out_channels;
+    }
+
+    x = ggml_leaky_relu(ctx_eval, x, 0.01f, false);
+    ggml_tensor * t_post_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, in_channels, 16);
+    ggml_set_name(t_post_w, "nemo.enc.post.w");
+    ggml_tensor * t_post_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 16);
+    ggml_set_name(t_post_b, "nemo.enc.post.b");
+    x = nemo_conv1d_replicate(ctx_eval, x, t_post_w, t_post_b, 1, 1, 3);
+    if (x == nullptr) {
+        return false;
+    }
+    ggml_set_name(x, "nemo.enc.post.out");
+
+    // FSQ encode per group
+    ggml_tensor * t_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
+    ggml_set_name(t_scale, nemo_fsq_name("scale").c_str());
+    ggml_tensor * t_out_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
+    ggml_set_name(t_out_scale, nemo_fsq_name("out_scale").c_str());
+    ggml_tensor * t_out_offset = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
+    ggml_set_name(t_out_offset, nemo_fsq_name("out_offset").c_str());
+    ggml_tensor * t_in_shift = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
+    ggml_set_name(t_in_shift, nemo_fsq_name("in_shift").c_str());
+    ggml_tensor * t_dim_base = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
+    ggml_set_name(t_dim_base, nemo_fsq_name("dim_base").c_str());
+
+    ggml_tensor * tokens = nullptr;
+    const int32_t t = (int32_t) x->ne[0];
+    for (int32_t g = 0; g < p->n_q; ++g) {
+        const size_t offset = (size_t) g * (size_t) p->codebook_dim * x->nb[1];
+        ggml_tensor * x_g = ggml_view_2d(ctx_eval, x, t, p->codebook_dim, x->nb[1], offset);
+
+        ggml_tensor * x_add = ggml_add(ctx_eval, x_g, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_in_shift, 1, p->codebook_dim), x_g));
+        ggml_tensor * x_tanh = ggml_tanh(ctx_eval, x_add);
+        ggml_tensor * x_mul = ggml_mul(ctx_eval, x_tanh, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_out_scale, 1, p->codebook_dim), x_g));
+        ggml_tensor * x_comp = ggml_sub(ctx_eval, x_mul, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_out_offset, 1, p->codebook_dim), x_g));
+        ggml_tensor * x_round = ggml_round(ctx_eval, x_comp);
+        ggml_tensor * x_norm = ggml_div(ctx_eval, x_round, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_scale, 1, p->codebook_dim), x_g));
+
+        ggml_tensor * x_nonneg = ggml_add(ctx_eval, ggml_mul(ctx_eval, x_norm, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_scale, 1, p->codebook_dim), x_g)),
+                                          ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_scale, 1, p->codebook_dim), x_g));
+        ggml_tensor * x_idx = ggml_mul(ctx_eval, x_nonneg, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_dim_base, 1, p->codebook_dim), x_g));
+        ggml_tensor * x_idx_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_idx)); // [dim, t]
+        ggml_tensor * idx_sum = ggml_sum_rows(ctx_eval, x_idx_ct); // [1, t]
+        ggml_tensor * idx_1d = ggml_reshape_1d(ctx_eval, idx_sum, t);
+        ggml_tensor * idx_i32 = ggml_cast(ctx_eval, idx_1d, GGML_TYPE_I32);
+        ggml_tensor * idx_2d = ggml_reshape_2d(ctx_eval, idx_i32, t, 1);
+
+        tokens = tokens == nullptr ? idx_2d : ggml_concat(ctx_eval, tokens, idx_2d, 1);
+    }
+
+    ggml_tensor * t_out = ggml_cont(ctx_eval, tokens);
+    ggml_set_name(t_out, "nemo.encode.out");
+    *out = t_out;
+    return true;
+}
+
+static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
+    nemo_decode_build * p = static_cast<nemo_decode_build *>(user_data);
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->t <= 0 || p->q <= 0) {
+        return false;
+    }
+
+    ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_I32, p->t, p->q);
+    ggml_set_name(t_tok, "nemo.decode.tok");
+
+    ggml_tensor * x_ct = nullptr;
+    for (int32_t g = 0; g < p->q; ++g) {
+        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->codebook_size);
+        ggml_set_name(t_codebook, ("nemo.fsq.codebook." + std::to_string(g)).c_str());
+
+        ggml_tensor * t_idx = ggml_view_1d(ctx_eval, t_tok, p->t, (size_t) g * t_tok->nb[1]);
+        ggml_tensor * t_emb = ggml_get_rows(ctx_eval, t_codebook, t_idx); // [codebook_dim, t]
+        x_ct = (x_ct == nullptr) ? t_emb : ggml_concat(ctx_eval, x_ct, t_emb, 0);
+    }
+
+    ggml_tensor * x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct)); // [t, c]
+    ggml_set_name(x, "nemo.dec.embed.out");
+
+    ggml_tensor * t_pre_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 16, 864);
+    ggml_set_name(t_pre_w, "nemo.dec.pre.w");
+    ggml_tensor * t_pre_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 864);
+    ggml_set_name(t_pre_b, "nemo.dec.pre.b");
+    x = codec_conv1d_causal(ctx_eval, x, t_pre_w, t_pre_b, 1, 1);
+    if (x == nullptr) {
+        return false;
+    }
+    ggml_set_name(x, "nemo.dec.pre.out");
+
+    const int32_t up_rates[5] = { 7, 7, 6, 3, 2 };
+    int32_t in_channels = 864;
+
+    for (int32_t li = 0; li < 5; ++li) {
+        ggml_tensor * t_act = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels / 2);
+        ggml_set_name(t_act, nemo_dec_act_name(li).c_str());
+        ggml_tensor * x_left = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels / 2, x->nb[1], 0);
+        ggml_tensor * x_right = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels - in_channels / 2, x->nb[1], (size_t) (in_channels / 2) * x->nb[1]);
+        ggml_tensor * x_snake = codec_op_snake(ctx_eval, x_left, t_act, 1e-9f);
+        ggml_tensor * x_lr = ggml_leaky_relu(ctx_eval, x_right, 0.01f, false);
+        ggml_tensor * x_cat = ggml_concat(ctx_eval, x_snake, x_lr, 1);
+        x = x_cat;
+
+        const int32_t out_channels = in_channels / 2;
+        const int32_t stride = up_rates[li];
+        ggml_tensor * t_up_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 2 * stride, out_channels, in_channels);
+        ggml_set_name(t_up_w, nemo_dec_up_w_name(li).c_str());
+        ggml_tensor * t_up_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_channels);
+        ggml_set_name(t_up_b, nemo_dec_up_b_name(li).c_str());
+        x = codec_convtr1d_causal(ctx_eval, x, t_up_w, t_up_b, stride, 1);
+        if (x == nullptr) {
+            return false;
+        }
+        ggml_set_name(x, ("nemo.dec.up." + std::to_string(li) + ".out").c_str());
+        in_channels = out_channels;
+
+        ggml_tensor * res_sum = nullptr;
+        for (int32_t bi = 0; bi < 3; ++bi) {
+            ggml_tensor * x_block = x;
+            const int32_t k = (bi == 1) ? 7 : (bi == 2 ? 11 : 3);
+            const int32_t dilations[3] = { 1, 3, 5 };
+            for (int32_t ri = 0; ri < 3; ++ri) {
+                ggml_tensor * t_in_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels / 2);
+                ggml_set_name(t_in_a, nemo_dec_res_in_a(li, bi, ri).c_str());
+                ggml_tensor * t_sk_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels / 2);
+                ggml_set_name(t_sk_a, nemo_dec_res_sk_a(li, bi, ri).c_str());
+                ggml_tensor * t_in_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, k, in_channels, in_channels);
+                ggml_set_name(t_in_w, nemo_dec_res_in_w(li, bi, ri).c_str());
+                ggml_tensor * t_in_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels);
+                ggml_set_name(t_in_b, nemo_dec_res_in_b(li, bi, ri).c_str());
+                ggml_tensor * t_sk_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, k, in_channels, in_channels);
+                ggml_set_name(t_sk_w, nemo_dec_res_sk_w(li, bi, ri).c_str());
+                ggml_tensor * t_sk_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels);
+                ggml_set_name(t_sk_b, nemo_dec_res_sk_b(li, bi, ri).c_str());
+
+                ggml_tensor * x_left_r = ggml_view_2d(ctx_eval, x_block, (int32_t) x_block->ne[0], in_channels / 2, x_block->nb[1], 0);
+                ggml_tensor * x_right_r = ggml_view_2d(ctx_eval, x_block, (int32_t) x_block->ne[0], in_channels - in_channels / 2, x_block->nb[1], (size_t) (in_channels / 2) * x_block->nb[1]);
+                ggml_tensor * x_snake_r = codec_op_snake(ctx_eval, x_left_r, t_in_a, 1e-9f);
+                ggml_tensor * x_lr_r = ggml_leaky_relu(ctx_eval, x_right_r, 0.01f, false);
+                ggml_tensor * x_act = ggml_concat(ctx_eval, x_snake_r, x_lr_r, 1);
+
+                ggml_tensor * h = codec_conv1d_causal(ctx_eval, x_act, t_in_w, t_in_b, 1, dilations[ri]);
+                if (h == nullptr) {
+                    return false;
+                }
+
+                ggml_tensor * h_left = ggml_view_2d(ctx_eval, h, (int32_t) h->ne[0], in_channels / 2, h->nb[1], 0);
+                ggml_tensor * h_right = ggml_view_2d(ctx_eval, h, (int32_t) h->ne[0], in_channels - in_channels / 2, h->nb[1], (size_t) (in_channels / 2) * h->nb[1]);
+                ggml_tensor * h_snake = codec_op_snake(ctx_eval, h_left, t_sk_a, 1e-9f);
+                ggml_tensor * h_lr = ggml_leaky_relu(ctx_eval, h_right, 0.01f, false);
+                ggml_tensor * h_act = ggml_concat(ctx_eval, h_snake, h_lr, 1);
+
+                h = codec_conv1d_causal(ctx_eval, h_act, t_sk_w, t_sk_b, 1, 1);
+                if (h == nullptr) {
+                    return false;
+                }
+                x_block = ggml_add(ctx_eval, x_block, h);
+                ggml_set_name(x_block, ("nemo.dec.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out").c_str());
+            }
+            res_sum = res_sum == nullptr ? x_block : ggml_add(ctx_eval, res_sum, x_block);
+        }
+        x = ggml_scale(ctx_eval, res_sum, 1.0f / 3.0f);
+    }
+
+    ggml_tensor * t_post_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, in_channels / 2);
+    ggml_set_name(t_post_a, "nemo.dec.post.a");
+    ggml_tensor * x_left_f = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels / 2, x->nb[1], 0);
+    ggml_tensor * x_right_f = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels - in_channels / 2, x->nb[1], (size_t) (in_channels / 2) * x->nb[1]);
+    ggml_tensor * x_snake_f = codec_op_snake(ctx_eval, x_left_f, t_post_a, 1e-9f);
+    ggml_tensor * x_lr_f = ggml_leaky_relu(ctx_eval, x_right_f, 0.01f, false);
+    ggml_tensor * x_act_f = ggml_concat(ctx_eval, x_snake_f, x_lr_f, 1);
+    x = x_act_f;
+    ggml_set_name(x, "nemo.dec.post.act");
+
+    ggml_tensor * t_post_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, in_channels, 1);
+    ggml_set_name(t_post_w, "nemo.dec.post.w");
+    ggml_tensor * t_post_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
+    ggml_set_name(t_post_b, "nemo.dec.post.b");
+    ggml_tensor * t_pcm = codec_conv1d_causal(ctx_eval, x, t_post_w, t_post_b, 1, 1);
+    if (t_pcm == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * t_out = ggml_clamp(ctx_eval, t_pcm, -1.0f, 1.0f);
+    ggml_set_name(t_pcm, "nemo.dec.post.out");
+    ggml_set_name(t_out, "nemo.decode.out");
+    *out = t_out;
+    return true;
+}
+
+static enum codec_status nemo_encode_graph(
+    codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    int32_t hop_size,
+    int32_t sample_rate) {
+
+    codec_nemo_nano_codec & nemo = *static_cast<codec_nemo_nano_codec *>(ctx->model->impl);
+    const int32_t n_in = (int32_t) pcm.size();
+    const int32_t n_q = std::max(1, nemo.n_q);
+    const int32_t codebook_dim = std::max(1, nemo.codebook_dim);
+    const int32_t codebook_size = std::max(2, nemo.codebook_size);
+
+    const size_t mem = 64 * 1024 * 1024 + (size_t) n_in * sizeof(float) * 24;
+    codec_graph_eval_guard eval_guard(ctx);
+    nemo_encode_build build = { n_in, hop_size, n_q, codebook_dim, codebook_size };
+    codec_graph_cache_entry * entry = nullptr;
+    std::string err;
+    if (!codec_graph_cache_get_or_build(
+            ctx,
+            { CODEC_GRAPH_NEMO_NANO_ENCODE, /*n_frames=*/0, /*n_q=*/n_q, /*hop=*/hop_size, /*n_in=*/n_in, /*latent_dim=*/codebook_dim },
+            mem,
+            nemo_build_encode,
+            &build,
+            sizeof(build),
+            &entry,
+            &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    ggml_tensor * t_pcm = codec_graph_get_tensor(ctx, entry, "nemo.encode.pcm");
+    ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "nemo.encode.out");
+    if (t_pcm == nullptr || t_out == nullptr) {
+        codec_context_set_error(ctx, "cached NeMo encode graph is invalid");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    if (!codec_graph_prepare_io(ctx, entry, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // write weights
+    if (!nemo_copy_conv1d(ctx, "nemo.enc.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.w"), &err) ||
+        !nemo_copy_bias_1d(ctx, "nemo.enc.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.b"), &err) ||
+        !nemo_copy_conv1d(ctx, "nemo.enc.post.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.w"), &err) ||
+        !nemo_copy_bias_1d(ctx, "nemo.enc.post.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.b"), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    for (int32_t li = 0; li < 5; ++li) {
+        if (!nemo_copy_conv1d(ctx, nemo_enc_down_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_w_name(li).c_str()), &err) ||
+            !nemo_copy_bias_1d(ctx, nemo_enc_down_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_b_name(li).c_str()), &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        for (int32_t bi = 0; bi < 3; ++bi) {
+            for (int32_t ri = 0; ri < 3; ++ri) {
+                if (!nemo_copy_conv1d(ctx, nemo_enc_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_w(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_bias_1d(ctx, nemo_enc_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_b(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_conv1d(ctx, nemo_enc_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_w(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_bias_1d(ctx, nemo_enc_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_b(li, bi, ri).c_str()), &err)) {
+                    codec_context_set_error(ctx, err);
+                    return CODEC_STATUS_INTERNAL_ERROR;
+                }
+            }
+        }
+    }
+
+    // FSQ constants
+    if (!nemo_copy_1d(ctx, "nemo.fsq.scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.scale"), &err) ||
+        !nemo_copy_1d(ctx, "nemo.fsq.out_scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_scale"), &err) ||
+        !nemo_copy_1d(ctx, "nemo.fsq.out_offset", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_offset"), &err) ||
+        !nemo_copy_1d(ctx, "nemo.fsq.in_shift", codec_graph_get_tensor(ctx, entry, "nemo.fsq.in_shift"), &err) ||
+        !nemo_copy_1d(ctx, "nemo.fsq.dim_base", codec_graph_get_tensor(ctx, entry, "nemo.fsq.dim_base"), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    const int32_t n_threads = ctx->model->n_threads > 0 ? ctx->model->n_threads : 1;
+    if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    if (nemo_dump_dir() != nullptr) {
+        if (!nemo_dump_tensor(ctx, entry, "nemo.encode.pcm", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.w", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.b", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.pad", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.im2col", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.out", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.enc.post.out", &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        for (int32_t li = 0; li < 5; ++li) {
+            if (!nemo_dump_tensor(ctx, entry, "nemo.enc.down." + std::to_string(li) + ".out", &err)) {
+                codec_context_set_error(ctx, err);
+                return CODEC_STATUS_INTERNAL_ERROR;
+            }
+            for (int32_t bi = 0; bi < 3; ++bi) {
+                for (int32_t ri = 0; ri < 3; ++ri) {
+                    const std::string name = "nemo.enc.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out";
+                    if (!nemo_dump_tensor(ctx, entry, name, &err)) {
+                        codec_context_set_error(ctx, err);
+                        return CODEC_STATUS_INTERNAL_ERROR;
+                    }
+                }
+            }
+        }
+    }
+
+    const int32_t n_frames = (int32_t) t_out->ne[0];
+    const int32_t nq = (int32_t) t_out->ne[1];
+    std::vector<int32_t> tok((size_t) n_frames * (size_t) nq, 0);
+    if (!codec_runtime_read_tensor(t_out, tok.data(), tok.size() * sizeof(int32_t), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // t_out is [t, q] in ggml order (q-major). Convert to t-major for tokens.
+    std::vector<int32_t> tok_tq(tok.size(), 0);
+    for (int32_t qi = 0; qi < nq; ++qi) {
+        for (int32_t ti = 0; ti < n_frames; ++ti) {
+            tok_tq[(size_t) ti * (size_t) nq + (size_t) qi] = tok[(size_t) qi * (size_t) n_frames + (size_t) ti];
+        }
+    }
+
+    int32_t * data = static_cast<int32_t *>(std::malloc(tok_tq.size() * sizeof(int32_t)));
+    if (data == nullptr) {
+        codec_context_set_error(ctx, "failed to allocate token output");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    std::memcpy(data, tok_tq.data(), tok_tq.size() * sizeof(int32_t));
+    codec_token_buffer_reset(out_tokens);
+    out_tokens->data = data;
+    out_tokens->n_tokens = n_frames * nq;
+    out_tokens->n_frames = n_frames;
+    out_tokens->n_q = nq;
+    out_tokens->codebook_size = codebook_size;
+    out_tokens->sample_rate = sample_rate;
+    out_tokens->hop_size = hop_size;
+
+    return CODEC_STATUS_SUCCESS;
+}
+
+static enum codec_status nemo_decode_graph(
+    codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    int32_t use_n_q,
+    struct codec_pcm_buffer * out_pcm,
+    int32_t hop_size,
+    int32_t sample_rate) {
+
+    codec_nemo_nano_codec & nemo = *static_cast<codec_nemo_nano_codec *>(ctx->model->impl);
+    if (tokens == nullptr || tokens->data == nullptr || tokens->n_frames <= 0) {
+        codec_context_set_error(ctx, "invalid NeMo token buffer");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    const int32_t t = tokens->n_frames;
+    const int32_t q = use_n_q;
+    const int32_t codebook_dim = std::max(1, nemo.codebook_dim);
+    const int32_t codebook_size = std::max(2, nemo.codebook_size);
+    const size_t mem = 64 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
+    codec_graph_eval_guard eval_guard(ctx);
+
+    nemo_decode_build build = { t, q, codebook_dim, codebook_size };
+    codec_graph_cache_entry * entry = nullptr;
+    std::string err;
+    if (!codec_graph_cache_get_or_build(
+            ctx,
+            { CODEC_GRAPH_NEMO_NANO_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop_size, /*n_in=*/0, /*latent_dim=*/0 },
+            mem,
+            nemo_build_decode,
+            &build,
+            sizeof(build),
+            &entry,
+            &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    ggml_tensor * t_tok = codec_graph_get_tensor(ctx, entry, "nemo.decode.tok");
+    ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "nemo.decode.out");
+    if (t_tok == nullptr || t_out == nullptr) {
+        codec_context_set_error(ctx, "cached NeMo decode graph is invalid");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    if (!codec_graph_prepare_io(ctx, entry, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // tokens->data is [t, q] (t-major). ggml expects [q, t] with t as ne0.
+    std::vector<int32_t> tok_i32((size_t) t * (size_t) q, 0);
+    const int32_t * src = static_cast<const int32_t *>(tokens->data);
+    for (int32_t ti = 0; ti < t; ++ti) {
+        for (int32_t qi = 0; qi < q; ++qi) {
+            int32_t v = src[(size_t) ti * (size_t) q + (size_t) qi];
+            v = std::max(0, std::min(codebook_size - 1, v));
+            tok_i32[(size_t) qi * (size_t) t + (size_t) ti] = v;
+        }
+    }
+
+    if (!codec_runtime_write_tensor(t_tok, tok_i32.data(), tok_i32.size() * sizeof(int32_t), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    for (int32_t g = 0; g < q; ++g) {
+        const std::string name = "nemo.fsq.codebook." + std::to_string(g);
+        if (!nemo_copy_codebook(ctx, name, codec_graph_get_tensor(ctx, entry, name.c_str()), &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    if (!nemo_copy_conv1d(ctx, "nemo.dec.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.w"), &err) ||
+        !nemo_copy_bias_1d(ctx, "nemo.dec.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.b"), &err) ||
+        !nemo_copy_conv1d(ctx, "nemo.dec.post.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.w"), &err) ||
+        !nemo_copy_bias_1d(ctx, "nemo.dec.post.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.b"), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    for (int32_t li = 0; li < 5; ++li) {
+        if (!nemo_copy_convtr1d(ctx, nemo_dec_up_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_w_name(li).c_str()), &err) ||
+            !nemo_copy_bias_1d(ctx, nemo_dec_up_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_b_name(li).c_str()), &err) ||
+            !nemo_copy_1d(ctx, nemo_dec_act_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_act_name(li).c_str()), &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        for (int32_t bi = 0; bi < 3; ++bi) {
+            for (int32_t ri = 0; ri < 3; ++ri) {
+                if (!nemo_copy_1d(ctx, nemo_dec_res_in_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_a(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_1d(ctx, nemo_dec_res_sk_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_a(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_conv1d(ctx, nemo_dec_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_w(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_bias_1d(ctx, nemo_dec_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_b(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_conv1d(ctx, nemo_dec_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_w(li, bi, ri).c_str()), &err) ||
+                    !nemo_copy_bias_1d(ctx, nemo_dec_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_b(li, bi, ri).c_str()), &err)) {
+                    codec_context_set_error(ctx, err);
+                    return CODEC_STATUS_INTERNAL_ERROR;
+                }
+            }
+        }
+    }
+
+    if (!nemo_copy_1d(ctx, "nemo.dec.post.a", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.a"), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    const int32_t n_threads = ctx->model->n_threads > 0 ? ctx->model->n_threads : 1;
+    if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    if (nemo_dump_dir() != nullptr) {
+        if (!nemo_dump_tensor(ctx, entry, "nemo.fsq.codebook.0", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.dec.embed.out", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.dec.pre.out", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.dec.post.act", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.dec.post.out", &err) ||
+            !nemo_dump_tensor(ctx, entry, "nemo.decode.out", &err)) {
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        for (int32_t li = 0; li < 5; ++li) {
+            if (!nemo_dump_tensor(ctx, entry, "nemo.dec.up." + std::to_string(li) + ".out", &err)) {
+                codec_context_set_error(ctx, err);
+                return CODEC_STATUS_INTERNAL_ERROR;
+            }
+            for (int32_t bi = 0; bi < 3; ++bi) {
+                for (int32_t ri = 0; ri < 3; ++ri) {
+                    const std::string name = "nemo.dec.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out";
+                    if (!nemo_dump_tensor(ctx, entry, name, &err)) {
+                        codec_context_set_error(ctx, err);
+                        return CODEC_STATUS_INTERNAL_ERROR;
+                    }
+                }
+            }
+        }
+    }
+
+    const int32_t n_pcm = (int32_t) t_out->ne[0];
+    std::vector<float> pcm((size_t) n_pcm, 0.0f);
+    if (!codec_runtime_read_tensor(t_out, pcm.data(), pcm.size() * sizeof(float), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    codec_pcm_buffer_reset(out_pcm);
+    out_pcm->n_channels = 1;
+    out_pcm->sample_rate = sample_rate;
+    out_pcm->n_samples = n_pcm;
+    out_pcm->data = static_cast<float *>(std::malloc(pcm.size() * sizeof(float)));
+    if (out_pcm->data == nullptr) {
+        codec_context_set_error(ctx, "failed to allocate PCM output");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    std::memcpy(out_pcm->data, pcm.data(), pcm.size() * sizeof(float));
+    return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status codec_nemo_nano_codec_init(struct codec_model * model) {
+    if (model == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    codec_nemo_nano_codec nemo;
+    nemo.sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 22050);
+    nemo.hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 1764);
+    nemo.n_q = codec_read_i32_kv(model->gguf, "codec.n_q", 4);
+    nemo.codebook_size = codec_read_i32_kv(model->gguf, "codec.codebook_size", 4032);
+    nemo.codebook_dim = codec_read_i32_kv(model->gguf, "codec.codebook_dim", 4);
+    nemo.latent_dim = codec_read_i32_kv(model->gguf, "codec.latent_dim", 16);
+    nemo.has_encoder = codec_read_bool_kv(model->gguf, "codec.has_encoder", true);
+    nemo.has_decoder = codec_read_bool_kv(model->gguf, "codec.has_decoder", true);
+
+    model->sample_rate = nemo.sample_rate;
+    model->hop_size = nemo.hop_size;
+    model->n_q = nemo.n_q;
+    model->codebook_size = nemo.codebook_size;
+    model->latent_dim = nemo.latent_dim;
+    model->has_encoder = nemo.has_encoder;
+    model->has_decoder = nemo.has_decoder;
+    model->impl = new (std::nothrow) codec_nemo_nano_codec(nemo);
+    if (model->impl == nullptr) {
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status codec_nemo_nano_codec_encode(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * /*out_latent*/,
+    struct codec_encode_params params) {
+
+    codec_nemo_nano_codec & nemo = *static_cast<codec_nemo_nano_codec *>(ctx->model->impl);
+    if (!nemo.has_encoder) {
+        codec_context_set_error(ctx, "model metadata indicates no encoder");
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (pcm.empty()) {
+        codec_context_set_error(ctx, "empty pcm");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    const int32_t model_n_q = std::max(1, nemo.n_q);
+    const int32_t use_n_q = params.n_q == 0 ? model_n_q : params.n_q;
+    if (params.n_q < 0 || use_n_q < 1 || use_n_q > model_n_q) {
+        codec_context_set_error(ctx, "NeMo encode n_q must be 0 or in [1, model_n_q]");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    const int32_t hop = std::max(1, params.hop_size > 0 ? params.hop_size : nemo.hop_size);
+    return nemo_encode_graph(ctx, pcm, out_tokens, hop, nemo.sample_rate);
+}
+
+enum codec_status codec_nemo_nano_codec_decode(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+
+    codec_nemo_nano_codec & nemo = *static_cast<codec_nemo_nano_codec *>(ctx->model->impl);
+    if (!nemo.has_decoder) {
+        codec_context_set_error(ctx, "model metadata indicates no decoder");
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    const int32_t model_n_q = std::max(1, nemo.n_q);
+    const int32_t use_n_q = params.n_q == 0 ? model_n_q : params.n_q;
+    if (params.n_q < 0 || use_n_q < 1 || use_n_q > model_n_q) {
+        codec_context_set_error(ctx, "NeMo decode n_q must be 0 or in [1, model_n_q]");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const int32_t hop = std::max(1, nemo.hop_size);
+    return nemo_decode_graph(ctx, tokens, use_n_q, out_pcm, hop, nemo.sample_rate);
+}
+
+static void * nemo_create_impl() {
+    return new (std::nothrow) codec_nemo_nano_codec();
+}
+
+static void nemo_destroy_impl(void * ptr) {
+    delete static_cast<codec_nemo_nano_codec *>(ptr);
+}
+
+static enum codec_status nemo_encode_wrap(
+    struct codec_context * ctx,
+    const std::vector<float> & pcm,
+    struct codec_token_buffer * out_tokens,
+    struct codec_latent_buffer * out_latent,
+    struct codec_encode_params params) {
+    return codec_nemo_nano_codec_encode(ctx, pcm, out_tokens, out_latent, params);
+}
+
+static enum codec_status nemo_decode_wrap(
+    struct codec_context * ctx,
+    const struct codec_token_buffer * tokens,
+    struct codec_pcm_buffer * out_pcm,
+    struct codec_decode_params params) {
+    return codec_nemo_nano_codec_decode(ctx, tokens, out_pcm, params);
+}
+
+const struct codec_model_vtable * codec_nemo_nano_codec_vtable() {
+    static codec_model_vtable vtable = {
+        CODEC_ARCH_NEMO_NANO_CODEC,
+        "nemo_nano_codec",
+        nemo_create_impl,
+        nemo_destroy_impl,
+        codec_nemo_nano_codec_init,
+        nemo_encode_wrap,
+        nemo_decode_wrap,
+        nullptr,
+    };
+    return &vtable;
+}

@@ -17,6 +17,10 @@ enum codec_arch {
     CODEC_ARCH_DAC = 2,
     CODEC_ARCH_MIMI = 3,
     CODEC_ARCH_QWEN3_TTS_TOKENIZER = 4,
+    CODEC_ARCH_SOPRANO = 5,
+    CODEC_ARCH_NEMO_NANO_CODEC = 6,
+    CODEC_ARCH_NEUCODEC = 7,
+    CODEC_ARCH_DISTILL_NEUCODEC = 8,
 };
 
 enum codec_status {

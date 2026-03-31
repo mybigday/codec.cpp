@@ -42,15 +42,21 @@ add_library(codec STATIC
     src/runtime/graph_exec.cpp
     src/ops/safe_math.cpp
     src/ops/ggml_ops.cpp
+    src/ops/lm_attn.cpp
     src/ops/rope.cpp
     src/ops/rvq.cpp
     src/ops/conv1d.cpp
     src/ops/convtr1d.cpp
+    src/ops/pool1d.cpp
+    src/ops/local_attn.cpp
     src/batch/batch.cpp
     src/models/wavtokenizer.cpp
     src/models/dac.cpp
     src/models/mimi.cpp
     src/models/qwen3_tts_tokenizer.cpp
+    src/models/soprano.cpp
+    src/models/nemo_nano_codec.cpp
+    src/models/neucodec.cpp
 )
 
 target_include_directories(codec

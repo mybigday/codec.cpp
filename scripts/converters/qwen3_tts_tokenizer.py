@@ -128,7 +128,7 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
             arr = mimi_transform_tensor_for_codec(key, encoder_sd[key], weight_transforms)
             for mapped in mimi_map_tensor_names(key):
                 short = mimi_shorten_tensor_name(mapped, used)
-                writer.add_tensor(short, arr, self._get_target_dtype(short, arr))
+                self._add_tensor(writer, short, arr, self._get_target_dtype(short, arr))
 
         # Add normalized RVQ codebook embeddings (semantic + acoustic) for encoder.
         def add_codebook_embeds(prefix: str, short_prefix: str) -> None:
@@ -144,7 +144,7 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
                 if embed.ndim != 2:
                     raise ValueError(f"Unexpected encoder codebook shape: {es_key} {embed.shape}")
                 name = f"{short_prefix}layers.{qi}.cb.embed"
-                writer.add_tensor(name, embed, self._get_target_dtype(name, embed))
+                self._add_tensor(writer, name, embed, self._get_target_dtype(name, embed))
                 used.add(name)
 
         add_codebook_embeds("quantizer.semantic_residual_vector_quantizer.", "q.s.")
@@ -157,7 +157,7 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
         def add_tensor(name: str, arr: np.ndarray) -> None:
             if len(name) > MAX_TENSOR_NAME:
                 raise ValueError(f"Qwen tensor name too long: {name}")
-            writer.add_tensor(name, arr, self._get_target_dtype(name, arr))
+            self._add_tensor(writer, name, arr, self._get_target_dtype(name, arr))
             used.add(name)
 
         def map_decoder_key(key: str) -> Optional[Tuple[str, str]]:
@@ -396,6 +396,7 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
 
         writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
         writer.add_name("Qwen3-TTS-Tokenizer")
 
         dec = _decoder_cfg(self.config)
@@ -458,5 +459,6 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
         self._write_encoder_weights(writer, used)
         self._write_decoder_weights(writer, used)
 
+        self._warn_if_no_quantized()
         writer.write_all()
         self.log(f"Wrote Qwen3-TTS-Tokenizer GGUF to {output_path}")

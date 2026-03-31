@@ -12,6 +12,11 @@ enum codec_graph_kind {
     CODEC_GRAPH_MIMI_DECODE = 6,
     CODEC_GRAPH_MIMI_ENCODE = 7,
     CODEC_GRAPH_Q3T_DECODE = 8,
+    CODEC_GRAPH_SOPRANO_DECODE = 9,
+    CODEC_GRAPH_NEMO_NANO_DECODE = 10,
+    CODEC_GRAPH_NEMO_NANO_ENCODE = 11,
+    CODEC_GRAPH_NEUCODEC_DECODE = 12,
+    CODEC_GRAPH_NEUCODEC_ENCODE = 13,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

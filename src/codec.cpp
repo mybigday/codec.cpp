@@ -4,6 +4,9 @@
 #include "models/dac.h"
 #include "models/mimi.h"
 #include "models/qwen3_tts_tokenizer.h"
+#include "models/soprano.h"
+#include "models/nemo_nano_codec.h"
+#include "models/neucodec.h"
 #include "models/wavtokenizer.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
@@ -97,6 +100,20 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
         return CODEC_ARCH_QWEN3_TTS_TOKENIZER;
     }
 
+    if (arch == "soprano") {
+        return CODEC_ARCH_SOPRANO;
+    }
+
+    if (arch == "nemo_nano_codec" || arch == "nemo-nano-codec" || arch == "nemo") {
+        return CODEC_ARCH_NEMO_NANO_CODEC;
+    }
+    if (arch == "neucodec") {
+        return CODEC_ARCH_NEUCODEC;
+    }
+    if (arch == "distill_neucodec" || arch == "distill-neucodec") {
+        return CODEC_ARCH_DISTILL_NEUCODEC;
+    }
+
     return CODEC_ARCH_UNKNOWN;
 }
 
@@ -110,6 +127,14 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_mimi_vtable();
         case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
             return codec_qwen3_tts_tokenizer_vtable();
+        case CODEC_ARCH_SOPRANO:
+            return codec_soprano_vtable();
+        case CODEC_ARCH_NEMO_NANO_CODEC:
+            return codec_nemo_nano_codec_vtable();
+        case CODEC_ARCH_NEUCODEC:
+            return codec_neucodec_vtable();
+        case CODEC_ARCH_DISTILL_NEUCODEC:
+            return codec_distill_neucodec_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -122,6 +147,10 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_DAC:                return "DAC";
         case CODEC_ARCH_MIMI:               return "Mimi";
         case CODEC_ARCH_QWEN3_TTS_TOKENIZER:return "Qwen3-TTS-Tokenizer";
+        case CODEC_ARCH_SOPRANO:            return "Soprano";
+        case CODEC_ARCH_NEMO_NANO_CODEC:    return "NeMo-Nano-Codec";
+        case CODEC_ARCH_NEUCODEC:           return "NeuCodec";
+        case CODEC_ARCH_DISTILL_NEUCODEC:   return "Distill-NeuCodec";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }
@@ -138,6 +167,7 @@ enum codec_status codec_model_init_arch(struct codec_model * model) {
         return model->vtable->init(model);
     }
     model->sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 0);
+    model->encode_sample_rate = codec_read_i32_kv(model->gguf, "codec.encode_sample_rate", 0);
     model->has_encoder = codec_read_bool_kv(model->gguf, "codec.has_encoder", false);
     model->has_decoder = codec_read_bool_kv(model->gguf, "codec.has_decoder", false);
     model->hop_size = codec_read_i32_kv(model->gguf, "codec.hop_size", 0);
@@ -315,6 +345,7 @@ struct codec_model * codec_model_load_from_file(const char * path_model, struct 
     }
 
     model->sample_rate = 0;
+    model->encode_sample_rate = 0;
     model->has_encoder = false;
     model->has_decoder = false;
     model->hop_size = 0;
@@ -439,9 +470,10 @@ static enum codec_status codec_encode_impl(
     }
     codec_context_set_error(ctx, "");
 
-    if (ctx->model->sample_rate > 0 && audio->sample_rate != ctx->model->sample_rate) {
+    const int32_t expect_sr = ctx->model->encode_sample_rate > 0 ? ctx->model->encode_sample_rate : ctx->model->sample_rate;
+    if (expect_sr > 0 && audio->sample_rate != expect_sr) {
         std::ostringstream oss;
-        oss << "sample_rate mismatch: got " << audio->sample_rate << ", expected " << ctx->model->sample_rate
+        oss << "sample_rate mismatch: got " << audio->sample_rate << ", expected " << expect_sr
             << " (resample before codec_encode)";
         codec_context_set_error(ctx, oss.str());
         return CODEC_STATUS_INVALID_ARG;

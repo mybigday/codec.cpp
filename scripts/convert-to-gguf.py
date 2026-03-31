@@ -9,7 +9,7 @@ Usage:
     python convert-to-gguf.py --model-id kyutai/mimi --output mimi.gguf
     
     # From local checkpoint
-    python convert-to-gguf.py --input-dir ./mimi-checkpoint --output mimi.gguf
+    python convert-to-gguf.py --checkpoint-path ./mimi-checkpoint --output mimi.gguf
     
     # With quantization
     python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantization Q4_K_M
@@ -42,6 +42,14 @@ def detect_model_type_from_config(config_path: Path) -> str:
         return "wavtokenizer"
     elif "qwen3" in model_type or "qwen" in model_type:
         return "qwen3_tts_tokenizer"
+    elif "soprano" in model_type:
+        return "soprano"
+    elif "nemo" in model_type or "nano" in model_type:
+        return "nemo_nano_codec"
+    elif "neucodec" in model_type:
+        if "distill" in model_type:
+            return "distill_neucodec"
+        return "neucodec"
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
@@ -53,6 +61,14 @@ def detect_model_type_from_config(config_path: Path) -> str:
             return "wavtokenizer"
         elif "qwen3" in arch or "qwen" in arch:
             return "qwen3_tts_tokenizer"
+        elif "soprano" in arch:
+            return "soprano"
+        elif "nemo" in arch or "nano" in arch:
+            return "nemo_nano_codec"
+        elif "neucodec" in arch:
+            if "distill" in arch:
+                return "distill_neucodec"
+            return "neucodec"
     
     raise ValueError(f"Unknown model type: {model_type}. Cannot auto-detect.")
 
@@ -68,6 +84,14 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         return 'dac'
     elif 'qwen' in name_lower:
         return 'qwen3_tts_tokenizer'
+    elif 'soprano' in name_lower:
+        return 'soprano'
+    elif 'nemo' in name_lower or 'nano-codec' in name_lower:
+        return 'nemo_nano_codec'
+    elif 'neucodec' in name_lower:
+        if 'distill' in name_lower:
+            return 'distill_neucodec'
+        return 'neucodec'
     return None
 
 
@@ -81,15 +105,15 @@ Examples:
   python convert-to-gguf.py --model-id kyutai/mimi --output mimi.gguf
   
   # Convert from local checkpoint file (auto-detect)
-  python convert-to-gguf.py --input-dir ./model.ckpt --output model.gguf
+  python convert-to-gguf.py --checkpoint-path ./model.ckpt --output model.gguf
   
   # Convert from local checkpoint directory
-  python convert-to-gguf.py --input-dir ./checkpoints/mimi --output mimi.gguf
+  python convert-to-gguf.py --checkpoint-path ./checkpoints/mimi --output mimi.gguf
   
   # With quantization
   python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantization Q4_K_M
   
-Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer
+Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, soprano, nemo_nano_codec, neucodec, distill_neucodec
         """
     )
     
@@ -100,7 +124,7 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer
         help="HuggingFace model ID (e.g., kyutai/mimi)"
     )
     source_group.add_argument(
-        "--input-dir",
+        "--checkpoint-path",
         type=str,
         help="Local checkpoint (directory or single .ckpt/.pth/.bin file)"
     )
@@ -176,7 +200,7 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer
                 raise ValueError(f"Cannot auto-detect model type for {args.model_id}. Please specify --model-type.") from e
     else:
         # Local checkpoint mode
-        input_path = Path(args.input_dir)
+        input_path = Path(args.checkpoint_path)
         checkpoint_path = input_path
         
         if args.model_type:

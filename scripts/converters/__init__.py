@@ -7,6 +7,9 @@ from .mimi import MimiConverter
 from .dac import DacConverter
 from .wavtokenizer import WavTokenizerConverter
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizerConverter
+from .soprano import SopranoConverter
+from .nemo_nano_codec import NemoNanoCodecConverter
+from .neucodec import NeuCodecConverter, DistillNeuCodecConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -14,6 +17,10 @@ _CONVERTER_REGISTRY = {
     'dac': DacConverter,
     'wavtokenizer': WavTokenizerConverter,
     'qwen3_tts_tokenizer': Qwen3TTSTokenizerConverter,
+    'soprano': SopranoConverter,
+    'nemo_nano_codec': NemoNanoCodecConverter,
+    'neucodec': NeuCodecConverter,
+    'distill_neucodec': DistillNeuCodecConverter,
 }
 
 

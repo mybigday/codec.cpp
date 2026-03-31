@@ -195,6 +195,30 @@ class DacConverter(BaseConverter):
     def architecture(self) -> str:
         return "dac"
 
+    def should_quantize_tensor(self, name: str, arr: np.ndarray) -> bool:
+        if self.quantization not in ("Q4_K_M", "Q5_K_M", "Q8_0"):
+            return False
+
+        if arr.ndim < 2:
+            return False
+
+        if name.endswith(".bias") or name.endswith(".b"):
+            return False
+
+        if (".codebook." in name or name.endswith(".embed")) and not self.quantize_codebook:
+            return False
+
+        is_weight = name.endswith(".weight") or name.endswith(".w")
+        if not is_weight:
+            return False
+
+        ne0 = int(arr.shape[0])
+        if self.quantization in ("Q4_K_M", "Q5_K_M"):
+            return (ne0 % 256) == 0
+        if self.quantization == "Q8_0":
+            return (ne0 % 32) == 0
+        return False
+
     def load_from_checkpoint(self, checkpoint_dir: Path) -> None:
         if torch is None:
             raise RuntimeError("torch is required for DAC checkpoint conversion")
@@ -202,7 +226,11 @@ class DacConverter(BaseConverter):
         checkpoint_dir = Path(checkpoint_dir)
         config_path = checkpoint_dir / "config.json"
         model_file = checkpoint_dir / "pytorch_model.bin"
-        if not model_file.is_file():
+
+        if checkpoint_dir.is_file() and checkpoint_dir.suffix in (".safetensors", ".bin", ".pt", ".pth"):
+            model_file = checkpoint_dir
+
+        elif not model_file.is_file():
             candidates = (
                 sorted(checkpoint_dir.glob("*.safetensors"))
                 + sorted(checkpoint_dir.glob("*.bin"))
@@ -277,6 +305,7 @@ class DacConverter(BaseConverter):
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
 
         writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
         writer.add_name(self.model_name)
         writer.add_uint32("codec.sample_rate", int(self.config["sample_rate"]))
         writer.add_uint32("codec.hop_size", int(self.config["hop_size"]))
@@ -301,7 +330,8 @@ class DacConverter(BaseConverter):
         used = set()
         for _src_key, (mapped_name, arr) in mapped.items():
             out_name = shorten_tensor_name(mapped_name, used)
-            writer.add_tensor(out_name, arr, self._get_target_dtype(out_name, arr))
+            self._add_tensor(writer, out_name, arr)
 
+        self._warn_if_no_quantized()
         writer.write()
         self.log(f"Wrote DAC GGUF to {output_path}")

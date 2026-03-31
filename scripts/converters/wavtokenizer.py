@@ -432,6 +432,7 @@ class WavTokenizerConverter(BaseConverter):
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
 
         writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
         writer.add_name("WavTokenizer")
         writer.add_uint32("codec.sample_rate", int(self.config["sample_rate"]))
         writer.add_uint32("codec.hop_size", int(self.config["hop_size"]))
@@ -456,8 +457,9 @@ class WavTokenizerConverter(BaseConverter):
                     arr = transform_tensor_for_codec(v_key, arr, self.conv_transforms)
                     out_mapped = mapped_v.replace(".weight_v", ".weight")
                     out_name = shorten_tensor_name(out_mapped, used_names)
-                    print(f"add_tensor {v_key}/{src_key} -> {out_name} {arr.shape} {self._get_target_dtype(out_name, arr)}")
-                    writer.add_tensor(out_name, arr, self._get_target_dtype(out_name, arr))
+                    st_dtype = self._get_target_dtype(out_name, arr)
+                    print(f"add_tensor {v_key}/{src_key} -> {out_name} {arr.shape} {st_dtype}")
+                    self._add_tensor(writer, out_name, arr, st_dtype)
                     handled.add(src_key)
                     handled.add(v_key)
                     continue
@@ -471,9 +473,11 @@ class WavTokenizerConverter(BaseConverter):
             arr = maybe_transpose_lstm_weight(src_key, arr)
             arr = transform_tensor_for_codec(src_key, arr, self.conv_transforms)
             out_name = shorten_tensor_name(mapped, used_names)
-            print(f"add_tensor {src_key} -> {out_name} {arr.shape} {self._get_target_dtype(out_name, arr)}")
-            writer.add_tensor(out_name, arr, self._get_target_dtype(out_name, arr))
+            st_dtype = self._get_target_dtype(out_name, arr)
+            print(f"add_tensor {src_key} -> {out_name} {arr.shape} {st_dtype}")
+            self._add_tensor(writer, out_name, arr, st_dtype)
 
         add_kernel_tensors(writer, int(self.config["hop_size"]))
+        self._warn_if_no_quantized()
         writer.write()
         self.log(f"Wrote WavTokenizer GGUF to {output_path}")

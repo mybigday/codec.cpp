@@ -3,6 +3,7 @@
 #include "../ops/conv1d.h"
 #include "../ops/convtr1d.h"
 #include "../ops/ggml_ops.h"
+#include "../ops/lm_attn.h"
 #include "../ops/rope.h"
 #include "../ops/rvq.h"
 #include "../runtime/graph.h"
@@ -508,16 +509,10 @@ static bool codec_mimi_build_encode_transformer(ggml_context * ctx_eval, void * 
             return false;
         }
 
-        ggml_tensor * attn_scores = ggml_mul_mat(ctx_eval, ggml_cont(ctx_eval, k_rope), q_rope); // [t, t, h]
-        if (attn_scores == nullptr) {
-            return false;
-        }
-        attn_scores = ggml_scale_inplace(ctx_eval, attn_scores, 1.0f / std::sqrt((float) p->head_dim));
-        attn_scores = ggml_diag_mask_inf_inplace(ctx_eval, attn_scores, 0);
-        ggml_tensor * attn_probs = ggml_soft_max(ctx_eval, attn_scores);
-
-        ggml_tensor * v_tdh = ggml_permute(ctx_eval, v_dth, 1, 0, 2, 3);
-        ggml_tensor * attn_ctx = ggml_mul_mat(ctx_eval, ggml_cont(ctx_eval, v_tdh), attn_probs); // [d, t, h]
+        codec_lm_attn_params attn_p = {};
+        attn_p.scale = 1.0f / std::sqrt((float) p->head_dim);
+        attn_p.causal = true;
+        ggml_tensor * attn_ctx = codec_op_lm_attn_ctx_dth(ctx_eval, q_rope, k_rope, v_dth, &attn_p); // [d, t, h]
         if (attn_ctx == nullptr) {
             return false;
         }

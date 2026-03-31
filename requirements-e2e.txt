@@ -13,3 +13,9 @@ transformers==4.57.3
 safetensors==0.7.0
 
 qwen-tts==0.1.1
+
+# NeuCodec deps
+torchtune==0.3.1
+vector-quantize-pytorch==1.17.8
+local-attention==1.11.1
+torchao==0.10.0

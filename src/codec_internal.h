@@ -27,6 +27,7 @@ struct codec_model {
     int32_t n_threads;
 
     int32_t sample_rate;
+    int32_t encode_sample_rate;
     bool has_encoder;
     bool has_decoder;
     int32_t hop_size;

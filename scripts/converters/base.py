@@ -7,6 +7,7 @@ All model-specific converters should inherit from this class.
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, Dict, Any
+import sys
 import numpy as np
 
 try:
@@ -44,6 +45,7 @@ class BaseConverter(ABC):
         self.quantization = quantization
         self.quantize_codebook = quantize_codebook
         self.verbose = verbose
+        self._quantized_tensors = 0
         
         # To be populated by load methods
         self.state_dict: Optional[Dict[str, np.ndarray]] = None
@@ -142,3 +144,24 @@ class BaseConverter(ABC):
             return self.quantization
         
         return "F16"
+
+    def _reset_quant_stats(self) -> None:
+        self._quantized_tensors = 0
+
+    def _track_quant(self, name: str, arr: np.ndarray) -> None:
+        if self.quantization in ("Q4_K_M", "Q5_K_M", "Q8_0") and self.should_quantize_tensor(name, arr):
+            self._quantized_tensors += 1
+
+    def _add_tensor(self, writer: GGUFWriter, name: str, arr: np.ndarray, st_dtype: Optional[str] = None) -> None:
+        if st_dtype is None:
+            st_dtype = self._get_target_dtype(name, arr)
+        self._track_quant(name, arr)
+        writer.add_tensor(name, arr, st_dtype)
+
+    def _warn_if_no_quantized(self) -> None:
+        if self.quantization in ("Q4_K_M", "Q5_K_M", "Q8_0") and self._quantized_tensors == 0:
+            print(
+                "Warning: 0 tensors eligible for quantization. This usually means tensor row sizes "
+                "do not meet the block-size requirements. Output will remain F16-sized.",
+                file=sys.stderr,
+            )
