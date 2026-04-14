@@ -618,14 +618,14 @@ static ggml_tensor * codec_wt_encode_resblock(
     return ggml_add(ctx_eval, sc, h);
 }
 
-static ggml_tensor * codec_wt_encode_lstm_layer(
+static ggml_tensor * codec_wt_encode_lstm_layers(
     ggml_context * ctx_eval,
     ggml_tensor * x_tc,
     int32_t dim,
-    int32_t layer,
+    int32_t n_layers,
     bool skip) {
 
-    if (ctx_eval == nullptr || x_tc == nullptr || dim <= 0) {
+    if (ctx_eval == nullptr || x_tc == nullptr || dim <= 0 || n_layers <= 0) {
         return nullptr;
     }
     const int32_t t = (int32_t) x_tc->ne[0];
@@ -633,54 +633,65 @@ static ggml_tensor * codec_wt_encode_lstm_layer(
         return nullptr;
     }
 
-    ggml_tensor * w_ih = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
-    ggml_set_name(w_ih, codec_wt_encode_lstm_name(layer, "w_ih").c_str());
-    ggml_tensor * w_hh = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
-    ggml_set_name(w_hh, codec_wt_encode_lstm_name(layer, "w_hh").c_str());
-    ggml_tensor * b_ih = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    ggml_set_name(b_ih, codec_wt_encode_lstm_name(layer, "b_ih").c_str());
-    ggml_tensor * b_hh = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    ggml_set_name(b_hh, codec_wt_encode_lstm_name(layer, "b_hh").c_str());
+    std::vector<ggml_tensor *> w_ih((size_t) n_layers, nullptr);
+    std::vector<ggml_tensor *> w_hh((size_t) n_layers, nullptr);
+    std::vector<ggml_tensor *> b_ih((size_t) n_layers, nullptr);
+    std::vector<ggml_tensor *> b_hh((size_t) n_layers, nullptr);
+    for (int32_t li = 0; li < n_layers; ++li) {
+        w_ih[(size_t) li] = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
+        ggml_set_name(w_ih[(size_t) li], codec_wt_encode_lstm_name(li, "w_ih").c_str());
+        w_hh[(size_t) li] = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
+        ggml_set_name(w_hh[(size_t) li], codec_wt_encode_lstm_name(li, "w_hh").c_str());
+        b_ih[(size_t) li] = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
+        ggml_set_name(b_ih[(size_t) li], codec_wt_encode_lstm_name(li, "b_ih").c_str());
+        b_hh[(size_t) li] = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
+        ggml_set_name(b_hh[(size_t) li], codec_wt_encode_lstm_name(li, "b_hh").c_str());
+    }
 
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc)); // [dim, t]
     ggml_tensor * y_ct = nullptr;
-    ggml_tensor * h_prev = nullptr;
-    ggml_tensor * c_prev = nullptr;
+    std::vector<ggml_tensor *> h_prev((size_t) n_layers, nullptr);
+    std::vector<ggml_tensor *> c_prev((size_t) n_layers, nullptr);
 
     for (int32_t ti = 0; ti < t; ++ti) {
         const size_t offset = (size_t) ti * (size_t) x_ct->nb[1];
-        ggml_tensor * x_t = ggml_view_2d(ctx_eval, x_ct, dim, 1, x_ct->nb[1], offset); // [dim, 1]
-        x_t = ggml_cont(ctx_eval, x_t);
-        if (h_prev == nullptr) {
-            h_prev = ggml_scale(ctx_eval, x_t, 0.0f);
-            c_prev = ggml_scale(ctx_eval, x_t, 0.0f);
+        ggml_tensor * layer_in = ggml_view_2d(ctx_eval, x_ct, dim, 1, x_ct->nb[1], offset); // [dim, 1]
+        layer_in = ggml_cont(ctx_eval, layer_in);
+
+        for (int32_t li = 0; li < n_layers; ++li) {
+            if (h_prev[(size_t) li] == nullptr) {
+                h_prev[(size_t) li] = ggml_scale(ctx_eval, layer_in, 0.0f);
+                c_prev[(size_t) li] = ggml_scale(ctx_eval, layer_in, 0.0f);
+            }
+
+            ggml_tensor * gates = ggml_add(
+                ctx_eval,
+                ggml_mul_mat(ctx_eval, w_ih[(size_t) li], layer_in),
+                ggml_mul_mat(ctx_eval, w_hh[(size_t) li], h_prev[(size_t) li]));
+            ggml_tensor * b_ih2 = ggml_reshape_2d(ctx_eval, b_ih[(size_t) li], 4 * dim, 1);
+            ggml_tensor * b_hh2 = ggml_reshape_2d(ctx_eval, b_hh[(size_t) li], 4 * dim, 1);
+            gates = ggml_add(ctx_eval, ggml_add(ctx_eval, gates, b_ih2), b_hh2);
+
+            const size_t gate_stride = (size_t) dim * gates->nb[0];
+            ggml_tensor * gate_i = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 0);
+            ggml_tensor * gate_f = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], gate_stride);
+            ggml_tensor * gate_g = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 2 * gate_stride);
+            ggml_tensor * gate_o = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 3 * gate_stride);
+
+            ggml_tensor * i = ggml_sigmoid(ctx_eval, gate_i);
+            ggml_tensor * f = ggml_sigmoid(ctx_eval, gate_f);
+            ggml_tensor * g = ggml_tanh(ctx_eval, gate_g);
+            ggml_tensor * o = ggml_sigmoid(ctx_eval, gate_o);
+
+            ggml_tensor * c_t = ggml_add(ctx_eval, ggml_mul(ctx_eval, f, c_prev[(size_t) li]), ggml_mul(ctx_eval, i, g));
+            ggml_tensor * h_t = ggml_mul(ctx_eval, o, ggml_tanh(ctx_eval, c_t));
+
+            h_prev[(size_t) li] = h_t;
+            c_prev[(size_t) li] = c_t;
+            layer_in = h_t;
         }
 
-        ggml_tensor * gates = ggml_add(
-            ctx_eval,
-            ggml_mul_mat(ctx_eval, w_ih, x_t),
-            ggml_mul_mat(ctx_eval, w_hh, h_prev));
-        ggml_tensor * b_ih2 = ggml_reshape_2d(ctx_eval, b_ih, 4 * dim, 1);
-        ggml_tensor * b_hh2 = ggml_reshape_2d(ctx_eval, b_hh, 4 * dim, 1);
-        gates = ggml_add(ctx_eval, ggml_add(ctx_eval, gates, b_ih2), b_hh2);
-
-        const size_t gate_stride = (size_t) dim * gates->nb[0];
-        ggml_tensor * gate_i = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 0);
-        ggml_tensor * gate_f = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], gate_stride);
-        ggml_tensor * gate_g = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 2 * gate_stride);
-        ggml_tensor * gate_o = ggml_view_2d(ctx_eval, gates, dim, 1, gates->nb[1], 3 * gate_stride);
-
-        ggml_tensor * i = ggml_sigmoid(ctx_eval, gate_i);
-        ggml_tensor * f = ggml_sigmoid(ctx_eval, gate_f);
-        ggml_tensor * g = ggml_tanh(ctx_eval, gate_g);
-        ggml_tensor * o = ggml_sigmoid(ctx_eval, gate_o);
-
-        ggml_tensor * c_t = ggml_add(ctx_eval, ggml_mul(ctx_eval, f, c_prev), ggml_mul(ctx_eval, i, g));
-        ggml_tensor * h_t = ggml_mul(ctx_eval, o, ggml_tanh(ctx_eval, c_t));
-
-        y_ct = (y_ct == nullptr) ? h_t : ggml_concat(ctx_eval, y_ct, h_t, 1);
-        h_prev = h_t;
-        c_prev = c_t;
+        y_ct = (y_ct == nullptr) ? layer_in : ggml_concat(ctx_eval, y_ct, layer_in, 1);
     }
 
     ggml_tensor * y_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, y_ct));
@@ -780,8 +791,7 @@ static bool codec_wt_build_encode(ggml_context * ctx_eval, void * user_data, ggm
         return false;
     }
 
-    x = codec_wt_encode_lstm_layer(ctx_eval, x, /*dim=*/512, /*layer=*/0, /*skip=*/true);
-    x = codec_wt_encode_lstm_layer(ctx_eval, x, /*dim=*/512, /*layer=*/1, /*skip=*/true);
+    x = codec_wt_encode_lstm_layers(ctx_eval, x, /*dim=*/512, /*n_layers=*/2, /*skip=*/true);
     if (x == nullptr) {
         return false;
     }
@@ -1741,8 +1751,8 @@ enum codec_status codec_wavtokenizer_encode(
 
     const int32_t n_frames = (int32_t) t_out->ne[0];
     const int32_t n_q = (int32_t) t_out->ne[1];
-    std::vector<int32_t> tok((size_t) n_frames * (size_t) n_q, 0);
-    if (!codec_runtime_read_tensor(t_out, tok.data(), tok.size() * sizeof(int32_t), &err)) {
+    std::vector<int32_t> tok;
+    if (!codec_runtime_read_tensor_i32_2d_tq(t_out, &tok, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

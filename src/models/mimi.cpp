@@ -503,8 +503,8 @@ static bool codec_mimi_build_encode_transformer(ggml_context * ctx_eval, void * 
         ggml_tensor * k_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, k, p->head_dim, p->n_heads, t_cur), 0, 2, 1, 3);
         ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, p->head_dim, p->n_heads, t_cur), 0, 2, 1, 3);
 
-        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->head_dim, p->rope_theta, freq_scale);
-        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->head_dim, p->rope_theta, freq_scale);
+        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->head_dim, p->rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
+        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->head_dim, p->rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
         if (q_rope == nullptr || k_rope == nullptr) {
             return false;
         }
@@ -856,6 +856,9 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
+    ggml_tensor * t_l0_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_name(t_l0_dbg, "mimi.encode_frontend.l0");
+    x = ggml_cpy(ctx_eval, x, t_l0_dbg);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_w[1], t_b[1], t_w[2], t_b[2]);
     if (x == nullptr) {
         return false;
@@ -901,6 +904,10 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
+
+    ggml_tensor * t_front_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_name(t_front_dbg, "mimi.encode_frontend.out");
+    x = ggml_cpy(ctx_eval, x, t_front_dbg);
 
     // Transformer layers operate on channel-major [c, t].
     x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x));
@@ -953,22 +960,16 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
         ggml_tensor * k_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, k, p->transformer.head_dim, p->transformer.n_heads, t_cur), 0, 2, 1, 3);
         ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, p->transformer.head_dim, p->transformer.n_heads, t_cur), 0, 2, 1, 3);
 
-        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer.head_dim, p->transformer.rope_theta, freq_scale);
-        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer.head_dim, p->transformer.rope_theta, freq_scale);
+        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer.head_dim, p->transformer.rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
+        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer.head_dim, p->transformer.rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
         if (q_rope == nullptr || k_rope == nullptr) {
             return false;
         }
 
-        ggml_tensor * attn_scores = ggml_mul_mat(ctx_eval, ggml_cont(ctx_eval, k_rope), q_rope);
-        if (attn_scores == nullptr) {
-            return false;
-        }
-        attn_scores = ggml_scale_inplace(ctx_eval, attn_scores, 1.0f / std::sqrt((float) p->transformer.head_dim));
-        attn_scores = ggml_diag_mask_inf_inplace(ctx_eval, attn_scores, 0);
-        ggml_tensor * attn_probs = ggml_soft_max(ctx_eval, attn_scores);
-
-        ggml_tensor * v_tdh = ggml_permute(ctx_eval, v_dth, 1, 0, 2, 3);
-        ggml_tensor * attn_ctx = ggml_mul_mat(ctx_eval, ggml_cont(ctx_eval, v_tdh), attn_probs);
+        codec_lm_attn_params attn_p = {};
+        attn_p.scale = 1.0f / std::sqrt((float) p->transformer.head_dim);
+        attn_p.causal = true;
+        ggml_tensor * attn_ctx = codec_op_lm_attn_ctx_dth(ctx_eval, q_rope, k_rope, v_dth, &attn_p);
         if (attn_ctx == nullptr) {
             return false;
         }
@@ -1003,13 +1004,17 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     }
     // Convolution/downsample path expects time-major [t, c].
     x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x));
+    ggml_tensor * t_x_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_name(t_x_dbg, "mimi.encode_transformer.out");
+    x = ggml_cpy(ctx_eval, x, t_x_dbg);
 
     ggml_tensor * t_downsample_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->downsample.kernel, p->downsample.in_c, p->downsample.out_c);
     ggml_set_name(t_downsample_w, "mimi.encode_downsample.w");
-    x = codec_conv1d_causal(ctx_eval, x, t_downsample_w, nullptr, p->downsample.stride, 1);
+    x = codec_conv1d_causal_replicate(ctx_eval, x, t_downsample_w, nullptr, p->downsample.stride, 1);
     if (x == nullptr) {
         return false;
     }
+    ggml_set_name(x, "mimi.encode_downsample.out");
 
     ggml_tensor * t_qs_ip_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->downsample.out_c, p->codebook_dim);
     ggml_set_name(t_qs_ip_w, CODEC_MIMI_ENCODE_RVQ_SEM_IP_TENSOR);
@@ -1022,22 +1027,32 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (sem_residual == nullptr || acu_residual == nullptr) {
         return false;
     }
+    ggml_set_name(sem_residual, "mimi.encode_rvq.sem_residual.l0");
+    ggml_set_name(acu_residual, "mimi.encode_rvq.acu_residual.l0");
 
     std::array<ggml_tensor *, CODEC_MIMI_MAX_RVQ_LAYERS> layer_indices = {};
     for (int32_t li = 0; li < p->n_q; ++li) {
         ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->codebook_size);
         ggml_set_name(t_codebook, codec_mimi_encode_rvq_codebook_tensor_name(li).c_str());
 
+        const mimi_encode_rvq_layer_desc & d = p->rvq_layers[(size_t) li];
+        if (d.group == CODEC_MIMI_RVQ_GROUP_ACOUSTIC && d.group_layer == 4) {
+            ggml_tensor * t_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, acu_residual->ne[0], acu_residual->ne[1]);
+            ggml_set_name(t_dbg, "mimi.encode_rvq.acu_input_q5");
+            acu_residual = ggml_cpy(ctx_eval, acu_residual, t_dbg);
+        }
         codec_rvq_layer_result_ggml res = {};
-        if (p->rvq_layers[(size_t) li].group == CODEC_MIMI_RVQ_GROUP_SEMANTIC) {
+        if (d.group == CODEC_MIMI_RVQ_GROUP_SEMANTIC) {
             if (!codec_rvq_build_layer_ggml(ctx_eval, sem_residual, t_codebook, &res)) {
                 return false;
             }
+            ggml_set_name(res.residual, ("mimi.encode_rvq.sem_residual.l" + std::to_string(li + 1)).c_str());
             sem_residual = res.residual;
         } else {
             if (!codec_rvq_build_layer_ggml(ctx_eval, acu_residual, t_codebook, &res)) {
                 return false;
             }
+            ggml_set_name(res.residual, ("mimi.encode_rvq.acu_residual.l" + std::to_string(d.group_layer + 1)).c_str());
             acu_residual = res.residual;
         }
 
@@ -1203,12 +1218,7 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
             return nullptr;
         }
         if (a->ne[0] != b->ne[0] || (b->ne[2] % a->ne[2]) != 0 || (b->ne[3] % a->ne[3]) != 0) {
-            std::fprintf(
-                stderr,
-                "mimi decode mul_mat mismatch at %s: a=[%lld,%lld,%lld,%lld] b=[%lld,%lld,%lld,%lld]\n",
-                tag,
-                (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3],
-                (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3]);
+            (void) tag;
             return nullptr;
         }
         return ggml_mul_mat(ctx_eval, a, b);
@@ -1298,22 +1308,16 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
         ggml_tensor * k_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, k, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
         ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
 
-        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer_head_dim, p->rope_theta, freq_scale);
-        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer_head_dim, p->rope_theta, freq_scale);
+        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer_head_dim, p->rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
+        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer_head_dim, p->rope_theta, freq_scale, CODEC_ROPE_MODE_NEOX);
         if (q_rope == nullptr || k_rope == nullptr) {
             return false;
         }
 
-        ggml_tensor * attn_scores = mul_mat_checked("dtr.attn_scores", ggml_cont(ctx_eval, k_rope), q_rope);
-        if (attn_scores == nullptr) {
-            return false;
-        }
-        attn_scores = ggml_scale_inplace(ctx_eval, attn_scores, 1.0f / std::sqrt((float) p->transformer_head_dim));
-        attn_scores = ggml_diag_mask_inf_inplace(ctx_eval, attn_scores, 0);
-        ggml_tensor * attn_probs = ggml_soft_max(ctx_eval, attn_scores);
-
-        ggml_tensor * v_tdh = ggml_permute(ctx_eval, v_dth, 1, 0, 2, 3);
-        ggml_tensor * ctx_3d = mul_mat_checked("dtr.attn_ctx", ggml_cont(ctx_eval, v_tdh), attn_probs);
+        codec_lm_attn_params attn_p = {};
+        attn_p.scale = 1.0f / std::sqrt((float) p->transformer_head_dim);
+        attn_p.causal = true;
+        ggml_tensor * ctx_3d = codec_op_lm_attn_ctx_dth(ctx_eval, q_rope, k_rope, v_dth, &attn_p);
         if (ctx_3d == nullptr) {
             return false;
         }
@@ -2268,8 +2272,8 @@ enum codec_status codec_mimi_encode_with(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    std::vector<int32_t> all_codes((size_t) t * (size_t) n_q_graph, 0);
-    if (!codec_runtime_read_tensor(t_indices, all_codes.data(), all_codes.size() * sizeof(int32_t), &err)) {
+    std::vector<int32_t> all_codes_tq;
+    if (!codec_runtime_read_tensor_i32_2d_tq(t_indices, &all_codes_tq, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -2283,7 +2287,7 @@ enum codec_status codec_mimi_encode_with(
     for (int32_t ti = 0; ti < t; ++ti) {
         for (int32_t qi = 0; qi < use_n_q; ++qi) {
             data[(size_t) ti * (size_t) use_n_q + (size_t) qi] =
-                all_codes[(size_t) ti * (size_t) n_q_graph + (size_t) qi];
+                all_codes_tq[(size_t) ti * (size_t) n_q_graph + (size_t) qi];
         }
     }
 

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -1159,6 +1160,7 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
     if (x == nullptr) {
         return false;
     }
+    ggml_set_name(x, "dac.encode.enc.c1");
 
     for (int32_t bi = 0; bi < p->n_blocks; ++bi) {
         for (int32_t ri = 0; ri < CODEC_DAC_RES_UNITS; ++ri) {
@@ -1209,11 +1211,13 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         if (x == nullptr) {
             return false;
         }
+        ggml_set_name(x, ("dac.encode.enc.b" + std::to_string(bi) + ".out").c_str());
     }
 
     ggml_tensor * t_fs = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
     ggml_set_name(t_fs, codec_dac_encode_final_snake_tensor_name().c_str());
     x = codec_op_snake(ctx_eval, x, t_fs, 1e-9f);
+    ggml_set_name(x, "dac.encode.enc.fs");
 
     ggml_tensor * t_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->conv2_kernel, p->conv2_in, p->hidden_dim);
     ggml_set_name(t_c2_w, codec_dac_encode_conv2_w_tensor_name().c_str());
@@ -1223,6 +1227,7 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
     if (x == nullptr) {
         return false;
     }
+    ggml_set_name(x, "dac.encode.enc.out");
 
     ggml_tensor * residual_tc = x;
     ggml_tensor * tokens = nullptr;
@@ -1239,13 +1244,23 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         if (z_tc == nullptr) {
             return false;
         }
+        ggml_set_name(z_tc, ("dac.encode.vq.q" + std::to_string(qi) + ".in").c_str());
         ggml_tensor * z_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_tc)); // [codebook_dim, t]
-
-        codec_rvq_layer_result_ggml layer = {};
-        if (!codec_rvq_build_layer_ggml(ctx_eval, z_ct, t_codebook, &layer)) {
+        ggml_tensor * z_norm_ct = ggml_l2_norm(ctx_eval, z_ct, 1e-12f);
+        ggml_tensor * codebook_norm_dc = ggml_l2_norm(ctx_eval, t_codebook, 1e-12f);
+        if (z_norm_ct == nullptr || codebook_norm_dc == nullptr) {
             return false;
         }
-        ggml_tensor * quantized = ggml_sub(ctx_eval, z_ct, layer.residual); // [codebook_dim, t]
+
+        ggml_tensor * indices = codec_rvq_select_indices_ggml(ctx_eval, z_norm_ct, codebook_norm_dc);
+        if (indices == nullptr) {
+            return false;
+        }
+        ggml_set_name(indices, ("dac.encode.vq.q" + std::to_string(qi) + ".idx").c_str());
+        ggml_tensor * quantized = ggml_get_rows(ctx_eval, t_codebook, indices); // [codebook_dim, t]
+        if (quantized == nullptr) {
+            return false;
+        }
         ggml_tensor * quantized_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, quantized));
 
         ggml_tensor * t_out_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->codebook_dim, p->hidden_dim);
@@ -1259,7 +1274,7 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
 
         residual_tc = ggml_sub(ctx_eval, residual_tc, zq_tc);
 
-        ggml_tensor * idx2d = ggml_reshape_2d(ctx_eval, layer.indices, layer.indices->ne[0], 1);
+        ggml_tensor * idx2d = ggml_reshape_2d(ctx_eval, indices, indices->ne[0], 1);
         tokens = (tokens == nullptr) ? idx2d : ggml_concat(ctx_eval, tokens, idx2d, 1);
     }
 
@@ -1661,8 +1676,8 @@ enum codec_status codec_dac_encode(
 
     const int32_t n_frames = (int32_t) t_out->ne[0];
     const int32_t n_q = (int32_t) t_out->ne[1];
-    std::vector<int32_t> tok((size_t) n_frames * (size_t) n_q, 0);
-    if (!codec_runtime_read_tensor(t_out, tok.data(), tok.size() * sizeof(int32_t), &err)) {
+    std::vector<int32_t> tok;
+    if (!codec_runtime_read_tensor_i32_2d_tq(t_out, &tok, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

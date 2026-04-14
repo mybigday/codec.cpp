@@ -134,8 +134,10 @@ bool codec_graph_cache_get_or_build(
     }
 
     size_t graph_size = GGML_DEFAULT_GRAPH_SIZE;
-    if (key.kind == CODEC_GRAPH_WT_ENCODE || key.kind == CODEC_GRAPH_WT_DECODE || key.kind == CODEC_GRAPH_SOPRANO_DECODE ||
-        key.kind == CODEC_GRAPH_NEMO_NANO_DECODE || key.kind == CODEC_GRAPH_NEMO_NANO_ENCODE) {
+    if (key.kind == CODEC_GRAPH_WT_ENCODE || key.kind == CODEC_GRAPH_WT_DECODE ||
+        key.kind == CODEC_GRAPH_MIMI_ENCODE || key.kind == CODEC_GRAPH_MIMI_DECODE ||
+        key.kind == CODEC_GRAPH_SOPRANO_DECODE || key.kind == CODEC_GRAPH_NEMO_NANO_DECODE ||
+        key.kind == CODEC_GRAPH_NEMO_NANO_ENCODE) {
         graph_size = GGML_DEFAULT_GRAPH_SIZE * 32;
     } else if (key.kind == CODEC_GRAPH_Q3T_DECODE || key.kind == CODEC_GRAPH_NEUCODEC_DECODE ||
                key.kind == CODEC_GRAPH_NEUCODEC_ENCODE) {

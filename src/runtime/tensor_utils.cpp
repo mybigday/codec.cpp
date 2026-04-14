@@ -54,6 +54,44 @@ bool codec_runtime_read_tensor(ggml_tensor * t, void * data, size_t n_bytes, std
     return true;
 }
 
+bool codec_runtime_read_tensor_i32_2d_tq(ggml_tensor * t, std::vector<int32_t> * out, std::string * error) {
+    if (t == nullptr || out == nullptr) {
+        if (error != nullptr) {
+            *error = "invalid token tensor get arguments";
+        }
+        return false;
+    }
+    if (t->type != GGML_TYPE_I32) {
+        if (error != nullptr) {
+            *error = "token tensor must be int32";
+        }
+        return false;
+    }
+    if (t->ne[0] <= 0 || t->ne[1] <= 0) {
+        if (error != nullptr) {
+            *error = "token tensor must be 2D with positive shape";
+        }
+        return false;
+    }
+
+    const int32_t n_frames = (int32_t) t->ne[0];
+    const int32_t n_q = (int32_t) t->ne[1];
+    std::vector<int32_t> raw((size_t) n_frames * (size_t) n_q, 0);
+    if (!codec_runtime_read_tensor(t, raw.data(), raw.size() * sizeof(int32_t), error)) {
+        return false;
+    }
+
+    out->assign(raw.size(), 0);
+    for (int32_t qi = 0; qi < n_q; ++qi) {
+        for (int32_t ti = 0; ti < n_frames; ++ti) {
+            // ggml stores ne[0] as the fastest dimension; codec token buffers are time-major [t, q].
+            (*out)[(size_t) ti * (size_t) n_q + (size_t) qi] =
+                raw[(size_t) qi * (size_t) n_frames + (size_t) ti];
+        }
+    }
+    return true;
+}
+
 void codec_context_set_error(struct codec_context * ctx, const std::string & error) {
     if (ctx != nullptr) {
         ctx->last_error = error;

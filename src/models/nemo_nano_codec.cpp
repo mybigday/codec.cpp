@@ -12,108 +12,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
-
-static const char * nemo_dump_dir() {
-    static const char * dir = std::getenv("NEMO_DUMP_DIR");
-    return dir;
-}
-
-static bool nemo_write_npy_f32(
-    const char * path,
-    const float * data,
-    const int64_t * shape,
-    int32_t n_dims,
-    std::string * err) {
-
-    if (path == nullptr || data == nullptr || shape == nullptr || n_dims <= 0) {
-        if (err) *err = "invalid npy write args";
-        return false;
-    }
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) {
-        if (err) *err = "failed to open npy file";
-        return false;
-    }
-
-    const char magic[] = "\x93NUMPY";
-    ofs.write(magic, 6);
-    const uint8_t major = 1;
-    const uint8_t minor = 0;
-    ofs.put((char) major);
-    ofs.put((char) minor);
-
-    std::string shape_str = "(";
-    for (int32_t i = 0; i < n_dims; ++i) {
-        shape_str += std::to_string(shape[i]);
-        if (i + 1 < n_dims) {
-            shape_str += ", ";
-        }
-    }
-    if (n_dims == 1) {
-        shape_str += ",";
-    }
-    shape_str += ")";
-
-    char header[256];
-    std::snprintf(
-        header,
-        sizeof(header),
-        "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }",
-        shape_str.c_str());
-    std::string hdr = header;
-    const size_t preamble = 6 + 2 + 2;
-    const size_t total = preamble + hdr.size();
-    const size_t pad = (16 - (total % 16)) % 16;
-    hdr.append(pad, ' ');
-    hdr.push_back('\n');
-
-    const uint16_t hlen = (uint16_t) hdr.size();
-    ofs.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
-    ofs.write(hdr.data(), (std::streamsize) hdr.size());
-
-    int64_t n_elems = 1;
-    for (int32_t i = 0; i < n_dims; ++i) {
-        n_elems *= shape[i];
-    }
-    ofs.write(reinterpret_cast<const char *>(data), (std::streamsize) (n_elems * (int64_t) sizeof(float)));
-    if (!ofs.good()) {
-        if (err) *err = "failed to write npy data";
-        return false;
-    }
-    return true;
-}
-
-static bool nemo_dump_tensor(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const std::string & name,
-    std::string * err) {
-
-    const char * dir = nemo_dump_dir();
-    if (dir == nullptr || dir[0] == '\0') {
-        return true;
-    }
-    ggml_tensor * t = codec_graph_get_tensor(ctx, entry, name.c_str());
-    if (t == nullptr) {
-        if (err) *err = "missing tensor for dump: " + name;
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(t, &v)) {
-        if (err) *err = "failed reading tensor for dump: " + name;
-        return false;
-    }
-    const int n_dims = ggml_n_dims(t);
-    int64_t shape[4] = { 1, 1, 1, 1 };
-    for (int i = 0; i < n_dims; ++i) {
-        shape[i] = (int64_t) t->ne[i];
-    }
-    std::string path = std::string(dir) + "/" + name + ".npy";
-    return nemo_write_npy_f32(path.c_str(), v.data(), shape, n_dims, err);
-}
 
 static ggml_tensor * nemo_get_tensor(ggml_context * ctx, const std::string & name) {
     return ggml_get_tensor(ctx, name.c_str());
@@ -328,30 +228,7 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
     ggml_set_name(t_pre_w, "nemo.enc.pre.w");
     ggml_tensor * t_pre_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 24);
     ggml_set_name(t_pre_b, "nemo.enc.pre.b");
-    // inline pre-conv to capture padding/conv outputs for parity debugging
-    ggml_tensor * pre_pad = codec_op_pad_1d_replicate(ctx_eval, x, 3, 3);
-    if (pre_pad == nullptr) {
-        return false;
-    }
-    ggml_set_name(pre_pad, "nemo.enc.pre.pad");
-    ggml_tensor * pre_out = nemo_conv1d_replicate(ctx_eval, pre_pad, t_pre_w, nullptr, 1, 1, 0);
-    if (nemo_dump_dir() != nullptr) {
-        ggml_tensor * pre_w_f32 = t_pre_w->type == GGML_TYPE_F32 ? t_pre_w : ggml_cast(ctx_eval, t_pre_w, GGML_TYPE_F32);
-        ggml_tensor * pre_im2col = ggml_im2col(ctx_eval, pre_w_f32, pre_pad, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
-        pre_im2col = ggml_cont(ctx_eval, pre_im2col);
-        ggml_set_name(pre_im2col, "nemo.enc.pre.im2col");
-        ggml_tensor * sum = ggml_sum(ctx_eval, pre_im2col);
-        ggml_tensor * sum_f32 = sum->type == GGML_TYPE_F32 ? sum : ggml_cast(ctx_eval, sum, GGML_TYPE_F32);
-        ggml_tensor * zero = ggml_scale(ctx_eval, sum_f32, 0.0f);
-        ggml_tensor * zero2d = ggml_reshape_2d(ctx_eval, zero, 1, 1);
-        ggml_tensor * zeros = ggml_repeat(ctx_eval, zero2d, pre_out);
-        pre_out = ggml_add(ctx_eval, pre_out, zeros);
-    }
-    if (t_pre_b != nullptr) {
-        ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, t_pre_b, 1, pre_out->ne[1]);
-        pre_out = ggml_add(ctx_eval, pre_out, ggml_repeat(ctx_eval, b2, pre_out));
-    }
-    x = ggml_cont(ctx_eval, pre_out);
+    x = nemo_conv1d_replicate(ctx_eval, x, t_pre_w, t_pre_b, 1, 1, 3);
     if (x == nullptr) {
         return false;
     }
@@ -685,48 +562,13 @@ static enum codec_status nemo_encode_graph(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
-    if (nemo_dump_dir() != nullptr) {
-        if (!nemo_dump_tensor(ctx, entry, "nemo.encode.pcm", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.w", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.b", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.pad", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.im2col", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.pre.out", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.enc.post.out", &err)) {
-            codec_context_set_error(ctx, err);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-        for (int32_t li = 0; li < 5; ++li) {
-            if (!nemo_dump_tensor(ctx, entry, "nemo.enc.down." + std::to_string(li) + ".out", &err)) {
-                codec_context_set_error(ctx, err);
-                return CODEC_STATUS_INTERNAL_ERROR;
-            }
-            for (int32_t bi = 0; bi < 3; ++bi) {
-                for (int32_t ri = 0; ri < 3; ++ri) {
-                    const std::string name = "nemo.enc.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out";
-                    if (!nemo_dump_tensor(ctx, entry, name, &err)) {
-                        codec_context_set_error(ctx, err);
-                        return CODEC_STATUS_INTERNAL_ERROR;
-                    }
-                }
-            }
-        }
-    }
-
     const int32_t n_frames = (int32_t) t_out->ne[0];
     const int32_t nq = (int32_t) t_out->ne[1];
-    std::vector<int32_t> tok((size_t) n_frames * (size_t) nq, 0);
-    if (!codec_runtime_read_tensor(t_out, tok.data(), tok.size() * sizeof(int32_t), &err)) {
+
+    std::vector<int32_t> tok_tq;
+    if (!codec_runtime_read_tensor_i32_2d_tq(t_out, &tok_tq, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    // t_out is [t, q] in ggml order (q-major). Convert to t-major for tokens.
-    std::vector<int32_t> tok_tq(tok.size(), 0);
-    for (int32_t qi = 0; qi < nq; ++qi) {
-        for (int32_t ti = 0; ti < n_frames; ++ti) {
-            tok_tq[(size_t) ti * (size_t) nq + (size_t) qi] = tok[(size_t) qi * (size_t) n_frames + (size_t) ti];
-        }
     }
 
     int32_t * data = static_cast<int32_t *>(std::malloc(tok_tq.size() * sizeof(int32_t)));
@@ -859,33 +701,6 @@ static enum codec_status nemo_decode_graph(
     if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    if (nemo_dump_dir() != nullptr) {
-        if (!nemo_dump_tensor(ctx, entry, "nemo.fsq.codebook.0", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.dec.embed.out", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.dec.pre.out", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.dec.post.act", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.dec.post.out", &err) ||
-            !nemo_dump_tensor(ctx, entry, "nemo.decode.out", &err)) {
-            codec_context_set_error(ctx, err);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-        for (int32_t li = 0; li < 5; ++li) {
-            if (!nemo_dump_tensor(ctx, entry, "nemo.dec.up." + std::to_string(li) + ".out", &err)) {
-                codec_context_set_error(ctx, err);
-                return CODEC_STATUS_INTERNAL_ERROR;
-            }
-            for (int32_t bi = 0; bi < 3; ++bi) {
-                for (int32_t ri = 0; ri < 3; ++ri) {
-                    const std::string name = "nemo.dec.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out";
-                    if (!nemo_dump_tensor(ctx, entry, name, &err)) {
-                        codec_context_set_error(ctx, err);
-                        return CODEC_STATUS_INTERNAL_ERROR;
-                    }
-                }
-            }
-        }
     }
 
     const int32_t n_pcm = (int32_t) t_out->ne[0];

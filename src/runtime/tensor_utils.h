@@ -5,5 +5,6 @@
 
 bool codec_runtime_write_tensor(ggml_tensor * t, const void * data, size_t n_bytes, std::string * error);
 bool codec_runtime_read_tensor(ggml_tensor * t, void * data, size_t n_bytes, std::string * error);
+bool codec_runtime_read_tensor_i32_2d_tq(ggml_tensor * t, std::vector<int32_t> * out, std::string * error);
 
 #endif

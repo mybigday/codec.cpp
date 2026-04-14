@@ -6,7 +6,11 @@
       "hf_file": null,
       "class": "transformers:MimiModel",
       "n_q": 32,
-      "gguf": "models/mimi/mimi.gguf"
+      "gguf": "models/mimi/mimi.gguf",
+      "thresholds": {
+        "encode_roundtrip_corr_min": 0.998,
+        "encode_roundtrip_mse_max": 0.0001
+      }
     },
     {
       "name": "dac",
@@ -16,7 +20,11 @@
       "n_q": 12,
       "gguf": "models/dac/dac.gguf",
       "sample_rate": 16000,
-      "converter": "dac"
+      "converter": "dac",
+      "thresholds": {
+        "encode_roundtrip_corr_min": 0.997,
+        "encode_roundtrip_mse_max": 0.0001
+      }
     },
     {
       "name": "wavtokenizer",
@@ -26,7 +34,11 @@
       "class": "wavtokenizer",
       "n_q": 1,
       "gguf": "models/wavtokenizer/wavtokenizer.gguf",
-      "converter": "wavtokenizer"
+      "converter": "wavtokenizer",
+      "thresholds": {
+        "encode_roundtrip_corr_min": 0.998,
+        "encode_roundtrip_mse_max": 0.0001
+      }
     },
     {
       "name": "qwen3_tts_tokenizer",
@@ -35,7 +47,11 @@
       "class": "qwen3_tts_tokenizer",
       "n_q": 16,
       "gguf": "models/qwen3_tts_tokenizer/qwen3_tts_tokenizer.gguf",
-      "converter": "qwen3_tts_tokenizer"
+      "converter": "qwen3_tts_tokenizer",
+      "thresholds": {
+        "encode_roundtrip_corr_min": 0.94,
+        "encode_roundtrip_mse_max": 0.001
+      }
     },
     {
       "name": "nemo_nano_codec",

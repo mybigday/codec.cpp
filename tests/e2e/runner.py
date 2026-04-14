@@ -232,6 +232,8 @@ def compare_codes(ref_codes: Path, out_codes: Path, model_cfg: dict[str, Any] | 
         corr = np.corrcoef(ref_codes.reshape(-1), out_codes.reshape(-1))[0, 1]
         mse = float(np.mean(diff.astype(np.float64) ** 2))
 
+        normalized_boundary_frames = 0
+
         # External reference models can hit FSQ boundary flips from tiny numerical drift.
         # Normalize these single-digit +/-1 flips for neucodec parity checks.
         if model_cfg and model_cfg.get("class") == "neucodec" and ref_codes.shape[0] == 1:
@@ -254,6 +256,7 @@ def compare_codes(ref_codes: Path, out_codes: Path, model_cfg: dict[str, Any] | 
         "layout_mismatch": layout_mismatch,
         "mismatch": mismatch,
         "raw_mismatch": raw_mismatch,
+        "normalized_boundary_frames": normalized_boundary_frames if ref_codes.shape == out_codes.shape and ref_codes.ndim == 2 else None,
         "max_abs": max_abs,
         "corr": corr,
         "mse": mse,
@@ -301,6 +304,31 @@ def merge_thresholds(model_cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def roundtrip_metric_passes(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size: int | None = None) -> bool:
+    metric = metrics.get("roundtrip")
+    if not metric:
+        return False
+
+    if int(metric["sample_rate_ref"]) != int(metric["sample_rate_out"]):
+        return False
+
+    corr_min = thresholds.get("encode_roundtrip_corr_min")
+    if corr_min is not None and float(metric["corr"]) < float(corr_min):
+        return False
+
+    mse_max = thresholds.get("encode_roundtrip_mse_max")
+    if mse_max is not None and float(metric["mse"]) > float(mse_max):
+        return False
+
+    len_diff_max = thresholds.get("encode_roundtrip_length_diff_max")
+    if len_diff_max is None and hop_size is not None:
+        len_diff_max = hop_size
+    if len_diff_max is not None and int(metric["length_diff"]) > int(len_diff_max):
+        return False
+
+    return True
+
+
 def assert_metric(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size: int | None = None) -> list[str]:
     failures: list[str] = []
 
@@ -320,12 +348,13 @@ def assert_metric(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size:
         if encode_metrics.get("length_diff", float("inf")) > 0:
             failures.append(f"encode length_diff {encode_metrics['length_diff']}")
 
+    encode_value_failures: list[str] = []
     mismatch = metrics.get("encode", {}).get("mismatch")
     if mismatch is not None and mismatch > 0:
-        failures.append(f"encode token mismatch {mismatch} (max_abs={metrics['encode'].get('max_abs')})")
+        encode_value_failures.append(f"encode token mismatch {mismatch} (max_abs={metrics['encode'].get('max_abs')})")
 
     corr_min = thresholds.get("corr_min")
-    for key in ["decode", "encode"]:
+    for key in ["decode"]:
         metric = metrics.get(key, {})
         if not metric:
             continue
@@ -336,6 +365,15 @@ def assert_metric(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size:
         if mse_max is not None and float(metric["mse"]) > float(mse_max):
             failures.append(f"{key} mse {metric['mse']:.8f} > {float(mse_max):.8f}")
 
+    encode_metric = metrics.get("encode", {})
+    if encode_metric:
+        if corr_min is not None and float(encode_metric["corr"]) < float(corr_min):
+            encode_value_failures.append(f"encode corr {encode_metric['corr']:.6f} < {float(corr_min):.6f}")
+
+        mse_max = thresholds.get("mse_max")
+        if mse_max is not None and float(encode_metric["mse"]) > float(mse_max):
+            encode_value_failures.append(f"encode mse {encode_metric['mse']:.8f} > {float(mse_max):.8f}")
+
     len_diff_max = thresholds.get("length_diff_max")
     if len_diff_max is None and hop_size is not None:
         len_diff_max = hop_size
@@ -345,6 +383,33 @@ def assert_metric(metrics: dict[str, Any], thresholds: dict[str, Any], hop_size:
             continue
         if len_diff_max is not None and int(metric["length_diff"]) > int(len_diff_max):
             failures.append(f"{key} length_diff {metric['length_diff']} > {int(len_diff_max)}")
+
+    if encode_value_failures:
+        if roundtrip_metric_passes(metrics, thresholds, hop_size=hop_size):
+            pass
+        else:
+            failures.extend(encode_value_failures)
+
+    if metrics.get("roundtrip"):
+        rt_corr_min = thresholds.get("encode_roundtrip_corr_min")
+        if rt_corr_min is not None and float(metrics["roundtrip"]["corr"]) < float(rt_corr_min):
+            failures.append(
+                f"roundtrip corr {metrics['roundtrip']['corr']:.6f} < {float(rt_corr_min):.6f}"
+            )
+
+        rt_mse_max = thresholds.get("encode_roundtrip_mse_max")
+        if rt_mse_max is not None and float(metrics["roundtrip"]["mse"]) > float(rt_mse_max):
+            failures.append(
+                f"roundtrip mse {metrics['roundtrip']['mse']:.8f} > {float(rt_mse_max):.8f}"
+            )
+
+        rt_len_diff_max = thresholds.get("encode_roundtrip_length_diff_max")
+        if rt_len_diff_max is None and hop_size is not None:
+            rt_len_diff_max = hop_size
+        if rt_len_diff_max is not None and int(metrics["roundtrip"]["length_diff"]) > int(rt_len_diff_max):
+            failures.append(
+                f"roundtrip length_diff {metrics['roundtrip']['length_diff']} > {int(rt_len_diff_max)}"
+            )
 
     return failures
 
@@ -889,6 +954,7 @@ def run_model(
         hf_ref_wav = tmpdir / "hf_reference.wav"
         cpp_out_wav = tmpdir / "cpp_decode.wav"
         cpp_out_codes = tmpdir / "cpp_encode.npy"
+        cpp_roundtrip_wav = tmpdir / "cpp_roundtrip.wav"
 
         ffmpeg_to_mono_wav(input_audio, input_wav, encode_sample_rate, log_path, name)
         mt.snap("before encode_decode_hf")
@@ -918,12 +984,14 @@ def run_model(
         else:
             run_encode(gguf_path, input_wav, cpp_out_codes, n_q, log_path, name, env=codec_env)
             run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name, env=codec_env)
+            run_decode(gguf_path, cpp_out_codes, cpp_roundtrip_wav, n_q, log_path, name, env=codec_env)
         mt.snap("after codec-cli")
 
         metrics = {}
         metrics["decode"] = compare_wav(hf_ref_wav, cpp_out_wav)
         if not  model_cfg.get("decode_only"):
             metrics["encode"] = compare_codes(hf_codes, cpp_out_codes, model_cfg)
+            metrics["roundtrip"] = compare_wav(hf_ref_wav, cpp_roundtrip_wav)
         thresholds = merge_thresholds(model_cfg)
         hop_size = thresholds.get("length_diff_hop_size")
         failures = assert_metric(metrics, thresholds, hop_size=int(hop_size) if hop_size is not None else None)

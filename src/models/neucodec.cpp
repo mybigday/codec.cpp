@@ -467,8 +467,8 @@ static ggml_tensor * codec_neu_transformer_block(
     ggml_tensor * k_dht = ggml_reshape_3d(ctx_eval, k, head_dim, n_heads, t); // [d, h, t]
     ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, head_dim, n_heads, t), 0, 2, 1, 3); // [d, t, h]
 
-    ggml_tensor * q_rope_dht = codec_op_rope(ctx_eval, q_dht, head_dim, rope_theta, 1.0f);
-    ggml_tensor * k_rope_dht = codec_op_rope(ctx_eval, k_dht, head_dim, rope_theta, 1.0f);
+    ggml_tensor * q_rope_dht = codec_op_rope(ctx_eval, q_dht, head_dim, rope_theta, 1.0f, CODEC_ROPE_MODE_NORMAL);
+    ggml_tensor * k_rope_dht = codec_op_rope(ctx_eval, k_dht, head_dim, rope_theta, 1.0f, CODEC_ROPE_MODE_NORMAL);
     ggml_tensor * q_rope = q_rope_dht ? ggml_cont(ctx_eval, ggml_permute(ctx_eval, q_rope_dht, 0, 2, 1, 3)) : nullptr; // [d, t, h]
     ggml_tensor * k_rope = k_rope_dht ? ggml_cont(ctx_eval, ggml_permute(ctx_eval, k_rope_dht, 0, 2, 1, 3)) : nullptr; // [d, t, h]
     if (q_rope == nullptr || k_rope == nullptr) {
@@ -1303,8 +1303,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(d3_b, "neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias");
     x = codec_conv1d(ctx_eval, x, d3_w, d3_b, 1, 1, 1);
     if (x == nullptr) return false;
-    codec_neu_set_enc_name(x, "neucodec.encode.debug.acoustic_tc");
-
     // en_encoder down_trans
     x = codec_neu_build_distill_local_trans(
         ctx_eval,
@@ -1323,8 +1321,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(down_b, "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias");
     x = codec_conv1d(ctx_eval, x, down_w, down_b, 5, 1, 0);
     if (x == nullptr) return false;
-    codec_neu_set_enc_name(x, "neucodec.encode.debug.down_tc");
-
     // en_encoder local_trans
     x = codec_neu_build_distill_local_trans(
         ctx_eval,
@@ -1337,8 +1333,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     if (x == nullptr) {
         return false;
     }
-    codec_neu_set_enc_name(x, "neucodec.encode.debug.local_tc");
-
     // fc_sq_prior (512->768)
     ggml_tensor * t_fc_sq_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 512, 768);
     codec_neu_set_enc_name(t_fc_sq_w, "neucodec.encode.fc_sq_prior.w");
@@ -1346,8 +1340,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(t_fc_sq_b, "neucodec.encode.fc_sq_prior.b");
     ggml_tensor * fsq_tc = codec_neu_linear_tc(ctx_eval, x, t_fc_sq_w, t_fc_sq_b);
     if (fsq_tc == nullptr) return false;
-    codec_neu_set_enc_name(fsq_tc, "neucodec.encode.debug.fsq_tc");
-
     // HuBERT semantic model
     ggml_tensor * sem = t_sem;
     for (int32_t li = 0; li < p->hubert_feat_layers; ++li) {
@@ -1446,8 +1438,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         hs = codec_neu_layer_norm_tc_eps(ctx_eval, hs, ffn_ln_w, ffn_ln_b, p->hubert_ln_eps);
         if (hs == nullptr) return false;
     }
-    codec_neu_set_enc_name(hs, "neucodec.encode.debug.hubert_hs");
-
     // Semantic encoder conv stack
     ggml_tensor * sem_init_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hubert_hidden, 1024);
     codec_neu_set_enc_name(sem_init_w, "neucodec.encode.semantic_encoder.initial_conv.w");
@@ -1464,22 +1454,15 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
 
     ggml_tensor * sem_tc = codec_conv1d(ctx_eval, hs, sem_init_w, nullptr, 1, 1, 1);
     if (sem_tc == nullptr) return false;
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_init_tc");
     sem_tc = ggml_relu(ctx_eval, sem_tc);
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_relu1_tc");
     // SemanticEncoder uses inplace ReLU in residual path.
     ggml_tensor * sem_res = sem_tc;
     sem_tc = codec_conv1d(ctx_eval, sem_tc, sem1_w, sem1_b, 1, 1, 1);
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_conv1_tc");
     sem_tc = ggml_relu(ctx_eval, sem_tc);
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_relu2_tc");
     sem_tc = codec_conv1d(ctx_eval, sem_tc, sem2_w, sem2_b, 1, 1, 1);
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_conv2_tc");
     sem_tc = ggml_add(ctx_eval, sem_tc, sem_res);
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_res_tc");
     sem_tc = codec_conv1d(ctx_eval, sem_tc, sem_out_w, nullptr, 1, 1, 1);
     if (sem_tc == nullptr) return false;
-    codec_neu_set_enc_name(sem_tc, "neucodec.encode.debug.sem_tc");
 
     // match lengths
     if (sem_tc->ne[0] != fsq_tc->ne[0]) {
@@ -1495,8 +1478,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(fc_b, "neucodec.encode.fc_prior.b");
     ggml_tensor * prior_tc = codec_neu_linear_tc(ctx_eval, concat, fc_w, fc_b);
     if (prior_tc == nullptr) return false;
-    codec_neu_set_enc_name(prior_tc, "neucodec.encode.debug.prior_tc");
-
     // FSQ project_in
     ggml_tensor * proj_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 2048, p->codebook_dim);
     codec_neu_set_enc_name(proj_w, "neucodec.encode.quant.project_in.w");
@@ -1504,8 +1485,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(proj_b, "neucodec.encode.quant.project_in.b");
     ggml_tensor * z_tc = codec_neu_linear_tc(ctx_eval, prior_tc, proj_w, proj_b);
     if (z_tc == nullptr) return false;
-    codec_neu_set_enc_name(z_tc, "neucodec.encode.debug.z_tc");
-
     // FSQ bound + quantize (vector-quantize-pytorch FSQ)
     const float eps = 1e-3f;
     const float half_l = (3.0f * (1.0f + eps)) / 2.0f;
@@ -1519,9 +1498,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     z_bound = ggml_scale_bias(ctx_eval, z_bound, half_l, -offset);
     z_bound = ggml_tanh(ctx_eval, ggml_scale_bias(ctx_eval, z_bound, 1.0f, shift));
     z_bound = ggml_scale_bias(ctx_eval, z_bound, half_l, -offset);
-    codec_neu_set_enc_name(z_bound, "neucodec.encode.debug.z_bound");
     ggml_tensor * zq = ggml_scale(ctx_eval, ggml_round(ctx_eval, z_bound), 1.0f / half_width);
-    codec_neu_set_enc_name(zq, "neucodec.encode.debug.zq");
 
     // indices
     ggml_tensor * basis = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
@@ -2098,8 +2075,7 @@ static enum codec_status codec_neu_encode_graph(
     ggml_tensor * t_sem = codec_graph_get_tensor(ctx, entry, codec_neu_encode_name("neucodec.encode.sem").c_str());
     ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, codec_neu_encode_name("neucodec.encode.out").c_str());
     ggml_tensor * t_basis = codec_graph_get_tensor(ctx, entry, codec_neu_encode_name("neucodec.encode.fsq.basis").c_str());
-    ggml_tensor * t_zq = codec_graph_get_tensor(ctx, entry, codec_neu_encode_name("neucodec.encode.debug.zq").c_str());
-    if (t_pcm == nullptr || t_sem == nullptr || t_out == nullptr || t_basis == nullptr || t_zq == nullptr) {
+    if (t_pcm == nullptr || t_sem == nullptr || t_out == nullptr || t_basis == nullptr) {
         codec_context_set_error(ctx, "cached NeuCodec encode graph is invalid");
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -2129,76 +2105,6 @@ static enum codec_status codec_neu_encode_graph(
     if (!codec_graph_compute(ctx, entry, ctx->model->n_threads, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    if (std::getenv("CODEC_DEBUG_NEUCODEC_ENC") != nullptr) {
-        auto dump_stats = [&](const char * name) {
-            ggml_tensor * t = codec_graph_get_tensor(ctx, entry, codec_neu_encode_name(name).c_str());
-            if (t == nullptr || t->type != GGML_TYPE_F32) {
-                std::fprintf(stderr, "neucodec debug: missing/non-f32 %s\n", name);
-                return;
-            }
-            int64_t n = std::max<int64_t>(1, t->ne[0]);
-            n *= std::max<int64_t>(1, t->ne[1]);
-            n *= std::max<int64_t>(1, t->ne[2]);
-            n *= std::max<int64_t>(1, t->ne[3]);
-            std::vector<float> v((size_t) n, 0.0f);
-            std::string derr;
-            if (!codec_runtime_read_tensor(t, v.data(), v.size() * sizeof(float), &derr)) {
-                std::fprintf(stderr, "neucodec debug: read failed %s: %s\n", name, derr.c_str());
-                return;
-            }
-            float mn = v.empty() ? 0.0f : v[0];
-            float mx = v.empty() ? 0.0f : v[0];
-            int64_t nan_n = 0;
-            for (float x : v) {
-                if (!std::isfinite(x)) {
-                    ++nan_n;
-                    continue;
-                }
-                mn = std::min(mn, x);
-                mx = std::max(mx, x);
-            }
-            std::fprintf(stderr, "neucodec debug: %s n=%lld min=%f max=%f nan=%lld\n",
-                name, (long long) n, mn, mx, (long long) nan_n);
-            std::fprintf(stderr, "neucodec debug: %s first=", name);
-            for (int i = 0; i < std::min<int64_t>(8, n); ++i) {
-                std::fprintf(stderr, "%s%f", i == 0 ? "" : ",", v[(size_t) i]);
-            }
-            std::fprintf(stderr, "\n");
-
-            const char * dump_dir = std::getenv("CODEC_DEBUG_NEUCODEC_DUMP_DIR");
-            if (dump_dir != nullptr && dump_dir[0] != '\0') {
-                std::string fname(name);
-                for (char & c : fname) {
-                    if (!(std::isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-')) {
-                        c = '_';
-                    }
-                }
-                const std::string path = std::string(dump_dir) + "/" + fname + ".f32bin";
-                FILE * fp = std::fopen(path.c_str(), "wb");
-                if (fp != nullptr) {
-                    std::fwrite(v.data(), sizeof(float), v.size(), fp);
-                    std::fclose(fp);
-                }
-            }
-        };
-        dump_stats("neucodec.encode.debug.prior_tc");
-        dump_stats("neucodec.encode.debug.fsq_tc");
-        dump_stats("neucodec.encode.debug.sem_tc");
-        dump_stats("neucodec.encode.debug.hubert_hs");
-        dump_stats("neucodec.encode.debug.acoustic_tc");
-        dump_stats("neucodec.encode.debug.down_tc");
-        dump_stats("neucodec.encode.debug.local_tc");
-        dump_stats("neucodec.encode.debug.sem_init_tc");
-        dump_stats("neucodec.encode.debug.sem_relu1_tc");
-        dump_stats("neucodec.encode.debug.sem_conv1_tc");
-        dump_stats("neucodec.encode.debug.sem_relu2_tc");
-        dump_stats("neucodec.encode.debug.sem_conv2_tc");
-        dump_stats("neucodec.encode.debug.sem_res_tc");
-        dump_stats("neucodec.encode.debug.z_tc");
-        dump_stats("neucodec.encode.debug.z_bound");
-        dump_stats("neucodec.encode.debug.zq");
     }
 
     if (t_out->type != GGML_TYPE_F32 || t_out->ne[1] != 1) {
