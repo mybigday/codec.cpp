@@ -65,7 +65,8 @@ struct codec_graph_cache_entry {
     size_t required_mem_size = 0;
     codec_graph_build_fn build_fn = nullptr;
     std::vector<uint8_t> build_user_data;
-    int32_t last_graph_size = 0;
+    int32_t last_graph_size = 0; // exact ggml graph capacity: max(n_nodes, n_leafs)
+    int32_t last_sched_graph_size = 0; // exact scheduler base size: n_nodes + n_leafs
     bool allocated = false; // whether this entry's graph has been allocated in the backend scheduler
 };
 
@@ -94,6 +95,11 @@ struct codec_model_vtable {
     void * (*create_impl)();
     void (*destroy_impl)(void *);
     enum codec_status (*init)(struct codec_model * model);
+    size_t (*graph_size)(
+        const struct codec_model * model,
+        const struct codec_graph_cache_key * key,
+        const void * user_data,
+        struct ggml_tensor * out);
     enum codec_status (*encode)(
         struct codec_context * ctx,
         const std::vector<float> & pcm,
@@ -143,5 +149,10 @@ int32_t codec_infer_n_q_from_tensor_names(const codec_model * model);
 
 bool codec_safe_add_i32(int32_t a, int32_t b, int32_t * out);
 bool codec_safe_mul_i32(int32_t a, int32_t b, int32_t * out);
+size_t codec_graph_size_exact(
+    const struct codec_model * model,
+    const struct codec_graph_cache_key * key,
+    const void * user_data,
+    struct ggml_tensor * out);
 
 #endif

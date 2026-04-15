@@ -103,6 +103,7 @@ const struct codec_model_vtable * codec_chatterbox_s3g_vtable() {
         codec_chatterbox_s3g_create_impl,
         codec_chatterbox_s3g_destroy_impl,
         codec_chatterbox_s3g_init,
+        codec_graph_size_exact,
         nullptr,
         codec_chatterbox_s3g_decode,
         nullptr,

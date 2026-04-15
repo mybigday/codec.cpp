@@ -2330,6 +2330,7 @@ const struct codec_model_vtable * codec_mimi_vtable() {
         codec_mimi_create_impl,
         codec_mimi_destroy_impl,
         codec_mimi_init,
+        codec_graph_size_exact,
         codec_mimi_encode_wrap,
         codec_mimi_decode_wrap,
         nullptr,

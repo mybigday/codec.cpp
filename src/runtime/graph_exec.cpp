@@ -52,12 +52,10 @@ static bool codec_sched_ensure_capacity(codec_context * ctx, int32_t required, s
         return false;
     }
     if (required <= 0) {
-        return true;
+        required = 1;
     }
 
-    const size_t min_size = (size_t) required;
-    const size_t base_size = GGML_DEFAULT_GRAPH_SIZE * 8;
-    size_t target = std::max(base_size, min_size * 2);
+    const size_t target = (size_t) required;
     if ((int32_t) target <= ctx->sched_reserved_graph_size && ctx->sched != nullptr) {
         return true;
     }
@@ -122,20 +120,6 @@ bool codec_runtime_init(codec_context * ctx, std::string * error) {
         }
     }
 
-    const size_t sched_graph_size = GGML_DEFAULT_GRAPH_SIZE * 8;
-    ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, n_backends, sched_graph_size, false, true);
-    if (ctx->sched == nullptr) {
-        if (ctx->cpu_backend != nullptr) {
-            ggml_backend_free(ctx->cpu_backend);
-            ctx->cpu_backend = nullptr;
-        }
-        if (error != nullptr) {
-            *error = "failed to create backend scheduler";
-        }
-        return false;
-    }
-    ctx->sched_reserved_graph_size = (int32_t) sched_graph_size;
-
     return true;
 }
 
@@ -143,7 +127,7 @@ bool codec_graph_prepare_io(
     codec_context * ctx,
     codec_graph_cache_entry * entry,
     std::string * error) {
-    if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->sched == nullptr || ctx->backend == nullptr) {
+    if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->backend == nullptr) {
         if (error != nullptr) {
             *error = "invalid graph prepare arguments";
         }
@@ -194,7 +178,7 @@ bool codec_graph_compute(
     int32_t n_threads,
     std::string * error) {
 
-    if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->sched == nullptr || ctx->backend == nullptr) {
+    if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->backend == nullptr) {
         if (error != nullptr) {
             *error = "invalid graph compute arguments";
         }
@@ -206,13 +190,15 @@ bool codec_graph_compute(
         codec_backend_set_n_threads(ctx->cpu_backend, n_threads);
     }
 
-    if (!codec_graph_prepare_io(ctx, entry, error)) {
+    int32_t required = entry->last_sched_graph_size;
+    if (required <= 0) {
+        required = std::max(1, ggml_graph_n_nodes(ctx->eval_graph));
+    }
+    if (!codec_sched_ensure_capacity(ctx, required, error)) {
         return false;
     }
 
-    const int32_t n_nodes = ggml_graph_n_nodes(ctx->eval_graph);
-    const int32_t required = n_nodes > 0 ? n_nodes * 2 : 0;
-    if (!codec_sched_ensure_capacity(ctx, required, error)) {
+    if (!codec_graph_prepare_io(ctx, entry, error)) {
         return false;
     }
 

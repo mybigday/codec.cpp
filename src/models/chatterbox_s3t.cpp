@@ -640,6 +640,7 @@ const struct codec_model_vtable * codec_chatterbox_s3t_vtable() {
         codec_chatterbox_s3t_create_impl,
         codec_chatterbox_s3t_destroy_impl,
         codec_chatterbox_s3t_init,
+        codec_graph_size_exact,
         codec_chatterbox_s3t_encode,
         nullptr,
         nullptr,

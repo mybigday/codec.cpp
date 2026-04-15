@@ -61,5 +61,5 @@ Recommended:
 - Validate shapes and memory use.
 
 Failure patterns:
-- Graph size assertion: increase graph size or scheduler capacity.
+- Graph size assertion: fix the exact graph sizing policy. Eval graph capacity and scheduler capacity may need different exact formulas; do not paper over this with large multipliers.
 - Wrong layout: fix in converter or add GGUF transpose op.

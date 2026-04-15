@@ -1561,6 +1561,7 @@ const struct codec_model_vtable * codec_dac_vtable() {
         codec_dac_create_impl,
         codec_dac_destroy_impl,
         codec_dac_init,
+        codec_graph_size_exact,
         codec_dac_encode_wrap,
         codec_dac_decode_wrap,
         codec_dac_decode_latent_wrap,

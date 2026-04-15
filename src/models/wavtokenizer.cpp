@@ -1791,6 +1791,7 @@ const struct codec_model_vtable * codec_wavtokenizer_vtable() {
         codec_wavtokenizer_create_impl,
         codec_wavtokenizer_destroy_impl,
         codec_wavtokenizer_init,
+        codec_graph_size_exact,
         codec_wavtokenizer_encode_wrap,
         codec_wavtokenizer_decode_wrap,
         nullptr,

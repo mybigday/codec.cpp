@@ -13,6 +13,49 @@ static bool codec_graph_key_equal(const codec_graph_cache_key & a, const codec_g
            a.latent_dim == b.latent_dim;
 }
 
+struct codec_graph_count_state {
+    std::vector<ggml_tensor *> visited;
+    size_t n_nodes = 0;
+    size_t n_leafs = 0;
+};
+
+static void codec_graph_count_visit(ggml_tensor * node, codec_graph_count_state * state) {
+    if (node == nullptr || state == nullptr) {
+        return;
+    }
+
+    if (std::find(state->visited.begin(), state->visited.end(), node) != state->visited.end()) {
+        return;
+    }
+    state->visited.push_back(node);
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        codec_graph_count_visit(node->src[i], state);
+    }
+
+    if (node->op == GGML_OP_NONE && (node->flags & GGML_TENSOR_FLAG_PARAM) == 0) {
+        ++state->n_leafs;
+    } else {
+        ++state->n_nodes;
+    }
+}
+
+static codec_graph_count_state codec_graph_count_exact(ggml_tensor * out) {
+    codec_graph_count_state state;
+    codec_graph_count_visit(out, &state);
+    return state;
+}
+
+size_t codec_graph_size_exact(
+    const struct codec_model * /*model*/,
+    const struct codec_graph_cache_key * /*key*/,
+    const void * /*user_data*/,
+    ggml_tensor * out) {
+
+    const codec_graph_count_state state = codec_graph_count_exact(out);
+    return std::max<size_t>(1, std::max(state.n_nodes, state.n_leafs));
+}
+
 void codec_graph_release(codec_context * ctx) {
     if (ctx == nullptr) {
         return;
@@ -93,6 +136,7 @@ bool codec_graph_cache_get_or_build(
         entry.required_mem_size = mem_size;
         entry.build_fn = build_fn;
         entry.last_graph_size = 0;
+        entry.last_sched_graph_size = 0;
         entry.allocated = false;
         if (user_data_size > 0) {
             const uint8_t * src = static_cast<const uint8_t *>(user_data);
@@ -133,15 +177,13 @@ bool codec_graph_cache_get_or_build(
         return false;
     }
 
-    size_t graph_size = GGML_DEFAULT_GRAPH_SIZE;
-    if (key.kind == CODEC_GRAPH_WT_ENCODE || key.kind == CODEC_GRAPH_WT_DECODE ||
-        key.kind == CODEC_GRAPH_MIMI_ENCODE || key.kind == CODEC_GRAPH_MIMI_DECODE ||
-        key.kind == CODEC_GRAPH_SOPRANO_DECODE || key.kind == CODEC_GRAPH_NEMO_NANO_DECODE ||
-        key.kind == CODEC_GRAPH_NEMO_NANO_ENCODE || key.kind == CODEC_GRAPH_CHATTERBOX_S3T_ENCODE) {
-        graph_size = GGML_DEFAULT_GRAPH_SIZE * 32;
-    } else if (key.kind == CODEC_GRAPH_Q3T_DECODE || key.kind == CODEC_GRAPH_NEUCODEC_DECODE ||
-               key.kind == CODEC_GRAPH_NEUCODEC_ENCODE) {
-        graph_size = GGML_DEFAULT_GRAPH_SIZE * 64;
+    const codec_graph_count_state counts = codec_graph_count_exact(out);
+    size_t graph_size = 0;
+    if (ctx->model != nullptr && ctx->model->vtable != nullptr && ctx->model->vtable->graph_size != nullptr) {
+        graph_size = ctx->model->vtable->graph_size(ctx->model, &cached->key, build_data, out);
+    }
+    if (graph_size == 0) {
+        graph_size = std::max<size_t>(1, std::max(counts.n_nodes, counts.n_leafs));
     }
 
     ctx->eval_graph = ggml_new_graph_custom(ctx->eval_ctx, graph_size, false);
@@ -150,7 +192,8 @@ bool codec_graph_cache_get_or_build(
     ctx->eval_entry = cached;
 
     cached->required_mem_size = std::max(cached->required_mem_size, ggml_used_mem(ctx->eval_ctx));
-    cached->last_graph_size = ggml_graph_n_nodes(ctx->eval_graph);
+    cached->last_graph_size = (int32_t) graph_size;
+    cached->last_sched_graph_size = (int32_t) std::max<size_t>(1, counts.n_nodes + counts.n_leafs);
     *out_entry = cached;
     return true;
 }

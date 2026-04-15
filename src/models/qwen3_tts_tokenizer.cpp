@@ -894,6 +894,7 @@ const struct codec_model_vtable * codec_qwen3_tts_tokenizer_vtable() {
         codec_qwen3_tts_tokenizer_create_impl,
         codec_qwen3_tts_tokenizer_destroy_impl,
         codec_qwen3_tts_tokenizer_init,
+        codec_graph_size_exact,
         codec_qwen3_tts_tokenizer_encode_wrap,
         codec_qwen3_tts_tokenizer_decode_wrap,
         nullptr,

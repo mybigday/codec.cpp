@@ -1982,6 +1982,7 @@ const struct codec_model_vtable * codec_neucodec_vtable() {
         codec_neu_create_impl,
         codec_neu_destroy_impl,
         codec_neucodec_init,
+        codec_graph_size_exact,
         codec_neu_encode_wrap,
         codec_neu_decode_wrap,
     };
@@ -1995,6 +1996,7 @@ const struct codec_model_vtable * codec_distill_neucodec_vtable() {
         codec_neu_create_impl,
         codec_neu_destroy_impl,
         codec_neucodec_init,
+        codec_graph_size_exact,
         codec_neu_encode_wrap,
         codec_neu_decode_wrap,
     };

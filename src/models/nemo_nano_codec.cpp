@@ -750,6 +750,7 @@ const struct codec_model_vtable * codec_nemo_nano_codec_vtable() {
         nemo_create_impl,
         nemo_destroy_impl,
         codec_nemo_nano_codec_init,
+        codec_graph_size_exact,
         nemo_encode_wrap,
         nemo_decode_wrap,
         nullptr,

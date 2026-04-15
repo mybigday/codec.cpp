@@ -514,6 +514,7 @@ const struct codec_model_vtable * codec_soprano_vtable() {
         codec_sop_create_impl,
         codec_sop_destroy_impl,
         codec_sop_init_wrap,
+        codec_graph_size_exact,
         nullptr,
         codec_sop_decode_wrap,
         codec_sop_decode_latent_wrap,

@@ -10,8 +10,8 @@ Use this skill when adding a **new model architecture** or a large variant that 
 ## Checklist (short)
 1. Converter + GGUF metadata
 2. Runtime model struct + vtable init
-3. Graph build (encode/decode)
-4. Weight copy + IO wiring
+3. Graph build (encode/decode) + exact graph sizing
+4. Exact weight upload + IO wiring
 5. E2E test + HF parity
 
 ---
@@ -47,31 +47,37 @@ Actions:
 - Implement `codec_<model>_vtable()` (create_impl/destroy_impl/init/encode/decode).
 - In `codec_<model>_init`, load GGUF keys with safe defaults and sanity checks.
 - Propagate model-level fields to `codec_model` (sample_rate, hop_size, n_q, etc.).
+- Set the model vtable `graph_size` callback. Default policy should be the shared exact DAG-based sizing helper unless the model truly needs something else.
 - Register the vtable in `codec_model_vtable_for_arch()` in `src/codec.cpp`.
 
 ---
 
-## 3) Graph build (encode/decode)
+## 3) Graph build (encode/decode) + exact graph sizing
 
 Files:
 - `src/models/<model>.cpp`
-- `src/runtime/graph.cpp` (graph sizing if needed)
-- `src/runtime/graph_exec.cpp` (scheduler sizing if needed)
+- `src/runtime/graph.cpp`
+- `src/runtime/graph_exec.cpp`
 
 Rules:
 - Build graphs using **ggml ops only**.
 - Avoid CPU-side tensor math.
 - Add graph cache keys: `(kind, n_frames, n_q, hop, n_in, latent_dim)`.
-- If graph is large, scale `ggml_new_graph_custom` size and ensure scheduler capacity.
+- Do not add `kind`-based graph-size heuristics.
+- Eval graph capacity should be exact for the built DAG.
+- Scheduler capacity must also be exact, but its requirement is not necessarily identical to eval-graph capacity. Follow ggml's scheduler contract instead of reusing old blanket multipliers.
+- If you need a model-specific graph sizing policy, put it behind the vtable callback rather than in shared conditional logic.
 
 ---
 
-## 4) Weight copy + IO
+## 4) Exact weight upload + IO
 
 Patterns:
-- Use `codec_*_copy_*` helpers to map GGUF tensors into graph tensors.
+- Runtime helpers should only do exact validated upload of already-converted tensors.
+- Shared runtime helpers should validate source existence, type, and exact shape compatibility, then upload.
 - Keep naming consistent: `codec_<model>_*_tensor_name`.
 - Validate shapes early and return actionable errors.
+- Never transpose/reshape/reorder weights at runtime. If layout is wrong, fix the converter.
 
 ---
 
@@ -90,3 +96,4 @@ Actions:
 If mismatch:
 - Compare HF vs ggml outputs step-by-step.
 - Check padding/stride and tensor layouts first.
+- For graph allocation failures, check the vtable graph sizing policy and scheduler sizing contract before increasing anything.
