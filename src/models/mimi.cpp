@@ -424,24 +424,6 @@ static bool codec_mimi_init_encode_build(
     return true;
 }
 
-static ggml_tensor * codec_mimi_layer_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, 1e-5f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
-}
-
 static bool codec_mimi_build_encode_transformer(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     mimi_encode_transformer_build * p = static_cast<mimi_encode_transformer_build *>(user_data);
     if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->t <= 0 || p->c <= 0 || p->n_layers <= 0 || p->n_heads <= 0 || p->head_dim <= 0) {
@@ -486,7 +468,7 @@ static bool codec_mimi_build_encode_transformer(ggml_context * ctx_eval, void * 
         ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->c);
         ggml_set_name(mlp_scale, codec_mimi_encode_transformer_tensor_name(li, "mlp_ls.scale").c_str());
 
-        ggml_tensor * h = codec_mimi_layer_norm_ct(ctx_eval, x, inln_w, inln_b);
+        ggml_tensor * h = codec_op_layer_norm_ct(ctx_eval, x, 1e-5f, inln_w, inln_b);
         if (h == nullptr) {
             return false;
         }
@@ -530,7 +512,7 @@ static bool codec_mimi_build_encode_transformer(ggml_context * ctx_eval, void * 
         }
         x = ggml_add(ctx_eval, x, codec_op_channel_scale(ctx_eval, attn_proj, sa_scale));
 
-        ggml_tensor * m = codec_mimi_layer_norm_ct(ctx_eval, x, paln_w, paln_b);
+        ggml_tensor * m = codec_op_layer_norm_ct(ctx_eval, x, 1e-5f, paln_w, paln_b);
         if (m == nullptr) {
             return false;
         }
@@ -943,7 +925,7 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
         ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->transformer.c);
         ggml_set_name(mlp_scale, codec_mimi_encode_transformer_tensor_name(li, "mlp_ls.scale").c_str());
 
-        ggml_tensor * h = codec_mimi_layer_norm_ct(ctx_eval, x, inln_w, inln_b);
+        ggml_tensor * h = codec_op_layer_norm_ct(ctx_eval, x, 1e-5f, inln_w, inln_b);
         if (h == nullptr) {
             return false;
         }
@@ -987,7 +969,7 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
         }
         x = ggml_add(ctx_eval, x, codec_op_channel_scale(ctx_eval, attn_proj, sa_scale));
 
-        ggml_tensor * m = codec_mimi_layer_norm_ct(ctx_eval, x, paln_w, paln_b);
+        ggml_tensor * m = codec_op_layer_norm_ct(ctx_eval, x, 1e-5f, paln_w, paln_b);
         if (m == nullptr) {
             return false;
         }
@@ -1294,7 +1276,7 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
         ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
         ggml_set_name(mlp_scale, codec_mimi_decode_transformer_tensor_name(li, "mlp_ls.scale").c_str());
 
-        ggml_tensor * h = codec_mimi_layer_norm_ct(ctx_eval, x_ct, inln_w, inln_b);
+        ggml_tensor * h = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-5f, inln_w, inln_b);
         const int32_t t_cur = (int32_t) h->ne[1];
 
         ggml_tensor * q = mul_mat_checked("dtr.q_proj", q_w, h);
@@ -1332,7 +1314,7 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
         }
         x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, attn_out, sa_scale));
 
-        ggml_tensor * m = codec_mimi_layer_norm_ct(ctx_eval, x_ct, paln_w, paln_b);
+        ggml_tensor * m = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-5f, paln_w, paln_b);
         m = mul_mat_checked("dtr.fc1", fc1_w, m);
         if (m == nullptr) {
             return false;

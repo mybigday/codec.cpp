@@ -17,6 +17,7 @@ enum codec_graph_kind {
     CODEC_GRAPH_NEMO_NANO_ENCODE = 11,
     CODEC_GRAPH_NEUCODEC_DECODE = 12,
     CODEC_GRAPH_NEUCODEC_ENCODE = 13,
+    CODEC_GRAPH_CHATTERBOX_S3T_ENCODE = 14,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

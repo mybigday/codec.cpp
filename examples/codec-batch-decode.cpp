@@ -1,15 +1,14 @@
 #include "codec.h"
+#include "utils/npy_io.h"
+#include "utils/wav_io.h"
 
 #include <algorithm>
-#include <cctype>
 #include <climits>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -20,19 +19,6 @@ struct codec_batch_decode_params {
     const char * out_path = nullptr;
     int32_t n_threads = 4;
     int32_t n_q = 0;
-};
-
-enum npy_dtype {
-    NPY_DTYPE_UNKNOWN = 0,
-    NPY_DTYPE_I32 = 1,
-    NPY_DTYPE_F32 = 2,
-};
-
-struct npy_array {
-    enum npy_dtype dtype = NPY_DTYPE_UNKNOWN;
-    std::vector<int32_t> shape;
-    std::vector<int32_t> i32;
-    std::vector<float> f32;
 };
 
 static void print_usage(const char * prog) {
@@ -163,244 +149,6 @@ static bool parse_args(int argc, char ** argv, struct codec_batch_decode_params 
     return true;
 }
 
-static bool write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err) {
-    FILE * fp = std::fopen(path, "wb");
-    if (fp == nullptr) {
-        if (err != nullptr) {
-            *err = "failed to open output wav";
-        }
-        return false;
-    }
-
-    const uint16_t audio_format = 1;
-    const uint16_t n_channels = 1;
-    const uint16_t bits_per_sample = 16;
-    const uint16_t block_align = n_channels * bits_per_sample / 8;
-    const uint32_t byte_rate = (uint32_t)sample_rate * block_align;
-    const uint32_t data_size = (uint32_t)n_samples * block_align;
-    const uint32_t riff_size = 36 + data_size;
-
-    std::fwrite("RIFF", 1, 4, fp);
-    std::fwrite(&riff_size, 4, 1, fp);
-    std::fwrite("WAVE", 1, 4, fp);
-    std::fwrite("fmt ", 1, 4, fp);
-    const uint32_t fmt_size = 16;
-    std::fwrite(&fmt_size, 4, 1, fp);
-    std::fwrite(&audio_format, 2, 1, fp);
-    std::fwrite(&n_channels, 2, 1, fp);
-    std::fwrite(&sample_rate, 4, 1, fp);
-    std::fwrite(&byte_rate, 4, 1, fp);
-    std::fwrite(&block_align, 2, 1, fp);
-    std::fwrite(&bits_per_sample, 2, 1, fp);
-    std::fwrite("data", 1, 4, fp);
-    std::fwrite(&data_size, 4, 1, fp);
-
-    for (int32_t i = 0; i < n_samples; ++i) {
-        const float x = std::max(-1.0f, std::min(1.0f, pcm[i]));
-        const int32_t q = (int32_t)std::lround(x * 32767.0f);
-        const int16_t s = (int16_t)std::max(-32768, std::min(32767, q));
-        std::fwrite(&s, sizeof(s), 1, fp);
-    }
-
-    std::fclose(fp);
-    return true;
-}
-
-static bool parse_shape_dims(const std::string & header, std::vector<int32_t> * out_shape, std::string * err) {
-    const size_t p0 = header.find('(');
-    const size_t p1 = header.find(')', p0 == std::string::npos ? 0 : p0 + 1);
-    if (p0 == std::string::npos || p1 == std::string::npos || p1 <= p0 + 1) {
-        if (err != nullptr) {
-            *err = "invalid npy shape";
-        }
-        return false;
-    }
-
-    out_shape->clear();
-    const std::string inside = header.substr(p0 + 1, p1 - p0 - 1);
-
-    size_t i = 0;
-    while (i < inside.size()) {
-        while (i < inside.size() && (std::isspace((unsigned char)inside[i]) || inside[i] == ',')) {
-            ++i;
-        }
-        if (i >= inside.size()) {
-            break;
-        }
-
-        size_t j = i;
-        while (j < inside.size() && std::isdigit((unsigned char)inside[j])) {
-            ++j;
-        }
-        if (j == i) {
-            if (err != nullptr) {
-                *err = "invalid npy shape contents";
-            }
-            return false;
-        }
-
-        const std::string token = inside.substr(i, j - i);
-        char * end = nullptr;
-        long v = std::strtol(token.c_str(), &end, 10);
-        if (end == token.c_str() || *end != '\0' || v <= 0 || v > INT32_MAX) {
-            if (err != nullptr) {
-                *err = "invalid npy dimensions";
-            }
-            return false;
-        }
-
-        out_shape->push_back((int32_t)v);
-        i = j;
-    }
-
-    if (out_shape->empty()) {
-        if (err != nullptr) {
-            *err = "npy shape is empty";
-        }
-        return false;
-    }
-
-    return true;
-}
-
-static bool parse_npy_header(std::ifstream & ifs, enum npy_dtype * dtype, std::vector<int32_t> * shape, std::string * err) {
-    char magic[6] = { 0 };
-    if (!ifs.read(magic, 6) || std::memcmp(magic, "\x93NUMPY", 6) != 0) {
-        if (err != nullptr) {
-            *err = "invalid npy magic";
-        }
-        return false;
-    }
-
-    uint8_t major = 0;
-    uint8_t minor = 0;
-    if (!ifs.read(reinterpret_cast<char *>(&major), 1) || !ifs.read(reinterpret_cast<char *>(&minor), 1)) {
-        if (err != nullptr) {
-            *err = "invalid npy version";
-        }
-        return false;
-    }
-
-    uint32_t hlen = 0;
-    if (major == 1) {
-        uint16_t h16 = 0;
-        if (!ifs.read(reinterpret_cast<char *>(&h16), 2)) {
-            if (err != nullptr) {
-                *err = "invalid npy header length";
-            }
-            return false;
-        }
-        hlen = h16;
-    } else if (major == 2 || major == 3) {
-        if (!ifs.read(reinterpret_cast<char *>(&hlen), 4)) {
-            if (err != nullptr) {
-                *err = "invalid npy header length";
-            }
-            return false;
-        }
-    } else {
-        if (err != nullptr) {
-            *err = "unsupported npy version";
-        }
-        return false;
-    }
-
-    std::string header(hlen, '\0');
-    if (!ifs.read(header.data(), (std::streamsize)hlen)) {
-        if (err != nullptr) {
-            *err = "failed to read npy header";
-        }
-        return false;
-    }
-
-    if (header.find("fortran_order") == std::string::npos || header.find("False") == std::string::npos) {
-        if (err != nullptr) {
-            *err = "fortran-order npy is not supported";
-        }
-        return false;
-    }
-
-    if (header.find("'descr': '<i4'") != std::string::npos || header.find("\"descr\": \"<i4\"") != std::string::npos) {
-        *dtype = NPY_DTYPE_I32;
-    } else if (header.find("'descr': '<f4'") != std::string::npos || header.find("\"descr\": \"<f4\"") != std::string::npos) {
-        *dtype = NPY_DTYPE_F32;
-    } else {
-        if (err != nullptr) {
-            *err = "only little-endian int32/float32 npy is supported";
-        }
-        return false;
-    }
-
-    return parse_shape_dims(header, shape, err);
-}
-
-static bool load_npy(const char * path, struct npy_array * out, std::string * err) {
-    if (path == nullptr || out == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid npy load arguments";
-        }
-        return false;
-    }
-
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) {
-        if (err != nullptr) {
-            *err = "failed to open npy file";
-        }
-        return false;
-    }
-
-    out->dtype = NPY_DTYPE_UNKNOWN;
-    out->shape.clear();
-    out->i32.clear();
-    out->f32.clear();
-
-    if (!parse_npy_header(ifs, &out->dtype, &out->shape, err)) {
-        return false;
-    }
-
-    size_t n_elem = 1;
-    for (size_t i = 0; i < out->shape.size(); ++i) {
-        if (out->shape[i] <= 0) {
-            if (err != nullptr) {
-                *err = "npy dimensions must be positive";
-            }
-            return false;
-        }
-        if (n_elem > SIZE_MAX / (size_t)out->shape[i]) {
-            if (err != nullptr) {
-                *err = "npy element count overflow";
-            }
-            return false;
-        }
-        n_elem *= (size_t)out->shape[i];
-    }
-
-    if (out->dtype == NPY_DTYPE_I32) {
-        out->i32.resize(n_elem);
-        if (!ifs.read(reinterpret_cast<char *>(out->i32.data()), (std::streamsize)(n_elem * sizeof(int32_t)))) {
-            if (err != nullptr) {
-                *err = "failed to read npy int32 payload";
-            }
-            return false;
-        }
-    } else if (out->dtype == NPY_DTYPE_F32) {
-        out->f32.resize(n_elem);
-        if (!ifs.read(reinterpret_cast<char *>(out->f32.data()), (std::streamsize)(n_elem * sizeof(float)))) {
-            if (err != nullptr) {
-                *err = "failed to read npy float32 payload";
-            }
-            return false;
-        }
-    } else {
-        if (err != nullptr) {
-            *err = "unsupported npy dtype";
-        }
-        return false;
-    }
-
-    return true;
-}
 
 int main(int argc, char ** argv) {
     struct codec_batch_decode_params args;
@@ -435,10 +183,10 @@ int main(int argc, char ** argv) {
     dparams.n_q = args.n_q;
 
     std::string npy_err;
-    struct npy_array arr;
+    struct codec_example_npy_array arr;
     const bool codes_mode = args.codes_path != nullptr;
     const char * input_path = codes_mode ? args.codes_path : args.latent_path;
-    if (!load_npy(input_path, &arr, &npy_err)) {
+    if (!codec_example_load_npy(input_path, &arr, &npy_err)) {
         std::fprintf(stderr, "failed to load npy: %s (%s)\n", input_path, npy_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -452,13 +200,13 @@ int main(int argc, char ** argv) {
         return 5;
     }
 
-    if (codes_mode && arr.dtype != NPY_DTYPE_I32) {
+    if (codes_mode && arr.dtype != CODEC_EXAMPLE_NPY_DTYPE_I32) {
         std::fprintf(stderr, "codes mode requires int32 npy\n");
         codec_free(ctx);
         codec_model_free(model);
         return 6;
     }
-    if (!codes_mode && arr.dtype != NPY_DTYPE_F32) {
+    if (!codes_mode && arr.dtype != CODEC_EXAMPLE_NPY_DTYPE_F32) {
         std::fprintf(stderr, "latent mode requires float32 npy\n");
         codec_free(ctx);
         codec_model_free(model);
@@ -500,7 +248,7 @@ int main(int argc, char ** argv) {
         }
 
         std::string wav_err;
-        if (!write_wav_pcm16(args.out_path, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
+        if (!codec_example_write_wav_pcm16(args.out_path, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
             std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
             codec_pcm_buffer_free(&pcm);
             codec_free(ctx);
@@ -620,7 +368,7 @@ int main(int argc, char ** argv) {
     for (int32_t i = 0; i < n_seq; ++i) {
         std::string out_wav = std::string(args.out_path) + "/seq_" + std::to_string(i) + ".wav";
         std::string wav_err;
-        if (!write_wav_pcm16(out_wav.c_str(), pcm[(size_t)i].data, pcm[(size_t)i].n_samples, pcm[(size_t)i].sample_rate, &wav_err)) {
+        if (!codec_example_write_wav_pcm16(out_wav.c_str(), pcm[(size_t)i].data, pcm[(size_t)i].n_samples, pcm[(size_t)i].sample_rate, &wav_err)) {
             std::fprintf(stderr, "failed to write %s: %s\n", out_wav.c_str(), wav_err.c_str());
             write_ok = false;
             break;

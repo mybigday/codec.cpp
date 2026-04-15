@@ -42,6 +42,10 @@ def detect_model_type_from_config(config_path: Path) -> str:
         return "wavtokenizer"
     elif "qwen3" in model_type or "qwen" in model_type:
         return "qwen3_tts_tokenizer"
+    elif "chatterbox_s3t" in model_type or "s3t" == model_type:
+        return "chatterbox_s3t"
+    elif "chatterbox_s3g" in model_type or "s3g" == model_type:
+        return "chatterbox_s3g"
     elif "soprano" in model_type:
         return "soprano"
     elif "nemo" in model_type or "nano" in model_type:
@@ -61,6 +65,10 @@ def detect_model_type_from_config(config_path: Path) -> str:
             return "wavtokenizer"
         elif "qwen3" in arch or "qwen" in arch:
             return "qwen3_tts_tokenizer"
+        elif "chatterbox_s3t" in arch or arch == "s3t":
+            return "chatterbox_s3t"
+        elif "chatterbox_s3g" in arch or arch == "s3g":
+            return "chatterbox_s3g"
         elif "soprano" in arch:
             return "soprano"
         elif "nemo" in arch or "nano" in arch:
@@ -84,6 +92,10 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         return 'dac'
     elif 'qwen' in name_lower:
         return 'qwen3_tts_tokenizer'
+    elif 'chatterbox-s3t' in name_lower or 'chatterbox_s3t' in name_lower or name_lower == 's3t':
+        return 'chatterbox_s3t'
+    elif 'chatterbox-s3g' in name_lower or 'chatterbox_s3g' in name_lower or name_lower == 's3g':
+        return 'chatterbox_s3g'
     elif 'soprano' in name_lower:
         return 'soprano'
     elif 'nemo' in name_lower or 'nano-codec' in name_lower:
@@ -113,7 +125,7 @@ Examples:
   # With quantization
   python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantization Q4_K_M
   
-Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, soprano, nemo_nano_codec, neucodec, distill_neucodec
+Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, chatterbox_s3g, soprano, nemo_nano_codec, neucodec, distill_neucodec
         """
     )
     

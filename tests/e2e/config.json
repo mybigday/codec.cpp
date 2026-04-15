@@ -64,6 +64,22 @@
       "converter": "nemo_nano_codec"
     },
     {
+      "name": "soprano",
+      "hf_repo_id": "ekwek/Soprano-1.1-80M",
+      "hf_file": "decoder.pth",
+      "class": "soprano",
+      "sample_rate": 32000,
+      "latent_dim": 512,
+      "latent_frames": 64,
+      "latent_only": true,
+      "gguf": "models/soprano/soprano.gguf",
+      "converter": "soprano",
+      "thresholds": {
+        "corr_min": 0.999,
+        "mse_max": 0.0001
+      }
+    },
+    {
       "name": "neucodec",
       "hf_repo_id": "neuphonic/neucodec",
       "hf_file": null,

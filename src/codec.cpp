@@ -4,6 +4,8 @@
 #include "models/dac.h"
 #include "models/mimi.h"
 #include "models/qwen3_tts_tokenizer.h"
+#include "models/chatterbox_s3g.h"
+#include "models/chatterbox_s3t.h"
 #include "models/soprano.h"
 #include "models/nemo_nano_codec.h"
 #include "models/neucodec.h"
@@ -113,6 +115,12 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "distill_neucodec" || arch == "distill-neucodec") {
         return CODEC_ARCH_DISTILL_NEUCODEC;
     }
+    if (arch == "chatterbox_s3t" || arch == "chatterbox-s3t" || arch == "s3t") {
+        return CODEC_ARCH_CHATTERBOX_S3T;
+    }
+    if (arch == "chatterbox_s3g" || arch == "chatterbox-s3g" || arch == "s3g") {
+        return CODEC_ARCH_CHATTERBOX_S3G;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -135,6 +143,10 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_neucodec_vtable();
         case CODEC_ARCH_DISTILL_NEUCODEC:
             return codec_distill_neucodec_vtable();
+        case CODEC_ARCH_CHATTERBOX_S3T:
+            return codec_chatterbox_s3t_vtable();
+        case CODEC_ARCH_CHATTERBOX_S3G:
+            return codec_chatterbox_s3g_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -151,6 +163,8 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_NEMO_NANO_CODEC:    return "NeMo-Nano-Codec";
         case CODEC_ARCH_NEUCODEC:           return "NeuCodec";
         case CODEC_ARCH_DISTILL_NEUCODEC:   return "Distill-NeuCodec";
+        case CODEC_ARCH_CHATTERBOX_S3T:     return "Chatterbox-S3T";
+        case CODEC_ARCH_CHATTERBOX_S3G:     return "Chatterbox-S3G";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }

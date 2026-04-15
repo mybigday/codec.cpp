@@ -20,7 +20,6 @@ static constexpr int32_t CODEC_Q3T_RES_UNITS = 3;
 static constexpr int32_t CODEC_Q3T_RES_DILATIONS[CODEC_Q3T_RES_UNITS] = { 1, 3, 9 };
 
 static ggml_tensor * codec_q3t_get_tensor(codec_model * model, const std::string & name);
-static bool codec_q3t_tensor_to_f32(ggml_tensor * src, std::vector<float> * out);
 
 enum codec_status codec_qwen3_tts_tokenizer_init(struct codec_model * model) {
     codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(model->impl);
@@ -149,92 +148,6 @@ static ggml_tensor * codec_q3t_get_tensor(codec_model * model, const std::string
     return ggml_get_tensor(model->weights, name.c_str());
 }
 
-static bool codec_q3t_tensor_to_f32(ggml_tensor * t, std::vector<float> * out) {
-    return codec_tensor_as_vec_f32(t, out);
-}
-
-static bool codec_q3t_copy_linear_weight_to_2d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    if (ctx == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 linear copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_q3t_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Qwen3 tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_q3t_tensor_to_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 linear tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_q3t_copy_conv1d_weight_to_3d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    if (ctx == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 conv1d copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_q3t_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Qwen3 tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_q3t_tensor_to_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 conv1d tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_q3t_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    if (ctx == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 bias copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_q3t_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Qwen3 tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_q3t_tensor_to_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 bias tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
 static bool codec_q3t_copy_bias_1d_optional(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
     if (dst == nullptr) {
         if (err != nullptr) {
@@ -242,42 +155,7 @@ static bool codec_q3t_copy_bias_1d_optional(codec_context * ctx, const std::stri
         }
         return false;
     }
-    ggml_tensor * src = codec_q3t_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        std::vector<float> zeros((size_t) ggml_nelements(dst), 0.0f);
-        return codec_runtime_write_tensor(dst, zeros.data(), zeros.size() * sizeof(float), err);
-    }
-    return codec_q3t_copy_bias_1d(ctx, src_name, dst, err);
-}
-
-static ggml_tensor * codec_q3t_rms_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    float eps) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_rms_norm(ctx_eval, x_ct, eps);
-    return codec_op_channel_scale(ctx_eval, y, gamma);
-}
-
-static ggml_tensor * codec_q3t_layer_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, 1e-6f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
+    return codec_runtime_copy_tensor_f32_exact_or_zeros(ctx, src_name, dst, err);
 }
 
 static ggml_tensor * codec_q3t_convnext_block(
@@ -304,7 +182,7 @@ static ggml_tensor * codec_q3t_convnext_block(
     }
 
     ggml_tensor * h_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, h)); // [c, t]
-    h_ct = codec_q3t_layer_norm_ct(ctx_eval, h_ct, ln_w, ln_b);
+    h_ct = codec_op_layer_norm_ct(ctx_eval, h_ct, 1e-6f, ln_w, ln_b);
     if (h_ct == nullptr) {
         return nullptr;
     }
@@ -496,7 +374,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
         ggml_set_name(mlp_scale, codec_q3t_decode_pt_layer_name(li, "mlp.scale").c_str());
 
-        ggml_tensor * h = codec_q3t_rms_norm_ct(ctx_eval, x_ct, inln_w, 1e-5f);
+        ggml_tensor * h = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, inln_w);
         if (h == nullptr) {
             return false;
         }
@@ -545,7 +423,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         attn_proj = ggml_add(ctx_eval, attn_proj, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, o_b, o_w->ne[1], 1), attn_proj));
         x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, attn_proj, sa_scale));
 
-        ggml_tensor * m = codec_q3t_rms_norm_ct(ctx_eval, x_ct, paln_w, 1e-5f);
+        ggml_tensor * m = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, paln_w);
         ggml_tensor * gate = ggml_mul_mat(ctx_eval, fc_gate, m);
         ggml_tensor * up = ggml_mul_mat(ctx_eval, fc_up, m);
         gate = ggml_silu(ctx_eval, gate);
@@ -556,7 +434,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     ggml_tensor * t_norm_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
     ggml_set_name(t_norm_w, "q3t.dec.pt.norm.w");
-    x_ct = codec_q3t_rms_norm_ct(ctx_eval, x_ct, t_norm_w, 1e-5f);
+    x_ct = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, t_norm_w);
 
     x_ct = ggml_mul_mat(ctx_eval, t_out_w, x_ct);
     ggml_tensor * out_b2 = ggml_reshape_2d(ctx_eval, t_out_b, t_out_w->ne[1], 1);
@@ -713,11 +591,11 @@ static bool codec_q3t_init_decode_build(codec_context * ctx, int32_t t, int32_t 
 
 static bool codec_q3t_write_decode_weights(codec_context * ctx, codec_graph_cache_entry * entry, const q3t_decode_build & build, std::string * err) {
     // quantizer output proj
-    if (!codec_q3t_copy_linear_weight_to_2d(ctx, "q3t.dec.q.s.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.s.op.w"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.q.s.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.s.op.w"), err)) {
         return false;
     }
     if (build.q > build.n_sem) {
-        if (!codec_q3t_copy_linear_weight_to_2d(ctx, "q3t.dec.q.a.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.a.op.w"), err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.q.a.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.a.op.w"), err)) {
             return false;
         }
     }
@@ -740,7 +618,7 @@ static bool codec_q3t_write_decode_weights(codec_context * ctx, codec_graph_cach
             return false;
         }
         std::vector<float> v;
-        if (!codec_q3t_tensor_to_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
+        if (!codec_tensor_as_vec_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
             if (err != nullptr) {
                 *err = "invalid Qwen3 codebook tensor: " + name;
             }
@@ -752,16 +630,16 @@ static bool codec_q3t_write_decode_weights(codec_context * ctx, codec_graph_cach
     }
 
     // pre-conv
-    if (!codec_q3t_copy_conv1d_weight_to_3d(ctx, "q3t.dec.pre.conv.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.w"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.pre.conv.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.b"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pre.conv.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.w"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pre.conv.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.b"), err)) {
         return false;
     }
 
     // pre-transformer input/output
-    if (!codec_q3t_copy_linear_weight_to_2d(ctx, "q3t.dec.pt.in.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.w"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.pt.in.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.b"), err) ||
-        !codec_q3t_copy_linear_weight_to_2d(ctx, "q3t.dec.pt.out.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.w"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.pt.out.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.b"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.in.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.w"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.in.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.b"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.out.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.w"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.out.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.b"), err)) {
         return false;
     }
 
@@ -769,80 +647,80 @@ static bool codec_q3t_write_decode_weights(codec_context * ctx, codec_graph_cach
         auto tensor = [&](const char * suffix) {
             return codec_graph_get_tensor(ctx, entry, codec_q3t_decode_pt_layer_name(li, suffix).c_str());
         };
-        if (!codec_q3t_copy_bias_1d(ctx, codec_q3t_decode_pt_layer_name(li, "inln.w"), tensor("inln.w"), err) ||
-            !codec_q3t_copy_bias_1d(ctx, codec_q3t_decode_pt_layer_name(li, "paln.w"), tensor("paln.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "attn.q.w"), tensor("attn.q.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "attn.k.w"), tensor("attn.k.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "attn.v.w"), tensor("attn.v.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "attn.o.w"), tensor("attn.o.w"), err) ||
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "inln.w"), tensor("inln.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "paln.w"), tensor("paln.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.q.w"), tensor("attn.q.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.k.w"), tensor("attn.k.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.v.w"), tensor("attn.v.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.o.w"), tensor("attn.o.w"), err) ||
             !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.q.b"), tensor("attn.q.b"), err) ||
             !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.k.b"), tensor("attn.k.b"), err) ||
             !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.v.b"), tensor("attn.v.b"), err) ||
             !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.o.b"), tensor("attn.o.b"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.gate.w"), tensor("mlp.gate.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.up.w"), tensor("mlp.up.w"), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.down.w"), tensor("mlp.down.w"), err) ||
-            !codec_q3t_copy_bias_1d(ctx, codec_q3t_decode_pt_layer_name(li, "sa.scale"), tensor("sa.scale"), err) ||
-            !codec_q3t_copy_bias_1d(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.scale"), tensor("mlp.scale"), err)) {
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.gate.w"), tensor("mlp.gate.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.up.w"), tensor("mlp.up.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.down.w"), tensor("mlp.down.w"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "sa.scale"), tensor("sa.scale"), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.scale"), tensor("mlp.scale"), err)) {
             return false;
         }
     }
 
-    if (!codec_q3t_copy_bias_1d(ctx, "q3t.dec.pt.norm.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.norm.w"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.norm.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.norm.w"), err)) {
         return false;
     }
 
     // upsampling ratios
     for (int32_t ui = 0; ui < build.n_upsampling_ratios; ++ui) {
         const std::string base = "q3t.dec.up" + std::to_string(ui);
-        if (!codec_q3t_copy_conv1d_weight_to_3d(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err) ||
-            !codec_q3t_copy_conv1d_weight_to_3d(ctx, base + ".cnx.dw.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.dw.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.b").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.norm.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.norm.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.b").c_str()), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, base + ".cnx.pw1.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.pw1.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.b").c_str()), err) ||
-            !codec_q3t_copy_linear_weight_to_2d(ctx, base + ".cnx.pw2.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.pw2.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.b").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".cnx.gamma", codec_graph_get_tensor(ctx, entry, (base + ".cnx.gamma").c_str()), err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.dw.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.dw.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.b").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.norm.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.norm.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.b").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw1.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw1.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.b").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw2.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw2.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.b").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.gamma", codec_graph_get_tensor(ctx, entry, (base + ".cnx.gamma").c_str()), err)) {
             return false;
         }
     }
 
     // decoder stack
-    if (!codec_q3t_copy_conv1d_weight_to_3d(ctx, "q3t.dec.d0.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.w"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.d0.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.b"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.d0.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.w"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.d0.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.b"), err)) {
         return false;
     }
 
     for (int32_t bi = 0; bi < build.n_upsample_rates; ++bi) {
         const std::string base = "q3t.dec.b" + std::to_string(bi);
-        if (!codec_q3t_copy_bias_1d(ctx, base + ".s0.a", codec_graph_get_tensor(ctx, entry, (base + ".s0.a").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".s0.binv", codec_graph_get_tensor(ctx, entry, (base + ".s0.binv").c_str()), err) ||
-            !codec_q3t_copy_conv1d_weight_to_3d(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
-            !codec_q3t_copy_bias_1d(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, base + ".s0.a", codec_graph_get_tensor(ctx, entry, (base + ".s0.a").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".s0.binv", codec_graph_get_tensor(ctx, entry, (base + ".s0.binv").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err)) {
             return false;
         }
         for (int32_t ri = 0; ri < CODEC_Q3T_RES_UNITS; ++ri) {
             const std::string rbase = base + ".r" + std::to_string(ri);
-            if (!codec_q3t_copy_bias_1d(ctx, rbase + ".s1.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.a").c_str()), err) ||
-                !codec_q3t_copy_bias_1d(ctx, rbase + ".s1.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.binv").c_str()), err) ||
-                !codec_q3t_copy_conv1d_weight_to_3d(ctx, rbase + ".c1.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.w").c_str()), err) ||
-                !codec_q3t_copy_bias_1d(ctx, rbase + ".c1.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.b").c_str()), err) ||
-                !codec_q3t_copy_bias_1d(ctx, rbase + ".s2.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.a").c_str()), err) ||
-                !codec_q3t_copy_bias_1d(ctx, rbase + ".s2.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.binv").c_str()), err) ||
-                !codec_q3t_copy_conv1d_weight_to_3d(ctx, rbase + ".c2.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.w").c_str()), err) ||
-                !codec_q3t_copy_bias_1d(ctx, rbase + ".c2.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.b").c_str()), err)) {
+            if (!codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s1.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.a").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s1.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.binv").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c1.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.w").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c1.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.b").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s2.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.a").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s2.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.binv").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c2.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.w").c_str()), err) ||
+                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c2.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.b").c_str()), err)) {
                 return false;
             }
         }
     }
 
-    if (!codec_q3t_copy_bias_1d(ctx, "q3t.dec.final.s.a", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.a"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.final.s.binv", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.binv"), err) ||
-        !codec_q3t_copy_conv1d_weight_to_3d(ctx, "q3t.dec.final.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.w"), err) ||
-        !codec_q3t_copy_bias_1d(ctx, "q3t.dec.final.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.b"), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.s.a", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.a"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.s.binv", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.binv"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.w"), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.b"), err)) {
         return false;
     }
 

@@ -7,29 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
-#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
 #include <vector>
-
-static ggml_tensor * codec_sop_layer_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, 1e-6f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
-}
 
 static std::string codec_sop_name_embed_w() { return "sop.decode.embed.w"; }
 static std::string codec_sop_name_embed_b() { return "sop.decode.embed.b"; }
@@ -96,7 +77,7 @@ static bool codec_sop_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [c, t]
     ggml_set_name(x_ct, "sop.stage.embed.ct");
-    x_ct = codec_sop_layer_norm_ct(ctx_eval, x_ct, t_norm_w, t_norm_b);
+    x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_norm_w, t_norm_b);
     if (x_ct == nullptr) {
         return false;
     }
@@ -119,9 +100,10 @@ static bool codec_sop_build_decode(ggml_context * ctx_eval, void * user_data, gg
         ggml_set_name(t_ln_w, codec_sop_name_cnx_ln_w(li).c_str());
         ggml_tensor * t_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dim);
         ggml_set_name(t_ln_b, codec_sop_name_cnx_ln_b(li).c_str());
-        ggml_tensor * x_blk_ct = codec_sop_layer_norm_ct(
+        ggml_tensor * x_blk_ct = codec_op_layer_norm_ct(
             ctx_eval,
             ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_dw)),
+            1e-6f,
             t_ln_w,
             t_ln_b);
         if (x_blk_ct == nullptr) {
@@ -161,7 +143,7 @@ static bool codec_sop_build_decode(ggml_context * ctx_eval, void * user_data, gg
     ggml_set_name(t_fln_w, codec_sop_name_fln_w().c_str());
     ggml_tensor * t_fln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->dim);
     ggml_set_name(t_fln_b, codec_sop_name_fln_b().c_str());
-    x_ct = codec_sop_layer_norm_ct(ctx_eval, x_ct, t_fln_w, t_fln_b);
+    x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_fln_w, t_fln_b);
     if (x_ct == nullptr) {
         return false;
     }
@@ -181,121 +163,34 @@ static bool codec_sop_build_decode(ggml_context * ctx_eval, void * user_data, gg
     return true;
 }
 
-static bool codec_sop_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = codec_sop_get_tensor(ctx->model, src_name);
-    if (src == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Soprano tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
-        if (err != nullptr) {
-            *err = "invalid Soprano bias tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_sop_copy_linear_weight_to_2d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    ggml_tensor * src = codec_sop_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Soprano tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> src_v;
-    if (!codec_tensor_as_vec_f32(src, &src_v)) {
-        if (err != nullptr) {
-            *err = "failed reading Soprano tensor: " + src_name;
-        }
-        return false;
-    }
-    const int32_t din = (int32_t) codec_ne(dst, 0);
-    const int32_t dout = (int32_t) codec_ne(dst, 1);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    if (n0 != din || n1 != dout) {
-        if (err != nullptr) {
-            *err = "unexpected Soprano linear shape: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
-}
-
-static bool codec_sop_copy_conv1d_weight_to_3d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    ggml_tensor * src = codec_sop_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Soprano tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> src_v;
-    if (!codec_tensor_as_vec_f32(src, &src_v)) {
-        if (err != nullptr) {
-            *err = "failed reading Soprano tensor: " + src_name;
-        }
-        return false;
-    }
-
-    const int32_t dk = (int32_t) codec_ne(dst, 0);
-    const int32_t din = (int32_t) codec_ne(dst, 1);
-    const int32_t dout = (int32_t) codec_ne(dst, 2);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) codec_ne(src, 2);
-    if (n0 != dk || n1 != din || n2 != dout) {
-        if (err != nullptr) {
-            *err = "unexpected Soprano conv1d shape: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, src_v.data(), src_v.size() * sizeof(float), err);
-}
-
 static bool codec_sop_write_decode_weights(codec_context * ctx, codec_graph_cache_entry * entry, const sop_decode_build & build, std::string * err) {
     auto graph = [&](const std::string & n) { return codec_graph_get_tensor(ctx, entry, n.c_str()); };
 
-    if (!codec_sop_copy_conv1d_weight_to_3d(ctx, codec_sop_name_embed_w(), graph(codec_sop_name_embed_w()), err) ||
-        !codec_sop_copy_bias_1d(ctx, codec_sop_name_embed_b(), graph(codec_sop_name_embed_b()), err) ||
-        !codec_sop_copy_bias_1d(ctx, codec_sop_name_norm_w(), graph(codec_sop_name_norm_w()), err) ||
-        !codec_sop_copy_bias_1d(ctx, codec_sop_name_norm_b(), graph(codec_sop_name_norm_b()), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_embed_w(), graph(codec_sop_name_embed_w()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_embed_b(), graph(codec_sop_name_embed_b()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_norm_w(), graph(codec_sop_name_norm_w()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_norm_b(), graph(codec_sop_name_norm_b()), err)) {
         return false;
     }
 
     for (int32_t li = 0; li < build.n_layers; ++li) {
-        if (!codec_sop_copy_conv1d_weight_to_3d(ctx, codec_sop_name_cnx_dw_w(li), graph(codec_sop_name_cnx_dw_w(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_dw_b(li), graph(codec_sop_name_cnx_dw_b(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_ln_w(li), graph(codec_sop_name_cnx_ln_w(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_ln_b(li), graph(codec_sop_name_cnx_ln_b(li)), err) ||
-            !codec_sop_copy_linear_weight_to_2d(ctx, codec_sop_name_cnx_pw1_w(li), graph(codec_sop_name_cnx_pw1_w(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_pw1_b(li), graph(codec_sop_name_cnx_pw1_b(li)), err) ||
-            !codec_sop_copy_linear_weight_to_2d(ctx, codec_sop_name_cnx_pw2_w(li), graph(codec_sop_name_cnx_pw2_w(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_pw2_b(li), graph(codec_sop_name_cnx_pw2_b(li)), err) ||
-            !codec_sop_copy_bias_1d(ctx, codec_sop_name_cnx_gamma(li), graph(codec_sop_name_cnx_gamma(li)), err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_dw_w(li), graph(codec_sop_name_cnx_dw_w(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_dw_b(li), graph(codec_sop_name_cnx_dw_b(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_ln_w(li), graph(codec_sop_name_cnx_ln_w(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_ln_b(li), graph(codec_sop_name_cnx_ln_b(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_pw1_w(li), graph(codec_sop_name_cnx_pw1_w(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_pw1_b(li), graph(codec_sop_name_cnx_pw1_b(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_pw2_w(li), graph(codec_sop_name_cnx_pw2_w(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_pw2_b(li), graph(codec_sop_name_cnx_pw2_b(li)), err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_cnx_gamma(li), graph(codec_sop_name_cnx_gamma(li)), err)) {
             return false;
         }
     }
 
-    if (!codec_sop_copy_bias_1d(ctx, codec_sop_name_fln_w(), graph(codec_sop_name_fln_w()), err) ||
-        !codec_sop_copy_bias_1d(ctx, codec_sop_name_fln_b(), graph(codec_sop_name_fln_b()), err) ||
-        !codec_sop_copy_linear_weight_to_2d(ctx, codec_sop_name_head_w(), graph(codec_sop_name_head_w()), err) ||
-        !codec_sop_copy_bias_1d(ctx, codec_sop_name_head_b(), graph(codec_sop_name_head_b()), err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_fln_w(), graph(codec_sop_name_fln_w()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_fln_b(), graph(codec_sop_name_fln_b()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_head_w(), graph(codec_sop_name_head_w()), err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, codec_sop_name_head_b(), graph(codec_sop_name_head_b()), err)) {
         return false;
     }
     return true;
@@ -375,106 +270,6 @@ static bool codec_sop_istft_from_head(
         (*out_pcm)[(size_t) (i - out_begin)] = y[(size_t) i] / den;
     }
     return true;
-}
-
-static bool codec_sop_write_npy_f32(
-    const char * path,
-    const float * data,
-    const int64_t * shape,
-    int32_t n_dims,
-    std::string * err) {
-
-    if (path == nullptr || data == nullptr || shape == nullptr || n_dims <= 0) {
-        if (err != nullptr) {
-            *err = "invalid Soprano npy write arguments";
-        }
-        return false;
-    }
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) {
-        if (err != nullptr) {
-            *err = "failed to open npy file";
-        }
-        return false;
-    }
-
-    const char magic[] = "\x93NUMPY";
-    ofs.write(magic, 6);
-    const uint8_t major = 1;
-    const uint8_t minor = 0;
-    ofs.put((char) major);
-    ofs.put((char) minor);
-
-    std::string shape_str = "(";
-    for (int32_t i = 0; i < n_dims; ++i) {
-        shape_str += std::to_string(shape[i]);
-        if (i + 1 < n_dims) {
-            shape_str += ", ";
-        }
-    }
-    if (n_dims == 1) {
-        shape_str += ",";
-    }
-    shape_str += ")";
-
-    char header[256];
-    std::snprintf(
-        header,
-        sizeof(header),
-        "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }",
-        shape_str.c_str());
-    std::string hdr = header;
-    const size_t preamble = 6 + 2 + 2;
-    const size_t total = preamble + hdr.size();
-    const size_t pad = (16 - (total % 16)) % 16;
-    hdr.append(pad, ' ');
-    hdr.push_back('\n');
-
-    const uint16_t hlen = (uint16_t) hdr.size();
-    ofs.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
-    ofs.write(hdr.data(), (std::streamsize) hdr.size());
-
-    int64_t n_elems = 1;
-    for (int32_t i = 0; i < n_dims; ++i) {
-        n_elems *= shape[i];
-    }
-    ofs.write(reinterpret_cast<const char *>(data), (std::streamsize) (n_elems * (int64_t) sizeof(float)));
-    if (!ofs.good()) {
-        if (err != nullptr) {
-            *err = "failed to write npy data";
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool codec_sop_dump_tensor(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const std::string & name,
-    const std::string & path,
-    std::string * err) {
-
-    ggml_tensor * t = codec_graph_get_tensor(ctx, entry, name.c_str());
-    if (t == nullptr) {
-        if (err != nullptr) {
-            *err = "missing Soprano tensor for dump: " + name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(t, &v)) {
-        if (err != nullptr) {
-            *err = "failed reading Soprano tensor for dump: " + name;
-        }
-        return false;
-    }
-    const int n_dims = ggml_n_dims(t);
-    int64_t shape[4] = { 1, 1, 1, 1 };
-    for (int i = 0; i < n_dims; ++i) {
-        shape[i] = (int64_t) t->ne[i];
-    }
-    return codec_sop_write_npy_f32(path.c_str(), v.data(), shape, n_dims, err);
 }
 
 enum codec_status codec_soprano_init(struct codec_model * model) {
@@ -648,47 +443,6 @@ enum codec_status codec_soprano_decode_latent(
     if (!codec_runtime_read_tensor(t_out, head.data(), head.size() * sizeof(float), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    const char * dump_head = std::getenv("SOPRANO_DUMP_HEAD");
-    if (dump_head != nullptr && dump_head[0] != '\0') {
-        const int64_t shape[2] = { build.head_out_dim, t_up };
-        std::string npy_err;
-        if (!codec_sop_write_npy_f32(dump_head, head.data(), shape, 2, &npy_err)) {
-            codec_context_set_error(ctx, npy_err);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-    }
-
-    const char * dump_dir = std::getenv("SOPRANO_DUMP_DIR");
-    if (dump_dir != nullptr && dump_dir[0] != '\0') {
-        std::string base(dump_dir);
-        std::string dump_err;
-        const char * stages[] = {
-            "sop.stage.embed.ct",
-            "sop.stage.norm.ct",
-            "sop.stage.final.ct",
-            "sop.decode.head.out",
-        };
-        for (const char * name : stages) {
-            std::string safe = name;
-            std::replace(safe.begin(), safe.end(), '.', '_');
-            std::string path = base + "/" + safe + ".npy";
-            if (!codec_sop_dump_tensor(ctx, entry, name, path, &dump_err)) {
-                codec_context_set_error(ctx, dump_err);
-                return CODEC_STATUS_INTERNAL_ERROR;
-            }
-        }
-        for (int32_t li = 0; li < build.n_layers; ++li) {
-            std::string name = "sop.stage.block." + std::to_string(li) + ".ct";
-            std::string safe = name;
-            std::replace(safe.begin(), safe.end(), '.', '_');
-            std::string path = base + "/" + safe + ".npy";
-            if (!codec_sop_dump_tensor(ctx, entry, name, path, &dump_err)) {
-                codec_context_set_error(ctx, dump_err);
-                return CODEC_STATUS_INTERNAL_ERROR;
-            }
-        }
     }
 
     std::vector<float> window;

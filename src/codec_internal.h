@@ -134,6 +134,8 @@ std::string codec_gguf_value_to_string(gguf_context * gf, int key_id);
 void codec_collect_gguf_metadata(codec_model * model);
 int32_t codec_read_i32_kv(gguf_context * gf, const char * key, int32_t fallback);
 int32_t codec_read_i32_kv_any(gguf_context * gf, const char * const * keys, size_t n_keys, int32_t fallback);
+void codec_read_i32_array_kv(gguf_context * gf, const char * key, int32_t * dst, int32_t dst_n);
+void codec_read_i32_array_kv_vec(gguf_context * gf, const char * key, std::vector<int32_t> * dst);
 float codec_read_f32_kv(gguf_context * gf, const char * key, float fallback);
 bool codec_read_bool_kv(gguf_context * gf, const char * key, bool fallback);
 int codec_count_tensors_with_prefix(const codec_model * model, const char * prefix);

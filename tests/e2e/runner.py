@@ -434,9 +434,12 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     if spec.lower() in {"neucodec"}:
         return "neucodec", ""
 
+    if spec.lower() in {"soprano"}:
+        return "soprano", ""
+
     if ":" not in spec:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', 'nemo_nano_codec', 'neucodec', or 'qwen3_tts_tokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', 'nemo_nano_codec', 'neucodec', 'soprano', or 'qwen3_tts_tokenizer'"
         )
 
     module_name, class_name = spec.split(":", 1)
@@ -444,7 +447,7 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     class_name = class_name.strip()
     if module_name != "transformers" or not class_name:
         raise RuntimeError(
-            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', 'nemo_nano_codec', 'neucodec', or 'qwen3_tts_tokenizer'"
+            f"invalid class spec '{class_spec}': expected 'transformers:ClassName', 'dac', 'wavtokenizer', 'nemo_nano_codec', 'neucodec', 'soprano', or 'qwen3_tts_tokenizer'"
         )
     return module_name, class_name
 
@@ -589,6 +592,42 @@ def load_native_model(model_cfg: dict[str, Any], local_path: Path):
             return SimpleNamespace(audio_values=model.decode_code(codes).cpu().numpy())
 
         return (model, _encode, _decode)
+    if class_name == "soprano":
+        sys.path.insert(0, str(REPO_ROOT / ".model-src" / "soprano"))
+        from soprano.vocos.decoder import SopranoDecoder
+
+        ckpt_path = local_path / "decoder.pth"
+        if not ckpt_path.is_file():
+            raise RuntimeError(f"missing Soprano decoder checkpoint: {ckpt_path}")
+
+        model = SopranoDecoder()
+        state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state)
+        model = model.eval()
+
+        def _decode(audio_codes=None, **kwargs):
+            latent = audio_codes
+            if latent is None:
+                latent = kwargs.get("latent")
+            if latent is None:
+                latent = kwargs.get("audio_codes")
+            if latent is None:
+                raise RuntimeError("missing latent input for Soprano decode")
+            if isinstance(latent, torch.Tensor):
+                t = latent.detach().to(torch.float32).cpu()
+            else:
+                t = torch.as_tensor(latent, dtype=torch.float32)
+            if t.ndim == 2:
+                t = t.transpose(0, 1).unsqueeze(0)
+            elif t.ndim == 3 and t.shape[0] == 1:
+                pass
+            else:
+                raise RuntimeError(f"unsupported Soprano latent shape: {tuple(t.shape)}")
+            return SimpleNamespace(audio_values=model(t).cpu().numpy())
+
+        return (model, None, _decode)
     raise RuntimeError(f"unsupported class family '{class_name}'")
 
 def to_torch_audio(wav: np.ndarray, channels: bool = True):
@@ -682,6 +721,8 @@ def class_family(class_spec: str) -> str:
         return "nemo_nano_codec"
     if module_name == "neucodec":
         return "neucodec"
+    if module_name == "soprano":
+        return "soprano"
     if module_name == "qwen3_tts_tokenizer":
         return "qwen3_tts_tokenizer"
     return class_name.lower().replace("model", "")
@@ -754,9 +795,64 @@ def encode_decode_hf(
     save_wav_pcm16(ref_out, decoded_audio, decode_sample_rate)
 
 
+def make_soprano_test_latent(n_frames: int, latent_dim: int, seed: int = 1234) -> np.ndarray:
+    if n_frames <= 1 or latent_dim <= 0:
+        raise RuntimeError("invalid Soprano latent shape")
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0.0, 1.0, n_frames, dtype=np.float32)[:, None]
+    c = np.linspace(0.0, 1.0, latent_dim, dtype=np.float32)[None, :]
+    base = (
+        0.55 * np.sin(2.0 * np.pi * (1.0 + 2.0 * c) * t) +
+        0.35 * np.cos(2.0 * np.pi * (0.5 + 3.0 * t) * c) +
+        0.15 * np.sin(2.0 * np.pi * (t * c * 7.0 + c))
+    )
+    noise = 0.03 * rng.standard_normal((n_frames, latent_dim), dtype=np.float32)
+    latent = np.tanh(base + noise).astype(np.float32, copy=False)
+    return np.ascontiguousarray(latent)
+
+
+def decode_latent_hf(
+    model_cfg: dict[str, Any],
+    latent_out: Path,
+    ref_out: Path,
+    decode_sample_rate: int,
+    log_path: Path,
+    model: Any,
+    decoder_fn: Callable[[np.ndarray, Any], Any],
+) -> None:
+    import torch
+
+    del model
+
+    n_frames = int(model_cfg.get("latent_frames", 64))
+    latent_dim = int(model_cfg.get("latent_dim", 0))
+    if latent_dim <= 0:
+        raise RuntimeError("soprano latent_dim must be configured")
+
+    latent = make_soprano_test_latent(n_frames, latent_dim)
+    np.save(latent_out, latent)
+
+    with log_path.open("a", encoding="utf-8") as lf:
+        lf.write(f"[hf] soprano latent decode: n_frames={n_frames} latent_dim={latent_dim}\n")
+
+    with torch.no_grad():
+        decoded = call_with_fallback(
+            decoder_fn,
+            [
+                ((), {"latent": latent}),
+                ((), {"audio_codes": latent}),
+                ((latent,), {}),
+            ],
+            "decode_latent",
+        )
+
+    decoded_audio = extract_audio_values(decoded)
+    save_wav_pcm16(ref_out, decoded_audio, decode_sample_rate)
+
+
 def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: str) -> Path:
     """Download HF model snapshot to local cache using huggingface_hub"""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download, snapshot_download
     
     repo_id = model_cfg["hf_repo_id"]
     local_path = REPO_ROOT / "models" / model_name
@@ -770,6 +866,19 @@ def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: 
 
     # Use HF cache dir
     cache_dir = REPO_ROOT / "models" / "hf"
+    cache_repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+
+    ref_file = cache_repo_dir / "refs" / "main"
+    if ref_file.is_file():
+        revision = ref_file.read_text(encoding="utf-8").strip()
+        snapshot_dir = cache_repo_dir / "snapshots" / revision
+        if snapshot_dir.is_dir():
+            if hf_file is None or (snapshot_dir / hf_file).exists():
+                if local_path.exists():
+                    shutil.rmtree(local_path)
+                shutil.copytree(snapshot_dir, local_path)
+                print(f"[{model_name}] Restored cached snapshot from: {snapshot_dir}")
+                return local_path.resolve()
     
     print(f"[{model_name}] Downloading HF snapshot: {repo_id}")
     
@@ -783,6 +892,19 @@ def download_hf_snapshot(model_cfg: dict[str, Any], log_path: Path, model_name: 
         print(f"[{model_name}] Downloaded to: {downloaded_path}")
         return Path(downloaded_path)
     except Exception as e:
+        if hf_file:
+            try:
+                downloaded_file = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=hf_file,
+                    cache_dir=str(cache_dir),
+                    local_dir=str(local_path),
+                    local_dir_use_symlinks=False,
+                )
+                print(f"[{model_name}] Downloaded single file to: {downloaded_file}")
+                return local_path.resolve()
+            except Exception:
+                pass
         raise RuntimeError(f"Failed to download HF snapshot: {e}")
 
 
@@ -888,6 +1010,30 @@ def run_decode(
     if ret != 0:
         raise RuntimeError(f"codec-cli decode failed (exit={ret})")
 
+
+def run_decode_latent(
+    gguf_path: Path,
+    latent_npy: Path,
+    out_wav: Path,
+    log_path: Path,
+    model_name: str,
+    env: dict[str, str] | None = None,
+) -> None:
+    cmd = [
+        str(REPO_ROOT / "build/codec-cli"),
+        "decode-latent",
+        "--model",
+        str(gguf_path),
+        "--latent",
+        str(latent_npy),
+        "--out",
+        str(out_wav),
+    ]
+
+    ret = run_and_log(cmd, log_path, model_name, env=env)
+    if ret != 0:
+        raise RuntimeError(f"codec-cli decode-latent failed (exit={ret})")
+
 def run_encode(
     gguf_path: Path,
     input_wav: Path,
@@ -951,25 +1097,37 @@ def run_model(
 
         input_wav = tmpdir / "input.wav"
         hf_codes = tmpdir / "hf_codes.npy"
+        hf_latent = tmpdir / "hf_latent.npy"
         hf_ref_wav = tmpdir / "hf_reference.wav"
         cpp_out_wav = tmpdir / "cpp_decode.wav"
         cpp_out_codes = tmpdir / "cpp_encode.npy"
         cpp_roundtrip_wav = tmpdir / "cpp_roundtrip.wav"
 
-        ffmpeg_to_mono_wav(input_audio, input_wav, encode_sample_rate, log_path, name)
         mt.snap("before encode_decode_hf")
-        encode_decode_hf(
-            model_cfg,
-            input_wav,
-            hf_codes,
-            hf_ref_wav,
-            encode_sample_rate,
-            decode_sample_rate,
-            log_path,
-            model,
-            encoder_fn,
-            decoder_fn,
-        )
+        if model_cfg.get("latent_only"):
+            decode_latent_hf(
+                model_cfg,
+                hf_latent,
+                hf_ref_wav,
+                decode_sample_rate,
+                log_path,
+                model,
+                decoder_fn,
+            )
+        else:
+            ffmpeg_to_mono_wav(input_audio, input_wav, encode_sample_rate, log_path, name)
+            encode_decode_hf(
+                model_cfg,
+                input_wav,
+                hf_codes,
+                hf_ref_wav,
+                encode_sample_rate,
+                decode_sample_rate,
+                log_path,
+                model,
+                encoder_fn,
+                decoder_fn,
+            )
         mt.snap("after encode_decode_hf")
 
         del model, encoder_fn, decoder_fn
@@ -979,7 +1137,9 @@ def run_model(
         n_q = int(model_cfg.get("n_q", 0))
         codec_env = dict(os.environ)
         # codec_env["GGML_DISABLE_VULKAN"] = "1"
-        if model_cfg.get("decode_only"):
+        if model_cfg.get("latent_only"):
+            run_decode_latent(gguf_path, hf_latent, cpp_out_wav, log_path, name, env=codec_env)
+        elif model_cfg.get("decode_only"):
             run_decode(gguf_path, hf_codes, cpp_out_wav, n_q, log_path, name, env=codec_env)
         else:
             run_encode(gguf_path, input_wav, cpp_out_codes, n_q, log_path, name, env=codec_env)
@@ -989,7 +1149,7 @@ def run_model(
 
         metrics = {}
         metrics["decode"] = compare_wav(hf_ref_wav, cpp_out_wav)
-        if not  model_cfg.get("decode_only"):
+        if not model_cfg.get("decode_only") and not model_cfg.get("latent_only"):
             metrics["encode"] = compare_codes(hf_codes, cpp_out_codes, model_cfg)
             metrics["roundtrip"] = compare_wav(hf_ref_wav, cpp_roundtrip_wav)
         thresholds = merge_thresholds(model_cfg)

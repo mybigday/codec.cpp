@@ -172,126 +172,6 @@ static bool codec_neu_build_dynamic_pos_bias(
     return true;
 }
 
-static void codec_neu_read_i32_array(
-    struct gguf_context * gf,
-    const char * key,
-    int32_t * dst,
-    int32_t dst_n) {
-
-    if (gf == nullptr || key == nullptr || dst == nullptr || dst_n <= 0) {
-        return;
-    }
-    const int key_id = gguf_find_key(gf, key);
-    if (key_id < 0 || gguf_get_kv_type(gf, key_id) != GGUF_TYPE_ARRAY) {
-        return;
-    }
-    const enum gguf_type arr_t = gguf_get_arr_type(gf, key_id);
-    const size_t n = gguf_get_arr_n(gf, key_id);
-    const size_t n_copy = std::min(n, (size_t) dst_n);
-    if (arr_t == GGUF_TYPE_UINT32) {
-        const uint32_t * src = static_cast<const uint32_t *>(gguf_get_arr_data(gf, key_id));
-        if (src != nullptr) {
-            for (size_t i = 0; i < n_copy; ++i) {
-                dst[i] = (int32_t) src[i];
-            }
-        }
-    } else if (arr_t == GGUF_TYPE_INT32) {
-        const int32_t * src = static_cast<const int32_t *>(gguf_get_arr_data(gf, key_id));
-        if (src != nullptr) {
-            for (size_t i = 0; i < n_copy; ++i) {
-                dst[i] = src[i];
-            }
-        }
-    }
-}
-
-static ggml_tensor * codec_neu_layer_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, 1e-6f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
-}
-
-static ggml_tensor * codec_neu_layer_norm_ct_eps(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta,
-    float eps) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, eps);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
-}
-
-static ggml_tensor * codec_neu_layer_norm_tc(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_tc,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_tc == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc));
-    ggml_tensor * y_ct = codec_neu_layer_norm_ct(ctx_eval, x_ct, gamma, beta);
-    if (y_ct == nullptr) {
-        return nullptr;
-    }
-    return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, y_ct));
-}
-
-static ggml_tensor * codec_neu_layer_norm_tc_eps(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_tc,
-    ggml_tensor * gamma,
-    ggml_tensor * beta,
-    float eps) {
-
-    if (ctx_eval == nullptr || x_tc == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc));
-    ggml_tensor * y_ct = codec_neu_layer_norm_ct_eps(ctx_eval, x_ct, gamma, beta, eps);
-    if (y_ct == nullptr) {
-        return nullptr;
-    }
-    return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, y_ct));
-}
-
-static ggml_tensor * codec_neu_linear_tc(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_tc,
-    ggml_tensor * w,
-    ggml_tensor * b) {
-
-    if (ctx_eval == nullptr || x_tc == nullptr || w == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc));
-    ggml_tensor * y_ct = codec_op_linear(ctx_eval, x_ct, w, b);
-    if (y_ct == nullptr) {
-        return nullptr;
-    }
-    return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, y_ct));
-}
-
 static ggml_tensor * codec_neu_grn_tc(
     ggml_context * ctx_eval,
     ggml_tensor * x_tc,
@@ -375,20 +255,6 @@ static ggml_tensor * codec_neu_conv1d_grouped(
     return ggml_cont(ctx_eval, out);
 }
 
-static ggml_tensor * codec_neu_rms_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_rms_norm(ctx_eval, x_ct, 1e-6f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    return y;
-}
-
 static ggml_tensor * codec_neu_resnet_block(
     ggml_context * ctx_eval,
     ggml_tensor * x_tc,
@@ -448,7 +314,7 @@ static ggml_tensor * codec_neu_transformer_block(
         return nullptr;
     }
 
-    ggml_tensor * h = codec_neu_rms_norm_ct(ctx_eval, x_ct, att_norm_w);
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-6f, att_norm_w);
     if (h == nullptr) {
         return nullptr;
     }
@@ -494,7 +360,7 @@ static ggml_tensor * codec_neu_transformer_block(
     }
     x_ct = ggml_add(ctx_eval, x_ct, attn_proj);
 
-    ggml_tensor * m = codec_neu_rms_norm_ct(ctx_eval, x_ct, ffn_norm_w);
+    ggml_tensor * m = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-6f, ffn_norm_w);
     if (m == nullptr) {
         return nullptr;
     }
@@ -600,13 +466,13 @@ static ggml_tensor * codec_neu_local_mha_tc(
     }
     ggml_tensor * h_tc = x_tc;
     if (ln_w != nullptr && ln_b != nullptr) {
-        h_tc = codec_neu_layer_norm_tc_eps(ctx_eval, h_tc, ln_w, ln_b, ln_eps);
+        h_tc = codec_op_layer_norm_tc(ctx_eval, h_tc, ln_eps, ln_w, ln_b);
         if (h_tc == nullptr) {
             return nullptr;
         }
     }
 
-    ggml_tensor * qkv_tc = codec_neu_linear_tc(ctx_eval, h_tc, w_qkv, nullptr); // [t, 3*dim]
+    ggml_tensor * qkv_tc = codec_op_linear_tc(ctx_eval, h_tc, w_qkv, nullptr); // [t, 3*dim]
     if (qkv_tc == nullptr) {
         return nullptr;
     }
@@ -644,7 +510,7 @@ static ggml_tensor * codec_neu_local_mha_tc(
 
     ggml_tensor * attn_dht = ggml_cont(ctx_eval, ggml_permute(ctx_eval, attn_dth, 0, 2, 1, 3));
     ggml_tensor * attn_ct = ggml_reshape_2d(ctx_eval, attn_dht, inner, t);
-    ggml_tensor * out_tc = codec_neu_linear_tc(ctx_eval, ggml_cont(ctx_eval, ggml_transpose(ctx_eval, attn_ct)), w_out, nullptr);
+    ggml_tensor * out_tc = codec_op_linear_tc(ctx_eval, ggml_cont(ctx_eval, ggml_transpose(ctx_eval, attn_ct)), w_out, nullptr);
     return out_tc;
 }
 
@@ -886,7 +752,7 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
     ggml_set_name(t_fln_w, codec_neu_name_final_ln_w().c_str());
     ggml_tensor * t_fln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
     ggml_set_name(t_fln_b, codec_neu_name_final_ln_b().c_str());
-    x_ct = codec_neu_layer_norm_ct(ctx_eval, x_ct, t_fln_w, t_fln_b);
+    x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_fln_w, t_fln_b);
     if (x_ct == nullptr) {
         return false;
     }
@@ -902,107 +768,6 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
     ggml_set_name(t_out, "neucodec.decode.head.out");
     *out = t_out;
     return true;
-}
-
-static bool codec_neu_copy_linear_weight_to_2d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec linear copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_neu_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing NeuCodec tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v)) {
-        if (err != nullptr) {
-            *err = "failed reading NeuCodec tensor: " + src_name;
-        }
-        return false;
-    }
-    if ((int32_t) codec_ne(src, 0) != (int32_t) dst->ne[0] || (int32_t) codec_ne(src, 1) != (int32_t) dst->ne[1]) {
-        if (err != nullptr) {
-            *err = "unexpected NeuCodec linear shape: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_neu_copy_conv1d_weight_to_3d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec conv copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_neu_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing NeuCodec tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v)) {
-        if (err != nullptr) {
-            *err = "failed reading NeuCodec tensor: " + src_name;
-        }
-        return false;
-    }
-    if ((int32_t) codec_ne(src, 0) != (int32_t) dst->ne[0] ||
-        (int32_t) codec_ne(src, 1) != (int32_t) dst->ne[1] ||
-        (int32_t) codec_ne(src, 2) != (int32_t) dst->ne[2]) {
-        if (err != nullptr) {
-            *err = "unexpected NeuCodec conv1d shape: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_neu_copy_bias_1d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec bias copy arguments";
-        }
-        return false;
-    }
-    ggml_tensor * src = codec_neu_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing NeuCodec tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) dst->ne[0]) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec bias tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
 }
 
 static bool codec_neu_init_decode_build(
@@ -1140,7 +905,7 @@ static ggml_tensor * codec_neu_build_distill_base_unit(
     codec_neu_set_enc_name(pw1_w, prefix + ".pw_conv1.weight");
     ggml_tensor * pw1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
     codec_neu_set_enc_name(pw1_b, prefix + ".pw_conv1.bias");
-    h = codec_neu_linear_tc(ctx_eval, h, pw1_w, pw1_b);
+    h = codec_op_linear_tc(ctx_eval, h, pw1_w, pw1_b);
     if (h == nullptr) {
         return nullptr;
     }
@@ -1165,7 +930,7 @@ static ggml_tensor * codec_neu_build_distill_base_unit(
     codec_neu_set_enc_name(pw2_w, prefix + ".pw_conv2.weight");
     ggml_tensor * pw2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
     codec_neu_set_enc_name(pw2_b, prefix + ".pw_conv2.bias");
-    h = codec_neu_linear_tc(ctx_eval, h, pw2_w, pw2_b);
+    h = codec_op_linear_tc(ctx_eval, h, pw2_w, pw2_b);
     if (h == nullptr) {
         return nullptr;
     }
@@ -1217,11 +982,11 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
         ggml_tensor * ff_w2 = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, inner_dim, dim);
         codec_neu_set_enc_name(ff_w2, prefix + ".layers." + std::to_string(li) + ".1.4.weight");
 
-        ggml_tensor * ff = codec_neu_layer_norm_tc_eps(ctx_eval, x_tc, ff_ln_w, ff_ln_b, 1e-5f);
+        ggml_tensor * ff = codec_op_layer_norm_tc(ctx_eval, x_tc, 1e-5f, ff_ln_w, ff_ln_b);
         if (ff == nullptr) {
             return nullptr;
         }
-        ff = codec_neu_linear_tc(ctx_eval, ff, ff_w1, nullptr);
+        ff = codec_op_linear_tc(ctx_eval, ff, ff_w1, nullptr);
         if (ff == nullptr) {
             return nullptr;
         }
@@ -1229,7 +994,7 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
         if (ff == nullptr) {
             return nullptr;
         }
-        ff = codec_neu_linear_tc(ctx_eval, ff, ff_w2, nullptr);
+        ff = codec_op_linear_tc(ctx_eval, ff, ff_w2, nullptr);
         if (ff == nullptr) {
             return nullptr;
         }
@@ -1338,7 +1103,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(t_fc_sq_w, "neucodec.encode.fc_sq_prior.w");
     ggml_tensor * t_fc_sq_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 768);
     codec_neu_set_enc_name(t_fc_sq_b, "neucodec.encode.fc_sq_prior.b");
-    ggml_tensor * fsq_tc = codec_neu_linear_tc(ctx_eval, x, t_fc_sq_w, t_fc_sq_b);
+    ggml_tensor * fsq_tc = codec_op_linear_tc(ctx_eval, x, t_fc_sq_w, t_fc_sq_b);
     if (fsq_tc == nullptr) return false;
     // HuBERT semantic model
     ggml_tensor * sem = t_sem;
@@ -1361,7 +1126,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(feat_w, "neucodec.encode.hubert.feature_projection.w");
     ggml_tensor * feat_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
     codec_neu_set_enc_name(feat_b, "neucodec.encode.hubert.feature_projection.b");
-    ggml_tensor * hs = codec_neu_linear_tc(ctx_eval, sem, feat_w, feat_b);
+    ggml_tensor * hs = codec_op_linear_tc(ctx_eval, sem, feat_w, feat_b);
     if (hs == nullptr) return false;
 
     // positional conv
@@ -1382,7 +1147,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(enc_ln_w, "neucodec.encode.hubert.encoder.layer_norm.w");
     ggml_tensor * enc_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
     codec_neu_set_enc_name(enc_ln_b, "neucodec.encode.hubert.encoder.layer_norm.b");
-    hs = codec_neu_layer_norm_tc_eps(ctx_eval, hs, enc_ln_w, enc_ln_b, p->hubert_ln_eps);
+    hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, enc_ln_w, enc_ln_b);
     if (hs == nullptr) return false;
 
     const int32_t h_head_dim = p->hubert_hidden / p->hubert_heads;
@@ -1413,7 +1178,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         codec_neu_set_enc_name(ln_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ln.w");
         ggml_tensor * ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
         codec_neu_set_enc_name(ln_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ln.b");
-        hs = codec_neu_layer_norm_tc_eps(ctx_eval, hs, ln_w, ln_b, p->hubert_ln_eps);
+        hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, ln_w, ln_b);
         if (hs == nullptr) return false;
 
         ggml_tensor * ff1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_intermediate);
@@ -1424,10 +1189,10 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         codec_neu_set_enc_name(ff2_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc2.w");
         ggml_tensor * ff2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
         codec_neu_set_enc_name(ff2_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc2.b");
-        ggml_tensor * ff = codec_neu_linear_tc(ctx_eval, hs, ff1_w, ff1_b);
+        ggml_tensor * ff = codec_op_linear_tc(ctx_eval, hs, ff1_w, ff1_b);
         if (ff == nullptr) return false;
         ff = ggml_gelu_erf(ctx_eval, ff);
-        ff = codec_neu_linear_tc(ctx_eval, ff, ff2_w, ff2_b);
+        ff = codec_op_linear_tc(ctx_eval, ff, ff2_w, ff2_b);
         if (ff == nullptr) return false;
         hs = ggml_add(ctx_eval, hs, ff);
 
@@ -1435,7 +1200,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         codec_neu_set_enc_name(ffn_ln_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn_ln.w");
         ggml_tensor * ffn_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
         codec_neu_set_enc_name(ffn_ln_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn_ln.b");
-        hs = codec_neu_layer_norm_tc_eps(ctx_eval, hs, ffn_ln_w, ffn_ln_b, p->hubert_ln_eps);
+        hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, ffn_ln_w, ffn_ln_b);
         if (hs == nullptr) return false;
     }
     // Semantic encoder conv stack
@@ -1476,14 +1241,14 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     codec_neu_set_enc_name(fc_w, "neucodec.encode.fc_prior.w");
     ggml_tensor * fc_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 2048);
     codec_neu_set_enc_name(fc_b, "neucodec.encode.fc_prior.b");
-    ggml_tensor * prior_tc = codec_neu_linear_tc(ctx_eval, concat, fc_w, fc_b);
+    ggml_tensor * prior_tc = codec_op_linear_tc(ctx_eval, concat, fc_w, fc_b);
     if (prior_tc == nullptr) return false;
     // FSQ project_in
     ggml_tensor * proj_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 2048, p->codebook_dim);
     codec_neu_set_enc_name(proj_w, "neucodec.encode.quant.project_in.w");
     ggml_tensor * proj_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
     codec_neu_set_enc_name(proj_b, "neucodec.encode.quant.project_in.b");
-    ggml_tensor * z_tc = codec_neu_linear_tc(ctx_eval, prior_tc, proj_w, proj_b);
+    ggml_tensor * z_tc = codec_op_linear_tc(ctx_eval, prior_tc, proj_w, proj_b);
     if (z_tc == nullptr) return false;
     // FSQ bound + quantize (vector-quantize-pytorch FSQ)
     const float eps = 1e-3f;
@@ -1534,57 +1299,60 @@ static bool codec_neu_write_decode_weights(
         const std::string short_name = codec_neu_encode_name(name);
         return codec_graph_get_tensor(ctx, entry, short_name.c_str());
     };
+    auto copy = [&](const std::string & name) -> bool {
+        return codec_runtime_copy_tensor_f32_exact_from(codec_neu_get_tensor(ctx->model, name), name, graph(name), err);
+    };
 
-    if (!codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_quant_w(), graph(codec_neu_name_quant_w()), err) ||
-        !codec_neu_copy_bias_1d(ctx, codec_neu_name_quant_b(), graph(codec_neu_name_quant_b()), err) ||
-        !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_fc_post_w(), graph(codec_neu_name_fc_post_w()), err) ||
-        !codec_neu_copy_bias_1d(ctx, codec_neu_name_fc_post_b(), graph(codec_neu_name_fc_post_b()), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, codec_neu_name_embed_w(), graph(codec_neu_name_embed_w()), err) ||
-        !codec_neu_copy_bias_1d(ctx, codec_neu_name_embed_b(), graph(codec_neu_name_embed_b()), err)) {
+    if (!copy(codec_neu_name_quant_w()) ||
+        !copy(codec_neu_name_quant_b()) ||
+        !copy(codec_neu_name_fc_post_w()) ||
+        !copy(codec_neu_name_fc_post_b()) ||
+        !copy(codec_neu_name_embed_w()) ||
+        !copy(codec_neu_name_embed_b())) {
         return false;
     }
 
     for (int32_t li = 0; li < 2; ++li) {
-        if (!codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "norm1.w"), graph(codec_neu_name_prior(li, "norm1.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "norm1.b"), graph(codec_neu_name_prior(li, "norm1.b")), err) ||
-            !codec_neu_copy_conv1d_weight_to_3d(ctx, codec_neu_name_prior(li, "conv1.w"), graph(codec_neu_name_prior(li, "conv1.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "conv1.b"), graph(codec_neu_name_prior(li, "conv1.b")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "norm2.w"), graph(codec_neu_name_prior(li, "norm2.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "norm2.b"), graph(codec_neu_name_prior(li, "norm2.b")), err) ||
-            !codec_neu_copy_conv1d_weight_to_3d(ctx, codec_neu_name_prior(li, "conv2.w"), graph(codec_neu_name_prior(li, "conv2.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_prior(li, "conv2.b"), graph(codec_neu_name_prior(li, "conv2.b")), err)) {
+        if (!copy(codec_neu_name_prior(li, "norm1.w")) ||
+            !copy(codec_neu_name_prior(li, "norm1.b")) ||
+            !copy(codec_neu_name_prior(li, "conv1.w")) ||
+            !copy(codec_neu_name_prior(li, "conv1.b")) ||
+            !copy(codec_neu_name_prior(li, "norm2.w")) ||
+            !copy(codec_neu_name_prior(li, "norm2.b")) ||
+            !copy(codec_neu_name_prior(li, "conv2.w")) ||
+            !copy(codec_neu_name_prior(li, "conv2.b"))) {
             return false;
         }
     }
 
     for (int32_t li = 0; li < 2; ++li) {
-        if (!codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "norm1.w"), graph(codec_neu_name_post(li, "norm1.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "norm1.b"), graph(codec_neu_name_post(li, "norm1.b")), err) ||
-            !codec_neu_copy_conv1d_weight_to_3d(ctx, codec_neu_name_post(li, "conv1.w"), graph(codec_neu_name_post(li, "conv1.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "conv1.b"), graph(codec_neu_name_post(li, "conv1.b")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "norm2.w"), graph(codec_neu_name_post(li, "norm2.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "norm2.b"), graph(codec_neu_name_post(li, "norm2.b")), err) ||
-            !codec_neu_copy_conv1d_weight_to_3d(ctx, codec_neu_name_post(li, "conv2.w"), graph(codec_neu_name_post(li, "conv2.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_post(li, "conv2.b"), graph(codec_neu_name_post(li, "conv2.b")), err)) {
+        if (!copy(codec_neu_name_post(li, "norm1.w")) ||
+            !copy(codec_neu_name_post(li, "norm1.b")) ||
+            !copy(codec_neu_name_post(li, "conv1.w")) ||
+            !copy(codec_neu_name_post(li, "conv1.b")) ||
+            !copy(codec_neu_name_post(li, "norm2.w")) ||
+            !copy(codec_neu_name_post(li, "norm2.b")) ||
+            !copy(codec_neu_name_post(li, "conv2.w")) ||
+            !copy(codec_neu_name_post(li, "conv2.b"))) {
             return false;
         }
     }
 
     for (int32_t li = 0; li < build.num_layers; ++li) {
-        if (!codec_neu_copy_bias_1d(ctx, codec_neu_name_transformer(li, "att_norm.w"), graph(codec_neu_name_transformer(li, "att_norm.w")), err) ||
-            !codec_neu_copy_bias_1d(ctx, codec_neu_name_transformer(li, "ffn_norm.w"), graph(codec_neu_name_transformer(li, "ffn_norm.w")), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_transformer(li, "att.c_attn.w"), graph(codec_neu_name_transformer(li, "att.c_attn.w")), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_transformer(li, "att.c_proj.w"), graph(codec_neu_name_transformer(li, "att.c_proj.w")), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_transformer(li, "mlp.fc1.w"), graph(codec_neu_name_transformer(li, "mlp.fc1.w")), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_transformer(li, "mlp.fc2.w"), graph(codec_neu_name_transformer(li, "mlp.fc2.w")), err)) {
+        if (!copy(codec_neu_name_transformer(li, "att_norm.w")) ||
+            !copy(codec_neu_name_transformer(li, "ffn_norm.w")) ||
+            !copy(codec_neu_name_transformer(li, "att.c_attn.w")) ||
+            !copy(codec_neu_name_transformer(li, "att.c_proj.w")) ||
+            !copy(codec_neu_name_transformer(li, "mlp.fc1.w")) ||
+            !copy(codec_neu_name_transformer(li, "mlp.fc2.w"))) {
             return false;
         }
     }
 
-    if (!codec_neu_copy_bias_1d(ctx, codec_neu_name_final_ln_w(), graph(codec_neu_name_final_ln_w()), err) ||
-        !codec_neu_copy_bias_1d(ctx, codec_neu_name_final_ln_b(), graph(codec_neu_name_final_ln_b()), err) ||
-        !codec_neu_copy_linear_weight_to_2d(ctx, codec_neu_name_head_w(), graph(codec_neu_name_head_w()), err) ||
-        !codec_neu_copy_bias_1d(ctx, codec_neu_name_head_b(), graph(codec_neu_name_head_b()), err)) {
+    if (!copy(codec_neu_name_final_ln_w()) ||
+        !copy(codec_neu_name_final_ln_b()) ||
+        !copy(codec_neu_name_head_w()) ||
+        !copy(codec_neu_name_head_b())) {
         return false;
     }
 
@@ -1643,23 +1411,22 @@ static bool codec_neu_write_encode_weights(
         const std::string short_name = codec_neu_encode_name(name);
         return codec_graph_get_tensor(ctx, entry, short_name.c_str());
     };
+    auto copy = [&](const std::string & name) -> bool {
+        return codec_runtime_copy_tensor_f32_exact_from(codec_neu_get_tensor(ctx->model, name), name, graph(name), err);
+    };
 
     // First block
     for (int32_t i = 0; i < 5; ++i) {
         const std::string base = "neucodec.encode.distill.codec_encoder.encoder.blocks.0.blocks." + std::to_string(i) + ".1";
-        if (!codec_neu_copy_conv1d_weight_to_3d(ctx, base + ".weight", graph(base + ".weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".bias", graph(base + ".bias"), err)) {
+        if (!copy(base + ".weight") ||
+            !copy(base + ".bias")) {
             return false;
         }
     }
-    if (!codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight",
-                                            graph("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias",
-                                graph("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias"), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight",
-                                            graph("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias",
-                                graph("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias"), err)) {
+    if (!copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight") ||
+        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias") ||
+        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight") ||
+        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias")) {
         return false;
     }
 
@@ -1668,15 +1435,15 @@ static bool codec_neu_write_encode_weights(
     for (size_t bi = 0; bi < 5; ++bi) {
         const std::string prefix = "neucodec.encode.distill.codec_encoder.encoder.blocks." +
             std::to_string(base_blocks[bi][0]) + "." + std::to_string(base_blocks[bi][1]) + ".module";
-        if (!codec_neu_copy_conv1d_weight_to_3d(ctx, prefix + ".dw_conv.weight", graph(prefix + ".dw_conv.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".dw_conv.bias", graph(prefix + ".dw_conv.bias"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, prefix + ".pw_conv1.weight", graph(prefix + ".pw_conv1.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".pw_conv1.bias", graph(prefix + ".pw_conv1.bias"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".act.alpha", graph(prefix + ".act.alpha"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".grn.gamma", graph(prefix + ".grn.gamma"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".grn.beta", graph(prefix + ".grn.beta"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, prefix + ".pw_conv2.weight", graph(prefix + ".pw_conv2.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, prefix + ".pw_conv2.bias", graph(prefix + ".pw_conv2.bias"), err)) {
+        if (!copy(prefix + ".dw_conv.weight") ||
+            !copy(prefix + ".dw_conv.bias") ||
+            !copy(prefix + ".pw_conv1.weight") ||
+            !copy(prefix + ".pw_conv1.bias") ||
+            !copy(prefix + ".act.alpha") ||
+            !copy(prefix + ".grn.gamma") ||
+            !copy(prefix + ".grn.beta") ||
+            !copy(prefix + ".pw_conv2.weight") ||
+            !copy(prefix + ".pw_conv2.bias")) {
             return false;
         }
     }
@@ -1686,15 +1453,13 @@ static bool codec_neu_write_encode_weights(
     for (int32_t i = 0; i < 4; ++i) {
         const std::string base = "neucodec.encode.distill.codec_encoder.encoder.blocks." + std::to_string(down_blocks[i]) + ".0";
         if (down_blocks[i] == 8) {
-            if (!codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight",
-                                                    graph("neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight"), err) ||
-                !codec_neu_copy_bias_1d(ctx, "neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias",
-                                        graph("neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias"), err)) {
+            if (!copy("neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight") ||
+                !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias")) {
                 return false;
             }
         } else {
-            if (!codec_neu_copy_conv1d_weight_to_3d(ctx, base + ".weight", graph(base + ".weight"), err) ||
-                !codec_neu_copy_bias_1d(ctx, base + ".bias", graph(base + ".bias"), err)) {
+            if (!copy(base + ".weight") ||
+                !copy(base + ".bias")) {
                 return false;
             }
         }
@@ -1704,101 +1469,93 @@ static bool codec_neu_write_encode_weights(
     const std::string down_trans = "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.trans";
     for (int32_t li = 0; li < 2; ++li) {
         const std::string base = down_trans + ".layers." + std::to_string(li);
-        if (!codec_neu_copy_bias_1d(ctx, base + ".0.norm.weight", graph(base + ".0.norm.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".0.norm.bias", graph(base + ".0.norm.bias"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".0.to_qkv.weight", graph(base + ".0.to_qkv.weight"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".0.to_out.weight", graph(base + ".0.to_out.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".1.0.weight", graph(base + ".1.0.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".1.0.bias", graph(base + ".1.0.bias"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".1.1.weight", graph(base + ".1.1.weight"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".1.4.weight", graph(base + ".1.4.weight"), err)) {
+        if (!copy(base + ".0.norm.weight") ||
+            !copy(base + ".0.norm.bias") ||
+            !copy(base + ".0.to_qkv.weight") ||
+            !copy(base + ".0.to_out.weight") ||
+            !copy(base + ".1.0.weight") ||
+            !copy(base + ".1.0.bias") ||
+            !copy(base + ".1.1.weight") ||
+            !copy(base + ".1.4.weight")) {
             return false;
         }
     }
-    if (!codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight",
-                                            graph("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias",
-                                graph("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias"), err)) {
+    if (!copy("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight") ||
+        !copy("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias")) {
         return false;
     }
 
     const std::string local_trans = "neucodec.encode.distill.codec_encoder.en_encoder.local_trans";
     for (int32_t li = 0; li < 3; ++li) {
         const std::string base = local_trans + ".layers." + std::to_string(li);
-        if (!codec_neu_copy_bias_1d(ctx, base + ".0.norm.weight", graph(base + ".0.norm.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".0.norm.bias", graph(base + ".0.norm.bias"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".0.to_qkv.weight", graph(base + ".0.to_qkv.weight"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".0.to_out.weight", graph(base + ".0.to_out.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".1.0.weight", graph(base + ".1.0.weight"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".1.0.bias", graph(base + ".1.0.bias"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".1.1.weight", graph(base + ".1.1.weight"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".1.4.weight", graph(base + ".1.4.weight"), err)) {
+        if (!copy(base + ".0.norm.weight") ||
+            !copy(base + ".0.norm.bias") ||
+            !copy(base + ".0.to_qkv.weight") ||
+            !copy(base + ".0.to_out.weight") ||
+            !copy(base + ".1.0.weight") ||
+            !copy(base + ".1.0.bias") ||
+            !copy(base + ".1.1.weight") ||
+            !copy(base + ".1.4.weight")) {
             return false;
         }
     }
 
     // fc layers
-    if (!codec_neu_copy_linear_weight_to_2d(ctx, "neucodec.encode.fc_sq_prior.w", graph("neucodec.encode.fc_sq_prior.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.fc_sq_prior.b", graph("neucodec.encode.fc_sq_prior.b"), err) ||
-        !codec_neu_copy_linear_weight_to_2d(ctx, "neucodec.encode.fc_prior.w", graph("neucodec.encode.fc_prior.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.fc_prior.b", graph("neucodec.encode.fc_prior.b"), err) ||
-        !codec_neu_copy_linear_weight_to_2d(ctx, "neucodec.encode.quant.project_in.w", graph("neucodec.encode.quant.project_in.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.quant.project_in.b", graph("neucodec.encode.quant.project_in.b"), err)) {
+    if (!copy("neucodec.encode.fc_sq_prior.w") ||
+        !copy("neucodec.encode.fc_sq_prior.b") ||
+        !copy("neucodec.encode.fc_prior.w") ||
+        !copy("neucodec.encode.fc_prior.b") ||
+        !copy("neucodec.encode.quant.project_in.w") ||
+        !copy("neucodec.encode.quant.project_in.b")) {
         return false;
     }
 
     // semantic encoder weights
-    if (!codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.semantic_encoder.initial_conv.w",
-                                            graph("neucodec.encode.semantic_encoder.initial_conv.w"), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.semantic_encoder.residual.1.w",
-                                            graph("neucodec.encode.semantic_encoder.residual.1.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.semantic_encoder.residual.1.b",
-                                graph("neucodec.encode.semantic_encoder.residual.1.b"), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.semantic_encoder.residual.3.w",
-                                            graph("neucodec.encode.semantic_encoder.residual.3.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.semantic_encoder.residual.3.b",
-                                graph("neucodec.encode.semantic_encoder.residual.3.b"), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.semantic_encoder.final_conv.w",
-                                            graph("neucodec.encode.semantic_encoder.final_conv.w"), err)) {
+    if (!copy("neucodec.encode.semantic_encoder.initial_conv.w") ||
+        !copy("neucodec.encode.semantic_encoder.residual.1.w") ||
+        !copy("neucodec.encode.semantic_encoder.residual.1.b") ||
+        !copy("neucodec.encode.semantic_encoder.residual.3.w") ||
+        !copy("neucodec.encode.semantic_encoder.residual.3.b") ||
+        !copy("neucodec.encode.semantic_encoder.final_conv.w")) {
         return false;
     }
 
     // HuBERT weights
     for (int32_t li = 0; li < build.hubert_feat_layers; ++li) {
         const std::string name = "neucodec.encode.hubert.feat.conv." + std::to_string(li) + ".w";
-        if (!codec_neu_copy_conv1d_weight_to_3d(ctx, name, graph(name), err)) {
+        if (!copy(name)) {
             return false;
         }
     }
-    if (!codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.feat.conv.0.gn.w", graph("neucodec.encode.hubert.feat.conv.0.gn.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.feat.conv.0.gn.b", graph("neucodec.encode.hubert.feat.conv.0.gn.b"), err) ||
-        !codec_neu_copy_linear_weight_to_2d(ctx, "neucodec.encode.hubert.feature_projection.w", graph("neucodec.encode.hubert.feature_projection.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.feature_projection.b", graph("neucodec.encode.hubert.feature_projection.b"), err) ||
-        !codec_neu_copy_conv1d_weight_to_3d(ctx, "neucodec.encode.hubert.encoder.pos_conv.w", graph("neucodec.encode.hubert.encoder.pos_conv.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.encoder.pos_conv.b", graph("neucodec.encode.hubert.encoder.pos_conv.b"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.encoder.layer_norm.w", graph("neucodec.encode.hubert.encoder.layer_norm.w"), err) ||
-        !codec_neu_copy_bias_1d(ctx, "neucodec.encode.hubert.encoder.layer_norm.b", graph("neucodec.encode.hubert.encoder.layer_norm.b"), err)) {
+    if (!copy("neucodec.encode.hubert.feat.conv.0.gn.w") ||
+        !copy("neucodec.encode.hubert.feat.conv.0.gn.b") ||
+        !copy("neucodec.encode.hubert.feature_projection.w") ||
+        !copy("neucodec.encode.hubert.feature_projection.b") ||
+        !copy("neucodec.encode.hubert.encoder.pos_conv.w") ||
+        !copy("neucodec.encode.hubert.encoder.pos_conv.b") ||
+        !copy("neucodec.encode.hubert.encoder.layer_norm.w") ||
+        !copy("neucodec.encode.hubert.encoder.layer_norm.b")) {
         return false;
     }
 
     for (int32_t li = 0; li < build.hubert_layers; ++li) {
         const std::string base = "neucodec.encode.hubert.encoder.layers." + std::to_string(li);
-        if (!codec_neu_copy_linear_weight_to_2d(ctx, base + ".att.q.w", graph(base + ".att.q.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".att.q.b", graph(base + ".att.q.b"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".att.k.w", graph(base + ".att.k.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".att.k.b", graph(base + ".att.k.b"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".att.v.w", graph(base + ".att.v.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".att.v.b", graph(base + ".att.v.b"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".att.o.w", graph(base + ".att.o.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".att.o.b", graph(base + ".att.o.b"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ln.w", graph(base + ".ln.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ln.b", graph(base + ".ln.b"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".ffn.fc1.w", graph(base + ".ffn.fc1.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ffn.fc1.b", graph(base + ".ffn.fc1.b"), err) ||
-            !codec_neu_copy_linear_weight_to_2d(ctx, base + ".ffn.fc2.w", graph(base + ".ffn.fc2.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ffn.fc2.b", graph(base + ".ffn.fc2.b"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ffn_ln.w", graph(base + ".ffn_ln.w"), err) ||
-            !codec_neu_copy_bias_1d(ctx, base + ".ffn_ln.b", graph(base + ".ffn_ln.b"), err)) {
+        if (!copy(base + ".att.q.w") ||
+            !copy(base + ".att.q.b") ||
+            !copy(base + ".att.k.w") ||
+            !copy(base + ".att.k.b") ||
+            !copy(base + ".att.v.w") ||
+            !copy(base + ".att.v.b") ||
+            !copy(base + ".att.o.w") ||
+            !copy(base + ".att.o.b") ||
+            !copy(base + ".ln.w") ||
+            !copy(base + ".ln.b") ||
+            !copy(base + ".ffn.fc1.w") ||
+            !copy(base + ".ffn.fc1.b") ||
+            !copy(base + ".ffn.fc2.w") ||
+            !copy(base + ".ffn.fc2.b") ||
+            !copy(base + ".ffn_ln.w") ||
+            !copy(base + ".ffn_ln.b")) {
             return false;
         }
     }
@@ -1981,9 +1738,9 @@ enum codec_status codec_neucodec_init(struct codec_model * model) {
         neu.hubert_pos_k = codec_read_i32_kv(model->gguf, "neucodec.hubert.num_conv_pos_embeddings", neu.hubert_pos_k);
         neu.hubert_pos_groups = codec_read_i32_kv(model->gguf, "neucodec.hubert.num_conv_pos_embedding_groups", neu.hubert_pos_groups);
         neu.hubert_ln_eps = codec_read_f32_kv(model->gguf, "neucodec.hubert.layer_norm_eps", neu.hubert_ln_eps);
-        codec_neu_read_i32_array(model->gguf, "neucodec.hubert.conv_dim", neu.hubert_conv_dim, neu.hubert_feat_layers);
-        codec_neu_read_i32_array(model->gguf, "neucodec.hubert.conv_kernel", neu.hubert_conv_kernel, neu.hubert_feat_layers);
-        codec_neu_read_i32_array(model->gguf, "neucodec.hubert.conv_stride", neu.hubert_conv_stride, neu.hubert_feat_layers);
+        codec_read_i32_array_kv(model->gguf, "neucodec.hubert.conv_dim", neu.hubert_conv_dim, neu.hubert_feat_layers);
+        codec_read_i32_array_kv(model->gguf, "neucodec.hubert.conv_kernel", neu.hubert_conv_kernel, neu.hubert_feat_layers);
+        codec_read_i32_array_kv(model->gguf, "neucodec.hubert.conv_stride", neu.hubert_conv_stride, neu.hubert_feat_layers);
     }
 
     model->sample_rate = neu.sample_rate;

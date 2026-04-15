@@ -19,90 +19,6 @@ static ggml_tensor * nemo_get_tensor(ggml_context * ctx, const std::string & nam
     return ggml_get_tensor(ctx, name.c_str());
 }
 
-static bool nemo_write_tensor(codec_context * ctx, ggml_tensor * dst, const float * data, size_t n_bytes, std::string * err) {
-    return codec_runtime_write_tensor(dst, data, n_bytes, err);
-}
-
-static bool nemo_copy_conv1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
-    if (src == nullptr) {
-        if (err) *err = "missing tensor: " + src_name;
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v)) {
-        if (err) *err = "failed reading tensor: " + src_name;
-        return false;
-    }
-    const int32_t dk = (int32_t) codec_ne(dst, 0);
-    const int32_t din = (int32_t) codec_ne(dst, 1);
-    const int32_t dout = (int32_t) codec_ne(dst, 2);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) codec_ne(src, 2);
-
-    if (n0 != dk || n1 != din || n2 != dout) {
-        if (err) *err = "unexpected conv1d shape: " + src_name;
-        return false;
-    }
-
-    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool nemo_copy_convtr1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
-    if (src == nullptr) {
-        if (err) *err = "missing tensor: " + src_name;
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v)) {
-        if (err) *err = "failed reading tensor: " + src_name;
-        return false;
-    }
-    const int32_t dk = (int32_t) codec_ne(dst, 0);
-    const int32_t dout = (int32_t) codec_ne(dst, 1);
-    const int32_t din = (int32_t) codec_ne(dst, 2);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) codec_ne(src, 2);
-
-    if (n0 != dk || n1 != dout || n2 != din) {
-        if (err) *err = "unexpected convtr1d shape: " + src_name;
-        return false;
-    }
-
-    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool nemo_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
-    if (src == nullptr) {
-        if (err) *err = "missing tensor: " + src_name;
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
-        if (err) *err = "invalid bias tensor: " + src_name;
-        return false;
-    }
-    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool nemo_copy_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
-    if (src == nullptr) {
-        if (err) *err = "missing tensor: " + src_name;
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
-        if (err) *err = "invalid 1d tensor: " + src_name;
-        return false;
-    }
-    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
-}
-
 static bool nemo_copy_codebook(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
     ggml_tensor * src = nemo_get_tensor(ctx->model->weights, src_name);
     if (src == nullptr) {
@@ -124,7 +40,7 @@ static bool nemo_copy_codebook(codec_context * ctx, const std::string & src_name
         return false;
     }
 
-    return nemo_write_tensor(ctx, dst, v.data(), v.size() * sizeof(float), err);
+    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
 }
 
 static ggml_tensor * nemo_conv1d_replicate(
@@ -519,26 +435,26 @@ static enum codec_status nemo_encode_graph(
     }
 
     // write weights
-    if (!nemo_copy_conv1d(ctx, "nemo.enc.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.w"), &err) ||
-        !nemo_copy_bias_1d(ctx, "nemo.enc.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.b"), &err) ||
-        !nemo_copy_conv1d(ctx, "nemo.enc.post.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.w"), &err) ||
-        !nemo_copy_bias_1d(ctx, "nemo.enc.post.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.b"), &err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "nemo.enc.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.w"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.enc.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.pre.b"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.enc.post.w", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.w"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.enc.post.b", codec_graph_get_tensor(ctx, entry, "nemo.enc.post.b"), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
     for (int32_t li = 0; li < 5; ++li) {
-        if (!nemo_copy_conv1d(ctx, nemo_enc_down_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_w_name(li).c_str()), &err) ||
-            !nemo_copy_bias_1d(ctx, nemo_enc_down_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_b_name(li).c_str()), &err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_down_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_w_name(li).c_str()), &err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_down_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_enc_down_b_name(li).c_str()), &err)) {
             codec_context_set_error(ctx, err);
             return CODEC_STATUS_INTERNAL_ERROR;
         }
         for (int32_t bi = 0; bi < 3; ++bi) {
             for (int32_t ri = 0; ri < 3; ++ri) {
-                if (!nemo_copy_conv1d(ctx, nemo_enc_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_w(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_bias_1d(ctx, nemo_enc_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_b(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_conv1d(ctx, nemo_enc_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_w(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_bias_1d(ctx, nemo_enc_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_b(li, bi, ri).c_str()), &err)) {
+                if (!codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_w(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_in_b(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_w(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_enc_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_enc_res_sk_b(li, bi, ri).c_str()), &err)) {
                     codec_context_set_error(ctx, err);
                     return CODEC_STATUS_INTERNAL_ERROR;
                 }
@@ -547,11 +463,11 @@ static enum codec_status nemo_encode_graph(
     }
 
     // FSQ constants
-    if (!nemo_copy_1d(ctx, "nemo.fsq.scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.scale"), &err) ||
-        !nemo_copy_1d(ctx, "nemo.fsq.out_scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_scale"), &err) ||
-        !nemo_copy_1d(ctx, "nemo.fsq.out_offset", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_offset"), &err) ||
-        !nemo_copy_1d(ctx, "nemo.fsq.in_shift", codec_graph_get_tensor(ctx, entry, "nemo.fsq.in_shift"), &err) ||
-        !nemo_copy_1d(ctx, "nemo.fsq.dim_base", codec_graph_get_tensor(ctx, entry, "nemo.fsq.dim_base"), &err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "nemo.fsq.scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.scale"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.fsq.out_scale", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_scale"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.fsq.out_offset", codec_graph_get_tensor(ctx, entry, "nemo.fsq.out_offset"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.fsq.in_shift", codec_graph_get_tensor(ctx, entry, "nemo.fsq.in_shift"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.fsq.dim_base", codec_graph_get_tensor(ctx, entry, "nemo.fsq.dim_base"), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -662,29 +578,29 @@ static enum codec_status nemo_decode_graph(
         }
     }
 
-    if (!nemo_copy_conv1d(ctx, "nemo.dec.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.w"), &err) ||
-        !nemo_copy_bias_1d(ctx, "nemo.dec.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.b"), &err) ||
-        !nemo_copy_conv1d(ctx, "nemo.dec.post.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.w"), &err) ||
-        !nemo_copy_bias_1d(ctx, "nemo.dec.post.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.b"), &err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "nemo.dec.pre.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.w"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.dec.pre.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.pre.b"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.dec.post.w", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.w"), &err) ||
+        !codec_runtime_copy_tensor_f32_exact(ctx, "nemo.dec.post.b", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.b"), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
     for (int32_t li = 0; li < 5; ++li) {
-        if (!nemo_copy_convtr1d(ctx, nemo_dec_up_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_w_name(li).c_str()), &err) ||
-            !nemo_copy_bias_1d(ctx, nemo_dec_up_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_b_name(li).c_str()), &err) ||
-            !nemo_copy_1d(ctx, nemo_dec_act_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_act_name(li).c_str()), &err)) {
+        if (!codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_up_w_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_w_name(li).c_str()), &err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_up_b_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_up_b_name(li).c_str()), &err) ||
+            !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_act_name(li), codec_graph_get_tensor(ctx, entry, nemo_dec_act_name(li).c_str()), &err)) {
             codec_context_set_error(ctx, err);
             return CODEC_STATUS_INTERNAL_ERROR;
         }
         for (int32_t bi = 0; bi < 3; ++bi) {
             for (int32_t ri = 0; ri < 3; ++ri) {
-                if (!nemo_copy_1d(ctx, nemo_dec_res_in_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_a(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_1d(ctx, nemo_dec_res_sk_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_a(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_conv1d(ctx, nemo_dec_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_w(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_bias_1d(ctx, nemo_dec_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_b(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_conv1d(ctx, nemo_dec_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_w(li, bi, ri).c_str()), &err) ||
-                    !nemo_copy_bias_1d(ctx, nemo_dec_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_b(li, bi, ri).c_str()), &err)) {
+                if (!codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_in_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_a(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_sk_a(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_a(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_in_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_w(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_in_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_in_b(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_sk_w(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_w(li, bi, ri).c_str()), &err) ||
+                    !codec_runtime_copy_tensor_f32_exact(ctx, nemo_dec_res_sk_b(li, bi, ri), codec_graph_get_tensor(ctx, entry, nemo_dec_res_sk_b(li, bi, ri).c_str()), &err)) {
                     codec_context_set_error(ctx, err);
                     return CODEC_STATUS_INTERNAL_ERROR;
                 }
@@ -692,7 +608,7 @@ static enum codec_status nemo_decode_graph(
         }
     }
 
-    if (!nemo_copy_1d(ctx, "nemo.dec.post.a", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.a"), &err)) {
+    if (!codec_runtime_copy_tensor_f32_exact(ctx, "nemo.dec.post.a", codec_graph_get_tensor(ctx, entry, "nemo.dec.post.a"), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

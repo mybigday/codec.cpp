@@ -42,6 +42,41 @@ ggml_tensor * codec_op_layer_norm(ggml_context * ctx, ggml_tensor * x, float eps
     return y;
 }
 
+ggml_tensor * codec_op_layer_norm_ct(ggml_context * ctx, ggml_tensor * x_ct, float eps, ggml_tensor * gamma, ggml_tensor * beta) {
+    if (ctx == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * y = ggml_norm(ctx, x_ct, eps);
+    ggml_tensor * g2 = ggml_reshape_2d(ctx, gamma, x_ct->ne[0], 1);
+    ggml_tensor * b2 = ggml_reshape_2d(ctx, beta, x_ct->ne[0], 1);
+    y = ggml_mul(ctx, y, ggml_repeat(ctx, g2, y));
+    y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+    return y;
+}
+
+ggml_tensor * codec_op_layer_norm_tc(ggml_context * ctx, ggml_tensor * x_tc, float eps, ggml_tensor * gamma, ggml_tensor * beta) {
+    if (ctx == nullptr || x_tc == nullptr || gamma == nullptr || beta == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, x_tc));
+    ggml_tensor * y_ct = codec_op_layer_norm_ct(ctx, x_ct, eps, gamma, beta);
+    if (y_ct == nullptr) {
+        return nullptr;
+    }
+    return ggml_cont(ctx, ggml_transpose(ctx, y_ct));
+}
+
+ggml_tensor * codec_op_rms_norm_ct(ggml_context * ctx, ggml_tensor * x_ct, float eps, ggml_tensor * gamma) {
+    if (ctx == nullptr || x_ct == nullptr || gamma == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * y = ggml_rms_norm(ctx, x_ct, eps);
+    return codec_op_channel_scale(ctx, y, gamma);
+}
+
 ggml_tensor * codec_op_group_norm(ggml_context * ctx, ggml_tensor * x, int32_t n_groups, float eps, ggml_tensor * gamma, ggml_tensor * beta) {
     if (ctx == nullptr || x == nullptr || n_groups <= 0 || x->ne[1] % n_groups != 0) {
         return nullptr;
@@ -73,6 +108,19 @@ ggml_tensor * codec_op_linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
         y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
     }
     return y;
+}
+
+ggml_tensor * codec_op_linear_tc(ggml_context * ctx, ggml_tensor * x_tc, ggml_tensor * w, ggml_tensor * b) {
+    if (ctx == nullptr || x_tc == nullptr || w == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, x_tc));
+    ggml_tensor * y_ct = codec_op_linear(ctx, x_ct, w, b);
+    if (y_ct == nullptr) {
+        return nullptr;
+    }
+    return ggml_cont(ctx, ggml_transpose(ctx, y_ct));
 }
 
 ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha, float eps) {

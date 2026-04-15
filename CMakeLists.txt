@@ -54,6 +54,8 @@ add_library(codec STATIC
     src/models/dac.cpp
     src/models/mimi.cpp
     src/models/qwen3_tts_tokenizer.cpp
+    src/models/chatterbox_s3t.cpp
+    src/models/chatterbox_s3g.cpp
     src/models/soprano.cpp
     src/models/nemo_nano_codec.cpp
     src/models/neucodec.cpp
@@ -77,15 +79,20 @@ add_executable(inspect-codec
 
 target_link_libraries(inspect-codec PRIVATE codec)
 
+add_library(codec-example-utils STATIC
+    examples/utils/wav_io.cpp
+    examples/utils/npy_io.cpp
+)
+
 add_executable(codec-cli
     examples/codec-cli.cpp
 )
 
-target_link_libraries(codec-cli PRIVATE codec)
+target_link_libraries(codec-cli PRIVATE codec codec-example-utils)
 
 add_executable(codec-batch-decode
     examples/codec-batch-decode.cpp
 )
 
 target_include_directories(codec-batch-decode PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(codec-batch-decode PRIVATE codec ggml ggml-cpu)
+target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml ggml-cpu)

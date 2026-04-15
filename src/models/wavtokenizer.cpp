@@ -89,23 +89,6 @@ static ggml_tensor * codec_wt_sum_codebook_features(
     return sum;
 }
 
-static ggml_tensor * codec_wt_layer_norm_ct(
-    ggml_context * ctx_eval,
-    ggml_tensor * x_ct,
-    ggml_tensor * gamma,
-    ggml_tensor * beta) {
-
-    if (ctx_eval == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
-        return nullptr;
-    }
-    ggml_tensor * y = ggml_norm(ctx_eval, x_ct, 1e-6f);
-    ggml_tensor * g2 = ggml_reshape_2d(ctx_eval, gamma, x_ct->ne[0], 1);
-    ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, beta, x_ct->ne[0], 1);
-    y = ggml_mul(ctx_eval, y, ggml_repeat(ctx_eval, g2, y));
-    y = ggml_add(ctx_eval, y, ggml_repeat(ctx_eval, b2, y));
-    return y;
-}
-
 static std::string codec_wt_decode_embed_w_name() { return "wt.decode.bb.embed.w"; }
 static std::string codec_wt_decode_embed_b_name() { return "wt.decode.bb.embed.b"; }
 static std::string codec_wt_decode_norm_w_name() { return "wt.decode.bb.norm.w"; }
@@ -344,7 +327,7 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
     ggml_set_name(t_inln_b, codec_wt_decode_norm_b_name().c_str());
 
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [c, t]
-    x_ct = codec_wt_layer_norm_ct(ctx_eval, x_ct, t_inln_w, t_inln_b);
+    x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_inln_w, t_inln_b);
     if (x_ct == nullptr) {
         return false;
     }
@@ -365,7 +348,7 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
         ggml_set_name(t_lnw, codec_wt_decode_blk_ln_w_name(li).c_str());
         ggml_tensor * t_lnb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
         ggml_set_name(t_lnb, codec_wt_decode_blk_ln_b_name(li).c_str());
-        ggml_tensor * x_blk_ct = codec_wt_layer_norm_ct(ctx_eval, ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_dw)), t_lnw, t_lnb);
+        ggml_tensor * x_blk_ct = codec_op_layer_norm_ct(ctx_eval, ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_dw)), 1e-6f, t_lnw, t_lnb);
         if (x_blk_ct == nullptr) {
             return false;
         }
@@ -402,7 +385,7 @@ static bool codec_wt_build_decode(ggml_context * ctx_eval, void * user_data, ggm
     ggml_set_name(t_fln_w, codec_wt_decode_final_ln_w_name().c_str());
     ggml_tensor * t_fln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->backbone_dim);
     ggml_set_name(t_fln_b, codec_wt_decode_final_ln_b_name().c_str());
-    x_ct = codec_wt_layer_norm_ct(ctx_eval, x_ct, t_fln_w, t_fln_b);
+    x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_fln_w, t_fln_b);
     if (x_ct == nullptr) {
         return false;
     }
