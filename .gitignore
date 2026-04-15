@@ -42,6 +42,7 @@ checkpoints/
 # Editor / OS
 *.swp
 .DS_Store
+.codex
 
 # Notes and scratch
 /*.md

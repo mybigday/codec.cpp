@@ -4,3 +4,4 @@ pyyaml
 transformers
 huggingface_hub
 safetensors
+torch
