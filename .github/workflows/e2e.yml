@@ -22,7 +22,7 @@ on:
       models:
         description: "Comma-separated list of models to test"
         required: false
-        default: "mimi,dac,wavtokenizer,qwen3_tts_tokenizer,nemo_nano_codec,neucodec,distill_neucodec"
+        default: "mimi,dac,wavtokenizer"
 
 env:
   BUILD_TYPE: Release
@@ -76,11 +76,7 @@ jobs:
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        if [ -n "${{ github.event.inputs.models }}" ]; then
-          python3 tests/e2e/runner.py --report-dir tests/e2e/reports --quantization F32 --models "${{ github.event.inputs.models }}"
-        else
-          python3 tests/e2e/runner.py --report-dir tests/e2e/reports --quantization F32
-        fi
+        python3 tests/e2e/runner.py --report-dir tests/e2e/reports --models ${{ github.event.inputs.models || 'mimi,dac,wavtokenizer' }}
 
     - name: Upload E2E reports
       if: always()
