@@ -341,5 +341,35 @@ bool codec_tensor_as_vec_f32(const struct ggml_tensor * t, std::vector<float> * 
         return true;
     }
 
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (traits != nullptr && traits->to_float != nullptr && t->ne[0] > 0) {
+        const int64_t ne0 = t->ne[0];
+        const size_t n = (size_t) ggml_nelements(t);
+        if ((n % (size_t) ne0) != 0) {
+            return false;
+        }
+
+        std::vector<uint8_t> tmp;
+        const uint8_t * data = nullptr;
+        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            data = static_cast<const uint8_t *>(ggml_get_data(const_cast<struct ggml_tensor *>(t)));
+            if (data == nullptr) {
+                return false;
+            }
+        } else {
+            tmp.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), tmp.data(), 0, tmp.size());
+            data = tmp.data();
+        }
+
+        const size_t row_size = ggml_row_size(t->type, ne0);
+        const size_t n_rows = n / (size_t) ne0;
+        out->resize(n);
+        for (size_t row = 0; row < n_rows; ++row) {
+            traits->to_float(data + row * row_size, out->data() + row * (size_t) ne0, ne0);
+        }
+        return true;
+    }
+
     return false;
 }

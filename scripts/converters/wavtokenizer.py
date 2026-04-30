@@ -327,7 +327,7 @@ class WavTokenizerConverter(BaseConverter):
         if not is_weight:
             return False
 
-        ne0 = int(arr.shape[0])
+        ne0 = int(arr.shape[-1])
         if self.quantization in ("Q4_K_M", "Q5_K_M"):
             return (ne0 % 256) == 0
         if self.quantization == "Q8_0":

@@ -127,7 +127,7 @@ class BaseConverter(ABC):
             return False
         
         # Check divisibility for quantization
-        ne0 = int(arr.shape[0])
+        ne0 = int(arr.shape[-1])
         if self.quantization in ("Q4_K_M", "Q5_K_M"):
             return (ne0 % 256) == 0 and name.endswith(".w")
         elif self.quantization == "Q8_0":

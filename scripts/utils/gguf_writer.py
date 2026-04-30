@@ -166,13 +166,13 @@ class GGUFWriter:
                 quantize_tensor_q5_k_m
             )
             if st_dtype in ("Q4_0", "Q4_1", "Q4_K", "Q4_K_M"):
-                data = quantize_tensor_q4_k_m(arr)
+                data = quantize_tensor_q4_k_m(arr, row_axis=arr.ndim - 1)
                 st_dtype = "Q4_K"  # Use base type for GGML
             elif st_dtype in ("Q5_0", "Q5_1", "Q5_K", "Q5_K_M"):
-                data = quantize_tensor_q5_k_m(arr)
+                data = quantize_tensor_q5_k_m(arr, row_axis=arr.ndim - 1)
                 st_dtype = "Q5_K"
             elif st_dtype == "Q8_0":
-                data = quantize_tensor_q8_0(arr)
+                data = quantize_tensor_q8_0(arr, row_axis=arr.ndim - 1)
             else:
                 raise ValueError(f"Quantization not implemented for {st_dtype}")
 

@@ -159,6 +159,151 @@ def transform_tensor_for_codec(key, arr, conv_transforms):
     raise ValueError(f"unknown transform op: {transform} for {key}")
 
 
+def _is_descript_dac_state_dict(state_dict) -> bool:
+    return any(k.endswith(".weight_g") for k in state_dict.keys()) and any(k.endswith(".weight_v") for k in state_dict.keys())
+
+
+def _materialize_weight_norm(weight_g, weight_v) -> np.ndarray:
+    g = np.asarray(to_numpy(weight_g), dtype=np.float32)
+    v = np.asarray(to_numpy(weight_v), dtype=np.float32)
+    axes = tuple(range(1, v.ndim))
+    norm = np.linalg.norm(v, axis=axes, keepdims=True)
+    norm = np.maximum(norm, 1e-12)
+    return (v * (g / norm)).astype(np.float32, copy=False)
+
+
+def materialize_descript_dac_weight_norm(state_dict) -> OrderedDict:
+    out = OrderedDict()
+    keys = set(state_dict.keys())
+
+    for key, value in state_dict.items():
+        if key.endswith(".weight_g") or key.endswith(".weight_v"):
+            continue
+        out[key] = to_numpy(value)
+
+    for key, value in state_dict.items():
+        if not key.endswith(".weight_g"):
+            continue
+        base = key[: -len(".weight_g")]
+        v_key = base + ".weight_v"
+        if v_key not in keys:
+            raise RuntimeError(f"missing DAC weight_norm tensor: {v_key}")
+        out[base + ".weight"] = _materialize_weight_norm(value, state_dict[v_key])
+
+    return out
+
+
+def map_descript_dac_key(key: str) -> str | None:
+    key = normalize_key(key)
+
+    match = re.match(r"^encoder\.block\.0\.(weight|bias)$", key)
+    if match:
+        return "enc.block.0." + match.group(1)
+
+    match = re.match(r"^encoder\.block\.([1-4])\.block\.([0-2])\.block\.(0|1|2|3)\.(alpha|weight|bias)$", key)
+    if match:
+        block_i = int(match.group(1))
+        res_i = int(match.group(2)) + 1
+        part_i = int(match.group(3))
+        param = match.group(4)
+        part = {
+            0: "snake1.alpha",
+            1: f"conv1.{param}",
+            2: "snake2.alpha",
+            3: f"conv2.{param}",
+        }[part_i]
+        if (part_i in (0, 2) and param != "alpha") or (part_i in (1, 3) and param == "alpha"):
+            return None
+        return f"enc.block.{block_i}.block.res_unit{res_i}.{part}"
+
+    match = re.match(r"^encoder\.block\.([1-4])\.block\.3\.alpha$", key)
+    if match:
+        return f"enc.block.{match.group(1)}.block.snake1.alpha"
+
+    match = re.match(r"^encoder\.block\.([1-4])\.block\.4\.(weight|bias)$", key)
+    if match:
+        return f"enc.block.{match.group(1)}.block.conv1.{match.group(2)}"
+
+    match = re.match(r"^encoder\.block\.5\.alpha$", key)
+    if match:
+        return "enc.block.5.alpha"
+
+    match = re.match(r"^encoder\.block\.6\.(weight|bias)$", key)
+    if match:
+        return "enc.block.6." + match.group(1)
+
+    match = re.match(r"^decoder\.model\.0\.(weight|bias)$", key)
+    if match:
+        return "dec.model.0." + match.group(1)
+
+    match = re.match(r"^decoder\.model\.([1-4])\.block\.0\.alpha$", key)
+    if match:
+        return f"dec.model.{match.group(1)}.block.snake1.alpha"
+
+    match = re.match(r"^decoder\.model\.([1-4])\.block\.1\.(weight|bias)$", key)
+    if match:
+        return f"dec.model.{match.group(1)}.block.conv_t1.{match.group(2)}"
+
+    match = re.match(r"^decoder\.model\.([1-4])\.block\.([2-4])\.block\.(0|1|2|3)\.(alpha|weight|bias)$", key)
+    if match:
+        block_i = int(match.group(1))
+        res_i = int(match.group(2)) - 1
+        part_i = int(match.group(3))
+        param = match.group(4)
+        part = {
+            0: "snake1.alpha",
+            1: f"conv1.{param}",
+            2: "snake2.alpha",
+            3: f"conv2.{param}",
+        }[part_i]
+        if (part_i in (0, 2) and param != "alpha") or (part_i in (1, 3) and param == "alpha"):
+            return None
+        return f"dec.model.{block_i}.block.res_unit{res_i}.{part}"
+
+    match = re.match(r"^decoder\.model\.5\.alpha$", key)
+    if match:
+        return "dec.model.5.alpha"
+
+    match = re.match(r"^decoder\.model\.6\.(weight|bias)$", key)
+    if match:
+        return "dec.model.6." + match.group(1)
+
+    if key.startswith("quantizer.quantizers."):
+        return "vq.q" + key[len("quantizer.quantizers.") :]
+
+    return None
+
+
+def config_from_descript_metadata(metadata, state_dict) -> Dict[str, int | bool]:
+    kwargs = {}
+    if isinstance(metadata, dict):
+        kwargs = metadata.get("kwargs") or {}
+    encoder_rates = kwargs.get("encoder_rates") or [2, 4, 5, 8]
+    n_q = kwargs.get("n_codebooks")
+    if n_q is None:
+        n_q = len({
+            re.match(r"^quantizer\.quantizers\.(\d+)\.codebook\.weight$", k).group(1)
+            for k in state_dict.keys()
+            if re.match(r"^quantizer\.quantizers\.(\d+)\.codebook\.weight$", k)
+        })
+    return {
+        "sample_rate": int(kwargs.get("sample_rate", 24000)),
+        "hop_size": int(np.prod(encoder_rates)),
+        "n_q": int(n_q),
+        "codebook_size": int(kwargs.get("codebook_size", 1024)),
+        "latent_dim": int(kwargs.get("latent_dim", 1024)),
+        "codebook_dim": int(kwargs.get("codebook_dim", 8)),
+        "has_encoder": True,
+        "has_decoder": True,
+    }
+
+
+def transform_descript_dac_tensor_for_codec(key: str, arr: np.ndarray) -> np.ndarray:
+    if key.endswith(".weight") and arr.ndim == 3:
+        return arr.transpose((2, 1, 0)).copy()
+    return arr
+
+
 def load_model(model_ref):
     if AutoModel is None:
         raise RuntimeError("transformers is required for DAC conversion")
@@ -186,6 +331,7 @@ class DacConverter(BaseConverter):
         super().__init__(*args, **kwargs)
         self.model_name = model_name
         self.conv_transforms: Dict[str, str] = {}
+        self.uses_descript_dac_layout = False
 
     @property
     def model_type(self) -> str:
@@ -205,6 +351,9 @@ class DacConverter(BaseConverter):
         if name.endswith(".bias") or name.endswith(".b"):
             return False
 
+        if self.uses_descript_dac_layout and name.endswith(".out_proj.weight"):
+            return False
+
         if (".codebook." in name or name.endswith(".embed")) and not self.quantize_codebook:
             return False
 
@@ -212,7 +361,7 @@ class DacConverter(BaseConverter):
         if not is_weight:
             return False
 
-        ne0 = int(arr.shape[0])
+        ne0 = int(arr.shape[-1])
         if self.quantization in ("Q4_K_M", "Q5_K_M"):
             return (ne0 % 256) == 0
         if self.quantization == "Q8_0":
@@ -241,6 +390,7 @@ class DacConverter(BaseConverter):
                 raise FileNotFoundError(f"No DAC checkpoint file found in {checkpoint_dir}")
             model_file = candidates[0]
 
+        checkpoint_metadata = None
         if model_file.suffix == ".safetensors":
             from safetensors.torch import load_file
 
@@ -248,13 +398,22 @@ class DacConverter(BaseConverter):
         else:
             state = torch.load(model_file, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
+            checkpoint_metadata = state.get("metadata")
             state = state["state_dict"]
 
         if not isinstance(state, dict):
             raise RuntimeError(f"Unsupported checkpoint format at {model_file}")
 
-        self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in state.items())
-        if config_path.is_file():
+        is_descript_dac = _is_descript_dac_state_dict(state)
+        if is_descript_dac:
+            self.state_dict = materialize_descript_dac_weight_norm(state)
+            self.config = config_from_descript_metadata(checkpoint_metadata, state)
+            self.uses_descript_dac_layout = True
+        else:
+            self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in state.items())
+            self.uses_descript_dac_layout = False
+
+        if not is_descript_dac and config_path.is_file():
             import json
 
             with config_path.open("r", encoding="utf-8") as f:
@@ -269,7 +428,7 @@ class DacConverter(BaseConverter):
                 "has_encoder": True,
                 "has_decoder": True,
             }
-        else:
+        elif not is_descript_dac:
             self.config = {
                 "sample_rate": 24000,
                 "hop_size": 320,
@@ -288,6 +447,7 @@ class DacConverter(BaseConverter):
 
         self.state_dict = OrderedDict((k, to_numpy(v)) for k, v in model.state_dict().items())
         self.conv_transforms = build_conv_transforms(model)
+        self.uses_descript_dac_layout = False
         cfg = model.config
         self.config = {
             "sample_rate": int(getattr(cfg, "sampling_rate", getattr(cfg, "sample_rate", 24000))),
@@ -319,12 +479,15 @@ class DacConverter(BaseConverter):
         mapped = OrderedDict()
         for raw_key, value in self.state_dict.items():
             key = normalize_key(raw_key)
-            out = map_key(key)
+            out = map_descript_dac_key(key) if self.uses_descript_dac_layout else map_key(key)
             if out is None:
                 continue
 
             arr = np.asarray(value)
-            arr = transform_tensor_for_codec(key, arr, self.conv_transforms)
+            if self.uses_descript_dac_layout:
+                arr = transform_descript_dac_tensor_for_codec(key, arr)
+            else:
+                arr = transform_tensor_for_codec(key, arr, self.conv_transforms)
             mapped[key] = (out, arr)
 
         used = set()

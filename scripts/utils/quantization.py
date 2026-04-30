@@ -156,48 +156,58 @@ def _quantize_row_q5_k(row: np.ndarray) -> np.ndarray:
     return np.frombuffer(bytes(out), dtype=np.uint8)
 
 
-def quantize_tensor_q8_0(arr: np.ndarray) -> bytes:
+def _rows_for_quant(arr: np.ndarray, row_axis: int) -> np.ndarray:
+    row_axis = row_axis % arr.ndim
+    row_len = arr.shape[row_axis]
+    arr_rows = np.moveaxis(arr, row_axis, -1)
+    return np.ascontiguousarray(arr_rows).reshape(-1, row_len)
+
+
+def quantize_tensor_q8_0(arr: np.ndarray, row_axis: int = 0) -> bytes:
     """Quantize a tensor to Q8_0 format."""
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
     if arr.ndim < 1:
         raise ValueError(f"Q8_0 tensor rank must be >= 1, got {arr.shape}")
-    if arr.shape[0] % QK8_0 != 0:
-        raise ValueError(f"Q8_0 tensor ne0 must be divisible by {QK8_0}, got {arr.shape[0]}")
+    row_len = arr.shape[row_axis % arr.ndim]
+    if row_len % QK8_0 != 0:
+        raise ValueError(f"Q8_0 tensor ne0 must be divisible by {QK8_0}, got {row_len}")
 
-    rows = arr.reshape(-1, arr.shape[0])
+    rows = _rows_for_quant(arr, row_axis)
     out = bytearray()
     for row in rows:
         out += _quantize_row_q8_0(row).tobytes()
     return bytes(out)
 
 
-def quantize_tensor_q4_k_m(arr: np.ndarray) -> bytes:
+def quantize_tensor_q4_k_m(arr: np.ndarray, row_axis: int = 0) -> bytes:
     """Quantize a tensor to Q4_K_M format."""
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
     if arr.ndim < 1:
         raise ValueError(f"Q4_K_M tensor rank must be >= 1, got {arr.shape}")
-    if arr.shape[0] % QK_K != 0:
-        raise ValueError(f"Q4_K_M tensor ne0 must be divisible by {QK_K}, got {arr.shape[0]}")
+    row_len = arr.shape[row_axis % arr.ndim]
+    if row_len % QK_K != 0:
+        raise ValueError(f"Q4_K_M tensor ne0 must be divisible by {QK_K}, got {row_len}")
 
-    rows = arr.reshape(-1, arr.shape[0])
+    rows = _rows_for_quant(arr, row_axis)
     out = bytearray()
     for row in rows:
         out += _quantize_row_q4_k(row).tobytes()
     return bytes(out)
 
 
-def quantize_tensor_q5_k_m(arr: np.ndarray) -> bytes:
+def quantize_tensor_q5_k_m(arr: np.ndarray, row_axis: int = 0) -> bytes:
     """Quantize a tensor to Q5_K_M format."""
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
     if arr.ndim < 1:
         raise ValueError(f"Q5_K_M tensor rank must be >= 1, got {arr.shape}")
-    if arr.shape[0] % QK_K != 0:
-        raise ValueError(f"Q5_K_M tensor ne0 must be divisible by {QK_K}, got {arr.shape[0]}")
+    row_len = arr.shape[row_axis % arr.ndim]
+    if row_len % QK_K != 0:
+        raise ValueError(f"Q5_K_M tensor ne0 must be divisible by {QK_K}, got {row_len}")
 
-    rows = arr.reshape(-1, arr.shape[0])
+    rows = _rows_for_quant(arr, row_axis)
     out = bytearray()
     for row in rows:
         out += _quantize_row_q5_k(row).tobytes()
