@@ -316,7 +316,7 @@ enum codec_status codec_soprano_decode_latent(
 
     std::vector<float> pcm_v;
     const std::vector<float> * win_ptr = window.empty() ? nullptr : &window;
-    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t_up, hop, win_ptr, true, &pcm_v, &err)) {
+    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t_up, hop, win_ptr, true, -1, &pcm_v, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

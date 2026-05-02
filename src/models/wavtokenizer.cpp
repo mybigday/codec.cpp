@@ -1060,7 +1060,7 @@ static enum codec_status codec_wt_decode_graph(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
     std::vector<float> pcm_v;
-    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t, hop, nullptr, false, &pcm_v, &err)) {
+    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t, hop, nullptr, false, -1, &pcm_v, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

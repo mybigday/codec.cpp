@@ -1325,7 +1325,7 @@ static enum codec_status codec_neu_decode_graph(
     }
 
     std::vector<float> pcm_v;
-    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t, hop, w_tensor != nullptr ? &window : nullptr, false, &pcm_v, &err)) {
+    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t, hop, w_tensor != nullptr ? &window : nullptr, false, -1, &pcm_v, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

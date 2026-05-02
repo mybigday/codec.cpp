@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 import numpy as np
 from safetensors import safe_open
@@ -58,20 +57,33 @@ def _find_s3gen_checkpoint(checkpoint_dir: Path) -> Path:
     )
 
 
-def _short_tensor_name(prefix: str, key: str, used: set[str]) -> str:
-    name = f"{prefix}{key}"
-    if len(name) <= 63 and name not in used:
-        used.add(name)
-        return name
+def _materialize_weight_norm(weight_g: np.ndarray, weight_v: np.ndarray) -> np.ndarray:
+    g = np.asarray(weight_g, dtype=np.float32)
+    v = np.asarray(weight_v, dtype=np.float32)
+    axes = tuple(range(1, v.ndim))
+    norm = np.linalg.norm(v, axis=axes, keepdims=True)
+    norm = np.maximum(norm, 1e-12)
+    return (v * (g / norm)).astype(np.float32, copy=False)
 
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-    name = f"{prefix}{digest}"
-    suffix = 0
-    while name in used:
-        suffix += 1
-        name = f"{prefix}{digest[:12]}{suffix:04d}"
-    used.add(name)
-    return name
+
+def _materialize_state_dict(state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Bake `parametrizations.weight.original{0,1}` into a single effective weight."""
+    out: Dict[str, np.ndarray] = {}
+    pending: Dict[str, Dict[str, np.ndarray]] = {}
+    for key, value in state.items():
+        if key.endswith(".parametrizations.weight.original0"):
+            base = key[: -len(".parametrizations.weight.original0")]
+            pending.setdefault(base, {})["g"] = value
+        elif key.endswith(".parametrizations.weight.original1"):
+            base = key[: -len(".parametrizations.weight.original1")]
+            pending.setdefault(base, {})["v"] = value
+        else:
+            out[key] = value
+    for base, gv in pending.items():
+        if "g" not in gv or "v" not in gv:
+            raise RuntimeError(f"incomplete weight_norm parametrization at {base}")
+        out[base + ".weight"] = _materialize_weight_norm(gv["g"], gv["v"])
+    return out
 
 
 def _load_optional_conds(path: Path) -> Dict[str, Any] | None:
@@ -95,6 +107,215 @@ def _as_numpy_int32_1d(x: Any) -> np.ndarray:
         x = x.detach().cpu().numpy()
     x = np.asarray(x)
     return x.astype(np.int32, copy=False).reshape(-1)
+
+
+# --- S3G state_dict → stable GGUF tensor name map -------------------------
+
+_S3G_FLOW_NUM_DOWN_BLOCKS = 6
+_S3G_FLOW_NUM_UP_BLOCKS = 4
+_S3G_CFM_NUM_DOWN_BLOCKS = 1
+_S3G_CFM_NUM_MID_BLOCKS = 12
+_S3G_CFM_NUM_UP_BLOCKS = 1
+_S3G_CFM_TRANSFORMERS_PER_BLOCK = 4
+_S3G_HIFT_F0_NUM_LAYERS = 5
+_S3G_HIFT_NUM_UPS = 3
+
+
+def _take(state: Dict[str, np.ndarray], key: str) -> np.ndarray:
+    if key not in state:
+        raise KeyError(f"missing S3G tensor: {key}")
+    return state.pop(key)
+
+
+def _emit_flow_attn_block(
+    out: list[tuple[str, np.ndarray]],
+    state: Dict[str, np.ndarray],
+    src_prefix: str,
+    dst_prefix: str,
+) -> None:
+    # ConformerEncoderLayer with rel_pos self-attention + FFN.
+    a = src_prefix + ".self_attn"
+    f = src_prefix + ".feed_forward"
+    out.append((dst_prefix + ".norm_mha.w", _take(state, src_prefix + ".norm_mha.weight")))
+    out.append((dst_prefix + ".norm_mha.b", _take(state, src_prefix + ".norm_mha.bias")))
+    out.append((dst_prefix + ".norm_ff.w",  _take(state, src_prefix + ".norm_ff.weight")))
+    out.append((dst_prefix + ".norm_ff.b",  _take(state, src_prefix + ".norm_ff.bias")))
+    out.append((dst_prefix + ".attn.q.w",   _take(state, a + ".linear_q.weight")))
+    out.append((dst_prefix + ".attn.q.b",   _take(state, a + ".linear_q.bias")))
+    out.append((dst_prefix + ".attn.k.w",   _take(state, a + ".linear_k.weight")))
+    out.append((dst_prefix + ".attn.k.b",   _take(state, a + ".linear_k.bias")))
+    out.append((dst_prefix + ".attn.v.w",   _take(state, a + ".linear_v.weight")))
+    out.append((dst_prefix + ".attn.v.b",   _take(state, a + ".linear_v.bias")))
+    out.append((dst_prefix + ".attn.o.w",   _take(state, a + ".linear_out.weight")))
+    out.append((dst_prefix + ".attn.o.b",   _take(state, a + ".linear_out.bias")))
+    out.append((dst_prefix + ".attn.pos.w", _take(state, a + ".linear_pos.weight")))
+    out.append((dst_prefix + ".attn.pbu",   _take(state, a + ".pos_bias_u")))
+    out.append((dst_prefix + ".attn.pbv",   _take(state, a + ".pos_bias_v")))
+    out.append((dst_prefix + ".ff.w1.w",    _take(state, f + ".w_1.weight")))
+    out.append((dst_prefix + ".ff.w1.b",    _take(state, f + ".w_1.bias")))
+    out.append((dst_prefix + ".ff.w2.w",    _take(state, f + ".w_2.weight")))
+    out.append((dst_prefix + ".ff.w2.b",    _take(state, f + ".w_2.bias")))
+
+
+def _emit_cfm_resnet(
+    out: list[tuple[str, np.ndarray]],
+    state: Dict[str, np.ndarray],
+    src_prefix: str,
+    dst_prefix: str,
+) -> None:
+    out.append((dst_prefix + ".b1.cv.w", _take(state, src_prefix + ".block1.block.0.weight")))
+    out.append((dst_prefix + ".b1.cv.b", _take(state, src_prefix + ".block1.block.0.bias")))
+    out.append((dst_prefix + ".b1.ln.w", _take(state, src_prefix + ".block1.block.2.weight")))
+    out.append((dst_prefix + ".b1.ln.b", _take(state, src_prefix + ".block1.block.2.bias")))
+    out.append((dst_prefix + ".b2.cv.w", _take(state, src_prefix + ".block2.block.0.weight")))
+    out.append((dst_prefix + ".b2.cv.b", _take(state, src_prefix + ".block2.block.0.bias")))
+    out.append((dst_prefix + ".b2.ln.w", _take(state, src_prefix + ".block2.block.2.weight")))
+    out.append((dst_prefix + ".b2.ln.b", _take(state, src_prefix + ".block2.block.2.bias")))
+    out.append((dst_prefix + ".mlp.w",   _take(state, src_prefix + ".mlp.1.weight")))
+    out.append((dst_prefix + ".mlp.b",   _take(state, src_prefix + ".mlp.1.bias")))
+    out.append((dst_prefix + ".res.w",   _take(state, src_prefix + ".res_conv.weight")))
+    out.append((dst_prefix + ".res.b",   _take(state, src_prefix + ".res_conv.bias")))
+
+
+def _emit_cfm_transformer(
+    out: list[tuple[str, np.ndarray]],
+    state: Dict[str, np.ndarray],
+    src_prefix: str,
+    dst_prefix: str,
+) -> None:
+    # BasicTransformerBlock: norm1 → self-attn → norm3 → GELU FFN.
+    a = src_prefix + ".attn1"
+    out.append((dst_prefix + ".norm1.w", _take(state, src_prefix + ".norm1.weight")))
+    out.append((dst_prefix + ".norm1.b", _take(state, src_prefix + ".norm1.bias")))
+    out.append((dst_prefix + ".norm3.w", _take(state, src_prefix + ".norm3.weight")))
+    out.append((dst_prefix + ".norm3.b", _take(state, src_prefix + ".norm3.bias")))
+    out.append((dst_prefix + ".attn.q.w", _take(state, a + ".to_q.weight")))
+    out.append((dst_prefix + ".attn.k.w", _take(state, a + ".to_k.weight")))
+    out.append((dst_prefix + ".attn.v.w", _take(state, a + ".to_v.weight")))
+    out.append((dst_prefix + ".attn.o.w", _take(state, a + ".to_out.0.weight")))
+    out.append((dst_prefix + ".attn.o.b", _take(state, a + ".to_out.0.bias")))
+    out.append((dst_prefix + ".ff.w1.w",  _take(state, src_prefix + ".ff.net.0.proj.weight")))
+    out.append((dst_prefix + ".ff.w1.b",  _take(state, src_prefix + ".ff.net.0.proj.bias")))
+    out.append((dst_prefix + ".ff.w2.w",  _take(state, src_prefix + ".ff.net.2.weight")))
+    out.append((dst_prefix + ".ff.w2.b",  _take(state, src_prefix + ".ff.net.2.bias")))
+
+
+def _emit_resblock(
+    out: list[tuple[str, np.ndarray]],
+    state: Dict[str, np.ndarray],
+    src_prefix: str,
+    dst_prefix: str,
+) -> None:
+    # HiFi-GAN ResBlock: 3× (snake-act → conv1 → snake-act → conv2 → residual).
+    for k in range(3):
+        out.append((dst_prefix + f".cv1.{k}.w", _take(state, src_prefix + f".convs1.{k}.weight")))
+        out.append((dst_prefix + f".cv1.{k}.b", _take(state, src_prefix + f".convs1.{k}.bias")))
+        out.append((dst_prefix + f".cv2.{k}.w", _take(state, src_prefix + f".convs2.{k}.weight")))
+        out.append((dst_prefix + f".cv2.{k}.b", _take(state, src_prefix + f".convs2.{k}.bias")))
+        out.append((dst_prefix + f".a1.{k}",    _take(state, src_prefix + f".activations1.{k}.alpha")))
+        out.append((dst_prefix + f".a2.{k}",    _take(state, src_prefix + f".activations2.{k}.alpha")))
+
+
+def _build_s3g_tensor_map(
+    state: Dict[str, np.ndarray],
+    *,
+    meanflow: bool,
+) -> list[tuple[str, np.ndarray]]:
+    state = dict(state)  # take pop ownership
+    out: list[tuple[str, np.ndarray]] = []
+
+    # Drop tokenizer/speaker_encoder weights — not used by the builtin-conds decode path.
+    for key in list(state.keys()):
+        if key.startswith("tokenizer.") or key.startswith("speaker_encoder."):
+            del state[key]
+
+    # --- flow shared
+    out.append(("s3g.flow.input_emb.w", _take(state, "flow.input_embedding.weight")))
+    out.append(("s3g.flow.spk_aff.w",   _take(state, "flow.spk_embed_affine_layer.weight")))
+    out.append(("s3g.flow.spk_aff.b",   _take(state, "flow.spk_embed_affine_layer.bias")))
+    out.append(("s3g.flow.proj.w",      _take(state, "flow.encoder_proj.weight")))
+    out.append(("s3g.flow.proj.b",      _take(state, "flow.encoder_proj.bias")))
+
+    # --- flow encoder (UpsampleConformerEncoder)
+    out.append(("s3g.flow.enc.embed.lin.w", _take(state, "flow.encoder.embed.out.0.weight")))
+    out.append(("s3g.flow.enc.embed.lin.b", _take(state, "flow.encoder.embed.out.0.bias")))
+    out.append(("s3g.flow.enc.embed.ln.w",  _take(state, "flow.encoder.embed.out.1.weight")))
+    out.append(("s3g.flow.enc.embed.ln.b",  _take(state, "flow.encoder.embed.out.1.bias")))
+    out.append(("s3g.flow.enc.up_embed.lin.w", _take(state, "flow.encoder.up_embed.out.0.weight")))
+    out.append(("s3g.flow.enc.up_embed.lin.b", _take(state, "flow.encoder.up_embed.out.0.bias")))
+    out.append(("s3g.flow.enc.up_embed.ln.w",  _take(state, "flow.encoder.up_embed.out.1.weight")))
+    out.append(("s3g.flow.enc.up_embed.ln.b",  _take(state, "flow.encoder.up_embed.out.1.bias")))
+    out.append(("s3g.flow.enc.after_norm.w", _take(state, "flow.encoder.after_norm.weight")))
+    out.append(("s3g.flow.enc.after_norm.b", _take(state, "flow.encoder.after_norm.bias")))
+    out.append(("s3g.flow.enc.pre.cv1.w", _take(state, "flow.encoder.pre_lookahead_layer.conv1.weight")))
+    out.append(("s3g.flow.enc.pre.cv1.b", _take(state, "flow.encoder.pre_lookahead_layer.conv1.bias")))
+    out.append(("s3g.flow.enc.pre.cv2.w", _take(state, "flow.encoder.pre_lookahead_layer.conv2.weight")))
+    out.append(("s3g.flow.enc.pre.cv2.b", _take(state, "flow.encoder.pre_lookahead_layer.conv2.bias")))
+    out.append(("s3g.flow.enc.up.w", _take(state, "flow.encoder.up_layer.conv.weight")))
+    out.append(("s3g.flow.enc.up.b", _take(state, "flow.encoder.up_layer.conv.bias")))
+    for li in range(_S3G_FLOW_NUM_DOWN_BLOCKS):
+        _emit_flow_attn_block(out, state, f"flow.encoder.encoders.{li}", f"s3g.flow.enc.blk.{li}")
+    for li in range(_S3G_FLOW_NUM_UP_BLOCKS):
+        _emit_flow_attn_block(out, state, f"flow.encoder.up_encoders.{li}", f"s3g.flow.enc.up_blk.{li}")
+
+    # --- CFM estimator (ConditionalDecoder)
+    out.append(("s3g.cfm.t.l1.w", _take(state, "flow.decoder.estimator.time_mlp.linear_1.weight")))
+    out.append(("s3g.cfm.t.l1.b", _take(state, "flow.decoder.estimator.time_mlp.linear_1.bias")))
+    out.append(("s3g.cfm.t.l2.w", _take(state, "flow.decoder.estimator.time_mlp.linear_2.weight")))
+    out.append(("s3g.cfm.t.l2.b", _take(state, "flow.decoder.estimator.time_mlp.linear_2.bias")))
+    if meanflow:
+        out.append(("s3g.cfm.t_mix.w", _take(state, "flow.decoder.estimator.time_embed_mixer.weight")))
+
+    def _emit_cfm_section(group: str, n_blocks: int, has_trailing: bool) -> None:
+        for bi in range(n_blocks):
+            src_b = f"flow.decoder.estimator.{group}.{bi}"
+            dst_b = f"s3g.cfm.{ {'down_blocks':'dn','mid_blocks':'md','up_blocks':'up'}[group] }.{bi}"
+            _emit_cfm_resnet(out, state, src_b + ".0", dst_b + ".r")
+            for ti in range(_S3G_CFM_TRANSFORMERS_PER_BLOCK):
+                _emit_cfm_transformer(out, state, f"{src_b}.1.{ti}", f"{dst_b}.t.{ti}")
+            if has_trailing:
+                out.append((dst_b + ".x.w", _take(state, src_b + ".2.weight")))
+                out.append((dst_b + ".x.b", _take(state, src_b + ".2.bias")))
+
+    _emit_cfm_section("down_blocks", _S3G_CFM_NUM_DOWN_BLOCKS, has_trailing=True)
+    _emit_cfm_section("mid_blocks",  _S3G_CFM_NUM_MID_BLOCKS,  has_trailing=False)
+    _emit_cfm_section("up_blocks",   _S3G_CFM_NUM_UP_BLOCKS,   has_trailing=True)
+
+    out.append(("s3g.cfm.final.cv.w", _take(state, "flow.decoder.estimator.final_block.block.0.weight")))
+    out.append(("s3g.cfm.final.cv.b", _take(state, "flow.decoder.estimator.final_block.block.0.bias")))
+    out.append(("s3g.cfm.final.ln.w", _take(state, "flow.decoder.estimator.final_block.block.2.weight")))
+    out.append(("s3g.cfm.final.ln.b", _take(state, "flow.decoder.estimator.final_block.block.2.bias")))
+    out.append(("s3g.cfm.proj.w",     _take(state, "flow.decoder.estimator.final_proj.weight")))
+    out.append(("s3g.cfm.proj.b",     _take(state, "flow.decoder.estimator.final_proj.bias")))
+
+    # --- HiFTGenerator (mel2wav)
+    for li in range(_S3G_HIFT_F0_NUM_LAYERS):
+        # condnet has format Sequential(Conv, ELU, Conv, ELU, ...) so even indices are Convs.
+        src_idx = li * 2
+        out.append((f"s3g.hift.f0.cn.{li}.w", _take(state, f"mel2wav.f0_predictor.condnet.{src_idx}.weight")))
+        out.append((f"s3g.hift.f0.cn.{li}.b", _take(state, f"mel2wav.f0_predictor.condnet.{src_idx}.bias")))
+    out.append(("s3g.hift.f0.cls.w", _take(state, "mel2wav.f0_predictor.classifier.weight")))
+    out.append(("s3g.hift.f0.cls.b", _take(state, "mel2wav.f0_predictor.classifier.bias")))
+    out.append(("s3g.hift.src.lin.w", _take(state, "mel2wav.m_source.l_linear.weight")))
+    out.append(("s3g.hift.src.lin.b", _take(state, "mel2wav.m_source.l_linear.bias")))
+    out.append(("s3g.hift.conv_pre.w", _take(state, "mel2wav.conv_pre.weight")))
+    out.append(("s3g.hift.conv_pre.b", _take(state, "mel2wav.conv_pre.bias")))
+    out.append(("s3g.hift.conv_post.w", _take(state, "mel2wav.conv_post.weight")))
+    out.append(("s3g.hift.conv_post.b", _take(state, "mel2wav.conv_post.bias")))
+    for ui in range(_S3G_HIFT_NUM_UPS):
+        out.append((f"s3g.hift.up.{ui}.w", _take(state, f"mel2wav.ups.{ui}.weight")))
+        out.append((f"s3g.hift.up.{ui}.b", _take(state, f"mel2wav.ups.{ui}.bias")))
+        out.append((f"s3g.hift.src_dn.{ui}.w", _take(state, f"mel2wav.source_downs.{ui}.weight")))
+        out.append((f"s3g.hift.src_dn.{ui}.b", _take(state, f"mel2wav.source_downs.{ui}.bias")))
+        _emit_resblock(out, state, f"mel2wav.source_resblocks.{ui}", f"s3g.hift.src_rb.{ui}")
+        for ki in range(3):  # 3 parallel resblocks per upsample stage
+            _emit_resblock(out, state, f"mel2wav.resblocks.{ui * 3 + ki}", f"s3g.hift.rb.{ui * 3 + ki}")
+
+    # Sanity: warn if we left tensors on the floor (other than known runtime-recomputed buffers).
+    leftovers = sorted(state.keys())
+    if leftovers:
+        raise RuntimeError(f"unmapped S3G tensors after conversion: {leftovers[:20]} (+{len(leftovers)-20} more)" if len(leftovers) > 20 else f"unmapped S3G tensors after conversion: {leftovers}")
+    return out
 
 
 class _BaseChatterboxConverter(BaseConverter):
@@ -286,12 +507,12 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         if self.state_dict is None or self.config is None:
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
 
+        meanflow = bool(self.config.get("meanflow", False))
         writer = GGUFWriter(output_path, self.architecture)
         self._reset_quant_stats()
         self._write_common_metadata(writer, self.config)
-        writer.add_bool("chatterbox_s3g.meanflow", bool(self.config.get("meanflow", False)))
+        writer.add_bool("chatterbox_s3g.meanflow", meanflow)
 
-        gen_conds = None
         if self.conds is not None:
             gen_conds = self.conds.get("gen")
             if not isinstance(gen_conds, dict):
@@ -321,17 +542,10 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         else:
             writer.add_bool("chatterbox_s3g.has_builtin_conditioning", False)
 
-        # Decode runtime is not implemented yet. Preserve the real checkpoint tensors under
-        # stable names so S3G conversion is no longer blocked on re-downloading or re-parsing.
-        used: set[str] = set()
-        for key in sorted(self.state_dict.keys()):
-            if key.startswith("tokenizer."):
-                continue
-            arr = np.asarray(self.state_dict[key])
-            if arr.ndim == 0:
-                continue
-            name = _short_tensor_name("s3g.", key, used)
-            self._add_tensor(writer, name, arr)
+        flat = _materialize_state_dict(self.state_dict)
+        emit = _build_s3g_tensor_map(flat, meanflow=meanflow)
+        for gguf_name, arr in emit:
+            self._add_tensor(writer, gguf_name, arr)
 
         writer.write()
         self._warn_if_no_quantized()

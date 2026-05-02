@@ -1,10 +1,12 @@
 #include "ggml_ops.h"
 
 #include "conv1d.h"
+#include "lm_attn.h"
 #include "../runtime/tensor_utils.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 
 ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op op) {
     if (ctx == nullptr || x == nullptr) {
@@ -23,6 +25,12 @@ ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op
             return ggml_silu(ctx, x);
         case CODEC_UNARY_GELU_ERF:
             return ggml_gelu_erf(ctx, x);
+        case CODEC_UNARY_MISH: {
+            // mish(x) = x * tanh(softplus(x))
+            ggml_tensor * sp = ggml_softplus(ctx, x);
+            ggml_tensor * t = ggml_tanh(ctx, sp);
+            return ggml_mul(ctx, x, t);
+        }
         default:
             return nullptr;
     }
@@ -309,4 +317,190 @@ ggml_tensor * codec_op_convnext_block_ct(
         }
     }
     return ggml_add(ctx, x_ct, pw2);
+}
+
+ggml_tensor * codec_op_causal_block1d_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * conv_w,
+    ggml_tensor * conv_b,
+    ggml_tensor * ln_w,
+    ggml_tensor * ln_b) {
+    if (ctx == nullptr || x_tc == nullptr || conv_w == nullptr) return nullptr;
+    ggml_tensor * y = codec_conv1d_causal(ctx, x_tc, conv_w, conv_b, /*stride=*/1, /*dilation=*/1);
+    if (y == nullptr) return nullptr;
+    y = codec_op_layer_norm_tc(ctx, y, /*eps=*/1e-5f, ln_w, ln_b);
+    if (y == nullptr) return nullptr;
+    return codec_op_unary(ctx, y, CODEC_UNARY_MISH);
+}
+
+ggml_tensor * codec_op_hifigan_resblock_branch_ct(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * a1,
+    ggml_tensor * a2,
+    ggml_tensor * c1_w,
+    ggml_tensor * c1_b,
+    ggml_tensor * c2_w,
+    ggml_tensor * c2_b,
+    int32_t kernel_size,
+    int32_t dilation) {
+    if (ctx == nullptr || x_tc == nullptr || a1 == nullptr || a2 == nullptr ||
+        c1_w == nullptr || c2_w == nullptr || kernel_size <= 0 || dilation <= 0) {
+        return nullptr;
+    }
+    const int32_t pad1 = (kernel_size * dilation - dilation) / 2;
+    const int32_t pad2 = (kernel_size - 1) / 2;
+    ggml_tensor * h = codec_op_snake(ctx, x_tc, a1, /*eps=*/1e-9f);
+    if (h == nullptr) return nullptr;
+    h = codec_conv1d(ctx, h, c1_w, c1_b, /*stride=*/1, /*dilation=*/dilation, /*padding=*/pad1);
+    if (h == nullptr) return nullptr;
+    h = codec_op_snake(ctx, h, a2, /*eps=*/1e-9f);
+    if (h == nullptr) return nullptr;
+    h = codec_conv1d(ctx, h, c2_w, c2_b, /*stride=*/1, /*dilation=*/1, /*padding=*/pad2);
+    if (h == nullptr) return nullptr;
+    return ggml_add(ctx, h, x_tc);
+}
+
+ggml_tensor * codec_op_cfm_causal_resnet_block_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * t_emb,
+    ggml_tensor * b1_conv_w, ggml_tensor * b1_conv_b,
+    ggml_tensor * b1_ln_w,   ggml_tensor * b1_ln_b,
+    ggml_tensor * b2_conv_w, ggml_tensor * b2_conv_b,
+    ggml_tensor * b2_ln_w,   ggml_tensor * b2_ln_b,
+    ggml_tensor * mlp_w,     ggml_tensor * mlp_b,
+    ggml_tensor * res_w,     ggml_tensor * res_b) {
+    if (ctx == nullptr || x_tc == nullptr || t_emb == nullptr ||
+        b1_conv_w == nullptr || b2_conv_w == nullptr ||
+        mlp_w == nullptr || res_w == nullptr) return nullptr;
+
+    ggml_tensor * h = codec_op_causal_block1d_tc(ctx, x_tc, b1_conv_w, b1_conv_b, b1_ln_w, b1_ln_b);
+    if (h == nullptr) return nullptr;
+
+    // Time embedding mlp: mish(t_emb) → Linear(time_embed_dim → out_dim) → broadcast over t.
+    ggml_tensor * tm = codec_op_unary(ctx, t_emb, CODEC_UNARY_MISH);
+    if (tm == nullptr) return nullptr;
+    ggml_tensor * tm_2d = ggml_reshape_2d(ctx, tm, tm->ne[0], 1);
+    ggml_tensor * tm_proj = ggml_mul_mat(ctx, mlp_w, tm_2d);  // [out, 1]
+    if (tm_proj == nullptr) return nullptr;
+    if (mlp_b != nullptr) {
+        ggml_tensor * mlp_b_2d = ggml_reshape_2d(ctx, mlp_b, mlp_b->ne[0], 1);
+        tm_proj = ggml_add(ctx, tm_proj, mlp_b_2d);
+    }
+    ggml_tensor * tm_to = ggml_cont(ctx, ggml_transpose(ctx, tm_proj));  // [1, out]
+    h = ggml_add(ctx, h, ggml_repeat(ctx, tm_to, h));
+
+    h = codec_op_causal_block1d_tc(ctx, h, b2_conv_w, b2_conv_b, b2_ln_w, b2_ln_b);
+    if (h == nullptr) return nullptr;
+
+    ggml_tensor * res = codec_conv1d(ctx, x_tc, res_w, res_b, /*stride=*/1, /*dilation=*/1, /*padding=*/0);
+    if (res == nullptr) return nullptr;
+    return ggml_add(ctx, h, res);
+}
+
+ggml_tensor * codec_op_basic_transformer_block_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * norm1_w, ggml_tensor * norm1_b,
+    ggml_tensor * qw, ggml_tensor * kw, ggml_tensor * vw,
+    ggml_tensor * ow, ggml_tensor * ob,
+    ggml_tensor * norm3_w, ggml_tensor * norm3_b,
+    ggml_tensor * ff1_w, ggml_tensor * ff1_b,
+    ggml_tensor * ff2_w, ggml_tensor * ff2_b,
+    int32_t head_dim,
+    int32_t num_heads) {
+    if (ctx == nullptr || x_tc == nullptr || qw == nullptr || kw == nullptr || vw == nullptr ||
+        ow == nullptr || ff1_w == nullptr || ff2_w == nullptr || head_dim <= 0 || num_heads <= 0) {
+        return nullptr;
+    }
+    const int32_t inner = head_dim * num_heads;
+    const int32_t T = (int32_t) x_tc->ne[0];
+
+    ggml_tensor * h_tc = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, norm1_w, norm1_b);
+    if (h_tc == nullptr) return nullptr;
+    ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, h_tc));
+    ggml_tensor * q_ct = codec_op_linear(ctx, h_ct, qw, /*b=*/nullptr);
+    ggml_tensor * k_ct = codec_op_linear(ctx, h_ct, kw, /*b=*/nullptr);
+    ggml_tensor * v_ct = codec_op_linear(ctx, h_ct, vw, /*b=*/nullptr);
+    if (q_ct == nullptr || k_ct == nullptr || v_ct == nullptr) return nullptr;
+
+    auto to_dth = [&](ggml_tensor * x_ct_in) {
+        ggml_tensor * r = ggml_reshape_3d(ctx, x_ct_in, head_dim, num_heads, T);
+        return ggml_cont(ctx, ggml_permute(ctx, r, 0, 2, 1, 3));
+    };
+    codec_lm_attn_params attn_p = {};
+    attn_p.scale = 1.0f / std::sqrt((float) head_dim);
+    attn_p.causal = false;
+    ggml_tensor * attn_dth = codec_op_lm_attn_ctx_dth(ctx, to_dth(q_ct), to_dth(k_ct), to_dth(v_ct), &attn_p);
+    if (attn_dth == nullptr) return nullptr;
+
+    ggml_tensor * attn_ct = ggml_reshape_2d(
+        ctx,
+        ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3)),
+        inner, T);
+    ggml_tensor * proj_ct = codec_op_linear(ctx, attn_ct, ow, ob);
+    if (proj_ct == nullptr) return nullptr;
+    x_tc = ggml_add(ctx, x_tc, ggml_cont(ctx, ggml_transpose(ctx, proj_ct)));
+
+    ggml_tensor * f_tc = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, norm3_w, norm3_b);
+    if (f_tc == nullptr) return nullptr;
+    ggml_tensor * f_ct = ggml_cont(ctx, ggml_transpose(ctx, f_tc));
+    ggml_tensor * ff = codec_op_linear(ctx, f_ct, ff1_w, ff1_b);
+    if (ff == nullptr) return nullptr;
+    ff = codec_op_unary(ctx, ff, CODEC_UNARY_GELU_ERF);
+    ff = codec_op_linear(ctx, ff, ff2_w, ff2_b);
+    if (ff == nullptr) return nullptr;
+    return ggml_add(ctx, x_tc, ggml_cont(ctx, ggml_transpose(ctx, ff)));
+}
+
+ggml_tensor * codec_op_sinusoidal_time_emb(
+    ggml_context * ctx,
+    float t_v,
+    int32_t dim,
+    float scale) {
+    if (ctx == nullptr || dim <= 0 || (dim & 1) != 0) return nullptr;
+    const int32_t half = dim / 2;
+    ggml_tensor * idx = ggml_arange(ctx, 0.0f, (float) half, 1.0f);
+    ggml_tensor * log_idx = ggml_scale(ctx, idx, -std::log(10000.0f) / (float) (half - 1));
+    ggml_tensor * freqs = ggml_exp(ctx, log_idx);
+    ggml_tensor * e = ggml_scale(ctx, freqs, t_v * scale);
+    return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), /*dim=*/0);
+}
+
+ggml_tensor * codec_op_espnet_rel_pos_emb(
+    ggml_context * ctx,
+    int32_t t,
+    int32_t d_model) {
+    if (ctx == nullptr || t <= 0 || d_model <= 0 || (d_model & 1) != 0) return nullptr;
+    const int32_t half = d_model / 2;
+    const int32_t pe_len = 2 * t - 1;
+
+    // Position values per row r ∈ [0, 2T-2] are p_r = (T-1) - r, giving the
+    // sequence [T-1, T-2, ..., 0, -1, ..., -(T-1)].
+    ggml_tensor * row_idx = ggml_arange(ctx, 0.0f, (float) pe_len, 1.0f);    // [pe_len]
+    ggml_tensor * pos = ggml_scale_bias(ctx, row_idx, -1.0f, (float) (t - 1));
+
+    // freq[k] = exp(-2k * log(10000) / d_model) for k ∈ [0, half).
+    ggml_tensor * k_idx = ggml_arange(ctx, 0.0f, (float) half, 1.0f);
+    ggml_tensor * log_k = ggml_scale(ctx, k_idx, -2.0f * std::log(10000.0f) / (float) d_model);
+    ggml_tensor * freqs = ggml_exp(ctx, log_k);                                // [half]
+
+    // Outer product: angle[k, r] = freqs[k] * pos[r]. Broadcast both to [half, pe_len].
+    ggml_tensor * pos_2d = ggml_reshape_2d(ctx, pos, 1, pe_len);
+    ggml_tensor * freqs_2d = ggml_reshape_2d(ctx, freqs, half, 1);
+    ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, half, pe_len);
+    ggml_tensor * angle = ggml_mul(ctx,
+        ggml_repeat(ctx, freqs_2d, tmpl),
+        ggml_repeat(ctx, pos_2d, tmpl));
+
+    // Interleave sin/cos along ne[0]: stack as [half, 2, pe_len], permute axes
+    // (ne[0],ne[1]) → (ne[1],ne[0]) so the interleaved layout falls out as the
+    // contiguous flatten over (k, j∈{sin,cos}, r).
+    ggml_tensor * sin_3d = ggml_reshape_3d(ctx, ggml_sin(ctx, angle), half, 1, pe_len);
+    ggml_tensor * cos_3d = ggml_reshape_3d(ctx, ggml_cos(ctx, angle), half, 1, pe_len);
+    ggml_tensor * stacked = ggml_concat(ctx, sin_3d, cos_3d, /*dim=*/1);       // [half, 2, pe_len]
+    ggml_tensor * permuted = ggml_cont(ctx, ggml_permute(ctx, stacked, 1, 0, 2, 3));
+    return ggml_reshape_2d(ctx, permuted, d_model, pe_len);
 }
