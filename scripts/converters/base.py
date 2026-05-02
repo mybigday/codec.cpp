@@ -114,10 +114,14 @@ class BaseConverter(ABC):
         if name.endswith(".b"):
             return False
         
-        # Never quantize layer norm weights
-        if re.search(r"(?:_ln|inln|paln)\.w$", name):
+        # Never quantize layer norm / adanorm weights. Block-quantization on
+        # these tiny (1D or low-rank-2D) tensors clustered around 1.0/0.0
+        # produces audio noise — see wavtokenizer adanorm (.norm.scale.weight)
+        # which has shape (4, hidden_dim) and qualifies for Q4_K by the
+        # divisibility check, but is catastrophically lossy when quantized.
+        if re.search(r"(?:_ln|inln|paln|norm|ln)\.(?:w|weight|scale\.weight|shift\.weight)$", name):
             return False
-        
+
         # Never quantize codebook unless explicitly enabled
         if re.search(r"^q\..*\.embed", name) and not self.quantize_codebook:
             return False

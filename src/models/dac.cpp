@@ -66,6 +66,7 @@ struct dac_decode_build {
     int32_t block_convtr_kernel[CODEC_DAC_MAX_BLOCKS];
     int32_t block_convtr_in[CODEC_DAC_MAX_BLOCKS];
     int32_t block_convtr_out[CODEC_DAC_MAX_BLOCKS];
+    const codec_model * model;
 };
 
 struct dac_decoder_shapes {
@@ -91,68 +92,106 @@ struct dac_encode_build {
     int32_t block_conv_kernel[CODEC_DAC_MAX_BLOCKS];
     int32_t block_conv_in[CODEC_DAC_MAX_BLOCKS];
     int32_t block_conv_out[CODEC_DAC_MAX_BLOCKS];
+    const codec_model * model;
 };
 
-static ggml_tensor * codec_dac_get_tensor(codec_model * model, const std::string & name) {
-    if (model == nullptr || model->weights == nullptr) {
+
+// Lookup a DAC conv1d weight by GGUF name with graph-cast to F32. For tensors
+// stored in legacy axis order ne=(out, in, k), apply
+// ggml_cont(ggml_permute(t, 2, 1, 0)) to bring it to ggml's canonical (k, in, out).
+static ggml_tensor * codec_dac_W_conv1d(ggml_context * ctx_eval, const codec_model * model, const std::string & name,
+                                         int32_t dk, int32_t din, int32_t dout) {
+    if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr) {
         return nullptr;
     }
-    return ggml_get_tensor(model->weights, name.c_str());
+    ggml_tensor * src = ggml_get_tensor(model->weights, name.c_str());
+    if (src == nullptr) {
+        return nullptr;
+    }
+    const int32_t n0 = (int32_t) src->ne[0];
+    const int32_t n1 = (int32_t) src->ne[1];
+    const int32_t n2 = (int32_t) src->ne[2];
+    if (n0 == dk && n1 == din && n2 == dout) {
+        return codec_graph_cast_f32(ctx_eval, src);
+    }
+    if (n0 == dout && n1 == din && n2 == dk) {
+        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
+        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, f32, 2, 1, 0, 3));
+    }
+    return nullptr;
 }
 
-static std::string codec_dac_decode_codebook_tensor_name(int32_t qi) {
-    return "dac.decode.vq.q" + std::to_string(qi) + ".codebook";
+// Same idea for ggml convtr1d weights: build expects ne=(dk, dout, din);
+// legacy axis order is ne=(din, dout, dk).
+static ggml_tensor * codec_dac_W_convtr(ggml_context * ctx_eval, const codec_model * model, const std::string & name,
+                                          int32_t dk, int32_t dout, int32_t din) {
+    if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * src = ggml_get_tensor(model->weights, name.c_str());
+    if (src == nullptr) {
+        return nullptr;
+    }
+    const int32_t n0 = (int32_t) src->ne[0];
+    const int32_t n1 = (int32_t) src->ne[1];
+    const int32_t n2 = (int32_t) src->ne[2];
+    if (n0 == dk && n1 == dout && n2 == din) {
+        return codec_graph_cast_f32(ctx_eval, src);
+    }
+    if (n0 == din && n1 == dout && n2 == dk) {
+        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
+        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, f32, 2, 1, 0, 3));
+    }
+    return nullptr;
 }
 
-static std::string codec_dac_decode_out_proj_tensor_name(int32_t qi) {
-    return "dac.decode.vq.q" + std::to_string(qi) + ".out_proj";
-}
-static std::string codec_dac_decode_out_proj_bias_tensor_name(int32_t qi) {
-    return "dac.decode.vq.q" + std::to_string(qi) + ".out_proj.b";
-}
-
-static std::string codec_dac_decode_conv1_w_tensor_name() { return "dac.decode.dec.conv1.w"; }
-static std::string codec_dac_decode_conv1_b_tensor_name() { return "dac.decode.dec.conv1.b"; }
-static std::string codec_dac_decode_conv2_w_tensor_name() { return "dac.decode.dec.conv2.w"; }
-static std::string codec_dac_decode_conv2_b_tensor_name() { return "dac.decode.dec.conv2.b"; }
-
-static std::string codec_dac_decode_block_snake_tensor_name(int32_t bi) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".snake.a";
-}
-
-static std::string codec_dac_decode_block_convtr_w_tensor_name(int32_t bi) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".convtr.w";
-}
-
-static std::string codec_dac_decode_block_convtr_b_tensor_name(int32_t bi) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".convtr.b";
+// Resolve a DAC codebook tensor — current converter emits canonical (cb_dim, cb_size).
+static ggml_tensor * codec_dac_W_codebook(ggml_context * ctx_eval, const codec_model * model, const std::string & name,
+                                          int32_t cb_dim, int32_t cb_size) {
+    if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * src = ggml_get_tensor(model->weights, name.c_str());
+    if (src == nullptr) {
+        return nullptr;
+    }
+    if (src->ne[0] == cb_dim && src->ne[1] == cb_size) {
+        return codec_graph_cast_f32(ctx_eval, src);
+    }
+    if (src->ne[0] == cb_size && src->ne[1] == cb_dim) {
+        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, codec_graph_cast_f32(ctx_eval, src)));
+    }
+    return nullptr;
 }
 
-static std::string codec_dac_decode_resunit_snake1_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s1.a";
+// Resolve a DAC VQ out_proj weight (1x1 conv stored as 2D or 3D).
+static ggml_tensor * codec_dac_W_out_proj(ggml_context * ctx_eval, const codec_model * model, const std::string & name,
+                                          int32_t cb_dim, int32_t hidden_dim) {
+    if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * src = ggml_get_tensor(model->weights, name.c_str());
+    if (src == nullptr) {
+        return nullptr;
+    }
+    const int64_t n0 = src->ne[0];
+    const int64_t n1 = src->ne[1];
+    const int64_t n2 = src->ne[2];
+    if (n0 == cb_dim && n1 == hidden_dim && n2 == 1) {
+        return codec_graph_cast_f32(ctx_eval, src);
+    }
+    if (n0 == 1 && n1 == cb_dim && n2 == hidden_dim) {
+        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
+        return ggml_reshape_2d(ctx_eval, f32, cb_dim, hidden_dim);
+    }
+    if (n0 == 1 && n1 == hidden_dim && n2 == cb_dim) {
+        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
+        ggml_tensor * v2d = ggml_reshape_2d(ctx_eval, f32, hidden_dim, cb_dim);
+        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, v2d));
+    }
+    return nullptr;
 }
 
-static std::string codec_dac_decode_resunit_snake2_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s2.a";
-}
-
-static std::string codec_dac_decode_resunit_conv1_w_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.w";
-}
-
-static std::string codec_dac_decode_resunit_conv1_b_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.b";
-}
-
-static std::string codec_dac_decode_resunit_conv2_w_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.w";
-}
-
-static std::string codec_dac_decode_resunit_conv2_b_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.decode.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.b";
-}
-
-static std::string codec_dac_decode_final_snake_tensor_name() { return "dac.decode.dec.final_snake.a"; }
 
 static std::string codec_dac_model_block_prefix(int32_t naming_mode, int32_t bi) {
     if (naming_mode == CODEC_DAC_NAMING_MODEL) {
@@ -226,53 +265,6 @@ static std::string codec_dac_model_enc_final_snake_name() { return "enc.block.5.
 static std::string codec_dac_model_enc_conv2_w_name() { return "enc.block.6.weight"; }
 static std::string codec_dac_model_enc_conv2_b_name() { return "enc.block.6.bias"; }
 
-static std::string codec_dac_encode_conv1_w_tensor_name() { return "dac.encode.enc.conv1.w"; }
-static std::string codec_dac_encode_conv1_b_tensor_name() { return "dac.encode.enc.conv1.b"; }
-static std::string codec_dac_encode_conv2_w_tensor_name() { return "dac.encode.enc.conv2.w"; }
-static std::string codec_dac_encode_conv2_b_tensor_name() { return "dac.encode.enc.conv2.b"; }
-static std::string codec_dac_encode_block_snake_tensor_name(int32_t bi) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".snake.a";
-}
-static std::string codec_dac_encode_block_conv_w_tensor_name(int32_t bi) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".conv.w";
-}
-static std::string codec_dac_encode_block_conv_b_tensor_name(int32_t bi) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".conv.b";
-}
-static std::string codec_dac_encode_resunit_snake1_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s1.a";
-}
-static std::string codec_dac_encode_resunit_snake2_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s2.a";
-}
-static std::string codec_dac_encode_resunit_conv1_w_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.w";
-}
-static std::string codec_dac_encode_resunit_conv1_b_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.b";
-}
-static std::string codec_dac_encode_resunit_conv2_w_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.w";
-}
-static std::string codec_dac_encode_resunit_conv2_b_tensor_name(int32_t bi, int32_t ri) {
-    return "dac.encode.enc.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.b";
-}
-static std::string codec_dac_encode_final_snake_tensor_name() { return "dac.encode.enc.final_snake.a"; }
-static std::string codec_dac_encode_codebook_tensor_name(int32_t qi) {
-    return "dac.encode.vq.q" + std::to_string(qi) + ".codebook";
-}
-static std::string codec_dac_encode_in_proj_w_tensor_name(int32_t qi) {
-    return "dac.encode.vq.q" + std::to_string(qi) + ".in_proj.w";
-}
-static std::string codec_dac_encode_in_proj_b_tensor_name(int32_t qi) {
-    return "dac.encode.vq.q" + std::to_string(qi) + ".in_proj.b";
-}
-static std::string codec_dac_encode_out_proj_w_tensor_name(int32_t qi) {
-    return "dac.encode.vq.q" + std::to_string(qi) + ".out_proj.w";
-}
-static std::string codec_dac_encode_out_proj_b_tensor_name(int32_t qi) {
-    return "dac.encode.vq.q" + std::to_string(qi) + ".out_proj.b";
-}
 
 static std::string codec_dac_model_block_snake_name(int32_t naming_mode, int32_t bi) {
     return codec_dac_model_block_prefix(naming_mode, bi) + "snake1.alpha";
@@ -367,132 +359,9 @@ static bool codec_dac_infer_convtr_shape(
     return true;
 }
 
-static bool codec_dac_copy_conv1d_weight_to_3d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    ggml_tensor * src = codec_dac_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> src_v;
-    if (!codec_tensor_as_vec_f32(src, &src_v)) {
-        if (err != nullptr) {
-            *err = "failed reading DAC tensor: " + src_name;
-        }
-        return false;
-    }
-
-    const int32_t dk = (int32_t) codec_ne(dst, 0);
-    const int32_t din = (int32_t) codec_ne(dst, 1);
-    const int32_t dout = (int32_t) codec_ne(dst, 2);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) codec_ne(src, 2);
-    std::vector<float> dst_v((size_t) dk * (size_t) din * (size_t) dout, 0.0f);
-
-    if (n0 == dk && n1 == din && n2 == dout) {
-        dst_v = src_v;
-    } else if (n0 == dout && n1 == din && n2 == dk) {
-        for (int32_t k = 0; k < dk; ++k) {
-            for (int32_t i = 0; i < din; ++i) {
-                for (int32_t o = 0; o < dout; ++o) {
-                    const size_t src_idx = (size_t) o + (size_t) dout * ((size_t) i + (size_t) din * (size_t) k);
-                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) i + (size_t) din * (size_t) o);
-                    dst_v[dst_idx] = src_v[src_idx];
-                }
-            }
-        }
-    } else {
-        if (err != nullptr) {
-            *err = "unexpected DAC conv1d shape: " + src_name;
-        }
-        return false;
-    }
-
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
-}
-
-static bool codec_dac_copy_convtr_weight_to_3d(
-    codec_context * ctx,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    std::string * err) {
-
-    ggml_tensor * src = codec_dac_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> src_v;
-    if (!codec_tensor_as_vec_f32(src, &src_v)) {
-        if (err != nullptr) {
-            *err = "failed reading DAC tensor: " + src_name;
-        }
-        return false;
-    }
-
-    const int32_t dk = (int32_t) codec_ne(dst, 0);
-    const int32_t dout = (int32_t) codec_ne(dst, 1);
-    const int32_t din = (int32_t) codec_ne(dst, 2);
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) codec_ne(src, 2);
-    std::vector<float> dst_v((size_t) dk * (size_t) dout * (size_t) din, 0.0f);
-
-    if (n0 == dk && n1 == dout && n2 == din) {
-        dst_v = src_v;
-    } else if (n0 == din && n1 == dout && n2 == dk) {
-        for (int32_t k = 0; k < dk; ++k) {
-            for (int32_t o = 0; o < dout; ++o) {
-                for (int32_t i = 0; i < din; ++i) {
-                    const size_t src_idx = (size_t) i + (size_t) din * ((size_t) o + (size_t) dout * (size_t) k);
-                    const size_t dst_idx = (size_t) k + (size_t) dk * ((size_t) o + (size_t) dout * (size_t) i);
-                    dst_v[dst_idx] = src_v[src_idx];
-                }
-            }
-        }
-    } else {
-        if (err != nullptr) {
-            *err = "unexpected DAC convtr shape: " + src_name;
-        }
-        return false;
-    }
-
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
-}
-
-static bool codec_dac_copy_bias_1d(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    ggml_tensor * src = codec_dac_get_tensor(ctx->model, src_name);
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC tensor: " + src_name;
-        }
-        return false;
-    }
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v) || (int32_t) v.size() != (int32_t) codec_ne(dst, 0)) {
-        if (err != nullptr) {
-            *err = "invalid DAC bias tensor: " + src_name;
-        }
-        return false;
-    }
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err);
-}
-
-static bool codec_dac_copy_snake_alpha(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    return codec_dac_copy_bias_1d(ctx, src_name, dst, err);
-}
-
 static ggml_tensor * codec_dac_sum_quantized_latent(
     ggml_context * ctx_eval,
+    const codec_model * model,
     ggml_tensor * t_tok,
     int32_t t,
     int32_t q,
@@ -500,14 +369,20 @@ static ggml_tensor * codec_dac_sum_quantized_latent(
     int32_t hidden_dim,
     int32_t codebook_size) {
 
+    if (model == nullptr) {
+        return nullptr;
+    }
     ggml_tensor * acc = nullptr;
     for (int32_t qi = 0; qi < q; ++qi) {
-        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, codebook_dim, codebook_size);
-        ggml_set_name(t_codebook, codec_dac_decode_codebook_tensor_name(qi).c_str());
-        ggml_tensor * t_out_proj = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, codebook_dim, hidden_dim);
-        ggml_set_name(t_out_proj, codec_dac_decode_out_proj_tensor_name(qi).c_str());
-        ggml_tensor * t_out_bias = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, hidden_dim);
-        ggml_set_name(t_out_bias, codec_dac_decode_out_proj_bias_tensor_name(qi).c_str());
+        const std::string cb_name = "vq.q" + std::to_string(qi) + ".codebook.weight";
+        const std::string op_name = "vq.q" + std::to_string(qi) + ".out_proj.weight";
+        const std::string ob_name = "vq.q" + std::to_string(qi) + ".out_proj.bias";
+        ggml_tensor * t_codebook = codec_dac_W_codebook(ctx_eval, model, cb_name, codebook_dim, codebook_size);
+        ggml_tensor * t_out_proj = codec_dac_W_out_proj(ctx_eval, model, op_name, codebook_dim, hidden_dim);
+        ggml_tensor * t_out_bias = codec_graph_weight(ctx_eval, model, ob_name);
+        if (t_codebook == nullptr || t_out_proj == nullptr || t_out_bias == nullptr) {
+            return nullptr;
+        }
 
         ggml_tensor * t_idx = ggml_view_1d(ctx_eval, t_tok, t, (size_t) qi * t_tok->nb[1]);
         ggml_tensor * t_embed = ggml_get_rows(ctx_eval, t_codebook, t_idx);     // [codebook_dim, t]
@@ -568,32 +443,44 @@ static bool codec_dac_build_decode(ggml_context * ctx_eval, void * user_data, gg
     dac_decode_build * p = static_cast<dac_decode_build *>(user_data);
     if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->t <= 0 || p->q <= 0 ||
         p->codebook_dim <= 0 || p->hidden_dim <= 0 || p->codebook_size <= 1 || p->n_blocks <= 0 || p->n_blocks > CODEC_DAC_MAX_BLOCKS ||
-        p->conv1_kernel <= 0 || p->conv1_out <= 0 || p->conv2_kernel <= 0 || p->conv2_in <= 0) {
+        p->conv1_kernel <= 0 || p->conv1_out <= 0 || p->conv2_kernel <= 0 || p->conv2_in <= 0 ||
+        p->model == nullptr) {
         return false;
     }
+
+    auto W = [&](const std::string & name) { return codec_graph_weight(ctx_eval, p->model, name); };
+    auto Wconv1d = [&](const std::string & name, int32_t dk, int32_t din, int32_t dout) {
+        return codec_dac_W_conv1d(ctx_eval, p->model, name, dk, din, dout);
+    };
+    auto Wconvtr = [&](const std::string & name, int32_t dk, int32_t dout, int32_t din) {
+        return codec_dac_W_convtr(ctx_eval, p->model, name, dk, dout, din);
+    };
 
     ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_I32, p->t, p->q);
     ggml_set_name(t_tok, "dac.decode.tok");
 
     ggml_tensor * t_latent_ct = codec_dac_sum_quantized_latent(
-        ctx_eval, t_tok, p->t, p->q, p->codebook_dim, p->hidden_dim, p->codebook_size);
+        ctx_eval, p->model, t_tok, p->t, p->q, p->codebook_dim, p->hidden_dim, p->codebook_size);
     if (t_latent_ct == nullptr) {
         return false;
     }
     ggml_tensor * x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_latent_ct)); // [t, hidden]
 
-    ggml_tensor * t_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->conv1_kernel, p->hidden_dim, p->conv1_out);
-    ggml_set_name(t_c1_w, codec_dac_decode_conv1_w_tensor_name().c_str());
-    ggml_tensor * t_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->conv1_out);
-    ggml_set_name(t_c1_b, codec_dac_decode_conv1_b_tensor_name().c_str());
+    ggml_tensor * t_c1_w = Wconv1d(codec_dac_model_conv1_w_name(p->naming_mode), p->conv1_kernel, p->hidden_dim, p->conv1_out);
+    ggml_tensor * t_c1_b = W(codec_dac_model_conv1_b_name(p->naming_mode));
+    if (t_c1_w == nullptr || t_c1_b == nullptr) {
+        return false;
+    }
     x = codec_conv1d(ctx_eval, x, t_c1_w, t_c1_b, 1, 1, p->conv1_kernel / 2);
     if (x == nullptr) {
         return false;
     }
 
     for (int32_t bi = 0; bi < p->n_blocks; ++bi) {
-        ggml_tensor * t_blk_snake = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-        ggml_set_name(t_blk_snake, codec_dac_decode_block_snake_tensor_name(bi).c_str());
+        ggml_tensor * t_blk_snake = W(codec_dac_model_block_snake_name(p->naming_mode, bi));
+        if (t_blk_snake == nullptr) {
+            return false;
+        }
         x = codec_op_snake(ctx_eval, x, t_blk_snake, 1e-9f);
 
         const int32_t blk_k = p->block_convtr_kernel[bi];
@@ -603,10 +490,11 @@ static bool codec_dac_build_decode(ggml_context * ctx_eval, void * user_data, gg
         if (blk_k <= 0 || blk_in <= 0 || blk_out <= 0 || blk_stride <= 0) {
             return false;
         }
-        ggml_tensor * t_ctr_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, blk_k, blk_out, blk_in);
-        ggml_set_name(t_ctr_w, codec_dac_decode_block_convtr_w_tensor_name(bi).c_str());
-        ggml_tensor * t_ctr_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, blk_out);
-        ggml_set_name(t_ctr_b, codec_dac_decode_block_convtr_b_tensor_name(bi).c_str());
+        ggml_tensor * t_ctr_w = Wconvtr(codec_dac_model_block_convtr_w_name(p->naming_mode, bi), blk_k, blk_out, blk_in);
+        ggml_tensor * t_ctr_b = W(codec_dac_model_block_convtr_b_name(p->naming_mode, bi));
+        if (t_ctr_w == nullptr || t_ctr_b == nullptr) {
+            return false;
+        }
         const int32_t blk_padding = std::max(0, (blk_stride + 1) / 2);
         x = codec_convtr1d(ctx_eval, x, t_ctr_w, t_ctr_b, blk_stride, blk_padding, 1);
         if (x == nullptr) {
@@ -614,18 +502,17 @@ static bool codec_dac_build_decode(ggml_context * ctx_eval, void * user_data, gg
         }
 
         for (int32_t ri = 0; ri < CODEC_DAC_RES_UNITS; ++ri) {
-            ggml_tensor * t_s1 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_s1, codec_dac_decode_resunit_snake1_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c1rw = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, (int64_t) x->ne[1], (int64_t) x->ne[1]);
-            ggml_set_name(t_c1rw, codec_dac_decode_resunit_conv1_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c1rb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_c1rb, codec_dac_decode_resunit_conv1_b_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_s2 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_s2, codec_dac_decode_resunit_snake2_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c2rw = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, (int64_t) x->ne[1], (int64_t) x->ne[1]);
-            ggml_set_name(t_c2rw, codec_dac_decode_resunit_conv2_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c2rb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_c2rb, codec_dac_decode_resunit_conv2_b_tensor_name(bi, ri).c_str());
+            const int32_t blk_dim = blk_out;
+            ggml_tensor * t_s1 = W(codec_dac_model_resunit_snake1_name(p->naming_mode, bi, ri));
+            ggml_tensor * t_c1rw = Wconv1d(codec_dac_model_resunit_conv1_w_name(p->naming_mode, bi, ri), 7, blk_dim, blk_dim);
+            ggml_tensor * t_c1rb = W(codec_dac_model_resunit_conv1_b_name(p->naming_mode, bi, ri));
+            ggml_tensor * t_s2 = W(codec_dac_model_resunit_snake2_name(p->naming_mode, bi, ri));
+            ggml_tensor * t_c2rw = Wconv1d(codec_dac_model_resunit_conv2_w_name(p->naming_mode, bi, ri), 1, blk_dim, blk_dim);
+            ggml_tensor * t_c2rb = W(codec_dac_model_resunit_conv2_b_name(p->naming_mode, bi, ri));
+            if (t_s1 == nullptr || t_c1rw == nullptr || t_c1rb == nullptr ||
+                t_s2 == nullptr || t_c2rw == nullptr || t_c2rb == nullptr) {
+                return false;
+            }
             x = codec_dac_resunit_ggml(
                 ctx_eval,
                 x,
@@ -642,14 +529,17 @@ static bool codec_dac_build_decode(ggml_context * ctx_eval, void * user_data, gg
         }
     }
 
-    ggml_tensor * t_final_snake = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->conv2_in);
-    ggml_set_name(t_final_snake, codec_dac_decode_final_snake_tensor_name().c_str());
+    ggml_tensor * t_final_snake = W(codec_dac_model_final_snake_name(p->naming_mode, p->n_blocks));
+    if (t_final_snake == nullptr) {
+        return false;
+    }
     x = codec_op_snake(ctx_eval, x, t_final_snake, 1e-9f);
 
-    ggml_tensor * t_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->conv2_kernel, p->conv2_in, 1);
-    ggml_set_name(t_c2_w, codec_dac_decode_conv2_w_tensor_name().c_str());
-    ggml_tensor * t_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
-    ggml_set_name(t_c2_b, codec_dac_decode_conv2_b_tensor_name().c_str());
+    ggml_tensor * t_c2_w = Wconv1d(codec_dac_model_conv2_w_name(p->naming_mode, p->n_blocks), p->conv2_kernel, p->conv2_in, 1);
+    ggml_tensor * t_c2_b = W(codec_dac_model_conv2_b_name(p->naming_mode, p->n_blocks));
+    if (t_c2_w == nullptr || t_c2_b == nullptr) {
+        return false;
+    }
     ggml_tensor * t_pcm = codec_conv1d(ctx_eval, x, t_c2_w, t_c2_b, 1, 1, p->conv2_kernel / 2);
     if (t_pcm == nullptr) {
         return false;
@@ -660,62 +550,6 @@ static bool codec_dac_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     *out = t_out;
     return true;
-}
-
-static bool codec_dac_copy_out_proj_to_2d(
-    codec_context * ctx,
-    const std::string & model_name,
-    ggml_tensor * dst,
-    int32_t codebook_dim,
-    int32_t hidden_dim,
-    std::string * err) {
-
-    ggml_tensor * src = ggml_get_tensor(ctx->model->weights, model_name.c_str());
-    if (src == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC tensor: " + model_name;
-        }
-        return false;
-    }
-    std::vector<float> src_v;
-    if (!codec_tensor_as_vec_f32(src, &src_v)) {
-        if (err != nullptr) {
-            *err = "failed reading DAC tensor: " + model_name;
-        }
-        return false;
-    }
-
-    const int32_t n0 = (int32_t) codec_ne(src, 0);
-    const int32_t n1 = (int32_t) codec_ne(src, 1);
-    const int32_t n2 = (int32_t) std::max<int64_t>(1, codec_ne(src, 2));
-    std::vector<float> dst_v((size_t) codebook_dim * (size_t) hidden_dim, 0.0f);
-
-    if (n0 == codebook_dim && n1 == hidden_dim && n2 == 1) {
-        dst_v = src_v;
-    } else if (n0 == 1 && n1 == codebook_dim && n2 == hidden_dim) {
-        for (int32_t i = 0; i < codebook_dim; ++i) {
-            for (int32_t o = 0; o < hidden_dim; ++o) {
-                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) i + (size_t) n1 * (size_t) o);
-                dst_v[(size_t) i + (size_t) codebook_dim * (size_t) o] = src_v[src_idx];
-            }
-        }
-    } else if (n0 == 1 && n1 == hidden_dim && n2 == codebook_dim) {
-        for (int32_t i = 0; i < codebook_dim; ++i) {
-            for (int32_t o = 0; o < hidden_dim; ++o) {
-                const size_t src_idx = (size_t) 0 + (size_t) n0 * ((size_t) o + (size_t) n1 * (size_t) i);
-                dst_v[(size_t) i + (size_t) codebook_dim * (size_t) o] = src_v[src_idx];
-            }
-        }
-    } else if (n0 == codebook_dim && n1 == hidden_dim && codec_ne(src, 2) == 0) {
-        dst_v = src_v;
-    } else {
-        if (err != nullptr) {
-            *err = "unexpected DAC out_proj shape: " + model_name;
-        }
-        return false;
-    }
-
-    return codec_runtime_write_tensor(dst, dst_v.data(), dst_v.size() * sizeof(float), err);
 }
 
 static bool codec_dac_init_decode_build(
@@ -745,12 +579,12 @@ static bool codec_dac_init_decode_build(
     std::fill_n(build->block_convtr_in, CODEC_DAC_MAX_BLOCKS, 0);
     std::fill_n(build->block_convtr_out, CODEC_DAC_MAX_BLOCKS, 0);
 
-    const int32_t naming_mode = codec_dac_get_tensor(ctx->model, codec_dac_model_conv1_w_name(CODEC_DAC_NAMING_MODEL)) != nullptr ?
+    const int32_t naming_mode = codec_model_get_tensor(ctx->model, codec_dac_model_conv1_w_name(CODEC_DAC_NAMING_MODEL)) != nullptr ?
         CODEC_DAC_NAMING_MODEL : CODEC_DAC_NAMING_LEGACY;
     build->naming_mode = naming_mode;
 
-    ggml_tensor * conv1_w = codec_dac_get_tensor(ctx->model, codec_dac_model_conv1_w_name(naming_mode));
-    ggml_tensor * conv1_b = codec_dac_get_tensor(ctx->model, codec_dac_model_conv1_b_name(naming_mode));
+    ggml_tensor * conv1_w = codec_model_get_tensor(ctx->model, codec_dac_model_conv1_w_name(naming_mode));
+    ggml_tensor * conv1_b = codec_model_get_tensor(ctx->model, codec_dac_model_conv1_b_name(naming_mode));
     if (conv1_w == nullptr || conv1_b == nullptr ||
         !codec_dac_infer_conv1d_shape(conv1_w, conv1_b, &build->conv1_kernel, &build->hidden_dim, &build->conv1_out)) {
         if (err != nullptr) {
@@ -763,8 +597,8 @@ static bool codec_dac_init_decode_build(
     for (int32_t bi = 0; bi < CODEC_DAC_MAX_BLOCKS; ++bi) {
         const std::string ctr_w_name = codec_dac_model_block_convtr_w_name(naming_mode, bi);
         const std::string ctr_b_name = codec_dac_model_block_convtr_b_name(naming_mode, bi);
-        ggml_tensor * ctr_w = codec_dac_get_tensor(ctx->model, ctr_w_name);
-        ggml_tensor * ctr_b = codec_dac_get_tensor(ctx->model, ctr_b_name);
+        ggml_tensor * ctr_w = codec_model_get_tensor(ctx->model, ctr_w_name);
+        ggml_tensor * ctr_b = codec_model_get_tensor(ctx->model, ctr_b_name);
         if (ctr_w == nullptr || ctr_b == nullptr) {
             break;
         }
@@ -790,8 +624,8 @@ static bool codec_dac_init_decode_build(
         return false;
     }
 
-    ggml_tensor * conv2_w = codec_dac_get_tensor(ctx->model, codec_dac_model_conv2_w_name(naming_mode, build->n_blocks));
-    ggml_tensor * conv2_b = codec_dac_get_tensor(ctx->model, codec_dac_model_conv2_b_name(naming_mode, build->n_blocks));
+    ggml_tensor * conv2_w = codec_model_get_tensor(ctx->model, codec_dac_model_conv2_w_name(naming_mode, build->n_blocks));
+    ggml_tensor * conv2_b = codec_model_get_tensor(ctx->model, codec_dac_model_conv2_b_name(naming_mode, build->n_blocks));
     int32_t conv2_out = 0;
     if (conv2_w == nullptr || conv2_b == nullptr ||
         !codec_dac_infer_conv1d_shape(conv2_w, conv2_b, &build->conv2_kernel, &build->conv2_in, &conv2_out) ||
@@ -802,13 +636,14 @@ static bool codec_dac_init_decode_build(
         return false;
     }
 
-    if (codec_dac_get_tensor(ctx->model, codec_dac_model_final_snake_name(naming_mode, build->n_blocks)) == nullptr) {
+    if (codec_model_get_tensor(ctx->model, codec_dac_model_final_snake_name(naming_mode, build->n_blocks)) == nullptr) {
         if (err != nullptr) {
             *err = "missing DAC final snake tensor";
         }
         return false;
     }
 
+    build->model = ctx->model;
     return true;
 }
 
@@ -839,8 +674,8 @@ static bool codec_dac_init_encode_build(
     std::fill_n(build->block_conv_in, CODEC_DAC_MAX_BLOCKS, 0);
     std::fill_n(build->block_conv_out, CODEC_DAC_MAX_BLOCKS, 0);
 
-    ggml_tensor * conv1_w = codec_dac_get_tensor(ctx->model, codec_dac_model_enc_conv1_w_name());
-    ggml_tensor * conv1_b = codec_dac_get_tensor(ctx->model, codec_dac_model_enc_conv1_b_name());
+    ggml_tensor * conv1_w = codec_model_get_tensor(ctx->model, codec_dac_model_enc_conv1_w_name());
+    ggml_tensor * conv1_b = codec_model_get_tensor(ctx->model, codec_dac_model_enc_conv1_b_name());
     int32_t conv1_in = 0;
     if (conv1_w == nullptr || conv1_b == nullptr ||
         !codec_dac_infer_conv1d_shape(conv1_w, conv1_b, &build->conv1_kernel, &conv1_in, &build->conv1_out)) {
@@ -855,8 +690,8 @@ static bool codec_dac_init_encode_build(
     for (int32_t bi = 0; bi < CODEC_DAC_MAX_BLOCKS; ++bi) {
         const std::string cw_name = codec_dac_model_enc_block_conv1_w_name(bi);
         const std::string cb_name = codec_dac_model_enc_block_conv1_b_name(bi);
-        ggml_tensor * cw = codec_dac_get_tensor(ctx->model, cw_name);
-        ggml_tensor * cb = codec_dac_get_tensor(ctx->model, cb_name);
+        ggml_tensor * cw = codec_model_get_tensor(ctx->model, cw_name);
+        ggml_tensor * cb = codec_model_get_tensor(ctx->model, cb_name);
         if (cw == nullptr || cb == nullptr) {
             break;
         }
@@ -882,8 +717,8 @@ static bool codec_dac_init_encode_build(
         return false;
     }
 
-    ggml_tensor * conv2_w = codec_dac_get_tensor(ctx->model, codec_dac_model_enc_conv2_w_name());
-    ggml_tensor * conv2_b = codec_dac_get_tensor(ctx->model, codec_dac_model_enc_conv2_b_name());
+    ggml_tensor * conv2_w = codec_model_get_tensor(ctx->model, codec_dac_model_enc_conv2_w_name());
+    ggml_tensor * conv2_b = codec_model_get_tensor(ctx->model, codec_dac_model_enc_conv2_b_name());
     int32_t conv2_out = 0;
     if (conv2_w == nullptr || conv2_b == nullptr ||
         !codec_dac_infer_conv1d_shape(conv2_w, conv2_b, &build->conv2_kernel, &build->conv2_in, &conv2_out) ||
@@ -894,227 +729,14 @@ static bool codec_dac_init_encode_build(
         return false;
     }
 
-    if (codec_dac_get_tensor(ctx->model, codec_dac_model_enc_final_snake_name()) == nullptr) {
+    if (codec_model_get_tensor(ctx->model, codec_dac_model_enc_final_snake_name()) == nullptr) {
         if (err != nullptr) {
             *err = "missing DAC encoder final snake tensor";
         }
         return false;
     }
 
-    return true;
-}
-
-static bool codec_dac_write_encode_weights(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const dac_encode_build & build,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || entry == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid DAC encoder write arguments";
-        }
-        return false;
-    }
-
-    ggml_tensor * t_c1_w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_conv1_w_tensor_name().c_str());
-    ggml_tensor * t_c1_b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_conv1_b_tensor_name().c_str());
-    ggml_tensor * t_c2_w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_conv2_w_tensor_name().c_str());
-    ggml_tensor * t_c2_b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_conv2_b_tensor_name().c_str());
-    ggml_tensor * t_fs_a = codec_graph_get_tensor(ctx, entry, codec_dac_encode_final_snake_tensor_name().c_str());
-    if (t_c1_w == nullptr || t_c1_b == nullptr || t_c2_w == nullptr || t_c2_b == nullptr || t_fs_a == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC encoder core graph tensors";
-        }
-        return false;
-    }
-
-    if (!codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_enc_conv1_w_name(), t_c1_w, err) ||
-        !codec_dac_copy_bias_1d(ctx, codec_dac_model_enc_conv1_b_name(), t_c1_b, err) ||
-        !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_enc_conv2_w_name(), t_c2_w, err) ||
-        !codec_dac_copy_bias_1d(ctx, codec_dac_model_enc_conv2_b_name(), t_c2_b, err) ||
-        !codec_dac_copy_snake_alpha(ctx, codec_dac_model_enc_final_snake_name(), t_fs_a, err)) {
-        return false;
-    }
-
-    for (int32_t bi = 0; bi < build.n_blocks; ++bi) {
-        ggml_tensor * t_bs = codec_graph_get_tensor(ctx, entry, codec_dac_encode_block_snake_tensor_name(bi).c_str());
-        ggml_tensor * t_cw = codec_graph_get_tensor(ctx, entry, codec_dac_encode_block_conv_w_tensor_name(bi).c_str());
-        ggml_tensor * t_cb = codec_graph_get_tensor(ctx, entry, codec_dac_encode_block_conv_b_tensor_name(bi).c_str());
-        if (t_bs == nullptr || t_cw == nullptr || t_cb == nullptr) {
-            if (err != nullptr) {
-                *err = "missing DAC encoder block graph tensors";
-            }
-            return false;
-        }
-        if (!codec_dac_copy_snake_alpha(ctx, codec_dac_model_enc_block_snake_name(bi), t_bs, err) ||
-            !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_enc_block_conv1_w_name(bi), t_cw, err) ||
-            !codec_dac_copy_bias_1d(ctx, codec_dac_model_enc_block_conv1_b_name(bi), t_cb, err)) {
-            return false;
-        }
-
-        for (int32_t ri = 0; ri < CODEC_DAC_RES_UNITS; ++ri) {
-            ggml_tensor * t_s1 = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_snake1_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_s2 = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_snake2_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r1w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_conv1_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r1b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_conv1_b_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r2w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_conv2_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r2b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_resunit_conv2_b_tensor_name(bi, ri).c_str());
-            if (t_s1 == nullptr || t_s2 == nullptr || t_r1w == nullptr || t_r1b == nullptr || t_r2w == nullptr || t_r2b == nullptr) {
-                if (err != nullptr) {
-                    *err = "missing DAC encoder residual graph tensors";
-                }
-                return false;
-            }
-            if (!codec_dac_copy_snake_alpha(ctx, codec_dac_model_enc_resunit_snake1_name(bi, ri), t_s1, err) ||
-                !codec_dac_copy_snake_alpha(ctx, codec_dac_model_enc_resunit_snake2_name(bi, ri), t_s2, err) ||
-                !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_enc_resunit_conv1_w_name(bi, ri), t_r1w, err) ||
-                !codec_dac_copy_bias_1d(ctx, codec_dac_model_enc_resunit_conv1_b_name(bi, ri), t_r1b, err) ||
-                !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_enc_resunit_conv2_w_name(bi, ri), t_r2w, err) ||
-                !codec_dac_copy_bias_1d(ctx, codec_dac_model_enc_resunit_conv2_b_name(bi, ri), t_r2b, err)) {
-                return false;
-            }
-        }
-    }
-
-    for (int32_t qi = 0; qi < build.n_q; ++qi) {
-        ggml_tensor * t_codebook = codec_graph_get_tensor(ctx, entry, codec_dac_encode_codebook_tensor_name(qi).c_str());
-        ggml_tensor * t_in_w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_in_proj_w_tensor_name(qi).c_str());
-        ggml_tensor * t_in_b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_in_proj_b_tensor_name(qi).c_str());
-        ggml_tensor * t_out_w = codec_graph_get_tensor(ctx, entry, codec_dac_encode_out_proj_w_tensor_name(qi).c_str());
-        ggml_tensor * t_out_b = codec_graph_get_tensor(ctx, entry, codec_dac_encode_out_proj_b_tensor_name(qi).c_str());
-        if (t_codebook == nullptr || t_in_w == nullptr || t_in_b == nullptr || t_out_w == nullptr || t_out_b == nullptr) {
-            if (err != nullptr) {
-                *err = "missing DAC encoder VQ tensors";
-            }
-            return false;
-        }
-
-        const std::string cb_name = "vq.q" + std::to_string(qi) + ".codebook.weight";
-        ggml_tensor * cb_src = ggml_get_tensor(ctx->model->weights, cb_name.c_str());
-        if (cb_src == nullptr) {
-            if (err != nullptr) {
-                *err = "missing DAC codebook tensor: " + cb_name;
-            }
-            return false;
-        }
-        std::vector<float> cb;
-        if (!codec_tensor_as_vec_f32(cb_src, &cb)) {
-            if (err != nullptr) {
-                *err = "failed reading DAC codebook tensor";
-            }
-            return false;
-        }
-        const int32_t cb0 = (int32_t) codec_ne(cb_src, 0);
-        const int32_t cb1 = (int32_t) codec_ne(cb_src, 1);
-        std::vector<float> cb_dst((size_t) build.codebook_dim * (size_t) build.codebook_size, 0.0f);
-        if (cb0 == build.codebook_size && cb1 == build.codebook_dim) {
-            for (int32_t i = 0; i < build.codebook_dim; ++i) {
-                for (int32_t j = 0; j < build.codebook_size; ++j) {
-                    cb_dst[(size_t) i + (size_t) build.codebook_dim * (size_t) j] =
-                        cb[(size_t) j + (size_t) build.codebook_size * (size_t) i];
-                }
-            }
-        } else if (cb0 == build.codebook_dim && cb1 == build.codebook_size) {
-            cb_dst = cb;
-        } else {
-            if (err != nullptr) {
-                *err = "unexpected DAC codebook tensor shape";
-            }
-            return false;
-        }
-        if (!codec_runtime_write_tensor(t_codebook, cb_dst.data(), cb_dst.size() * sizeof(float), err)) {
-            return false;
-        }
-
-        const std::string in_w_name = "vq.q" + std::to_string(qi) + ".in_proj.weight";
-        const std::string in_b_name = "vq.q" + std::to_string(qi) + ".in_proj.bias";
-        const std::string out_w_name = "vq.q" + std::to_string(qi) + ".out_proj.weight";
-        const std::string out_b_name = "vq.q" + std::to_string(qi) + ".out_proj.bias";
-        if (!codec_dac_copy_conv1d_weight_to_3d(ctx, in_w_name, t_in_w, err) ||
-            !codec_dac_copy_bias_1d(ctx, in_b_name, t_in_b, err) ||
-            !codec_dac_copy_conv1d_weight_to_3d(ctx, out_w_name, t_out_w, err) ||
-            !codec_dac_copy_bias_1d(ctx, out_b_name, t_out_b, err)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool codec_dac_write_decode_weights(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const dac_decode_build & build,
-    std::string * err) {
-
-    if (ctx == nullptr || ctx->model == nullptr || entry == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid DAC decoder write arguments";
-        }
-        return false;
-    }
-
-    ggml_tensor * t_c1_w = codec_graph_get_tensor(ctx, entry, codec_dac_decode_conv1_w_tensor_name().c_str());
-    ggml_tensor * t_c1_b = codec_graph_get_tensor(ctx, entry, codec_dac_decode_conv1_b_tensor_name().c_str());
-    ggml_tensor * t_c2_w = codec_graph_get_tensor(ctx, entry, codec_dac_decode_conv2_w_tensor_name().c_str());
-    ggml_tensor * t_c2_b = codec_graph_get_tensor(ctx, entry, codec_dac_decode_conv2_b_tensor_name().c_str());
-    ggml_tensor * t_fs_a = codec_graph_get_tensor(ctx, entry, codec_dac_decode_final_snake_tensor_name().c_str());
-    if (t_c1_w == nullptr || t_c1_b == nullptr || t_c2_w == nullptr || t_c2_b == nullptr || t_fs_a == nullptr) {
-        if (err != nullptr) {
-            *err = "missing DAC decoder core graph tensors";
-        }
-        return false;
-    }
-
-    if (!codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_conv1_w_name(build.naming_mode), t_c1_w, err) ||
-        !codec_dac_copy_bias_1d(ctx, codec_dac_model_conv1_b_name(build.naming_mode), t_c1_b, err) ||
-        !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_conv2_w_name(build.naming_mode, build.n_blocks), t_c2_w, err) ||
-        !codec_dac_copy_bias_1d(ctx, codec_dac_model_conv2_b_name(build.naming_mode, build.n_blocks), t_c2_b, err) ||
-        !codec_dac_copy_snake_alpha(ctx, codec_dac_model_final_snake_name(build.naming_mode, build.n_blocks), t_fs_a, err)) {
-        return false;
-    }
-
-    for (int32_t bi = 0; bi < build.n_blocks; ++bi) {
-        ggml_tensor * t_bs = codec_graph_get_tensor(ctx, entry, codec_dac_decode_block_snake_tensor_name(bi).c_str());
-        ggml_tensor * t_cw = codec_graph_get_tensor(ctx, entry, codec_dac_decode_block_convtr_w_tensor_name(bi).c_str());
-        ggml_tensor * t_cb = codec_graph_get_tensor(ctx, entry, codec_dac_decode_block_convtr_b_tensor_name(bi).c_str());
-        if (t_bs == nullptr || t_cw == nullptr || t_cb == nullptr) {
-            if (err != nullptr) {
-                *err = "missing DAC decoder block graph tensors";
-            }
-            return false;
-        }
-        if (!codec_dac_copy_snake_alpha(ctx, codec_dac_model_block_snake_name(build.naming_mode, bi), t_bs, err) ||
-            !codec_dac_copy_convtr_weight_to_3d(ctx, codec_dac_model_block_convtr_w_name(build.naming_mode, bi), t_cw, err) ||
-            !codec_dac_copy_bias_1d(ctx, codec_dac_model_block_convtr_b_name(build.naming_mode, bi), t_cb, err)) {
-            return false;
-        }
-
-        for (int32_t ri = 0; ri < CODEC_DAC_RES_UNITS; ++ri) {
-            ggml_tensor * t_s1 = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_snake1_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_s2 = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_snake2_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r1w = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_conv1_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r1b = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_conv1_b_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r2w = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_conv2_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_r2b = codec_graph_get_tensor(ctx, entry, codec_dac_decode_resunit_conv2_b_tensor_name(bi, ri).c_str());
-            if (t_s1 == nullptr || t_s2 == nullptr || t_r1w == nullptr || t_r1b == nullptr || t_r2w == nullptr || t_r2b == nullptr) {
-                if (err != nullptr) {
-                    *err = "missing DAC decoder residual graph tensors";
-                }
-                return false;
-            }
-            if (!codec_dac_copy_snake_alpha(ctx, codec_dac_model_resunit_snake1_name(build.naming_mode, bi, ri), t_s1, err) ||
-                !codec_dac_copy_snake_alpha(ctx, codec_dac_model_resunit_snake2_name(build.naming_mode, bi, ri), t_s2, err) ||
-                !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_resunit_conv1_w_name(build.naming_mode, bi, ri), t_r1w, err) ||
-                !codec_dac_copy_bias_1d(ctx, codec_dac_model_resunit_conv1_b_name(build.naming_mode, bi, ri), t_r1b, err) ||
-                !codec_dac_copy_conv1d_weight_to_3d(ctx, codec_dac_model_resunit_conv2_w_name(build.naming_mode, bi, ri), t_r2w, err) ||
-                !codec_dac_copy_bias_1d(ctx, codec_dac_model_resunit_conv2_b_name(build.naming_mode, bi, ri), t_r2b, err)) {
-                return false;
-            }
-        }
-    }
-
+    build->model = ctx->model;
     return true;
 }
 
@@ -1144,17 +766,24 @@ static bool codec_dac_build_decode_latent(ggml_context * ctx_eval, void * user_d
 static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     dac_encode_build * p = static_cast<dac_encode_build *>(user_data);
     if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->n_in <= 0 || p->n_q <= 0 ||
-        p->codebook_dim <= 0 || p->codebook_size <= 1 || p->hidden_dim <= 0 || p->n_blocks <= 0) {
+        p->codebook_dim <= 0 || p->codebook_size <= 1 || p->hidden_dim <= 0 || p->n_blocks <= 0 ||
+        p->model == nullptr) {
         return false;
     }
+
+    auto W = [&](const std::string & name) { return codec_graph_weight(ctx_eval, p->model, name); };
+    auto Wconv1d = [&](const std::string & name, int32_t dk, int32_t din, int32_t dout) {
+        return codec_dac_W_conv1d(ctx_eval, p->model, name, dk, din, dout);
+    };
 
     ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->n_in, 1);
     ggml_set_name(t_pcm, "dac.encode.pcm");
 
-    ggml_tensor * t_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->conv1_kernel, 1, p->conv1_out);
-    ggml_set_name(t_c1_w, codec_dac_encode_conv1_w_tensor_name().c_str());
-    ggml_tensor * t_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->conv1_out);
-    ggml_set_name(t_c1_b, codec_dac_encode_conv1_b_tensor_name().c_str());
+    ggml_tensor * t_c1_w = Wconv1d(codec_dac_model_enc_conv1_w_name(), p->conv1_kernel, 1, p->conv1_out);
+    ggml_tensor * t_c1_b = W(codec_dac_model_enc_conv1_b_name());
+    if (t_c1_w == nullptr || t_c1_b == nullptr) {
+        return false;
+    }
 
     ggml_tensor * x = codec_conv1d(ctx_eval, t_pcm, t_c1_w, t_c1_b, 1, 1, p->conv1_kernel / 2);
     if (x == nullptr) {
@@ -1164,18 +793,17 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
 
     for (int32_t bi = 0; bi < p->n_blocks; ++bi) {
         for (int32_t ri = 0; ri < CODEC_DAC_RES_UNITS; ++ri) {
-            ggml_tensor * t_s1 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_s1, codec_dac_encode_resunit_snake1_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c1rw = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, (int64_t) x->ne[1], (int64_t) x->ne[1]);
-            ggml_set_name(t_c1rw, codec_dac_encode_resunit_conv1_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c1rb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_c1rb, codec_dac_encode_resunit_conv1_b_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_s2 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_s2, codec_dac_encode_resunit_snake2_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c2rw = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, (int64_t) x->ne[1], (int64_t) x->ne[1]);
-            ggml_set_name(t_c2rw, codec_dac_encode_resunit_conv2_w_tensor_name(bi, ri).c_str());
-            ggml_tensor * t_c2rb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-            ggml_set_name(t_c2rb, codec_dac_encode_resunit_conv2_b_tensor_name(bi, ri).c_str());
+            const int32_t blk_dim = (int32_t) x->ne[1];
+            ggml_tensor * t_s1 = W(codec_dac_model_enc_resunit_snake1_name(bi, ri));
+            ggml_tensor * t_c1rw = Wconv1d(codec_dac_model_enc_resunit_conv1_w_name(bi, ri), 7, blk_dim, blk_dim);
+            ggml_tensor * t_c1rb = W(codec_dac_model_enc_resunit_conv1_b_name(bi, ri));
+            ggml_tensor * t_s2 = W(codec_dac_model_enc_resunit_snake2_name(bi, ri));
+            ggml_tensor * t_c2rw = Wconv1d(codec_dac_model_enc_resunit_conv2_w_name(bi, ri), 1, blk_dim, blk_dim);
+            ggml_tensor * t_c2rb = W(codec_dac_model_enc_resunit_conv2_b_name(bi, ri));
+            if (t_s1 == nullptr || t_c1rw == nullptr || t_c1rb == nullptr ||
+                t_s2 == nullptr || t_c2rw == nullptr || t_c2rb == nullptr) {
+                return false;
+            }
             x = codec_dac_resunit_ggml(
                 ctx_eval,
                 x,
@@ -1191,8 +819,10 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
             }
         }
 
-        ggml_tensor * t_blk_snake = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-        ggml_set_name(t_blk_snake, codec_dac_encode_block_snake_tensor_name(bi).c_str());
+        ggml_tensor * t_blk_snake = W(codec_dac_model_enc_block_snake_name(bi));
+        if (t_blk_snake == nullptr) {
+            return false;
+        }
         x = codec_op_snake(ctx_eval, x, t_blk_snake, 1e-9f);
 
         const int32_t blk_k = p->block_conv_kernel[bi];
@@ -1202,10 +832,11 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         if (blk_k <= 0 || blk_in <= 0 || blk_out <= 0 || blk_stride <= 0) {
             return false;
         }
-        ggml_tensor * t_cw = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, blk_k, blk_in, blk_out);
-        ggml_set_name(t_cw, codec_dac_encode_block_conv_w_tensor_name(bi).c_str());
-        ggml_tensor * t_cb = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, blk_out);
-        ggml_set_name(t_cb, codec_dac_encode_block_conv_b_tensor_name(bi).c_str());
+        ggml_tensor * t_cw = Wconv1d(codec_dac_model_enc_block_conv1_w_name(bi), blk_k, blk_in, blk_out);
+        ggml_tensor * t_cb = W(codec_dac_model_enc_block_conv1_b_name(bi));
+        if (t_cw == nullptr || t_cb == nullptr) {
+            return false;
+        }
         const int32_t blk_pad = std::max(0, (blk_stride + 1) / 2);
         x = codec_conv1d(ctx_eval, x, t_cw, t_cb, blk_stride, 1, blk_pad);
         if (x == nullptr) {
@@ -1214,15 +845,18 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         ggml_set_name(x, ("dac.encode.enc.b" + std::to_string(bi) + ".out").c_str());
     }
 
-    ggml_tensor * t_fs = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, (int64_t) x->ne[1]);
-    ggml_set_name(t_fs, codec_dac_encode_final_snake_tensor_name().c_str());
+    ggml_tensor * t_fs = W(codec_dac_model_enc_final_snake_name());
+    if (t_fs == nullptr) {
+        return false;
+    }
     x = codec_op_snake(ctx_eval, x, t_fs, 1e-9f);
     ggml_set_name(x, "dac.encode.enc.fs");
 
-    ggml_tensor * t_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->conv2_kernel, p->conv2_in, p->hidden_dim);
-    ggml_set_name(t_c2_w, codec_dac_encode_conv2_w_tensor_name().c_str());
-    ggml_tensor * t_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-    ggml_set_name(t_c2_b, codec_dac_encode_conv2_b_tensor_name().c_str());
+    ggml_tensor * t_c2_w = Wconv1d(codec_dac_model_enc_conv2_w_name(), p->conv2_kernel, p->conv2_in, p->hidden_dim);
+    ggml_tensor * t_c2_b = W(codec_dac_model_enc_conv2_b_name());
+    if (t_c2_w == nullptr || t_c2_b == nullptr) {
+        return false;
+    }
     x = codec_conv1d(ctx_eval, x, t_c2_w, t_c2_b, 1, 1, p->conv2_kernel / 2);
     if (x == nullptr) {
         return false;
@@ -1233,13 +867,22 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
     ggml_tensor * tokens = nullptr;
 
     for (int32_t qi = 0; qi < p->n_q; ++qi) {
-        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->codebook_size);
-        ggml_set_name(t_codebook, codec_dac_encode_codebook_tensor_name(qi).c_str());
+        const std::string cb_name = "vq.q" + std::to_string(qi) + ".codebook.weight";
+        const std::string in_w_name = "vq.q" + std::to_string(qi) + ".in_proj.weight";
+        const std::string in_b_name = "vq.q" + std::to_string(qi) + ".in_proj.bias";
+        const std::string out_w_name = "vq.q" + std::to_string(qi) + ".out_proj.weight";
+        const std::string out_b_name = "vq.q" + std::to_string(qi) + ".out_proj.bias";
 
-        ggml_tensor * t_in_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->hidden_dim, p->codebook_dim);
-        ggml_set_name(t_in_w, codec_dac_encode_in_proj_w_tensor_name(qi).c_str());
-        ggml_tensor * t_in_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
-        ggml_set_name(t_in_b, codec_dac_encode_in_proj_b_tensor_name(qi).c_str());
+        ggml_tensor * t_codebook = codec_dac_W_codebook(ctx_eval, p->model, cb_name, p->codebook_dim, p->codebook_size);
+        ggml_tensor * t_in_w = Wconv1d(in_w_name, 1, p->hidden_dim, p->codebook_dim);
+        ggml_tensor * t_in_b = W(in_b_name);
+        ggml_tensor * t_out_w = Wconv1d(out_w_name, 1, p->codebook_dim, p->hidden_dim);
+        ggml_tensor * t_out_b = W(out_b_name);
+        if (t_codebook == nullptr || t_in_w == nullptr || t_in_b == nullptr ||
+            t_out_w == nullptr || t_out_b == nullptr) {
+            return false;
+        }
+
         ggml_tensor * z_tc = codec_conv1d(ctx_eval, residual_tc, t_in_w, t_in_b, 1, 1, 0); // [t, codebook_dim]
         if (z_tc == nullptr) {
             return false;
@@ -1263,10 +906,6 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         }
         ggml_tensor * quantized_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, quantized));
 
-        ggml_tensor * t_out_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, p->codebook_dim, p->hidden_dim);
-        ggml_set_name(t_out_w, codec_dac_encode_out_proj_w_tensor_name(qi).c_str());
-        ggml_tensor * t_out_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(t_out_b, codec_dac_encode_out_proj_b_tensor_name(qi).c_str());
         ggml_tensor * zq_tc = codec_conv1d(ctx_eval, quantized_tc, t_out_w, t_out_b, 1, 1, 0); // [t, hidden_dim]
         if (zq_tc == nullptr) {
             return false;
@@ -1343,61 +982,6 @@ static enum codec_status codec_dac_decode_tokens_graph(
             tok_i32[(size_t) qi * (size_t) t + (size_t) ti] = tok;
         }
     }
-    for (int32_t qi = 0; qi < q; ++qi) {
-        ggml_tensor * t_codebook = codec_graph_get_tensor(ctx, entry, codec_dac_decode_codebook_tensor_name(qi).c_str());
-        ggml_tensor * t_out_proj = codec_graph_get_tensor(ctx, entry, codec_dac_decode_out_proj_tensor_name(qi).c_str());
-        ggml_tensor * t_out_bias = codec_graph_get_tensor(ctx, entry, codec_dac_decode_out_proj_bias_tensor_name(qi).c_str());
-        if (t_codebook == nullptr || t_out_proj == nullptr || t_out_bias == nullptr) {
-            codec_context_set_error(ctx, "cached DAC decode graph is missing VQ tensors");
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-
-        const std::string cb_name = "vq.q" + std::to_string(qi) + ".codebook.weight";
-        ggml_tensor * cb_src = ggml_get_tensor(ctx->model->weights, cb_name.c_str());
-        if (cb_src == nullptr) {
-            codec_context_set_error(ctx, "missing DAC codebook tensor: " + cb_name);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-        std::vector<float> cb;
-        if (!codec_tensor_as_vec_f32(cb_src, &cb)) {
-            codec_context_set_error(ctx, "failed reading DAC codebook tensor");
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-        const int32_t cb0 = (int32_t) codec_ne(cb_src, 0);
-        const int32_t cb1 = (int32_t) codec_ne(cb_src, 1);
-        std::vector<float> cb_dst((size_t) build.codebook_dim * (size_t) build.codebook_size, 0.0f);
-        if (cb0 == build.codebook_dim && cb1 == build.codebook_size) {
-            cb_dst = cb;
-        } else if (cb0 == build.codebook_size && cb1 == build.codebook_dim) {
-            for (int32_t i = 0; i < build.codebook_dim; ++i) {
-                for (int32_t j = 0; j < build.codebook_size; ++j) {
-                    cb_dst[(size_t) i + (size_t) build.codebook_dim * (size_t) j] =
-                        cb[(size_t) j + (size_t) build.codebook_size * (size_t) i];
-                }
-            }
-        } else {
-            codec_context_set_error(ctx, "unexpected DAC codebook tensor shape");
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-        if (!codec_runtime_write_tensor(t_codebook, cb_dst.data(), cb_dst.size() * sizeof(float), &err)) {
-            codec_context_set_error(ctx, err);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-
-        const std::string op_name = "vq.q" + std::to_string(qi) + ".out_proj.weight";
-        const std::string ob_name = "vq.q" + std::to_string(qi) + ".out_proj.bias";
-        if (!codec_dac_copy_out_proj_to_2d(ctx, op_name, t_out_proj, build.codebook_dim, build.hidden_dim, &err) ||
-            !codec_dac_copy_bias_1d(ctx, ob_name, t_out_bias, &err)) {
-            codec_context_set_error(ctx, err);
-            return CODEC_STATUS_INTERNAL_ERROR;
-        }
-    }
-
-    if (!codec_dac_write_decode_weights(ctx, entry, build, &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
     if (!codec_runtime_write_tensor(t_tok, tok_i32.data(), tok_i32.size() * sizeof(int32_t), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
@@ -1660,11 +1244,6 @@ enum codec_status codec_dac_encode(
     }
 
     if (!codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    if (!codec_dac_write_encode_weights(ctx, entry, build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

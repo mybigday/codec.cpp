@@ -36,6 +36,44 @@ DEFAULT_THRESHOLDS = {
     "mse_max": 0.0001,
 }
 
+# Per-quantization correlation/MSE relaxation. F32 and F16 should match the
+# reference closely; quantized formats lose precision so the same threshold is
+# unrealistic. Each entry scales the per-model thresholds: corr_min is reduced
+# (1.0 - delta) and mse_max is multiplied. None means "use the strict
+# per-model threshold as-is".
+QUANT_THRESHOLD_RELAX: dict[str, dict[str, float]] = {
+    "F32":    {"corr_delta": 0.0,    "mse_mul": 1.0},
+    "F16":    {"corr_delta": 0.0,    "mse_mul": 1.0},
+    "Q8_0":   {"corr_delta": 0.015,  "mse_mul": 4.0},
+    "Q5_K_M": {"corr_delta": 0.10,   "mse_mul": 16.0},
+    "Q4_K_M": {"corr_delta": 0.20,   "mse_mul": 64.0},
+}
+
+
+def relax_thresholds_for_quantization(thresholds: dict[str, Any], quantization: str | None) -> dict[str, Any]:
+    """Apply per-quantization relaxation to a threshold dict, returning a new copy.
+
+    For quantized runs we don't expect bit-exact parity with the HF reference;
+    the legitimate quality drop is roughly proportional to the quantization
+    aggressiveness. Use --strict-thresholds on the CLI to disable.
+    """
+    if quantization is None:
+        return dict(thresholds)
+    relax = QUANT_THRESHOLD_RELAX.get(quantization)
+    if relax is None:
+        return dict(thresholds)
+
+    out = dict(thresholds)
+    corr_delta = float(relax.get("corr_delta", 0.0))
+    mse_mul = float(relax.get("mse_mul", 1.0))
+    for key in ("corr_min", "encode_roundtrip_corr_min"):
+        if out.get(key) is not None:
+            out[key] = max(0.0, float(out[key]) - corr_delta)
+    for key in ("mse_max", "encode_roundtrip_mse_max"):
+        if out.get(key) is not None:
+            out[key] = float(out[key]) * mse_mul
+    return out
+
 
 @dataclass
 class ModelResult:
@@ -1066,6 +1104,7 @@ def run_model(
     input_audio: Path,
     sample_rate: int,
     quantization: str | None,
+    strict_thresholds: bool = False,
 ) -> ModelResult:
     name = model_cfg["name"]
     mt = MemTracker(name)
@@ -1153,6 +1192,8 @@ def run_model(
             metrics["encode"] = compare_codes(hf_codes, cpp_out_codes, model_cfg)
             metrics["roundtrip"] = compare_wav(hf_ref_wav, cpp_roundtrip_wav)
         thresholds = merge_thresholds(model_cfg)
+        if not strict_thresholds:
+            thresholds = relax_thresholds_for_quantization(thresholds, quantization)
         hop_size = thresholds.get("length_diff_hop_size")
         failures = assert_metric(metrics, thresholds, hop_size=int(hop_size) if hop_size is not None else None)
 
@@ -1284,6 +1325,11 @@ def parse_args() -> argparse.Namespace:
         help="Run models in-process (useful in sandbox environments without multiprocessing.SemLock)",
     )
     parser.add_argument("--list-models", action="store_true", help="List configured models and exit")
+    parser.add_argument(
+        "--strict-thresholds",
+        action="store_true",
+        help="Skip per-quantization threshold relaxation. By default, quantized runs (Q8_0/Q5_K_M/Q4_K_M) get tier-scaled corr_min and mse_max because exact parity with the HF reference isn't realistic for lossy formats.",
+    )
     return parser.parse_args()
 
 
@@ -1307,8 +1353,9 @@ def _run_model_worker(
     input_audio: Path,
     sample_rate: int,
     quantization: str | None,
+    strict_thresholds: bool = False,
 ) -> None:
-    result = run_model(report_dir, model_cfg, input_audio, sample_rate, quantization)
+    result = run_model(report_dir, model_cfg, input_audio, sample_rate, quantization, strict_thresholds=strict_thresholds)
     result_queue.put(result)
 
 
@@ -1318,6 +1365,7 @@ def _run_model_isolated(
     input_audio: Path,
     sample_rate: int,
     quantization: str | None,
+    strict_thresholds: bool = False,
 ) -> ModelResult:
     """Run a single model test in an isolated subprocess so all memory
     (PyTorch allocator pools, imported modules, HF caches) is reclaimed
@@ -1326,10 +1374,10 @@ def _run_model_isolated(
         q: multiprocessing.Queue = multiprocessing.Queue()
     except PermissionError:
         # Some sandboxed environments disallow SemLock.
-        return run_model(report_dir, model_cfg, input_audio, sample_rate, quantization)
+        return run_model(report_dir, model_cfg, input_audio, sample_rate, quantization, strict_thresholds=strict_thresholds)
     p = multiprocessing.Process(
         target=_run_model_worker,
-        args=(q, report_dir, model_cfg, input_audio, sample_rate, quantization),
+        args=(q, report_dir, model_cfg, input_audio, sample_rate, quantization, strict_thresholds),
     )
     p.start()
     p.join()
@@ -1378,6 +1426,7 @@ def main() -> int:
                 input_audio,
                 int(args.sample_rate),
                 args.quantization,
+                strict_thresholds=args.strict_thresholds,
             )
         else:
             result = _run_model_isolated(
@@ -1386,6 +1435,7 @@ def main() -> int:
                 input_audio,
                 int(args.sample_rate),
                 args.quantization,
+                strict_thresholds=args.strict_thresholds,
             )
         results.append(result)
         print(f"[{result.name}] result: {result.status}")

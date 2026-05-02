@@ -24,7 +24,7 @@ MAX_TENSOR_NAME = 63
 RE_QUANTIZE_ENCODER_CONV = re.compile(r"^enc\.l\d+(?:\.block\.[13])?\.conv\.w$")
 RE_QUANTIZE_ENCODER_TRANS = re.compile(r"^etr\.l\d+\..*\.w$")
 RE_NEVER_Q_BIAS = re.compile(r"\.b$")
-RE_NEVER_Q_LAYER_NORM = re.compile(r"(?:_ln|inln|paln)\.w$")
+RE_NEVER_Q_LAYER_NORM = re.compile(r"(?:_ln|inln|paln|norm|ln)\.(?:w|weight|scale\.weight|shift\.weight)$")
 RE_NEVER_Q_CODEBOOK = re.compile(r"^q\..*\.embed$")
 RE_NEVER_Q_CODEBOOK_CB = re.compile(r"^q\..*\.cb\.embed$")
 
@@ -42,6 +42,13 @@ def _is_mimi_rvq_output_proj_weight_key(key: str) -> bool:
     )
 
 
+def _is_mimi_decoder_upsample_weight_key(key: str) -> bool:
+    return key in (
+        "upsample.conv.weight",
+        "decoder.upsample.conv.weight",
+    )
+
+
 def build_weight_transforms(keys: List[str]) -> Dict[str, str]:
     weight_transforms: Dict[str, str] = {}
     for key in keys:
@@ -49,6 +56,8 @@ def build_weight_transforms(keys: List[str]) -> Dict[str, str]:
             weight_transforms[key] = "squeeze_2d"
         elif _is_mimi_rvq_output_proj_weight_key(key):
             weight_transforms[key] = "squeeze_2d"
+        elif _is_mimi_decoder_upsample_weight_key(key):
+            weight_transforms[key] = "depthwise_convtr_to_dense"
     return weight_transforms
 
 
@@ -88,6 +97,17 @@ def transform_tensor_for_codec(key: str, arr: np.ndarray, weight_transforms: Dic
         if arr.ndim != 2:
             raise ValueError(f"Expected rank-2 RVQ projection weight: {key} shape={arr.shape}")
         return _normalize_rvq_codebook_embed_layout(key, arr)
+    if transform_op == "depthwise_convtr_to_dense":
+        # PyTorch depthwise ConvTranspose1d stores weight as (c, 1, k) with groups=c.
+        # ggml_conv_transpose_1d isn't depthwise, so expand to dense diagonal:
+        # output[c_out=c, c_in=c, k] = src[c, 0, k] when c_out == c_in else 0.
+        if arr.ndim != 3 or arr.shape[1] != 1:
+            raise ValueError(f"Depthwise ConvTranspose1d weight must be (c, 1, k): {key} shape={arr.shape}")
+        c, _, k = arr.shape
+        dense = np.zeros((c, c, k), dtype=arr.dtype)
+        idx = np.arange(c)
+        dense[idx, idx, :] = arr[:, 0, :]
+        return dense
     raise ValueError(f"unknown transform op: {transform_op} for {key}")
 
 

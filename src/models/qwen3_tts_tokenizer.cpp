@@ -19,8 +19,6 @@
 static constexpr int32_t CODEC_Q3T_RES_UNITS = 3;
 static constexpr int32_t CODEC_Q3T_RES_DILATIONS[CODEC_Q3T_RES_UNITS] = { 1, 3, 9 };
 
-static ggml_tensor * codec_q3t_get_tensor(codec_model * model, const std::string & name);
-
 enum codec_status codec_qwen3_tts_tokenizer_init(struct codec_model * model) {
     codec_qwen3_tts_tokenizer_impl & impl = *static_cast<codec_qwen3_tts_tokenizer_impl *>(model->impl);
     codec_qwen3_tts_tokenizer & q3 = impl.q3;
@@ -139,23 +137,16 @@ struct q3t_decode_build {
     int32_t upsample_rates[CODEC_Q3T_MAX_UPSAMPLE];
     int32_t upsampling_ratios[CODEC_Q3T_MAX_UPSAMPLE];
     int32_t decoder_dim;
+    const codec_model * model;
 };
 
-static ggml_tensor * codec_q3t_get_tensor(codec_model * model, const std::string & name) {
-    if (model == nullptr || model->weights == nullptr) {
-        return nullptr;
+// Add bias broadcast over channels; no-op when bias is null. Used for
+// attention q/k/v/o biases which are optional in some Qwen3 checkpoints.
+static ggml_tensor * codec_q3t_add_bias_ct(ggml_context * ctx_eval, ggml_tensor * x, ggml_tensor * b) {
+    if (b == nullptr) {
+        return x;
     }
-    return ggml_get_tensor(model->weights, name.c_str());
-}
-
-static bool codec_q3t_copy_bias_1d_optional(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * err) {
-    if (dst == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid Qwen3 optional bias destination";
-        }
-        return false;
-    }
-    return codec_runtime_copy_tensor_f32_exact_or_zeros(ctx, src_name, dst, err);
+    return ggml_add(ctx_eval, x, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, b, x->ne[0], 1), x));
 }
 
 static ggml_tensor * codec_q3t_convnext_block(
@@ -253,11 +244,19 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->t <= 0 || p->q <= 0 ||
         p->codebook_size <= 1 || p->codebook_dim <= 0 || p->codebook_dim_half <= 0 ||
         p->latent_dim <= 0 || p->hidden_size <= 0 || p->transformer_layers <= 0 ||
-        p->transformer_heads <= 0 || p->transformer_head_dim <= 0 || p->transformer_intermediate <= 0) {
+        p->transformer_heads <= 0 || p->transformer_head_dim <= 0 || p->transformer_intermediate <= 0 ||
+        p->model == nullptr) {
         return false;
     }
     const int32_t attn_dim = p->transformer_heads * p->transformer_head_dim;
     const int32_t kv_dim = p->transformer_kv_heads * p->transformer_head_dim;
+
+    auto W = [&](const std::string & name) -> ggml_tensor * {
+        return codec_graph_weight(ctx_eval, p->model, name);
+    };
+    auto Wopt = [&](const std::string & name) -> ggml_tensor * {
+        return codec_graph_weight_or_null(ctx_eval, p->model, name);
+    };
 
     // Codebook lookup per-quantizer
     ggml_tensor * sem_sum = nullptr;
@@ -266,8 +265,10 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         ggml_tensor * t_idx = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, p->t);
         ggml_set_name(t_idx, codec_q3t_decode_idx_tensor_name(qi).c_str());
 
-        ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim_half, p->codebook_size);
-        ggml_set_name(t_codebook, codec_q3t_decode_codebook_tensor_name(qi).c_str());
+        ggml_tensor * t_codebook = W(codec_q3t_decode_codebook_tensor_name(qi));
+        if (t_codebook == nullptr) {
+            return false;
+        }
 
         ggml_tensor * t_qi = ggml_get_rows(ctx_eval, t_codebook, t_idx); // [cb_dim_half, t]
         if (t_qi == nullptr) {
@@ -288,8 +289,10 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         return false;
     }
 
-    ggml_tensor * t_sem_op_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim_half, p->codebook_dim);
-    ggml_set_name(t_sem_op_w, "q3t.dec.q.s.op.w");
+    ggml_tensor * t_sem_op_w = W("q3t.dec.q.s.op.w");
+    if (t_sem_op_w == nullptr) {
+        return false;
+    }
     ggml_tensor * sem_ct = ggml_cont(ctx_eval, sem_sum); // [cb_dim_half, t]
     ggml_tensor * sem_out = ggml_mul_mat(ctx_eval, t_sem_op_w, sem_ct); // [cb_dim, t]
     sem_out = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, sem_out)); // [t, cb_dim]
@@ -300,8 +303,10 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     ggml_tensor * x_tc = sem_out;
     if (acu_sum != nullptr) {
-        ggml_tensor * t_acu_op_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim_half, p->codebook_dim);
-        ggml_set_name(t_acu_op_w, "q3t.dec.q.a.op.w");
+        ggml_tensor * t_acu_op_w = W("q3t.dec.q.a.op.w");
+        if (t_acu_op_w == nullptr) {
+            return false;
+        }
         ggml_tensor * acu_ct = ggml_cont(ctx_eval, acu_sum); // [cb_dim_half, t]
         ggml_tensor * acu_out = ggml_mul_mat(ctx_eval, t_acu_op_w, acu_ct); // [cb_dim, t]
         acu_out = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, acu_out)); // [t, cb_dim]
@@ -312,10 +317,11 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     }
     ggml_set_name(x_tc, "q3t.dec.qsum");
 
-    ggml_tensor * t_pre_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->codebook_dim, p->latent_dim);
-    ggml_set_name(t_pre_w, "q3t.dec.pre.conv.w");
-    ggml_tensor * t_pre_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-    ggml_set_name(t_pre_b, "q3t.dec.pre.conv.b");
+    ggml_tensor * t_pre_w = W("q3t.dec.pre.conv.w");
+    ggml_tensor * t_pre_b = W("q3t.dec.pre.conv.b");
+    if (t_pre_w == nullptr || t_pre_b == nullptr) {
+        return false;
+    }
     x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_pre_w, t_pre_b, 1, 1);
     if (x_tc == nullptr) {
         return false;
@@ -325,54 +331,39 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc)); // [latent_dim, t]
 
     // pre-transformer input/output projections
-    ggml_tensor * t_in_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->latent_dim, p->hidden_size);
-    ggml_set_name(t_in_w, "q3t.dec.pt.in.w");
-    ggml_tensor * t_in_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-    ggml_set_name(t_in_b, "q3t.dec.pt.in.b");
-    ggml_tensor * t_out_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->latent_dim);
-    ggml_set_name(t_out_w, "q3t.dec.pt.out.w");
-    ggml_tensor * t_out_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-    ggml_set_name(t_out_b, "q3t.dec.pt.out.b");
+    ggml_tensor * t_in_w = W("q3t.dec.pt.in.w");
+    ggml_tensor * t_in_b = W("q3t.dec.pt.in.b");
+    ggml_tensor * t_out_w = W("q3t.dec.pt.out.w");
+    ggml_tensor * t_out_b = W("q3t.dec.pt.out.b");
+    if (t_in_w == nullptr || t_in_b == nullptr || t_out_w == nullptr || t_out_b == nullptr) {
+        return false;
+    }
 
     x_ct = ggml_mul_mat(ctx_eval, t_in_w, x_ct);
     ggml_tensor * in_b2 = ggml_reshape_2d(ctx_eval, t_in_b, t_in_w->ne[1], 1);
     x_ct = ggml_add(ctx_eval, x_ct, ggml_repeat(ctx_eval, in_b2, x_ct));
 
     for (int32_t li = 0; li < p->transformer_layers; ++li) {
-        ggml_tensor * inln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-        ggml_set_name(inln_w, codec_q3t_decode_pt_layer_name(li, "inln.w").c_str());
-        ggml_tensor * paln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-        ggml_set_name(paln_w, codec_q3t_decode_pt_layer_name(li, "paln.w").c_str());
-
-        ggml_tensor * q_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, attn_dim);
-        ggml_set_name(q_w, codec_q3t_decode_pt_layer_name(li, "attn.q.w").c_str());
-        ggml_tensor * k_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, kv_dim);
-        ggml_set_name(k_w, codec_q3t_decode_pt_layer_name(li, "attn.k.w").c_str());
-        ggml_tensor * v_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, kv_dim);
-        ggml_set_name(v_w, codec_q3t_decode_pt_layer_name(li, "attn.v.w").c_str());
-        ggml_tensor * o_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, attn_dim, p->hidden_size);
-        ggml_set_name(o_w, codec_q3t_decode_pt_layer_name(li, "attn.o.w").c_str());
-
-        ggml_tensor * q_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, attn_dim);
-        ggml_set_name(q_b, codec_q3t_decode_pt_layer_name(li, "attn.q.b").c_str());
-        ggml_tensor * k_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, kv_dim);
-        ggml_set_name(k_b, codec_q3t_decode_pt_layer_name(li, "attn.k.b").c_str());
-        ggml_tensor * v_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, kv_dim);
-        ggml_set_name(v_b, codec_q3t_decode_pt_layer_name(li, "attn.v.b").c_str());
-        ggml_tensor * o_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-        ggml_set_name(o_b, codec_q3t_decode_pt_layer_name(li, "attn.o.b").c_str());
-
-        ggml_tensor * fc_gate = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->transformer_intermediate);
-        ggml_set_name(fc_gate, codec_q3t_decode_pt_layer_name(li, "mlp.gate.w").c_str());
-        ggml_tensor * fc_up = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_size, p->transformer_intermediate);
-        ggml_set_name(fc_up, codec_q3t_decode_pt_layer_name(li, "mlp.up.w").c_str());
-        ggml_tensor * fc_down = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->transformer_intermediate, p->hidden_size);
-        ggml_set_name(fc_down, codec_q3t_decode_pt_layer_name(li, "mlp.down.w").c_str());
-
-        ggml_tensor * sa_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-        ggml_set_name(sa_scale, codec_q3t_decode_pt_layer_name(li, "sa.scale").c_str());
-        ggml_tensor * mlp_scale = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-        ggml_set_name(mlp_scale, codec_q3t_decode_pt_layer_name(li, "mlp.scale").c_str());
+        ggml_tensor * inln_w = W(codec_q3t_decode_pt_layer_name(li, "inln.w"));
+        ggml_tensor * paln_w = W(codec_q3t_decode_pt_layer_name(li, "paln.w"));
+        ggml_tensor * q_w = W(codec_q3t_decode_pt_layer_name(li, "attn.q.w"));
+        ggml_tensor * k_w = W(codec_q3t_decode_pt_layer_name(li, "attn.k.w"));
+        ggml_tensor * v_w = W(codec_q3t_decode_pt_layer_name(li, "attn.v.w"));
+        ggml_tensor * o_w = W(codec_q3t_decode_pt_layer_name(li, "attn.o.w"));
+        ggml_tensor * q_b = Wopt(codec_q3t_decode_pt_layer_name(li, "attn.q.b"));
+        ggml_tensor * k_b = Wopt(codec_q3t_decode_pt_layer_name(li, "attn.k.b"));
+        ggml_tensor * v_b = Wopt(codec_q3t_decode_pt_layer_name(li, "attn.v.b"));
+        ggml_tensor * o_b = Wopt(codec_q3t_decode_pt_layer_name(li, "attn.o.b"));
+        ggml_tensor * fc_gate = W(codec_q3t_decode_pt_layer_name(li, "mlp.gate.w"));
+        ggml_tensor * fc_up = W(codec_q3t_decode_pt_layer_name(li, "mlp.up.w"));
+        ggml_tensor * fc_down = W(codec_q3t_decode_pt_layer_name(li, "mlp.down.w"));
+        ggml_tensor * sa_scale = W(codec_q3t_decode_pt_layer_name(li, "sa.scale"));
+        ggml_tensor * mlp_scale = W(codec_q3t_decode_pt_layer_name(li, "mlp.scale"));
+        if (inln_w == nullptr || paln_w == nullptr || q_w == nullptr || k_w == nullptr ||
+            v_w == nullptr || o_w == nullptr || fc_gate == nullptr || fc_up == nullptr ||
+            fc_down == nullptr || sa_scale == nullptr || mlp_scale == nullptr) {
+            return false;
+        }
 
         ggml_tensor * h = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, inln_w);
         if (h == nullptr) {
@@ -385,10 +376,9 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         if (q == nullptr || k == nullptr || v == nullptr) {
             return false;
         }
-        // optional bias (may be all zeros if not present)
-        q = ggml_add(ctx_eval, q, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, q_b, q->ne[0], 1), q));
-        k = ggml_add(ctx_eval, k, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, k_b, k->ne[0], 1), k));
-        v = ggml_add(ctx_eval, v, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, v_b, v->ne[0], 1), v));
+        q = codec_q3t_add_bias_ct(ctx_eval, q, q_b);
+        k = codec_q3t_add_bias_ct(ctx_eval, k, k_b);
+        v = codec_q3t_add_bias_ct(ctx_eval, v, v_b);
 
         const int64_t t_cur = q->ne[1];
         ggml_tensor * q_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, q, p->transformer_head_dim, p->transformer_heads, t_cur), 0, 2, 1, 3);
@@ -420,7 +410,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
             attn_dim,
             t_cur);
         ggml_tensor * attn_proj = ggml_mul_mat(ctx_eval, o_w, attn_ct);
-        attn_proj = ggml_add(ctx_eval, attn_proj, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, o_b, o_w->ne[1], 1), attn_proj));
+        attn_proj = codec_q3t_add_bias_ct(ctx_eval, attn_proj, o_b);
         x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, attn_proj, sa_scale));
 
         ggml_tensor * m = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, paln_w);
@@ -432,8 +422,10 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, down, mlp_scale));
     }
 
-    ggml_tensor * t_norm_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_size);
-    ggml_set_name(t_norm_w, "q3t.dec.pt.norm.w");
+    ggml_tensor * t_norm_w = W("q3t.dec.pt.norm.w");
+    if (t_norm_w == nullptr) {
+        return false;
+    }
     x_ct = codec_op_rms_norm_ct(ctx_eval, x_ct, 1e-5f, t_norm_w);
 
     x_ct = ggml_mul_mat(ctx_eval, t_out_w, x_ct);
@@ -445,75 +437,66 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     // upsampling ratios (convtr + convnext)
     for (int32_t ui = 0; ui < p->n_upsampling_ratios; ++ui) {
-        ggml_tensor * t_up_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->upsampling_ratios[ui], p->latent_dim, p->latent_dim);
-        ggml_set_name(t_up_w, ("q3t.dec.up" + std::to_string(ui) + ".tr.w").c_str());
-        ggml_tensor * t_up_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_up_b, ("q3t.dec.up" + std::to_string(ui) + ".tr.b").c_str());
+        const std::string base = "q3t.dec.up" + std::to_string(ui);
+        ggml_tensor * t_up_w = W(base + ".tr.w");
+        ggml_tensor * t_up_b = W(base + ".tr.b");
+        ggml_tensor * t_dw_w = W(base + ".cnx.dw.w");
+        ggml_tensor * t_dw_b = W(base + ".cnx.dw.b");
+        ggml_tensor * t_ln_w = W(base + ".cnx.norm.w");
+        ggml_tensor * t_ln_b = W(base + ".cnx.norm.b");
+        ggml_tensor * t_pw1_w = W(base + ".cnx.pw1.w");
+        ggml_tensor * t_pw1_b = W(base + ".cnx.pw1.b");
+        ggml_tensor * t_pw2_w = W(base + ".cnx.pw2.w");
+        ggml_tensor * t_pw2_b = W(base + ".cnx.pw2.b");
+        ggml_tensor * t_gamma = W(base + ".cnx.gamma");
+        if (t_up_w == nullptr || t_up_b == nullptr || t_dw_w == nullptr || t_dw_b == nullptr ||
+            t_ln_w == nullptr || t_ln_b == nullptr || t_pw1_w == nullptr || t_pw1_b == nullptr ||
+            t_pw2_w == nullptr || t_pw2_b == nullptr || t_gamma == nullptr) {
+            return false;
+        }
         x_tc = codec_convtr1d_causal(ctx_eval, x_tc, t_up_w, t_up_b, p->upsampling_ratios[ui], 1);
-
-        ggml_tensor * t_dw_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 1, p->latent_dim);
-        ggml_set_name(t_dw_w, ("q3t.dec.up" + std::to_string(ui) + ".cnx.dw.w").c_str());
-        ggml_tensor * t_dw_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_dw_b, ("q3t.dec.up" + std::to_string(ui) + ".cnx.dw.b").c_str());
-        ggml_tensor * t_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_ln_w, ("q3t.dec.up" + std::to_string(ui) + ".cnx.norm.w").c_str());
-        ggml_tensor * t_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_ln_b, ("q3t.dec.up" + std::to_string(ui) + ".cnx.norm.b").c_str());
-        ggml_tensor * t_pw1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->latent_dim, 4 * p->latent_dim);
-        ggml_set_name(t_pw1_w, ("q3t.dec.up" + std::to_string(ui) + ".cnx.pw1.w").c_str());
-        ggml_tensor * t_pw1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * p->latent_dim);
-        ggml_set_name(t_pw1_b, ("q3t.dec.up" + std::to_string(ui) + ".cnx.pw1.b").c_str());
-        ggml_tensor * t_pw2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 4 * p->latent_dim, p->latent_dim);
-        ggml_set_name(t_pw2_w, ("q3t.dec.up" + std::to_string(ui) + ".cnx.pw2.w").c_str());
-        ggml_tensor * t_pw2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_pw2_b, ("q3t.dec.up" + std::to_string(ui) + ".cnx.pw2.b").c_str());
-        ggml_tensor * t_gamma = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->latent_dim);
-        ggml_set_name(t_gamma, ("q3t.dec.up" + std::to_string(ui) + ".cnx.gamma").c_str());
         x_tc = codec_q3t_convnext_block(ctx_eval, x_tc, t_dw_w, t_dw_b, t_ln_w, t_ln_b, t_pw1_w, t_pw1_b, t_pw2_w, t_pw2_b, t_gamma);
-        ggml_set_name(x_tc, ("q3t.dec.up" + std::to_string(ui) + ".out").c_str());
+        ggml_set_name(x_tc, (base + ".out").c_str());
     }
 
     // decoder conv stack
-    ggml_tensor * t_dec0_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, p->latent_dim, p->decoder_dim);
-    ggml_set_name(t_dec0_w, "q3t.dec.d0.w");
-    ggml_tensor * t_dec0_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->decoder_dim);
-    ggml_set_name(t_dec0_b, "q3t.dec.d0.b");
+    ggml_tensor * t_dec0_w = W("q3t.dec.d0.w");
+    ggml_tensor * t_dec0_b = W("q3t.dec.d0.b");
+    if (t_dec0_w == nullptr || t_dec0_b == nullptr) {
+        return false;
+    }
     x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_dec0_w, t_dec0_b, 1, 1);
 
     int32_t cur_dim = p->decoder_dim;
     for (int32_t bi = 0; bi < p->n_upsample_rates; ++bi) {
+        const std::string base = "q3t.dec.b" + std::to_string(bi);
         const int32_t out_dim = p->decoder_dim / (1 << (bi + 1));
         const int32_t up_rate = p->upsample_rates[bi];
 
-        ggml_tensor * t_s0_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, cur_dim);
-        ggml_set_name(t_s0_a, ("q3t.dec.b" + std::to_string(bi) + ".s0.a").c_str());
-        ggml_tensor * t_s0_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, cur_dim);
-        ggml_set_name(t_s0_b, ("q3t.dec.b" + std::to_string(bi) + ".s0.binv").c_str());
+        ggml_tensor * t_s0_a = W(base + ".s0.a");
+        ggml_tensor * t_s0_b = W(base + ".s0.binv");
+        ggml_tensor * t_tr_w = W(base + ".tr.w");
+        ggml_tensor * t_tr_b = W(base + ".tr.b");
+        if (t_s0_a == nullptr || t_s0_b == nullptr || t_tr_w == nullptr || t_tr_b == nullptr) {
+            return false;
+        }
         x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_s0_a, t_s0_b, 1e-9f);
-
-        ggml_tensor * t_tr_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 2 * up_rate, out_dim, cur_dim);
-        ggml_set_name(t_tr_w, ("q3t.dec.b" + std::to_string(bi) + ".tr.w").c_str());
-        ggml_tensor * t_tr_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-        ggml_set_name(t_tr_b, ("q3t.dec.b" + std::to_string(bi) + ".tr.b").c_str());
         x_tc = codec_convtr1d_causal(ctx_eval, x_tc, t_tr_w, t_tr_b, up_rate, 1);
 
         for (int32_t ri = 0; ri < CODEC_Q3T_RES_UNITS; ++ri) {
-            ggml_tensor * t_s1_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_s1_a, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s1.a").c_str());
-            ggml_tensor * t_s1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_s1_b, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s1.binv").c_str());
-            ggml_tensor * t_c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, out_dim, out_dim);
-            ggml_set_name(t_c1_w, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.w").c_str());
-            ggml_tensor * t_c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_c1_b, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c1.b").c_str());
-            ggml_tensor * t_s2_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_s2_a, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s2.a").c_str());
-            ggml_tensor * t_s2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_s2_b, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".s2.binv").c_str());
-            ggml_tensor * t_c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, out_dim, out_dim);
-            ggml_set_name(t_c2_w, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.w").c_str());
-            ggml_tensor * t_c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, out_dim);
-            ggml_set_name(t_c2_b, ("q3t.dec.b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".c2.b").c_str());
+            const std::string rbase = base + ".r" + std::to_string(ri);
+            ggml_tensor * t_s1_a = W(rbase + ".s1.a");
+            ggml_tensor * t_s1_b = W(rbase + ".s1.binv");
+            ggml_tensor * t_c1_w = W(rbase + ".c1.w");
+            ggml_tensor * t_c1_b = W(rbase + ".c1.b");
+            ggml_tensor * t_s2_a = W(rbase + ".s2.a");
+            ggml_tensor * t_s2_b = W(rbase + ".s2.binv");
+            ggml_tensor * t_c2_w = W(rbase + ".c2.w");
+            ggml_tensor * t_c2_b = W(rbase + ".c2.b");
+            if (t_s1_a == nullptr || t_s1_b == nullptr || t_c1_w == nullptr || t_c1_b == nullptr ||
+                t_s2_a == nullptr || t_s2_b == nullptr || t_c2_w == nullptr || t_c2_b == nullptr) {
+                return false;
+            }
 
             ggml_tensor * res = x_tc;
             x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_s1_a, t_s1_b, 1e-9f);
@@ -526,16 +509,15 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     }
     ggml_set_name(x_tc, "q3t.dec.dec_out");
 
-    ggml_tensor * t_fs_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, cur_dim);
-    ggml_set_name(t_fs_a, "q3t.dec.final.s.a");
-    ggml_tensor * t_fs_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, cur_dim);
-    ggml_set_name(t_fs_b, "q3t.dec.final.s.binv");
+    ggml_tensor * t_fs_a = W("q3t.dec.final.s.a");
+    ggml_tensor * t_fs_b = W("q3t.dec.final.s.binv");
+    ggml_tensor * t_out_final_w = W("q3t.dec.final.w");
+    ggml_tensor * t_out_final_b = W("q3t.dec.final.b");
+    if (t_fs_a == nullptr || t_fs_b == nullptr || t_out_final_w == nullptr || t_out_final_b == nullptr) {
+        return false;
+    }
     x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_fs_a, t_fs_b, 1e-9f);
 
-    ggml_tensor * t_out_final_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, cur_dim, 1);
-    ggml_set_name(t_out_final_w, "q3t.dec.final.w");
-    ggml_tensor * t_out_final_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
-    ggml_set_name(t_out_final_b, "q3t.dec.final.b");
     ggml_tensor * t_out = codec_conv1d_causal(ctx_eval, x_tc, t_out_final_w, t_out_final_b, 1, 1);
     if (t_out == nullptr) {
         return false;
@@ -586,146 +568,10 @@ static bool codec_q3t_init_decode_build(codec_context * ctx, int32_t t, int32_t 
     for (int32_t i = 0; i < build->n_upsampling_ratios; ++i) {
         build->upsampling_ratios[i] = std::max(1, q3.upsampling_ratios[i]);
     }
+    build->model = ctx->model;
     return true;
 }
 
-static bool codec_q3t_write_decode_weights(codec_context * ctx, codec_graph_cache_entry * entry, const q3t_decode_build & build, std::string * err) {
-    // quantizer output proj
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.q.s.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.s.op.w"), err)) {
-        return false;
-    }
-    if (build.q > build.n_sem) {
-        if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.q.a.op.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.q.a.op.w"), err)) {
-            return false;
-        }
-    }
-
-    // codebooks
-    for (int32_t qi = 0; qi < build.q; ++qi) {
-        const std::string name = codec_q3t_decode_codebook_tensor_name(qi);
-        ggml_tensor * dst = codec_graph_get_tensor(ctx, entry, name.c_str());
-        if (dst == nullptr) {
-            if (err != nullptr) {
-                *err = "missing Qwen3 codebook tensor: " + name;
-            }
-            return false;
-        }
-        ggml_tensor * src = codec_q3t_get_tensor(ctx->model, name);
-        if (src == nullptr) {
-            if (err != nullptr) {
-                *err = "missing Qwen3 codebook weights: " + name;
-            }
-            return false;
-        }
-        std::vector<float> v;
-        if (!codec_tensor_as_vec_f32(src, &v) || (int64_t) v.size() != ggml_nelements(dst)) {
-            if (err != nullptr) {
-                *err = "invalid Qwen3 codebook tensor: " + name;
-            }
-            return false;
-        }
-        if (!codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), err)) {
-            return false;
-        }
-    }
-
-    // pre-conv
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pre.conv.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pre.conv.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pre.conv.b"), err)) {
-        return false;
-    }
-
-    // pre-transformer input/output
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.in.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.in.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.in.b"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.out.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.out.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.out.b"), err)) {
-        return false;
-    }
-
-    for (int32_t li = 0; li < build.transformer_layers; ++li) {
-        auto tensor = [&](const char * suffix) {
-            return codec_graph_get_tensor(ctx, entry, codec_q3t_decode_pt_layer_name(li, suffix).c_str());
-        };
-        if (!codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "inln.w"), tensor("inln.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "paln.w"), tensor("paln.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.q.w"), tensor("attn.q.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.k.w"), tensor("attn.k.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.v.w"), tensor("attn.v.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "attn.o.w"), tensor("attn.o.w"), err) ||
-            !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.q.b"), tensor("attn.q.b"), err) ||
-            !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.k.b"), tensor("attn.k.b"), err) ||
-            !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.v.b"), tensor("attn.v.b"), err) ||
-            !codec_q3t_copy_bias_1d_optional(ctx, codec_q3t_decode_pt_layer_name(li, "attn.o.b"), tensor("attn.o.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.gate.w"), tensor("mlp.gate.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.up.w"), tensor("mlp.up.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.down.w"), tensor("mlp.down.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "sa.scale"), tensor("sa.scale"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, codec_q3t_decode_pt_layer_name(li, "mlp.scale"), tensor("mlp.scale"), err)) {
-            return false;
-        }
-    }
-
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.pt.norm.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.pt.norm.w"), err)) {
-        return false;
-    }
-
-    // upsampling ratios
-    for (int32_t ui = 0; ui < build.n_upsampling_ratios; ++ui) {
-        const std::string base = "q3t.dec.up" + std::to_string(ui);
-        if (!codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.dw.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.dw.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.dw.b").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.norm.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.norm.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.norm.b").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw1.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw1.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw1.b").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw2.w", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.pw2.b", codec_graph_get_tensor(ctx, entry, (base + ".cnx.pw2.b").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".cnx.gamma", codec_graph_get_tensor(ctx, entry, (base + ".cnx.gamma").c_str()), err)) {
-            return false;
-        }
-    }
-
-    // decoder stack
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.d0.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.d0.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.d0.b"), err)) {
-        return false;
-    }
-
-    for (int32_t bi = 0; bi < build.n_upsample_rates; ++bi) {
-        const std::string base = "q3t.dec.b" + std::to_string(bi);
-        if (!codec_runtime_copy_tensor_f32_exact(ctx, base + ".s0.a", codec_graph_get_tensor(ctx, entry, (base + ".s0.a").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".s0.binv", codec_graph_get_tensor(ctx, entry, (base + ".s0.binv").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.w", codec_graph_get_tensor(ctx, entry, (base + ".tr.w").c_str()), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".tr.b", codec_graph_get_tensor(ctx, entry, (base + ".tr.b").c_str()), err)) {
-            return false;
-        }
-        for (int32_t ri = 0; ri < CODEC_Q3T_RES_UNITS; ++ri) {
-            const std::string rbase = base + ".r" + std::to_string(ri);
-            if (!codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s1.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.a").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s1.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s1.binv").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c1.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.w").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c1.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c1.b").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s2.a", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.a").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".s2.binv", codec_graph_get_tensor(ctx, entry, (rbase + ".s2.binv").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c2.w", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.w").c_str()), err) ||
-                !codec_runtime_copy_tensor_f32_exact(ctx, rbase + ".c2.b", codec_graph_get_tensor(ctx, entry, (rbase + ".c2.b").c_str()), err)) {
-                return false;
-            }
-        }
-    }
-
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.s.a", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.a"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.s.binv", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.s.binv"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.w", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "q3t.dec.final.b", codec_graph_get_tensor(ctx, entry, "q3t.dec.final.b"), err)) {
-        return false;
-    }
-
-    return true;
-}
 
 enum codec_status codec_qwen3_tts_tokenizer_decode(
     struct codec_context * ctx,
@@ -813,11 +659,6 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
             codec_context_set_error(ctx, err);
             return CODEC_STATUS_INTERNAL_ERROR;
         }
-    }
-
-    if (!codec_q3t_write_decode_weights(ctx, entry, build, &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
     }
 
     const int32_t n_threads = ctx->model->n_threads > 0 ? ctx->model->n_threads : 1;

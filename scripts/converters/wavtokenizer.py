@@ -327,6 +327,17 @@ class WavTokenizerConverter(BaseConverter):
         if not is_weight:
             return False
 
+        # Skip adanorm scale/shift weights: they have shape (4, hidden) and the
+        # last-axis divides 256, so the naive size check would happily Q4-quant
+        # them, but they only have 4 rows of values clustered near 1.0/0.0. Block
+        # quantization wrecks them and produces audio noise.
+        low = name.lower()
+        if ".norm.scale.weight" in low or ".norm.shift.weight" in low:
+            return False
+        # Also skip generic norm/ln weights even when 2D (defensive).
+        if any(seg in low for seg in (".norm.weight", ".ln.weight", ".inln.weight", ".paln.weight")):
+            return False
+
         ne0 = int(arr.shape[-1])
         if self.quantization in ("Q4_K_M", "Q5_K_M"):
             return (ne0 % 256) == 0

@@ -38,6 +38,7 @@ add_library(codec STATIC
     src/codec.cpp
     src/runtime/gguf_kv.cpp
     src/runtime/tensor_utils.cpp
+    src/runtime/audio_dsp.cpp
     src/runtime/graph.cpp
     src/runtime/graph_exec.cpp
     src/ops/safe_math.cpp

@@ -24,14 +24,9 @@ struct codec_chatterbox_s3t_build {
     int32_t n_layers = 6;
     int32_t fsmn_kernel = 31;
     float rope_theta = 10000.0f;
+    const codec_model * model = nullptr;
 };
 
-static ggml_tensor * codec_chatterbox_s3t_get_tensor(codec_model * model, const std::string & name) {
-    if (model == nullptr || model->weights == nullptr) {
-        return nullptr;
-    }
-    return ggml_get_tensor(model->weights, name.c_str());
-}
 
 static std::string codec_chatterbox_s3t_block_prefix(int32_t li) {
     return "s3t.enc.blk." + std::to_string(li);
@@ -145,21 +140,24 @@ static bool codec_chatterbox_s3t_build_encode(
 
     const codec_chatterbox_s3t_build * p = static_cast<const codec_chatterbox_s3t_build *>(user_data);
     if (p->t_mel <= 0 || p->t_tok <= 0 || p->n_mels <= 0 || p->hidden <= 0 || p->n_heads <= 0 ||
-        p->n_layers <= 0 || p->hidden % p->n_heads != 0) {
+        p->n_layers <= 0 || p->hidden % p->n_heads != 0 || p->model == nullptr) {
         return false;
     }
+
+    auto W = [&](const std::string & name) -> ggml_tensor * {
+        return codec_graph_weight(ctx_eval, p->model, name);
+    };
 
     ggml_tensor * t_mel = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->t_mel, p->n_mels);
     ggml_set_name(t_mel, "s3t.encode.mel");
 
-    ggml_tensor * t_conv1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->n_mels, p->hidden);
-    ggml_set_name(t_conv1_w, "s3t.enc.conv1.w");
-    ggml_tensor * t_conv1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-    ggml_set_name(t_conv1_b, "s3t.enc.conv1.b");
-    ggml_tensor * t_conv2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hidden, p->hidden);
-    ggml_set_name(t_conv2_w, "s3t.enc.conv2.w");
-    ggml_tensor * t_conv2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-    ggml_set_name(t_conv2_b, "s3t.enc.conv2.b");
+    ggml_tensor * t_conv1_w = W("s3t.enc.conv1.w");
+    ggml_tensor * t_conv1_b = W("s3t.enc.conv1.b");
+    ggml_tensor * t_conv2_w = W("s3t.enc.conv2.w");
+    ggml_tensor * t_conv2_b = W("s3t.enc.conv2.b");
+    if (t_conv1_w == nullptr || t_conv1_b == nullptr || t_conv2_w == nullptr || t_conv2_b == nullptr) {
+        return false;
+    }
 
     ggml_tensor * x_tc = codec_conv1d(ctx_eval, t_mel, t_conv1_w, t_conv1_b, 2, 1, 1);
     if (x_tc == nullptr) {
@@ -176,39 +174,28 @@ static bool codec_chatterbox_s3t_build_encode(
     for (int32_t li = 0; li < p->n_layers; ++li) {
         const std::string base = codec_chatterbox_s3t_block_prefix(li);
 
-        ggml_tensor * t_attn_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_attn_ln_w, (base + ".attn_ln.w").c_str());
-        ggml_tensor * t_attn_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_attn_ln_b, (base + ".attn_ln.b").c_str());
-        ggml_tensor * t_q_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, p->hidden);
-        ggml_set_name(t_q_w, (base + ".attn.q.w").c_str());
-        ggml_tensor * t_q_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_q_b, (base + ".attn.q.b").c_str());
-        ggml_tensor * t_k_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, p->hidden);
-        ggml_set_name(t_k_w, (base + ".attn.k.w").c_str());
-        ggml_tensor * t_v_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, p->hidden);
-        ggml_set_name(t_v_w, (base + ".attn.v.w").c_str());
-        ggml_tensor * t_v_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_v_b, (base + ".attn.v.b").c_str());
-        ggml_tensor * t_o_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, p->hidden);
-        ggml_set_name(t_o_w, (base + ".attn.o.w").c_str());
-        ggml_tensor * t_o_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_o_b, (base + ".attn.o.b").c_str());
-        ggml_tensor * t_fsmn_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->fsmn_kernel, 1, p->hidden);
-        ggml_set_name(t_fsmn_w, (base + ".attn.fsmn.w").c_str());
-
-        ggml_tensor * t_mlp_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_mlp_ln_w, (base + ".mlp_ln.w").c_str());
-        ggml_tensor * t_mlp_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_mlp_ln_b, (base + ".mlp_ln.b").c_str());
-        ggml_tensor * t_fc1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, p->hidden * 4);
-        ggml_set_name(t_fc1_w, (base + ".mlp.fc1.w").c_str());
-        ggml_tensor * t_fc1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden * 4);
-        ggml_set_name(t_fc1_b, (base + ".mlp.fc1.b").c_str());
-        ggml_tensor * t_fc2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden * 4, p->hidden);
-        ggml_set_name(t_fc2_w, (base + ".mlp.fc2.w").c_str());
-        ggml_tensor * t_fc2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden);
-        ggml_set_name(t_fc2_b, (base + ".mlp.fc2.b").c_str());
+        ggml_tensor * t_attn_ln_w = W(base + ".attn_ln.w");
+        ggml_tensor * t_attn_ln_b = W(base + ".attn_ln.b");
+        ggml_tensor * t_q_w = W(base + ".attn.q.w");
+        ggml_tensor * t_q_b = W(base + ".attn.q.b");
+        ggml_tensor * t_k_w = W(base + ".attn.k.w");
+        ggml_tensor * t_v_w = W(base + ".attn.v.w");
+        ggml_tensor * t_v_b = W(base + ".attn.v.b");
+        ggml_tensor * t_o_w = W(base + ".attn.o.w");
+        ggml_tensor * t_o_b = W(base + ".attn.o.b");
+        ggml_tensor * t_fsmn_w = W(base + ".attn.fsmn.w");
+        ggml_tensor * t_mlp_ln_w = W(base + ".mlp_ln.w");
+        ggml_tensor * t_mlp_ln_b = W(base + ".mlp_ln.b");
+        ggml_tensor * t_fc1_w = W(base + ".mlp.fc1.w");
+        ggml_tensor * t_fc1_b = W(base + ".mlp.fc1.b");
+        ggml_tensor * t_fc2_w = W(base + ".mlp.fc2.w");
+        ggml_tensor * t_fc2_b = W(base + ".mlp.fc2.b");
+        if (t_attn_ln_w == nullptr || t_attn_ln_b == nullptr || t_q_w == nullptr || t_q_b == nullptr ||
+            t_k_w == nullptr || t_v_w == nullptr || t_v_b == nullptr || t_o_w == nullptr ||
+            t_o_b == nullptr || t_fsmn_w == nullptr || t_mlp_ln_w == nullptr || t_mlp_ln_b == nullptr ||
+            t_fc1_w == nullptr || t_fc1_b == nullptr || t_fc2_w == nullptr || t_fc2_b == nullptr) {
+            return false;
+        }
 
         x_ct = codec_chatterbox_s3t_block(
             ctx_eval,
@@ -237,10 +224,13 @@ static bool codec_chatterbox_s3t_build_encode(
         }
     }
 
-    ggml_tensor * t_q_proj_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden, 8);
-    ggml_set_name(t_q_proj_w, "s3t.q.proj.w");
-    ggml_tensor * t_q_proj_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 8);
-    ggml_set_name(t_q_proj_b, "s3t.q.proj.b");
+    ggml_tensor * t_q_proj_w = W("s3t.q.proj.w");
+    ggml_tensor * t_q_proj_b = W("s3t.q.proj.b");
+    if (t_q_proj_w == nullptr || t_q_proj_b == nullptr) {
+        return false;
+    }
+    // Token-id powers {1,3,9,...} are baked here as a graph leaf written at
+    // runtime; they're a constant base-3 expansion, not in the GGUF.
     ggml_tensor * t_q_powers = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 8);
     ggml_set_name(t_q_powers, "s3t.encode.q.powers");
 
@@ -263,45 +253,11 @@ static bool codec_chatterbox_s3t_build_encode(
     return true;
 }
 
-static bool codec_chatterbox_s3t_write_encode_weights(
+static bool codec_chatterbox_s3t_write_encode_powers(
     codec_context * ctx,
     codec_graph_cache_entry * entry,
-    const codec_chatterbox_s3t_build & build,
     std::string * err) {
-    auto graph = [&](const std::string & name) { return codec_graph_get_tensor(ctx, entry, name.c_str()); };
-
-    if (!codec_runtime_copy_tensor_f32_exact(ctx, "s3t.enc.conv1.w", graph("s3t.enc.conv1.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "s3t.enc.conv1.b", graph("s3t.enc.conv1.b"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "s3t.enc.conv2.w", graph("s3t.enc.conv2.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "s3t.enc.conv2.b", graph("s3t.enc.conv2.b"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "s3t.q.proj.w", graph("s3t.q.proj.w"), err) ||
-        !codec_runtime_copy_tensor_f32_exact(ctx, "s3t.q.proj.b", graph("s3t.q.proj.b"), err)) {
-        return false;
-    }
-
-    for (int32_t li = 0; li < build.n_layers; ++li) {
-        const std::string base = codec_chatterbox_s3t_block_prefix(li);
-        if (!codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn_ln.w", graph(base + ".attn_ln.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn_ln.b", graph(base + ".attn_ln.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.q.w", graph(base + ".attn.q.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.q.b", graph(base + ".attn.q.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.k.w", graph(base + ".attn.k.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.v.w", graph(base + ".attn.v.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.v.b", graph(base + ".attn.v.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.o.w", graph(base + ".attn.o.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.o.b", graph(base + ".attn.o.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".attn.fsmn.w", graph(base + ".attn.fsmn.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp_ln.w", graph(base + ".mlp_ln.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp_ln.b", graph(base + ".mlp_ln.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp.fc1.w", graph(base + ".mlp.fc1.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp.fc1.b", graph(base + ".mlp.fc1.b"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp.fc2.w", graph(base + ".mlp.fc2.w"), err) ||
-            !codec_runtime_copy_tensor_f32_exact(ctx, base + ".mlp.fc2.b", graph(base + ".mlp.fc2.b"), err)) {
-            return false;
-        }
-    }
-
-    ggml_tensor * t_q_powers = graph("s3t.encode.q.powers");
+    ggml_tensor * t_q_powers = codec_graph_get_tensor(ctx, entry, "s3t.encode.q.powers");
     if (t_q_powers == nullptr) {
         if (err != nullptr) {
             *err = "missing Chatterbox-S3T powers tensor";
@@ -339,7 +295,7 @@ static bool codec_chatterbox_s3t_prepare_log_mel(
         return false;
     }
 
-    ggml_tensor * mel_tensor = codec_chatterbox_s3t_get_tensor(ctx->model, "s3t.mel_filters");
+    ggml_tensor * mel_tensor = codec_model_get_tensor(ctx->model, "s3t.mel_filters");
     if (mel_tensor == nullptr) {
         if (err != nullptr) {
             *err = "missing Chatterbox-S3T mel filter tensor";
@@ -364,7 +320,7 @@ static bool codec_chatterbox_s3t_prepare_log_mel(
         return false;
     }
 
-    ggml_tensor * window_tensor = codec_chatterbox_s3t_get_tensor(ctx->model, "s3t.window");
+    ggml_tensor * window_tensor = codec_model_get_tensor(ctx->model, "s3t.window");
     std::vector<float> window;
     if (window_tensor != nullptr) {
         if (!codec_tensor_as_vec_f32(window_tensor, &window)) {
@@ -561,6 +517,7 @@ enum codec_status codec_chatterbox_s3t_encode(
     build.n_layers = s3t.audio_layer;
     build.fsmn_kernel = s3t.fsmn_kernel_size;
     build.rope_theta = s3t.rope_theta;
+    build.model = ctx->model;
 
     const size_t mem = 512 * 1024 * 1024;
     codec_graph_eval_guard eval_guard(ctx);
@@ -587,7 +544,7 @@ enum codec_status codec_chatterbox_s3t_encode(
 
     if (!codec_graph_prepare_io(ctx, entry, &err) ||
         !codec_runtime_write_tensor(t_mel_tensor, mel_tc.data(), mel_tc.size() * sizeof(float), &err) ||
-        !codec_chatterbox_s3t_write_encode_weights(ctx, entry, build, &err)) {
+        !codec_chatterbox_s3t_write_encode_powers(ctx, entry, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

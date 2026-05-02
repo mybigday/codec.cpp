@@ -6,6 +6,7 @@
 #include "../ops/local_attn.h"
 #include "../ops/rope.h"
 #include "../ops/pool1d.h"
+#include "../runtime/audio_dsp.h"
 #include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
 
@@ -67,12 +68,19 @@ static void codec_neu_set_enc_name(ggml_tensor * tensor, const std::string & nam
     ggml_set_name(tensor, short_name.c_str());
 }
 
+
+// Returns the raw GGUF weight tensor for `name`, applying encoder-name hashing
+// for `neucodec.encode.*` entries (which are stored under short `nce.*` digests).
+// Decode-side names pass through unchanged.
 static ggml_tensor * codec_neu_get_tensor(codec_model * model, const std::string & name) {
-    if (model == nullptr || model->weights == nullptr) {
-        return nullptr;
-    }
-    const std::string short_name = codec_neu_encode_name(name);
-    return ggml_get_tensor(model->weights, short_name.c_str());
+    return codec_model_get_tensor(model, codec_neu_encode_name(name));
+}
+
+// Resolve a logical NeuCodec tensor name to its (possibly hashed) GGUF entry,
+// then return it cast to F32 in the eval graph. Encode-side tensors live under
+// hashed names (codec_neu_encode_name); decode-side names pass through.
+static ggml_tensor * codec_neu_W(ggml_context * ctx_eval, const codec_model * model, const std::string & name) {
+    return codec_graph_weight(ctx_eval, model, codec_neu_encode_name(name));
 }
 
 static float codec_neu_silu(float x) {
@@ -514,90 +522,6 @@ static ggml_tensor * codec_neu_local_mha_tc(
     return out_tc;
 }
 
-static bool codec_neu_istft_from_head(
-    const std::vector<float> & head,
-    int32_t out_dim,
-    int32_t n_frames,
-    int32_t hop,
-    const std::vector<float> * window,
-    std::vector<float> * out_pcm,
-    std::string * err) {
-
-    if (out_pcm == nullptr || out_dim <= 0 || n_frames <= 0 || hop <= 0 || (out_dim % 2) != 0) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec ISTFT arguments";
-        }
-        return false;
-    }
-    const int32_t n_bins = out_dim / 2;
-    const int32_t n_fft = 2 * (n_bins - 1);
-    const float pi = 3.14159265358979323846f;
-    if (n_fft <= 0) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec head output dimension";
-        }
-        return false;
-    }
-    const int32_t pad = (n_fft - hop) / 2;
-    const int32_t out_size = (n_frames - 1) * hop + n_fft;
-
-    std::vector<float> win((size_t) n_fft, 0.0f);
-    if (window != nullptr && (int32_t) window->size() == n_fft) {
-        win = *window;
-    } else {
-        for (int32_t n = 0; n < n_fft; ++n) {
-            win[(size_t) n] = 0.5f - 0.5f * std::cos(2.0f * pi * (float) n / (float) (n_fft - 1));
-        }
-    }
-
-    std::vector<float> y((size_t) out_size, 0.0f);
-    std::vector<float> env((size_t) out_size, 0.0f);
-    std::vector<float> frame((size_t) n_fft, 0.0f);
-
-    for (int32_t ti = 0; ti < n_frames; ++ti) {
-        for (int32_t n = 0; n < n_fft; ++n) {
-            float sum = 0.0f;
-            float mag0 = std::exp(head[(size_t) 0 + (size_t) out_dim * (size_t) ti]);
-            if (mag0 > 1e2f) {
-                mag0 = 1e2f;
-            }
-            const float re0 = mag0 * std::cos(head[(size_t) n_bins + (size_t) out_dim * (size_t) ti]);
-            sum += re0;
-            float magn = std::exp(head[(size_t) (n_bins - 1) + (size_t) out_dim * (size_t) ti]);
-            if (magn > 1e2f) {
-                magn = 1e2f;
-            }
-            const float ren = magn * std::cos(head[(size_t) (2 * n_bins - 1) + (size_t) out_dim * (size_t) ti]);
-            sum += ren * ((n & 1) ? -1.0f : 1.0f);
-            for (int32_t k = 1; k < n_bins - 1; ++k) {
-                float mag = std::exp(head[(size_t) k + (size_t) out_dim * (size_t) ti]);
-                if (mag > 1e2f) {
-                    mag = 1e2f;
-                }
-                const float ph = head[(size_t) (n_bins + k) + (size_t) out_dim * (size_t) ti];
-                const float re = mag * std::cos(ph);
-                const float im = mag * std::sin(ph);
-                const float ang = 2.0f * pi * (float) k * (float) n / (float) n_fft;
-                sum += 2.0f * (re * std::cos(ang) - im * std::sin(ang));
-            }
-            frame[(size_t) n] = (sum / (float) n_fft) * win[(size_t) n];
-        }
-        const int32_t off = ti * hop;
-        for (int32_t n = 0; n < n_fft; ++n) {
-            y[(size_t) (off + n)] += frame[(size_t) n];
-            env[(size_t) (off + n)] += win[(size_t) n] * win[(size_t) n];
-        }
-    }
-
-    const int32_t out_begin = std::max(0, pad);
-    const int32_t out_end = std::max(out_begin, out_size - pad);
-    out_pcm->assign((size_t) (out_end - out_begin), 0.0f);
-    for (int32_t i = out_begin; i < out_end; ++i) {
-        const float den = env[(size_t) i] > 1e-11f ? env[(size_t) i] : 1.0f;
-        (*out_pcm)[(size_t) (i - out_begin)] = y[(size_t) i] / den;
-    }
-    return true;
-}
 
 struct neucodec_decode_build {
     int32_t t = 0;
@@ -611,11 +535,12 @@ struct neucodec_decode_build {
     int32_t head_dim = 0;
     int32_t head_out_dim = 0;
     float rope_theta = 10000.0f;
+    const codec_model * model = nullptr;
 };
 
 static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     neucodec_decode_build * p = static_cast<neucodec_decode_build *>(user_data);
-    if (ctx_eval == nullptr || p == nullptr || out == nullptr) {
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->model == nullptr) {
         return false;
     }
     if (p->t <= 0 || p->q <= 0 || p->codebook_dim <= 0 || p->codebook_size <= 0 ||
@@ -624,29 +549,37 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
         return false;
     }
 
+    auto W = [&](const std::string & name) -> ggml_tensor * {
+        return codec_neu_W(ctx_eval, p->model, name);
+    };
+
     ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_I32, p->t, p->q);
     ggml_set_name(t_tok, codec_neu_name_tok().c_str());
 
-    ggml_tensor * t_codebook = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->codebook_size);
-    ggml_set_name(t_codebook, codec_neu_name_codebook().c_str());
+    ggml_tensor * t_codebook = W(codec_neu_name_codebook());
+    if (t_codebook == nullptr) {
+        return false;
+    }
 
     ggml_tensor * t_idx = ggml_view_1d(ctx_eval, t_tok, p->t, 0);
     ggml_tensor * t_q = ggml_get_rows(ctx_eval, t_codebook, t_idx); // [codebook_dim, t]
 
-    ggml_tensor * t_qp_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->codebook_dim, p->vq_dim);
-    ggml_set_name(t_qp_w, codec_neu_name_quant_w().c_str());
-    ggml_tensor * t_qp_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->vq_dim);
-    ggml_set_name(t_qp_b, codec_neu_name_quant_b().c_str());
+    ggml_tensor * t_qp_w = W(codec_neu_name_quant_w());
+    ggml_tensor * t_qp_b = W(codec_neu_name_quant_b());
+    if (t_qp_w == nullptr || t_qp_b == nullptr) {
+        return false;
+    }
 
     ggml_tensor * x_ct = codec_op_linear(ctx_eval, t_q, t_qp_w, t_qp_b); // [vq_dim, t]
     if (x_ct == nullptr) {
         return false;
     }
 
-    ggml_tensor * t_fc_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->vq_dim, p->hidden_dim);
-    ggml_set_name(t_fc_w, codec_neu_name_fc_post_w().c_str());
-    ggml_tensor * t_fc_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-    ggml_set_name(t_fc_b, codec_neu_name_fc_post_b().c_str());
+    ggml_tensor * t_fc_w = W(codec_neu_name_fc_post_w());
+    ggml_tensor * t_fc_b = W(codec_neu_name_fc_post_b());
+    if (t_fc_w == nullptr || t_fc_b == nullptr) {
+        return false;
+    }
     x_ct = codec_op_linear(ctx_eval, x_ct, t_fc_w, t_fc_b); // [hidden_dim, t]
     if (x_ct == nullptr) {
         return false;
@@ -654,32 +587,29 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     ggml_tensor * x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct)); // [t, hidden]
 
-    ggml_tensor * t_embed_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, p->hidden_dim, p->hidden_dim);
-    ggml_set_name(t_embed_w, codec_neu_name_embed_w().c_str());
-    ggml_tensor * t_embed_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-    ggml_set_name(t_embed_b, codec_neu_name_embed_b().c_str());
+    ggml_tensor * t_embed_w = W(codec_neu_name_embed_w());
+    ggml_tensor * t_embed_b = W(codec_neu_name_embed_b());
+    if (t_embed_w == nullptr || t_embed_b == nullptr) {
+        return false;
+    }
     x_tc = codec_conv1d(ctx_eval, x_tc, t_embed_w, t_embed_b, 1, 1, 3);
     if (x_tc == nullptr) {
         return false;
     }
 
     for (int32_t li = 0; li < 2; ++li) {
-        ggml_tensor * n1_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n1_w, codec_neu_name_prior(li, "norm1.w").c_str());
-        ggml_tensor * n1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n1_b, codec_neu_name_prior(li, "norm1.b").c_str());
-        ggml_tensor * c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hidden_dim, p->hidden_dim);
-        ggml_set_name(c1_w, codec_neu_name_prior(li, "conv1.w").c_str());
-        ggml_tensor * c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(c1_b, codec_neu_name_prior(li, "conv1.b").c_str());
-        ggml_tensor * n2_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n2_w, codec_neu_name_prior(li, "norm2.w").c_str());
-        ggml_tensor * n2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n2_b, codec_neu_name_prior(li, "norm2.b").c_str());
-        ggml_tensor * c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hidden_dim, p->hidden_dim);
-        ggml_set_name(c2_w, codec_neu_name_prior(li, "conv2.w").c_str());
-        ggml_tensor * c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(c2_b, codec_neu_name_prior(li, "conv2.b").c_str());
+        ggml_tensor * n1_w = W(codec_neu_name_prior(li, "norm1.w"));
+        ggml_tensor * n1_b = W(codec_neu_name_prior(li, "norm1.b"));
+        ggml_tensor * c1_w = W(codec_neu_name_prior(li, "conv1.w"));
+        ggml_tensor * c1_b = W(codec_neu_name_prior(li, "conv1.b"));
+        ggml_tensor * n2_w = W(codec_neu_name_prior(li, "norm2.w"));
+        ggml_tensor * n2_b = W(codec_neu_name_prior(li, "norm2.b"));
+        ggml_tensor * c2_w = W(codec_neu_name_prior(li, "conv2.w"));
+        ggml_tensor * c2_b = W(codec_neu_name_prior(li, "conv2.b"));
+        if (n1_w == nullptr || n1_b == nullptr || c1_w == nullptr || c1_b == nullptr ||
+            n2_w == nullptr || n2_b == nullptr || c2_w == nullptr || c2_b == nullptr) {
+            return false;
+        }
 
         x_tc = codec_neu_resnet_block(ctx_eval, x_tc, n1_w, n1_b, c1_w, c1_b, n2_w, n2_b, c2_w, c2_b);
         if (x_tc == nullptr) {
@@ -690,18 +620,16 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
     x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc)); // [hidden, t]
 
     for (int32_t li = 0; li < p->num_layers; ++li) {
-        ggml_tensor * attn_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(attn_w, codec_neu_name_transformer(li, "att_norm.w").c_str());
-        ggml_tensor * ffn_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(ffn_w, codec_neu_name_transformer(li, "ffn_norm.w").c_str());
-        ggml_tensor * c_attn_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_dim, 3 * p->hidden_dim);
-        ggml_set_name(c_attn_w, codec_neu_name_transformer(li, "att.c_attn.w").c_str());
-        ggml_tensor * c_proj_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_dim, p->hidden_dim);
-        ggml_set_name(c_proj_w, codec_neu_name_transformer(li, "att.c_proj.w").c_str());
-        ggml_tensor * fc1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_dim, 4 * p->hidden_dim);
-        ggml_set_name(fc1_w, codec_neu_name_transformer(li, "mlp.fc1.w").c_str());
-        ggml_tensor * fc2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 4 * p->hidden_dim, p->hidden_dim);
-        ggml_set_name(fc2_w, codec_neu_name_transformer(li, "mlp.fc2.w").c_str());
+        ggml_tensor * attn_w = W(codec_neu_name_transformer(li, "att_norm.w"));
+        ggml_tensor * ffn_w = W(codec_neu_name_transformer(li, "ffn_norm.w"));
+        ggml_tensor * c_attn_w = W(codec_neu_name_transformer(li, "att.c_attn.w"));
+        ggml_tensor * c_proj_w = W(codec_neu_name_transformer(li, "att.c_proj.w"));
+        ggml_tensor * fc1_w = W(codec_neu_name_transformer(li, "mlp.fc1.w"));
+        ggml_tensor * fc2_w = W(codec_neu_name_transformer(li, "mlp.fc2.w"));
+        if (attn_w == nullptr || ffn_w == nullptr || c_attn_w == nullptr || c_proj_w == nullptr ||
+            fc1_w == nullptr || fc2_w == nullptr) {
+            return false;
+        }
 
         x_ct = codec_neu_transformer_block(
             ctx_eval,
@@ -723,22 +651,18 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
     x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct)); // [t, hidden]
 
     for (int32_t li = 0; li < 2; ++li) {
-        ggml_tensor * n1_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n1_w, codec_neu_name_post(li, "norm1.w").c_str());
-        ggml_tensor * n1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n1_b, codec_neu_name_post(li, "norm1.b").c_str());
-        ggml_tensor * c1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hidden_dim, p->hidden_dim);
-        ggml_set_name(c1_w, codec_neu_name_post(li, "conv1.w").c_str());
-        ggml_tensor * c1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(c1_b, codec_neu_name_post(li, "conv1.b").c_str());
-        ggml_tensor * n2_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n2_w, codec_neu_name_post(li, "norm2.w").c_str());
-        ggml_tensor * n2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(n2_b, codec_neu_name_post(li, "norm2.b").c_str());
-        ggml_tensor * c2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hidden_dim, p->hidden_dim);
-        ggml_set_name(c2_w, codec_neu_name_post(li, "conv2.w").c_str());
-        ggml_tensor * c2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-        ggml_set_name(c2_b, codec_neu_name_post(li, "conv2.b").c_str());
+        ggml_tensor * n1_w = W(codec_neu_name_post(li, "norm1.w"));
+        ggml_tensor * n1_b = W(codec_neu_name_post(li, "norm1.b"));
+        ggml_tensor * c1_w = W(codec_neu_name_post(li, "conv1.w"));
+        ggml_tensor * c1_b = W(codec_neu_name_post(li, "conv1.b"));
+        ggml_tensor * n2_w = W(codec_neu_name_post(li, "norm2.w"));
+        ggml_tensor * n2_b = W(codec_neu_name_post(li, "norm2.b"));
+        ggml_tensor * c2_w = W(codec_neu_name_post(li, "conv2.w"));
+        ggml_tensor * c2_b = W(codec_neu_name_post(li, "conv2.b"));
+        if (n1_w == nullptr || n1_b == nullptr || c1_w == nullptr || c1_b == nullptr ||
+            n2_w == nullptr || n2_b == nullptr || c2_w == nullptr || c2_b == nullptr) {
+            return false;
+        }
 
         x_tc = codec_neu_resnet_block(ctx_eval, x_tc, n1_w, n1_b, c1_w, c1_b, n2_w, n2_b, c2_w, c2_b);
         if (x_tc == nullptr) {
@@ -748,19 +672,21 @@ static bool codec_neu_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc)); // [hidden, t]
 
-    ggml_tensor * t_fln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-    ggml_set_name(t_fln_w, codec_neu_name_final_ln_w().c_str());
-    ggml_tensor * t_fln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hidden_dim);
-    ggml_set_name(t_fln_b, codec_neu_name_final_ln_b().c_str());
+    ggml_tensor * t_fln_w = W(codec_neu_name_final_ln_w());
+    ggml_tensor * t_fln_b = W(codec_neu_name_final_ln_b());
+    if (t_fln_w == nullptr || t_fln_b == nullptr) {
+        return false;
+    }
     x_ct = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-6f, t_fln_w, t_fln_b);
     if (x_ct == nullptr) {
         return false;
     }
 
-    ggml_tensor * t_head_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hidden_dim, p->head_out_dim);
-    ggml_set_name(t_head_w, codec_neu_name_head_w().c_str());
-    ggml_tensor * t_head_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->head_out_dim);
-    ggml_set_name(t_head_b, codec_neu_name_head_b().c_str());
+    ggml_tensor * t_head_w = W(codec_neu_name_head_w());
+    ggml_tensor * t_head_b = W(codec_neu_name_head_b());
+    if (t_head_w == nullptr || t_head_b == nullptr) {
+        return false;
+    }
     ggml_tensor * t_out = codec_op_linear(ctx_eval, x_ct, t_head_w, t_head_b); // [out_dim, t]
     if (t_out == nullptr) {
         return false;
@@ -794,6 +720,7 @@ static bool codec_neu_init_decode_build(
 
     build->t = t;
     build->q = q;
+    build->model = ctx->model;
     build->codebook_dim = neu->codebook_dim;
     build->codebook_size = neu->codebook_size;
     build->vq_dim = neu->vq_dim;
@@ -835,13 +762,15 @@ struct neucodec_encode_build {
     int32_t local_down_window = 1500;
     const codec_local_attn_params * down_attn = nullptr;
     const codec_local_attn_params * local_attn = nullptr;
+    const codec_model * model = nullptr;
 };
 
 static ggml_tensor * codec_neu_build_distill_first_block(
     ggml_context * ctx_eval,
+    const codec_model * model,
     ggml_tensor * x_tc) {
 
-    if (ctx_eval == nullptr || x_tc == nullptr) {
+    if (ctx_eval == nullptr || model == nullptr || x_tc == nullptr) {
         return nullptr;
     }
 
@@ -853,10 +782,12 @@ static ggml_tensor * codec_neu_build_distill_first_block(
         ggml_tensor * x_max = codec_op_max_pool1d(ctx_eval, x_abs, k, k / 2);
         ggml_tensor * x_avg = codec_op_avg_pool1d(ctx_eval, x_max, k, k / 2);
 
-        ggml_tensor * w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 1, 4);
-        codec_neu_set_enc_name(w, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.blocks." + std::to_string(i) + ".1.weight");
-        ggml_tensor * b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4);
-        codec_neu_set_enc_name(b, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.blocks." + std::to_string(i) + ".1.bias");
+        const std::string prefix = "neucodec.encode.distill.codec_encoder.encoder.blocks.0.blocks." + std::to_string(i) + ".1.";
+        ggml_tensor * w = codec_neu_W(ctx_eval, model, prefix + "weight");
+        ggml_tensor * b = codec_neu_W(ctx_eval, model, prefix + "bias");
+        if (w == nullptr || b == nullptr) {
+            return nullptr;
+        }
         ggml_tensor * y = codec_conv1d(ctx_eval, x_avg, w, b, 1, 1, 3);
         if (y == nullptr) {
             return nullptr;
@@ -864,10 +795,11 @@ static ggml_tensor * codec_neu_build_distill_first_block(
         concat = concat == nullptr ? y : ggml_concat(ctx_eval, concat, y, 1);
     }
 
-    ggml_tensor * w1 = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, 20, 80);
-    codec_neu_set_enc_name(w1, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight");
-    ggml_tensor * b1 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 80);
-    codec_neu_set_enc_name(b1, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias");
+    ggml_tensor * w1 = codec_neu_W(ctx_eval, model, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight");
+    ggml_tensor * b1 = codec_neu_W(ctx_eval, model, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias");
+    if (w1 == nullptr || b1 == nullptr) {
+        return nullptr;
+    }
     ggml_tensor * h = codec_conv1d(ctx_eval, concat, w1, b1, 1, 1, 0);
     if (h == nullptr) {
         return nullptr;
@@ -875,61 +807,68 @@ static ggml_tensor * codec_neu_build_distill_first_block(
     h = ggml_gelu_erf(ctx_eval, h);
 
     ggml_tensor * x_cat = ggml_concat(ctx_eval, h, x_tc, 1);
-    ggml_tensor * w2 = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 1, 81, 32);
-    codec_neu_set_enc_name(w2, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight");
-    ggml_tensor * b2 = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 32);
-    codec_neu_set_enc_name(b2, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias");
+    ggml_tensor * w2 = codec_neu_W(ctx_eval, model, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight");
+    ggml_tensor * b2 = codec_neu_W(ctx_eval, model, "neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias");
+    if (w2 == nullptr || b2 == nullptr) {
+        return nullptr;
+    }
     ggml_tensor * y = codec_conv1d(ctx_eval, x_cat, w2, b2, 1, 1, 0);
     return y;
 }
 
 static ggml_tensor * codec_neu_build_distill_base_unit(
     ggml_context * ctx_eval,
+    const codec_model * model,
     ggml_tensor * x_tc,
     const std::string & prefix) {
 
-    if (ctx_eval == nullptr || x_tc == nullptr) {
+    if (ctx_eval == nullptr || model == nullptr || x_tc == nullptr) {
         return nullptr;
     }
-    const int32_t dim = (int32_t) x_tc->ne[1];
-    ggml_tensor * dw_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 7, 1, dim);
-    codec_neu_set_enc_name(dw_w, prefix + ".dw_conv.weight");
-    ggml_tensor * dw_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-    codec_neu_set_enc_name(dw_b, prefix + ".dw_conv.bias");
+    ggml_tensor * dw_w = codec_neu_W(ctx_eval, model, prefix + ".dw_conv.weight");
+    ggml_tensor * dw_b = codec_neu_W(ctx_eval, model, prefix + ".dw_conv.bias");
+    if (dw_w == nullptr || dw_b == nullptr) {
+        return nullptr;
+    }
     ggml_tensor * h = codec_conv1d_depthwise(ctx_eval, x_tc, dw_w, dw_b, 1, 1, 3);
     if (h == nullptr) {
         return nullptr;
     }
 
-    ggml_tensor * pw1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 4 * dim);
-    codec_neu_set_enc_name(pw1_w, prefix + ".pw_conv1.weight");
-    ggml_tensor * pw1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    codec_neu_set_enc_name(pw1_b, prefix + ".pw_conv1.bias");
+    ggml_tensor * pw1_w = codec_neu_W(ctx_eval, model, prefix + ".pw_conv1.weight");
+    ggml_tensor * pw1_b = codec_neu_W(ctx_eval, model, prefix + ".pw_conv1.bias");
+    if (pw1_w == nullptr || pw1_b == nullptr) {
+        return nullptr;
+    }
     h = codec_op_linear_tc(ctx_eval, h, pw1_w, pw1_b);
     if (h == nullptr) {
         return nullptr;
     }
 
-    ggml_tensor * act_a = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    codec_neu_set_enc_name(act_a, prefix + ".act.alpha");
+    ggml_tensor * act_a = codec_neu_W(ctx_eval, model, prefix + ".act.alpha");
+    if (act_a == nullptr) {
+        return nullptr;
+    }
     h = codec_neu_snake_tc(ctx_eval, h, act_a, 1.1920929e-7f);
     if (h == nullptr) {
         return nullptr;
     }
 
-    ggml_tensor * grn_g = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    codec_neu_set_enc_name(grn_g, prefix + ".grn.gamma");
-    ggml_tensor * grn_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 4 * dim);
-    codec_neu_set_enc_name(grn_b, prefix + ".grn.beta");
+    ggml_tensor * grn_g = codec_neu_W(ctx_eval, model, prefix + ".grn.gamma");
+    ggml_tensor * grn_b = codec_neu_W(ctx_eval, model, prefix + ".grn.beta");
+    if (grn_g == nullptr || grn_b == nullptr) {
+        return nullptr;
+    }
     h = codec_neu_grn_tc(ctx_eval, h, grn_g, grn_b, 1.1920929e-7f);
     if (h == nullptr) {
         return nullptr;
     }
 
-    ggml_tensor * pw2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 4 * dim, dim);
-    codec_neu_set_enc_name(pw2_w, prefix + ".pw_conv2.weight");
-    ggml_tensor * pw2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-    codec_neu_set_enc_name(pw2_b, prefix + ".pw_conv2.bias");
+    ggml_tensor * pw2_w = codec_neu_W(ctx_eval, model, prefix + ".pw_conv2.weight");
+    ggml_tensor * pw2_b = codec_neu_W(ctx_eval, model, prefix + ".pw_conv2.bias");
+    if (pw2_w == nullptr || pw2_b == nullptr) {
+        return nullptr;
+    }
     h = codec_op_linear_tc(ctx_eval, h, pw2_w, pw2_b);
     if (h == nullptr) {
         return nullptr;
@@ -940,6 +879,7 @@ static ggml_tensor * codec_neu_build_distill_base_unit(
 
 static ggml_tensor * codec_neu_build_distill_local_trans(
     ggml_context * ctx_eval,
+    const codec_model * model,
     ggml_tensor * x_tc,
     const std::string & prefix,
     int32_t depth,
@@ -947,24 +887,24 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
     int32_t head_dim,
     const codec_local_attn_params * attn_params) {
 
-    if (ctx_eval == nullptr || x_tc == nullptr || depth <= 0 || attn_params == nullptr) {
+    if (ctx_eval == nullptr || model == nullptr || x_tc == nullptr || depth <= 0 || attn_params == nullptr) {
         return nullptr;
     }
 
     const int32_t dim = (int32_t) x_tc->ne[1];
-    const int32_t attn_inner = heads * head_dim;
-    const int32_t inner_dim = (int32_t) (dim * 4 * 2 / 3);
+    (void) dim;
+    const int32_t inner_dim = (int32_t) ((int32_t) x_tc->ne[1] * 4 * 2 / 3);
 
     for (int32_t li = 0; li < depth; ++li) {
+        const std::string lp = prefix + ".layers." + std::to_string(li);
         // LocalMHA
-        ggml_tensor * ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-        codec_neu_set_enc_name(ln_w, prefix + ".layers." + std::to_string(li) + ".0.norm.weight");
-        ggml_tensor * ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-        codec_neu_set_enc_name(ln_b, prefix + ".layers." + std::to_string(li) + ".0.norm.bias");
-        ggml_tensor * w_qkv = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, 3 * attn_inner);
-        codec_neu_set_enc_name(w_qkv, prefix + ".layers." + std::to_string(li) + ".0.to_qkv.weight");
-        ggml_tensor * w_out = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, attn_inner, dim);
-        codec_neu_set_enc_name(w_out, prefix + ".layers." + std::to_string(li) + ".0.to_out.weight");
+        ggml_tensor * ln_w = codec_neu_W(ctx_eval, model, lp + ".0.norm.weight");
+        ggml_tensor * ln_b = codec_neu_W(ctx_eval, model, lp + ".0.norm.bias");
+        ggml_tensor * w_qkv = codec_neu_W(ctx_eval, model, lp + ".0.to_qkv.weight");
+        ggml_tensor * w_out = codec_neu_W(ctx_eval, model, lp + ".0.to_out.weight");
+        if (ln_w == nullptr || ln_b == nullptr || w_qkv == nullptr || w_out == nullptr) {
+            return nullptr;
+        }
 
         ggml_tensor * attn = codec_neu_local_mha_tc(ctx_eval, x_tc, ln_w, ln_b, w_qkv, w_out, heads, head_dim, attn_params, 1e-5f);
         if (attn == nullptr) {
@@ -973,14 +913,13 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
         x_tc = ggml_add(ctx_eval, x_tc, attn);
 
         // FeedForward
-        ggml_tensor * ff_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-        codec_neu_set_enc_name(ff_ln_w, prefix + ".layers." + std::to_string(li) + ".1.0.weight");
-        ggml_tensor * ff_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, dim);
-        codec_neu_set_enc_name(ff_ln_b, prefix + ".layers." + std::to_string(li) + ".1.0.bias");
-        ggml_tensor * ff_w1 = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, dim, inner_dim * 2);
-        codec_neu_set_enc_name(ff_w1, prefix + ".layers." + std::to_string(li) + ".1.1.weight");
-        ggml_tensor * ff_w2 = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, inner_dim, dim);
-        codec_neu_set_enc_name(ff_w2, prefix + ".layers." + std::to_string(li) + ".1.4.weight");
+        ggml_tensor * ff_ln_w = codec_neu_W(ctx_eval, model, lp + ".1.0.weight");
+        ggml_tensor * ff_ln_b = codec_neu_W(ctx_eval, model, lp + ".1.0.bias");
+        ggml_tensor * ff_w1 = codec_neu_W(ctx_eval, model, lp + ".1.1.weight");
+        ggml_tensor * ff_w2 = codec_neu_W(ctx_eval, model, lp + ".1.4.weight");
+        if (ff_ln_w == nullptr || ff_ln_b == nullptr || ff_w1 == nullptr || ff_w2 == nullptr) {
+            return nullptr;
+        }
 
         ggml_tensor * ff = codec_op_layer_norm_tc(ctx_eval, x_tc, 1e-5f, ff_ln_w, ff_ln_b);
         if (ff == nullptr) {
@@ -1006,7 +945,7 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
 
 static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
     neucodec_encode_build * p = static_cast<neucodec_encode_build *>(user_data);
-    if (ctx_eval == nullptr || p == nullptr || out == nullptr) {
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->model == nullptr) {
         return false;
     }
     if (p->n_in <= 0 || p->n_in_sem <= 0) {
@@ -1016,61 +955,60 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         return false;
     }
 
+    auto W = [&](const std::string & name) { return codec_neu_W(ctx_eval, p->model, name); };
+
     ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->n_in, 1);
     codec_neu_set_enc_name(t_pcm, "neucodec.encode.pcm");
     ggml_tensor * t_sem = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->n_in_sem, 1);
     codec_neu_set_enc_name(t_sem, "neucodec.encode.sem");
 
     // Distill acoustic encoder
-    ggml_tensor * x = codec_neu_build_distill_first_block(ctx_eval, t_pcm);
+    ggml_tensor * x = codec_neu_build_distill_first_block(ctx_eval, p->model, t_pcm);
     if (x == nullptr) {
         return false;
     }
 
     // stage 0
-    x = codec_neu_build_distill_base_unit(ctx_eval, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.1.0.module");
+    x = codec_neu_build_distill_base_unit(ctx_eval, p->model, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.1.0.module");
     if (x == nullptr) return false;
-    ggml_tensor * d0_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 4, 32, 64);
-    codec_neu_set_enc_name(d0_w, "neucodec.encode.distill.codec_encoder.encoder.blocks.2.0.weight");
-    ggml_tensor * d0_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 64);
-    codec_neu_set_enc_name(d0_b, "neucodec.encode.distill.codec_encoder.encoder.blocks.2.0.bias");
+    ggml_tensor * d0_w = W("neucodec.encode.distill.codec_encoder.encoder.blocks.2.0.weight");
+    ggml_tensor * d0_b = W("neucodec.encode.distill.codec_encoder.encoder.blocks.2.0.bias");
+    if (d0_w == nullptr || d0_b == nullptr) return false;
     x = codec_conv1d(ctx_eval, x, d0_w, d0_b, 4, 1, 0);
     if (x == nullptr) return false;
 
     // stage 1
-    x = codec_neu_build_distill_base_unit(ctx_eval, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.3.0.module");
+    x = codec_neu_build_distill_base_unit(ctx_eval, p->model, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.3.0.module");
     if (x == nullptr) return false;
-    ggml_tensor * d1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 4, 64, 128);
-    codec_neu_set_enc_name(d1_w, "neucodec.encode.distill.codec_encoder.encoder.blocks.4.0.weight");
-    ggml_tensor * d1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 128);
-    codec_neu_set_enc_name(d1_b, "neucodec.encode.distill.codec_encoder.encoder.blocks.4.0.bias");
+    ggml_tensor * d1_w = W("neucodec.encode.distill.codec_encoder.encoder.blocks.4.0.weight");
+    ggml_tensor * d1_b = W("neucodec.encode.distill.codec_encoder.encoder.blocks.4.0.bias");
+    if (d1_w == nullptr || d1_b == nullptr) return false;
     x = codec_conv1d(ctx_eval, x, d1_w, d1_b, 4, 1, 0);
     if (x == nullptr) return false;
 
     // stage 2
-    x = codec_neu_build_distill_base_unit(ctx_eval, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.5.0.module");
+    x = codec_neu_build_distill_base_unit(ctx_eval, p->model, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.5.0.module");
     if (x == nullptr) return false;
-    ggml_tensor * d2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 4, 128, 256);
-    codec_neu_set_enc_name(d2_w, "neucodec.encode.distill.codec_encoder.encoder.blocks.6.0.weight");
-    ggml_tensor * d2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 256);
-    codec_neu_set_enc_name(d2_b, "neucodec.encode.distill.codec_encoder.encoder.blocks.6.0.bias");
+    ggml_tensor * d2_w = W("neucodec.encode.distill.codec_encoder.encoder.blocks.6.0.weight");
+    ggml_tensor * d2_b = W("neucodec.encode.distill.codec_encoder.encoder.blocks.6.0.bias");
+    if (d2_w == nullptr || d2_b == nullptr) return false;
     x = codec_conv1d(ctx_eval, x, d2_w, d2_b, 4, 1, 0);
     if (x == nullptr) return false;
 
     // final stage (2 blocks)
-    x = codec_neu_build_distill_base_unit(ctx_eval, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.7.0.module");
+    x = codec_neu_build_distill_base_unit(ctx_eval, p->model, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.7.0.module");
     if (x == nullptr) return false;
-    x = codec_neu_build_distill_base_unit(ctx_eval, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.7.1.module");
+    x = codec_neu_build_distill_base_unit(ctx_eval, p->model, x, "neucodec.encode.distill.codec_encoder.encoder.blocks.7.1.module");
     if (x == nullptr) return false;
-    ggml_tensor * d3_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, 256, 512);
-    codec_neu_set_enc_name(d3_w, "neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight");
-    ggml_tensor * d3_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 512);
-    codec_neu_set_enc_name(d3_b, "neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias");
+    ggml_tensor * d3_w = W("neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight");
+    ggml_tensor * d3_b = W("neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias");
+    if (d3_w == nullptr || d3_b == nullptr) return false;
     x = codec_conv1d(ctx_eval, x, d3_w, d3_b, 1, 1, 1);
     if (x == nullptr) return false;
     // en_encoder down_trans
     x = codec_neu_build_distill_local_trans(
         ctx_eval,
+        p->model,
         x,
         "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.trans",
         2,
@@ -1080,15 +1018,15 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     if (x == nullptr) {
         return false;
     }
-    ggml_tensor * down_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 5, 512, 512);
-    codec_neu_set_enc_name(down_w, "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight");
-    ggml_tensor * down_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 512);
-    codec_neu_set_enc_name(down_b, "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias");
+    ggml_tensor * down_w = W("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight");
+    ggml_tensor * down_b = W("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias");
+    if (down_w == nullptr || down_b == nullptr) return false;
     x = codec_conv1d(ctx_eval, x, down_w, down_b, 5, 1, 0);
     if (x == nullptr) return false;
     // en_encoder local_trans
     x = codec_neu_build_distill_local_trans(
         ctx_eval,
+        p->model,
         x,
         "neucodec.encode.distill.codec_encoder.en_encoder.local_trans",
         3,
@@ -1099,41 +1037,37 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         return false;
     }
     // fc_sq_prior (512->768)
-    ggml_tensor * t_fc_sq_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 512, 768);
-    codec_neu_set_enc_name(t_fc_sq_w, "neucodec.encode.fc_sq_prior.w");
-    ggml_tensor * t_fc_sq_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 768);
-    codec_neu_set_enc_name(t_fc_sq_b, "neucodec.encode.fc_sq_prior.b");
+    ggml_tensor * t_fc_sq_w = W("neucodec.encode.fc_sq_prior.w");
+    ggml_tensor * t_fc_sq_b = W("neucodec.encode.fc_sq_prior.b");
+    if (t_fc_sq_w == nullptr || t_fc_sq_b == nullptr) return false;
     ggml_tensor * fsq_tc = codec_op_linear_tc(ctx_eval, x, t_fc_sq_w, t_fc_sq_b);
     if (fsq_tc == nullptr) return false;
     // HuBERT semantic model
     ggml_tensor * sem = t_sem;
     for (int32_t li = 0; li < p->hubert_feat_layers; ++li) {
-        ggml_tensor * w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->hubert_conv_kernel[li], li == 0 ? 1 : p->hubert_conv_dim[li - 1], p->hubert_conv_dim[li]);
-        codec_neu_set_enc_name(w, "neucodec.encode.hubert.feat.conv." + std::to_string(li) + ".w");
+        ggml_tensor * w = W("neucodec.encode.hubert.feat.conv." + std::to_string(li) + ".w");
+        if (w == nullptr) return false;
         sem = codec_conv1d(ctx_eval, sem, w, nullptr, p->hubert_conv_stride[li], 1, 0);
         if (sem == nullptr) return false;
         if (li == 0) {
-            ggml_tensor * gn_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_conv_dim[li]);
-            codec_neu_set_enc_name(gn_w, "neucodec.encode.hubert.feat.conv.0.gn.w");
-            ggml_tensor * gn_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_conv_dim[li]);
-            codec_neu_set_enc_name(gn_b, "neucodec.encode.hubert.feat.conv.0.gn.b");
+            ggml_tensor * gn_w = W("neucodec.encode.hubert.feat.conv.0.gn.w");
+            ggml_tensor * gn_b = W("neucodec.encode.hubert.feat.conv.0.gn.b");
+            if (gn_w == nullptr || gn_b == nullptr) return false;
             sem = codec_op_group_norm(ctx_eval, sem, p->hubert_conv_dim[li], p->hubert_ln_eps, gn_w, gn_b);
         }
         sem = ggml_gelu_erf(ctx_eval, sem);
     }
 
-    ggml_tensor * feat_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_conv_dim[p->hubert_feat_layers - 1], p->hubert_hidden);
-    codec_neu_set_enc_name(feat_w, "neucodec.encode.hubert.feature_projection.w");
-    ggml_tensor * feat_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-    codec_neu_set_enc_name(feat_b, "neucodec.encode.hubert.feature_projection.b");
+    ggml_tensor * feat_w = W("neucodec.encode.hubert.feature_projection.w");
+    ggml_tensor * feat_b = W("neucodec.encode.hubert.feature_projection.b");
+    if (feat_w == nullptr || feat_b == nullptr) return false;
     ggml_tensor * hs = codec_op_linear_tc(ctx_eval, sem, feat_w, feat_b);
     if (hs == nullptr) return false;
 
     // positional conv
-    ggml_tensor * pos_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, p->hubert_pos_k, p->hubert_hidden / p->hubert_pos_groups, p->hubert_hidden);
-    codec_neu_set_enc_name(pos_w, "neucodec.encode.hubert.encoder.pos_conv.w");
-    ggml_tensor * pos_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-    codec_neu_set_enc_name(pos_b, "neucodec.encode.hubert.encoder.pos_conv.b");
+    ggml_tensor * pos_w = W("neucodec.encode.hubert.encoder.pos_conv.w");
+    ggml_tensor * pos_b = W("neucodec.encode.hubert.encoder.pos_conv.b");
+    if (pos_w == nullptr || pos_b == nullptr) return false;
     ggml_tensor * pos = codec_neu_conv1d_grouped(ctx_eval, hs, pos_w, pos_b, 1, 1, p->hubert_pos_k / 2, p->hubert_pos_groups);
     if (pos == nullptr) return false;
     if ((p->hubert_pos_k % 2) == 0) {
@@ -1143,52 +1077,44 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     hs = ggml_add(ctx_eval, hs, pos);
 
     // encoder layer norm
-    ggml_tensor * enc_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-    codec_neu_set_enc_name(enc_ln_w, "neucodec.encode.hubert.encoder.layer_norm.w");
-    ggml_tensor * enc_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-    codec_neu_set_enc_name(enc_ln_b, "neucodec.encode.hubert.encoder.layer_norm.b");
+    ggml_tensor * enc_ln_w = W("neucodec.encode.hubert.encoder.layer_norm.w");
+    ggml_tensor * enc_ln_b = W("neucodec.encode.hubert.encoder.layer_norm.b");
+    if (enc_ln_w == nullptr || enc_ln_b == nullptr) return false;
     hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, enc_ln_w, enc_ln_b);
     if (hs == nullptr) return false;
 
     const int32_t h_head_dim = p->hubert_hidden / p->hubert_heads;
     for (int32_t li = 0; li < p->hubert_layers; ++li) {
+        const std::string lp = "neucodec.encode.hubert.encoder.layers." + std::to_string(li);
         ggml_tensor * res = hs;
-        ggml_tensor * q_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_hidden);
-        codec_neu_set_enc_name(q_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.q.w");
-        ggml_tensor * q_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(q_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.q.b");
-        ggml_tensor * k_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_hidden);
-        codec_neu_set_enc_name(k_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.k.w");
-        ggml_tensor * k_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(k_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.k.b");
-        ggml_tensor * v_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_hidden);
-        codec_neu_set_enc_name(v_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.v.w");
-        ggml_tensor * v_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(v_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.v.b");
-        ggml_tensor * o_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_hidden);
-        codec_neu_set_enc_name(o_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.o.w");
-        ggml_tensor * o_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(o_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".att.o.b");
+        ggml_tensor * q_w = W(lp + ".att.q.w");
+        ggml_tensor * q_b = W(lp + ".att.q.b");
+        ggml_tensor * k_w = W(lp + ".att.k.w");
+        ggml_tensor * k_b = W(lp + ".att.k.b");
+        ggml_tensor * v_w = W(lp + ".att.v.w");
+        ggml_tensor * v_b = W(lp + ".att.v.b");
+        ggml_tensor * o_w = W(lp + ".att.o.w");
+        ggml_tensor * o_b = W(lp + ".att.o.b");
+        if (q_w == nullptr || q_b == nullptr || k_w == nullptr || k_b == nullptr ||
+            v_w == nullptr || v_b == nullptr || o_w == nullptr || o_b == nullptr) {
+            return false;
+        }
 
         ggml_tensor * attn = codec_neu_attention_full_tc(ctx_eval, hs, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b, h_head_dim, p->hubert_heads);
         if (attn == nullptr) return false;
         hs = ggml_add(ctx_eval, res, attn);
 
-        ggml_tensor * ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(ln_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ln.w");
-        ggml_tensor * ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(ln_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ln.b");
+        ggml_tensor * ln_w = W(lp + ".ln.w");
+        ggml_tensor * ln_b = W(lp + ".ln.b");
+        if (ln_w == nullptr || ln_b == nullptr) return false;
         hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, ln_w, ln_b);
         if (hs == nullptr) return false;
 
-        ggml_tensor * ff1_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden, p->hubert_intermediate);
-        codec_neu_set_enc_name(ff1_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc1.w");
-        ggml_tensor * ff1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_intermediate);
-        codec_neu_set_enc_name(ff1_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc1.b");
-        ggml_tensor * ff2_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->hubert_intermediate, p->hubert_hidden);
-        codec_neu_set_enc_name(ff2_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc2.w");
-        ggml_tensor * ff2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(ff2_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn.fc2.b");
+        ggml_tensor * ff1_w = W(lp + ".ffn.fc1.w");
+        ggml_tensor * ff1_b = W(lp + ".ffn.fc1.b");
+        ggml_tensor * ff2_w = W(lp + ".ffn.fc2.w");
+        ggml_tensor * ff2_b = W(lp + ".ffn.fc2.b");
+        if (ff1_w == nullptr || ff1_b == nullptr || ff2_w == nullptr || ff2_b == nullptr) return false;
         ggml_tensor * ff = codec_op_linear_tc(ctx_eval, hs, ff1_w, ff1_b);
         if (ff == nullptr) return false;
         ff = ggml_gelu_erf(ctx_eval, ff);
@@ -1196,26 +1122,23 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         if (ff == nullptr) return false;
         hs = ggml_add(ctx_eval, hs, ff);
 
-        ggml_tensor * ffn_ln_w = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(ffn_ln_w, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn_ln.w");
-        ggml_tensor * ffn_ln_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->hubert_hidden);
-        codec_neu_set_enc_name(ffn_ln_b, "neucodec.encode.hubert.encoder.layers." + std::to_string(li) + ".ffn_ln.b");
+        ggml_tensor * ffn_ln_w = W(lp + ".ffn_ln.w");
+        ggml_tensor * ffn_ln_b = W(lp + ".ffn_ln.b");
+        if (ffn_ln_w == nullptr || ffn_ln_b == nullptr) return false;
         hs = codec_op_layer_norm_tc(ctx_eval, hs, p->hubert_ln_eps, ffn_ln_w, ffn_ln_b);
         if (hs == nullptr) return false;
     }
     // Semantic encoder conv stack
-    ggml_tensor * sem_init_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, p->hubert_hidden, 1024);
-    codec_neu_set_enc_name(sem_init_w, "neucodec.encode.semantic_encoder.initial_conv.w");
-    ggml_tensor * sem1_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, 1024, 1024);
-    codec_neu_set_enc_name(sem1_w, "neucodec.encode.semantic_encoder.residual.1.w");
-    ggml_tensor * sem1_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1024);
-    codec_neu_set_enc_name(sem1_b, "neucodec.encode.semantic_encoder.residual.1.b");
-    ggml_tensor * sem2_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, 1024, 1024);
-    codec_neu_set_enc_name(sem2_w, "neucodec.encode.semantic_encoder.residual.3.w");
-    ggml_tensor * sem2_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1024);
-    codec_neu_set_enc_name(sem2_b, "neucodec.encode.semantic_encoder.residual.3.b");
-    ggml_tensor * sem_out_w = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, 3, 1024, 768);
-    codec_neu_set_enc_name(sem_out_w, "neucodec.encode.semantic_encoder.final_conv.w");
+    ggml_tensor * sem_init_w = W("neucodec.encode.semantic_encoder.initial_conv.w");
+    ggml_tensor * sem1_w = W("neucodec.encode.semantic_encoder.residual.1.w");
+    ggml_tensor * sem1_b = W("neucodec.encode.semantic_encoder.residual.1.b");
+    ggml_tensor * sem2_w = W("neucodec.encode.semantic_encoder.residual.3.w");
+    ggml_tensor * sem2_b = W("neucodec.encode.semantic_encoder.residual.3.b");
+    ggml_tensor * sem_out_w = W("neucodec.encode.semantic_encoder.final_conv.w");
+    if (sem_init_w == nullptr || sem1_w == nullptr || sem1_b == nullptr ||
+        sem2_w == nullptr || sem2_b == nullptr || sem_out_w == nullptr) {
+        return false;
+    }
 
     ggml_tensor * sem_tc = codec_conv1d(ctx_eval, hs, sem_init_w, nullptr, 1, 1, 1);
     if (sem_tc == nullptr) return false;
@@ -1237,17 +1160,15 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     }
 
     ggml_tensor * concat = ggml_concat(ctx_eval, sem_tc, fsq_tc, 1);
-    ggml_tensor * fc_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 1536, 2048);
-    codec_neu_set_enc_name(fc_w, "neucodec.encode.fc_prior.w");
-    ggml_tensor * fc_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 2048);
-    codec_neu_set_enc_name(fc_b, "neucodec.encode.fc_prior.b");
+    ggml_tensor * fc_w = W("neucodec.encode.fc_prior.w");
+    ggml_tensor * fc_b = W("neucodec.encode.fc_prior.b");
+    if (fc_w == nullptr || fc_b == nullptr) return false;
     ggml_tensor * prior_tc = codec_op_linear_tc(ctx_eval, concat, fc_w, fc_b);
     if (prior_tc == nullptr) return false;
     // FSQ project_in
-    ggml_tensor * proj_w = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, 2048, p->codebook_dim);
-    codec_neu_set_enc_name(proj_w, "neucodec.encode.quant.project_in.w");
-    ggml_tensor * proj_b = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);
-    codec_neu_set_enc_name(proj_b, "neucodec.encode.quant.project_in.b");
+    ggml_tensor * proj_w = W("neucodec.encode.quant.project_in.w");
+    ggml_tensor * proj_b = W("neucodec.encode.quant.project_in.b");
+    if (proj_w == nullptr || proj_b == nullptr) return false;
     ggml_tensor * z_tc = codec_op_linear_tc(ctx_eval, prior_tc, proj_w, proj_b);
     if (z_tc == nullptr) return false;
     // FSQ bound + quantize (vector-quantize-pytorch FSQ)
@@ -1279,83 +1200,6 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     ggml_tensor * out_t = ggml_cont(ctx_eval, idx_2d);
     codec_neu_set_enc_name(out_t, "neucodec.encode.out");
     *out = out_t;
-    return true;
-}
-
-static bool codec_neu_write_decode_weights(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const neucodec_decode_build & build,
-    std::string * err) {
-
-    if (ctx == nullptr || entry == nullptr) {
-        if (err != nullptr) {
-            *err = "invalid NeuCodec write arguments";
-        }
-        return false;
-    }
-
-    auto graph = [&](const std::string & name) -> ggml_tensor * {
-        const std::string short_name = codec_neu_encode_name(name);
-        return codec_graph_get_tensor(ctx, entry, short_name.c_str());
-    };
-    auto copy = [&](const std::string & name) -> bool {
-        return codec_runtime_copy_tensor_f32_exact_from(codec_neu_get_tensor(ctx->model, name), name, graph(name), err);
-    };
-
-    if (!copy(codec_neu_name_quant_w()) ||
-        !copy(codec_neu_name_quant_b()) ||
-        !copy(codec_neu_name_fc_post_w()) ||
-        !copy(codec_neu_name_fc_post_b()) ||
-        !copy(codec_neu_name_embed_w()) ||
-        !copy(codec_neu_name_embed_b())) {
-        return false;
-    }
-
-    for (int32_t li = 0; li < 2; ++li) {
-        if (!copy(codec_neu_name_prior(li, "norm1.w")) ||
-            !copy(codec_neu_name_prior(li, "norm1.b")) ||
-            !copy(codec_neu_name_prior(li, "conv1.w")) ||
-            !copy(codec_neu_name_prior(li, "conv1.b")) ||
-            !copy(codec_neu_name_prior(li, "norm2.w")) ||
-            !copy(codec_neu_name_prior(li, "norm2.b")) ||
-            !copy(codec_neu_name_prior(li, "conv2.w")) ||
-            !copy(codec_neu_name_prior(li, "conv2.b"))) {
-            return false;
-        }
-    }
-
-    for (int32_t li = 0; li < 2; ++li) {
-        if (!copy(codec_neu_name_post(li, "norm1.w")) ||
-            !copy(codec_neu_name_post(li, "norm1.b")) ||
-            !copy(codec_neu_name_post(li, "conv1.w")) ||
-            !copy(codec_neu_name_post(li, "conv1.b")) ||
-            !copy(codec_neu_name_post(li, "norm2.w")) ||
-            !copy(codec_neu_name_post(li, "norm2.b")) ||
-            !copy(codec_neu_name_post(li, "conv2.w")) ||
-            !copy(codec_neu_name_post(li, "conv2.b"))) {
-            return false;
-        }
-    }
-
-    for (int32_t li = 0; li < build.num_layers; ++li) {
-        if (!copy(codec_neu_name_transformer(li, "att_norm.w")) ||
-            !copy(codec_neu_name_transformer(li, "ffn_norm.w")) ||
-            !copy(codec_neu_name_transformer(li, "att.c_attn.w")) ||
-            !copy(codec_neu_name_transformer(li, "att.c_proj.w")) ||
-            !copy(codec_neu_name_transformer(li, "mlp.fc1.w")) ||
-            !copy(codec_neu_name_transformer(li, "mlp.fc2.w"))) {
-            return false;
-        }
-    }
-
-    if (!copy(codec_neu_name_final_ln_w()) ||
-        !copy(codec_neu_name_final_ln_b()) ||
-        !copy(codec_neu_name_head_w()) ||
-        !copy(codec_neu_name_head_b())) {
-        return false;
-    }
-
     return true;
 }
 
@@ -1393,173 +1237,6 @@ static bool codec_neu_init_encode_build(
     build->local_down_window = 1500;
     build->down_attn = &neu->distill_attn_down;
     build->local_attn = &neu->distill_attn_local;
-    return true;
-}
-
-static bool codec_neu_write_encode_weights(
-    codec_context * ctx,
-    codec_graph_cache_entry * entry,
-    const neucodec_encode_build & build,
-    std::string * err) {
-
-    if (ctx == nullptr || entry == nullptr) {
-        if (err) *err = "invalid NeuCodec encode write arguments";
-        return false;
-    }
-
-    auto graph = [&](const std::string & name) -> ggml_tensor * {
-        const std::string short_name = codec_neu_encode_name(name);
-        return codec_graph_get_tensor(ctx, entry, short_name.c_str());
-    };
-    auto copy = [&](const std::string & name) -> bool {
-        return codec_runtime_copy_tensor_f32_exact_from(codec_neu_get_tensor(ctx->model, name), name, graph(name), err);
-    };
-
-    // First block
-    for (int32_t i = 0; i < 5; ++i) {
-        const std::string base = "neucodec.encode.distill.codec_encoder.encoder.blocks.0.blocks." + std::to_string(i) + ".1";
-        if (!copy(base + ".weight") ||
-            !copy(base + ".bias")) {
-            return false;
-        }
-    }
-    if (!copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.weight") ||
-        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_1.bias") ||
-        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.weight") ||
-        !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.0.conv_2.bias")) {
-        return false;
-    }
-
-    // Base units
-    const int32_t base_blocks[][2] = { {1, 0}, {3, 0}, {5, 0}, {7, 0}, {7, 1} };
-    for (size_t bi = 0; bi < 5; ++bi) {
-        const std::string prefix = "neucodec.encode.distill.codec_encoder.encoder.blocks." +
-            std::to_string(base_blocks[bi][0]) + "." + std::to_string(base_blocks[bi][1]) + ".module";
-        if (!copy(prefix + ".dw_conv.weight") ||
-            !copy(prefix + ".dw_conv.bias") ||
-            !copy(prefix + ".pw_conv1.weight") ||
-            !copy(prefix + ".pw_conv1.bias") ||
-            !copy(prefix + ".act.alpha") ||
-            !copy(prefix + ".grn.gamma") ||
-            !copy(prefix + ".grn.beta") ||
-            !copy(prefix + ".pw_conv2.weight") ||
-            !copy(prefix + ".pw_conv2.bias")) {
-            return false;
-        }
-    }
-
-    // Down layers + final conv
-    const int32_t down_blocks[] = { 2, 4, 6, 8 };
-    for (int32_t i = 0; i < 4; ++i) {
-        const std::string base = "neucodec.encode.distill.codec_encoder.encoder.blocks." + std::to_string(down_blocks[i]) + ".0";
-        if (down_blocks[i] == 8) {
-            if (!copy("neucodec.encode.distill.codec_encoder.encoder.blocks.8.weight") ||
-                !copy("neucodec.encode.distill.codec_encoder.encoder.blocks.8.bias")) {
-                return false;
-            }
-        } else {
-            if (!copy(base + ".weight") ||
-                !copy(base + ".bias")) {
-                return false;
-            }
-        }
-    }
-
-    // en_encoder local trans weights
-    const std::string down_trans = "neucodec.encode.distill.codec_encoder.en_encoder.down_trans.trans";
-    for (int32_t li = 0; li < 2; ++li) {
-        const std::string base = down_trans + ".layers." + std::to_string(li);
-        if (!copy(base + ".0.norm.weight") ||
-            !copy(base + ".0.norm.bias") ||
-            !copy(base + ".0.to_qkv.weight") ||
-            !copy(base + ".0.to_out.weight") ||
-            !copy(base + ".1.0.weight") ||
-            !copy(base + ".1.0.bias") ||
-            !copy(base + ".1.1.weight") ||
-            !copy(base + ".1.4.weight")) {
-            return false;
-        }
-    }
-    if (!copy("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.weight") ||
-        !copy("neucodec.encode.distill.codec_encoder.en_encoder.down_trans.down_layer.bias")) {
-        return false;
-    }
-
-    const std::string local_trans = "neucodec.encode.distill.codec_encoder.en_encoder.local_trans";
-    for (int32_t li = 0; li < 3; ++li) {
-        const std::string base = local_trans + ".layers." + std::to_string(li);
-        if (!copy(base + ".0.norm.weight") ||
-            !copy(base + ".0.norm.bias") ||
-            !copy(base + ".0.to_qkv.weight") ||
-            !copy(base + ".0.to_out.weight") ||
-            !copy(base + ".1.0.weight") ||
-            !copy(base + ".1.0.bias") ||
-            !copy(base + ".1.1.weight") ||
-            !copy(base + ".1.4.weight")) {
-            return false;
-        }
-    }
-
-    // fc layers
-    if (!copy("neucodec.encode.fc_sq_prior.w") ||
-        !copy("neucodec.encode.fc_sq_prior.b") ||
-        !copy("neucodec.encode.fc_prior.w") ||
-        !copy("neucodec.encode.fc_prior.b") ||
-        !copy("neucodec.encode.quant.project_in.w") ||
-        !copy("neucodec.encode.quant.project_in.b")) {
-        return false;
-    }
-
-    // semantic encoder weights
-    if (!copy("neucodec.encode.semantic_encoder.initial_conv.w") ||
-        !copy("neucodec.encode.semantic_encoder.residual.1.w") ||
-        !copy("neucodec.encode.semantic_encoder.residual.1.b") ||
-        !copy("neucodec.encode.semantic_encoder.residual.3.w") ||
-        !copy("neucodec.encode.semantic_encoder.residual.3.b") ||
-        !copy("neucodec.encode.semantic_encoder.final_conv.w")) {
-        return false;
-    }
-
-    // HuBERT weights
-    for (int32_t li = 0; li < build.hubert_feat_layers; ++li) {
-        const std::string name = "neucodec.encode.hubert.feat.conv." + std::to_string(li) + ".w";
-        if (!copy(name)) {
-            return false;
-        }
-    }
-    if (!copy("neucodec.encode.hubert.feat.conv.0.gn.w") ||
-        !copy("neucodec.encode.hubert.feat.conv.0.gn.b") ||
-        !copy("neucodec.encode.hubert.feature_projection.w") ||
-        !copy("neucodec.encode.hubert.feature_projection.b") ||
-        !copy("neucodec.encode.hubert.encoder.pos_conv.w") ||
-        !copy("neucodec.encode.hubert.encoder.pos_conv.b") ||
-        !copy("neucodec.encode.hubert.encoder.layer_norm.w") ||
-        !copy("neucodec.encode.hubert.encoder.layer_norm.b")) {
-        return false;
-    }
-
-    for (int32_t li = 0; li < build.hubert_layers; ++li) {
-        const std::string base = "neucodec.encode.hubert.encoder.layers." + std::to_string(li);
-        if (!copy(base + ".att.q.w") ||
-            !copy(base + ".att.q.b") ||
-            !copy(base + ".att.k.w") ||
-            !copy(base + ".att.k.b") ||
-            !copy(base + ".att.v.w") ||
-            !copy(base + ".att.v.b") ||
-            !copy(base + ".att.o.w") ||
-            !copy(base + ".att.o.b") ||
-            !copy(base + ".ln.w") ||
-            !copy(base + ".ln.b") ||
-            !copy(base + ".ffn.fc1.w") ||
-            !copy(base + ".ffn.fc1.b") ||
-            !copy(base + ".ffn.fc2.w") ||
-            !copy(base + ".ffn.fc2.b") ||
-            !copy(base + ".ffn_ln.w") ||
-            !copy(base + ".ffn_ln.b")) {
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -1605,8 +1282,7 @@ static enum codec_status codec_neu_decode_graph(
 
     ggml_tensor * t_tok = codec_graph_get_tensor(ctx, entry, codec_neu_name_tok().c_str());
     ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "neucodec.decode.head.out");
-    ggml_tensor * t_codebook = codec_graph_get_tensor(ctx, entry, codec_neu_name_codebook().c_str());
-    if (t_tok == nullptr || t_out == nullptr || t_codebook == nullptr) {
+    if (t_tok == nullptr || t_out == nullptr) {
         codec_context_set_error(ctx, "cached NeuCodec decode graph is invalid");
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -1625,31 +1301,6 @@ static enum codec_status codec_neu_decode_graph(
         }
     }
 
-    ggml_tensor * cb_src = codec_neu_get_tensor(ctx->model, codec_neu_name_codebook());
-    if (cb_src == nullptr) {
-        codec_context_set_error(ctx, "missing NeuCodec codebook tensor");
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-    std::vector<float> cb;
-    if (!codec_tensor_as_vec_f32(cb_src, &cb)) {
-        codec_context_set_error(ctx, "failed reading NeuCodec codebook tensor");
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-    const int32_t ncb0 = (int32_t) codec_ne(cb_src, 0);
-    const int32_t ncb1 = (int32_t) codec_ne(cb_src, 1);
-    if (ncb0 != build.codebook_dim || ncb1 != build.codebook_size) {
-        codec_context_set_error(ctx, "unexpected NeuCodec codebook shape");
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-    if (!codec_runtime_write_tensor(t_codebook, cb.data(), cb.size() * sizeof(float), &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    if (!codec_neu_write_decode_weights(ctx, entry, build, &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
     if (!codec_runtime_write_tensor(t_tok, tok_i32.data(), tok_i32.size() * sizeof(int32_t), &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
@@ -1668,13 +1319,13 @@ static enum codec_status codec_neu_decode_graph(
     }
 
     std::vector<float> window;
-    ggml_tensor * w_tensor = codec_neu_get_tensor(ctx->model, codec_neu_name_istft_window());
+    ggml_tensor * w_tensor = codec_model_get_tensor(ctx->model, codec_neu_name_istft_window());
     if (w_tensor != nullptr) {
         codec_tensor_as_vec_f32(w_tensor, &window);
     }
 
     std::vector<float> pcm_v;
-    if (!codec_neu_istft_from_head(head, build.head_out_dim, t, hop, w_tensor != nullptr ? &window : nullptr, &pcm_v, &err)) {
+    if (!codec_runtime_istft_from_head(head, build.head_out_dim, t, hop, w_tensor != nullptr ? &window : nullptr, false, &pcm_v, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -1813,6 +1464,7 @@ static enum codec_status codec_neu_encode_graph(
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
+    build.model = ctx->model;
 
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
@@ -1850,11 +1502,6 @@ static enum codec_status codec_neu_encode_graph(
 
     const float basis_vals[8] = { 1, 4, 16, 64, 256, 1024, 4096, 16384 };
     if (!codec_runtime_write_tensor(t_basis, basis_vals, sizeof(basis_vals), &err)) {
-        codec_context_set_error(ctx, err);
-        return CODEC_STATUS_INTERNAL_ERROR;
-    }
-
-    if (!codec_neu_write_encode_weights(ctx, entry, build, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

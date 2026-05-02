@@ -92,95 +92,48 @@ bool codec_runtime_read_tensor_i32_2d_tq(ggml_tensor * t, std::vector<int32_t> *
     return true;
 }
 
-static bool codec_runtime_tensor_shape_exact(const ggml_tensor * a, const ggml_tensor * b) {
-    if (a == nullptr || b == nullptr) {
-        return false;
+ggml_tensor * codec_model_get_tensor(const codec_model * model, const char * name) {
+    if (model == nullptr || model->weights == nullptr || name == nullptr) {
+        return nullptr;
     }
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (a->ne[i] != b->ne[i]) {
-            return false;
-        }
-    }
-    return true;
+    return ggml_get_tensor(model->weights, name);
 }
 
-static bool codec_runtime_copy_tensor_f32_exact_impl(
-    ggml_tensor * src,
-    const std::string & src_name,
-    ggml_tensor * dst,
-    bool allow_missing,
-    std::string * error) {
-
-    if (dst == nullptr) {
-        if (error != nullptr) {
-            *error = "invalid exact tensor copy arguments";
-        }
-        return false;
-    }
-    if (dst->type != GGML_TYPE_F32) {
-        if (error != nullptr) {
-            *error = "exact tensor copy requires F32 destination";
-        }
-        return false;
-    }
-
-    if (src == nullptr) {
-        if (!allow_missing) {
-            if (error != nullptr) {
-                *error = "missing tensor: " + src_name;
-            }
-            return false;
-        }
-        std::vector<float> zeros((size_t) ggml_nelements(dst), 0.0f);
-        return codec_runtime_write_tensor(dst, zeros.data(), zeros.size() * sizeof(float), error);
-    }
-
-    if (!codec_runtime_tensor_shape_exact(src, dst)) {
-        if (error != nullptr) {
-            *error = "unexpected tensor shape: " + src_name;
-        }
-        return false;
-    }
-
-    std::vector<float> v;
-    if (!codec_tensor_as_vec_f32(src, &v)) {
-        if (error != nullptr) {
-            *error = "failed reading tensor: " + src_name;
-        }
-        return false;
-    }
-    if ((size_t) ggml_nelements(dst) != v.size()) {
-        if (error != nullptr) {
-            *error = "tensor element count mismatch: " + src_name;
-        }
-        return false;
-    }
-
-    return codec_runtime_write_tensor(dst, v.data(), v.size() * sizeof(float), error);
+ggml_tensor * codec_model_get_tensor(const codec_model * model, const std::string & name) {
+    return codec_model_get_tensor(model, name.c_str());
 }
 
-bool codec_runtime_copy_tensor_f32_exact_from(ggml_tensor * src, const std::string & src_name, ggml_tensor * dst, std::string * error) {
-    return codec_runtime_copy_tensor_f32_exact_impl(src, src_name, dst, false, error);
+ggml_tensor * codec_graph_cast_f32(ggml_context * ctx_eval, ggml_tensor * t) {
+    if (ctx_eval == nullptr || t == nullptr) {
+        return nullptr;
+    }
+    if (t->type == GGML_TYPE_F32) {
+        return t;
+    }
+    return ggml_cast(ctx_eval, t, GGML_TYPE_F32);
 }
 
-bool codec_runtime_copy_tensor_f32_exact(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * error) {
-    if (ctx == nullptr || ctx->model == nullptr || ctx->model->weights == nullptr) {
-        if (error != nullptr) {
-            *error = "invalid exact tensor copy arguments";
-        }
-        return false;
+ggml_tensor * codec_graph_weight_or_null(ggml_context * ctx_eval, const codec_model * model, const char * name) {
+    if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr || name == nullptr) {
+        return nullptr;
     }
-    return codec_runtime_copy_tensor_f32_exact_impl(ggml_get_tensor(ctx->model->weights, src_name.c_str()), src_name, dst, false, error);
+    ggml_tensor * w = ggml_get_tensor(model->weights, name);
+    if (w == nullptr) {
+        return nullptr;
+    }
+    return codec_graph_cast_f32(ctx_eval, w);
 }
 
-bool codec_runtime_copy_tensor_f32_exact_or_zeros(codec_context * ctx, const std::string & src_name, ggml_tensor * dst, std::string * error) {
-    if (ctx == nullptr || ctx->model == nullptr || ctx->model->weights == nullptr) {
-        if (error != nullptr) {
-            *error = "invalid exact tensor copy arguments";
-        }
-        return false;
-    }
-    return codec_runtime_copy_tensor_f32_exact_impl(ggml_get_tensor(ctx->model->weights, src_name.c_str()), src_name, dst, true, error);
+ggml_tensor * codec_graph_weight_or_null(ggml_context * ctx_eval, const codec_model * model, const std::string & name) {
+    return codec_graph_weight_or_null(ctx_eval, model, name.c_str());
+}
+
+ggml_tensor * codec_graph_weight(ggml_context * ctx_eval, const codec_model * model, const char * name) {
+    return codec_graph_weight_or_null(ctx_eval, model, name);
+}
+
+ggml_tensor * codec_graph_weight(ggml_context * ctx_eval, const codec_model * model, const std::string & name) {
+    return codec_graph_weight_or_null(ctx_eval, model, name.c_str());
 }
 
 void codec_context_set_error(struct codec_context * ctx, const std::string & error) {

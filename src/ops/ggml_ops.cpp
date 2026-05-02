@@ -1,5 +1,8 @@
 #include "ggml_ops.h"
 
+#include "conv1d.h"
+#include "../runtime/tensor_utils.h"
+
 #include <algorithm>
 #include <cfloat>
 
@@ -30,6 +33,9 @@ ggml_tensor * codec_op_layer_norm(ggml_context * ctx, ggml_tensor * x, float eps
         return nullptr;
     }
 
+    gamma = codec_graph_cast_f32(ctx, gamma);
+    beta = codec_graph_cast_f32(ctx, beta);
+
     ggml_tensor * y = ggml_norm(ctx, x, eps);
     if (gamma != nullptr) {
         ggml_tensor * g2 = ggml_reshape_2d(ctx, gamma, 1, x->ne[1]);
@@ -46,6 +52,9 @@ ggml_tensor * codec_op_layer_norm_ct(ggml_context * ctx, ggml_tensor * x_ct, flo
     if (ctx == nullptr || x_ct == nullptr || gamma == nullptr || beta == nullptr) {
         return nullptr;
     }
+
+    gamma = codec_graph_cast_f32(ctx, gamma);
+    beta = codec_graph_cast_f32(ctx, beta);
 
     ggml_tensor * y = ggml_norm(ctx, x_ct, eps);
     ggml_tensor * g2 = ggml_reshape_2d(ctx, gamma, x_ct->ne[0], 1);
@@ -82,6 +91,9 @@ ggml_tensor * codec_op_group_norm(ggml_context * ctx, ggml_tensor * x, int32_t n
         return nullptr;
     }
 
+    gamma = codec_graph_cast_f32(ctx, gamma);
+    beta = codec_graph_cast_f32(ctx, beta);
+
     const int64_t cpg = x->ne[1] / n_groups;
     ggml_tensor * x3 = ggml_reshape_3d(ctx, x, x->ne[0], cpg, n_groups);
     ggml_tensor * y = ggml_reshape_2d(ctx, ggml_group_norm(ctx, x3, n_groups, eps), x->ne[0], x->ne[1]);
@@ -102,9 +114,16 @@ ggml_tensor * codec_op_linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
         return nullptr;
     }
 
-    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
-    if (b != nullptr) {
-        ggml_tensor * b2 = ggml_reshape_2d(ctx, b, w->ne[1], 1);
+    // Cast weight to F32 to preserve numerical parity with the legacy
+    // dequant-into-graph-buffer path. ggml_mul_mat itself supports quantized
+    // weights natively, but mixing Q8_0 weight + F32 activations introduces
+    // additional per-block quantization on the activation side.
+    ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
+    ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
+
+    ggml_tensor * y = ggml_mul_mat(ctx, w_f32, x);
+    if (b_f32 != nullptr) {
+        ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, w_f32->ne[1], 1);
         y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
     }
     return y;
@@ -128,6 +147,8 @@ ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * 
         return nullptr;
     }
 
+    alpha = codec_graph_cast_f32(ctx, alpha);
+
     ggml_tensor * alpha_2d = ggml_reshape_2d(ctx, alpha, 1, x->ne[1]);
     ggml_tensor * alpha_rep = ggml_repeat(ctx, alpha_2d, x);
     ggml_tensor * alpha_clamped = ggml_clamp(ctx, alpha_rep, eps, FLT_MAX);
@@ -142,6 +163,9 @@ ggml_tensor * codec_op_snake_beta(ggml_context * ctx, ggml_tensor * x, ggml_tens
     if (ctx == nullptr || x == nullptr || alpha == nullptr || inv_beta == nullptr) {
         return nullptr;
     }
+
+    alpha = codec_graph_cast_f32(ctx, alpha);
+    inv_beta = codec_graph_cast_f32(ctx, inv_beta);
 
     ggml_tensor * alpha_2d = ggml_reshape_2d(ctx, alpha, 1, x->ne[1]);
     ggml_tensor * alpha_rep = ggml_repeat(ctx, alpha_2d, x);
@@ -212,6 +236,7 @@ ggml_tensor * codec_op_channel_scale(ggml_context * ctx, ggml_tensor * x, ggml_t
     if (ctx == nullptr || x == nullptr || scale == nullptr) {
         return nullptr;
     }
+    scale = codec_graph_cast_f32(ctx, scale);
     ggml_tensor * s2 = ggml_reshape_2d(ctx, scale, x->ne[0], 1);
     return ggml_mul(ctx, x, ggml_repeat(ctx, s2, x));
 }
@@ -235,4 +260,53 @@ ggml_tensor * codec_op_tokens_to_features(ggml_context * ctx, ggml_tensor * toke
         return base;
     }
     return ggml_repeat(ctx, base, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], out_channels));
+}
+
+ggml_tensor * codec_op_convnext_block_ct(
+    ggml_context * ctx,
+    ggml_tensor * x_ct,
+    ggml_tensor * dw_w,
+    ggml_tensor * dw_b,
+    ggml_tensor * ln_w,
+    ggml_tensor * ln_b,
+    ggml_tensor * pw1_w,
+    ggml_tensor * pw1_b,
+    ggml_tensor * pw2_w,
+    ggml_tensor * pw2_b,
+    ggml_tensor * gamma,
+    int32_t dw_padding) {
+
+    if (ctx == nullptr || x_ct == nullptr || dw_w == nullptr || ln_w == nullptr || pw1_w == nullptr || pw2_w == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * res_tc = ggml_cont(ctx, ggml_transpose(ctx, x_ct)); // [t, c]
+    ggml_tensor * x_dw = codec_conv1d_depthwise(ctx, res_tc, dw_w, dw_b, 1, 1, dw_padding);
+    if (x_dw == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * h_ct = codec_op_layer_norm_ct(
+        ctx, ggml_cont(ctx, ggml_transpose(ctx, x_dw)), 1e-6f, ln_w, ln_b);
+    if (h_ct == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * pw1 = codec_op_linear(ctx, h_ct, pw1_w, pw1_b);
+    if (pw1 == nullptr) {
+        return nullptr;
+    }
+    pw1 = ggml_gelu_erf(ctx, pw1);
+
+    ggml_tensor * pw2 = codec_op_linear(ctx, pw1, pw2_w, pw2_b);
+    if (pw2 == nullptr) {
+        return nullptr;
+    }
+    if (gamma != nullptr) {
+        pw2 = codec_op_channel_scale(ctx, pw2, gamma);
+        if (pw2 == nullptr) {
+            return nullptr;
+        }
+    }
+    return ggml_add(ctx, x_ct, pw2);
 }

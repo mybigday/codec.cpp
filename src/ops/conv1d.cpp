@@ -1,6 +1,21 @@
 #include "conv1d.h"
 
 #include "ggml_ops.h"
+#include "../runtime/tensor_utils.h"
+
+// Conv weights are loaded directly from the GGUF context. Quantized weight
+// types can't be reshaped (their row size is fixed by the block format), so
+// cast to F32 before any reshape/im2col path. F16 weights are kept as F16 to
+// preserve the fast im2col-F16 path that ggml_conv_1d uses.
+static ggml_tensor * codec_conv1d_prepare_w(ggml_context * ctx, ggml_tensor * w) {
+    if (w == nullptr) {
+        return nullptr;
+    }
+    if (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16) {
+        return w;
+    }
+    return ggml_cast(ctx, w, GGML_TYPE_F32);
+}
 
 static ggml_tensor * codec_conv1d_pointwise_impl(
     ggml_context * ctx,
@@ -96,6 +111,9 @@ ggml_tensor * codec_conv1d(
         return nullptr;
     }
 
+    w = codec_conv1d_prepare_w(ctx, w);
+    b = codec_graph_cast_f32(ctx, b);
+
     ggml_tensor * y = codec_conv1d_impl(ctx, x, w, stride, padding, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
@@ -116,6 +134,9 @@ ggml_tensor * codec_conv1d_depthwise(
     if (ctx == nullptr || x == nullptr || w == nullptr || stride <= 0 || dilation <= 0 || padding < 0) {
         return nullptr;
     }
+
+    w = codec_conv1d_prepare_w(ctx, w);
+    b = codec_graph_cast_f32(ctx, b);
 
     ggml_tensor * y = codec_conv1d_depthwise_impl(ctx, x, w, stride, padding, dilation);
     if (b != nullptr) {
@@ -140,6 +161,9 @@ ggml_tensor * codec_conv1d_causal(
     if (w->ne[0] < stride) {
         return nullptr;
     }
+
+    w = codec_conv1d_prepare_w(ctx, w);
+    b = codec_graph_cast_f32(ctx, b);
 
     const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;
@@ -175,6 +199,9 @@ ggml_tensor * codec_conv1d_causal_replicate(
         return nullptr;
     }
 
+    w = codec_conv1d_prepare_w(ctx, w);
+    b = codec_graph_cast_f32(ctx, b);
+
     const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;
     const int32_t pad_left = kernel_eff - stride;
@@ -208,6 +235,9 @@ ggml_tensor * codec_conv1d_depthwise_causal(
     if (w->ne[0] < stride) {
         return nullptr;
     }
+
+    w = codec_conv1d_prepare_w(ctx, w);
+    b = codec_graph_cast_f32(ctx, b);
 
     const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;

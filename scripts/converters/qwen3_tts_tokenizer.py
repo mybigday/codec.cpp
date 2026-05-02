@@ -383,12 +383,8 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
         if self.quantization == "F16":
             return np.float16
         if arr.ndim >= 2 and self.should_quantize_tensor(name, arr):
-            if self.quantization == "Q8_0":
-                return quant_utils.Q8_0
-            if self.quantization == "Q4_K_M":
-                return quant_utils.Q4_K_M
-            if self.quantization == "Q5_K_M":
-                return quant_utils.Q5_K_M
+            if self.quantization in ("Q8_0", "Q4_K_M", "Q5_K_M"):
+                return self.quantization
         return np.float16
 
     def convert_and_save(self, output_path: Path) -> None:

@@ -351,6 +351,12 @@ class DacConverter(BaseConverter):
         if name.endswith(".bias") or name.endswith(".b"):
             return False
 
+        # Never quantize layer norm / adanorm weights even when 2D — block
+        # quantization on tensors clustered around 1.0/0.0 produces audio noise.
+        import re
+        if re.search(r"(?:_ln|inln|paln|norm|ln)\.(?:w|weight|scale\.weight|shift\.weight)$", name):
+            return False
+
         if self.uses_descript_dac_layout and name.endswith(".out_proj.weight"):
             return False
 
