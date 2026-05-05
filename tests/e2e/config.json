@@ -101,6 +101,26 @@
       "decode_sample_rate": 24000,
       "gguf": "models/distill_neucodec/distill_neucodec.gguf",
       "converter": "distill_neucodec"
+    },
+    {
+      "name": "xcodec2",
+      "hf_repo_id": "HKUSTAudio/xcodec2",
+      "hf_file": null,
+      "class": "xcodec2",
+      "n_q": 1,
+      "encode_sample_rate": 16000,
+      "decode_sample_rate": 16000,
+      "gguf": "models/xcodec2/xcodec2.gguf",
+      "converter": "xcodec2",
+      "force_cpu_backend": true,
+      "max_input_seconds": 5.0,
+      "thresholds": {
+        "corr_min": 0.99,
+        "mse_max": 0.0005,
+        "encode_roundtrip_corr_min": 0.99,
+        "encode_roundtrip_mse_max": 0.001,
+        "encode_roundtrip_length_diff_max": 320
+      }
     }
   ]
 }

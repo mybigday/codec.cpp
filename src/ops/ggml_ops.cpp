@@ -2,6 +2,7 @@
 
 #include "conv1d.h"
 #include "lm_attn.h"
+#include "rope.h"
 #include "../runtime/tensor_utils.h"
 
 #include <algorithm>
@@ -467,6 +468,161 @@ ggml_tensor * codec_op_sinusoidal_time_emb(
     ggml_tensor * freqs = ggml_exp(ctx, log_idx);
     ggml_tensor * e = ggml_scale(ctx, freqs, t_v * scale);
     return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), /*dim=*/0);
+}
+
+ggml_tensor * codec_op_alias_free_snake_beta_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * alpha,
+    ggml_tensor * inv_beta,
+    ggml_tensor * kernel_12) {
+
+    if (ctx == nullptr || x_tc == nullptr || alpha == nullptr || inv_beta == nullptr || kernel_12 == nullptr) {
+        return nullptr;
+    }
+    if (kernel_12->ne[0] != 12) return nullptr;
+    const int64_t c = x_tc->ne[1];
+
+    // Replicate-pad the input by 5 each side.  This matches alias_free_torch's
+    // `self.pad = kernel_size // ratio - 1 = 5` before the conv-transpose.
+    ggml_tensor * x_rp = codec_op_pad_1d_replicate(ctx, x_tc, 5, 5);
+    if (x_rp == nullptr) return nullptr;
+    const int64_t t_rp = x_rp->ne[0];
+
+    // Zero-insert by 2: rebuild the padded sequence as
+    // [x[0], 0, x[1], 0, …, x[t_rp-1], 0] using ggml_pad along a new
+    // innermost axis.  Reshape (t_rp, c) → (1, t_rp, c) → ggml_pad(0, 1, 0…)
+    // → (2, t_rp, c) with the second slot zeroed → reshape to (2*t_rp, c).
+    ggml_tensor * x_3d = ggml_reshape_3d(ctx, x_rp, 1, t_rp, c);
+    ggml_tensor * x_zero_3d = ggml_pad(ctx, x_3d, 1, 0, 0, 0);  // ne=(2, t_rp, c)
+    if (x_zero_3d == nullptr) return nullptr;
+    x_zero_3d = ggml_cont(ctx, x_zero_3d);
+    ggml_tensor * x_zi = ggml_reshape_2d(ctx, x_zero_3d, 2 * t_rp, c);
+
+    // Pad with 11 zeros on each side, then depthwise-correlate with the
+    // (symmetric) 12-tap Kaiser kernel.  Conv-transpose stride 2 of input
+    // length L produces 2L+10 outputs; our zero-inserted/padded direct-conv
+    // produces 2L+11, one too long, so we trim the trailing sample after.
+    ggml_tensor * x_zp = codec_op_pad_1d(ctx, x_zi, 11, 11);
+
+    ggml_tensor * w_3d = ggml_reshape_3d(ctx, kernel_12, 12, 1, 1);
+    ggml_tensor * w_dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 12, 1, c);
+    ggml_tensor * w_dw = ggml_repeat(ctx, w_3d, w_dst);
+
+    ggml_tensor * y = codec_conv1d_depthwise(ctx, x_zp, w_dw, nullptr, /*stride=*/1, /*dilation=*/1, /*padding=*/0);
+    if (y == nullptr) return nullptr;
+    // y length = (2*t_rp + 22) - 12 + 1 = 2*t_rp + 11.  Trim 1 from end → 2*t_rp + 10.
+    y = codec_op_crop_1d(ctx, y, 0, 1);
+
+    // Multiply by ratio=2 (matches `x = ratio * F.conv_transpose1d(...)`).
+    y = ggml_scale(ctx, y, 2.0f);
+
+    // Trim Activation1d's pad_left=15 / pad_right=15 → length 2t.
+    y = codec_op_crop_1d(ctx, y, 15, 15);
+
+    // Snake-beta non-linearity at the upsampled rate.
+    ggml_tensor * y_act = codec_op_snake_beta(ctx, y, alpha, inv_beta, /*eps=*/1e-9f);
+    if (y_act == nullptr) return nullptr;
+
+    // Downsample 2×: replicate-pad (5, 6) then depthwise conv stride=2.
+    ggml_tensor * d_pad = codec_op_pad_1d_replicate(ctx, y_act, 5, 6);
+    return codec_conv1d_depthwise(ctx, d_pad, w_dw, nullptr, /*stride=*/2, /*dilation=*/1, /*padding=*/0);
+}
+
+ggml_tensor * codec_op_vocos_resnet_block_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * n1_w, ggml_tensor * n1_b,
+    ggml_tensor * c1_w, ggml_tensor * c1_b,
+    ggml_tensor * n2_w, ggml_tensor * n2_b,
+    ggml_tensor * c2_w, ggml_tensor * c2_b) {
+
+    if (ctx == nullptr || x_tc == nullptr ||
+        n1_w == nullptr || n1_b == nullptr || c1_w == nullptr || c1_b == nullptr ||
+        n2_w == nullptr || n2_b == nullptr || c2_w == nullptr || c2_b == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * h = codec_op_group_norm(ctx, x_tc, 32, 1e-6f, n1_w, n1_b);
+    if (h == nullptr) return nullptr;
+    h = ggml_silu(ctx, h);
+    h = codec_conv1d(ctx, h, c1_w, c1_b, 1, 1, 1);
+    if (h == nullptr) return nullptr;
+    h = codec_op_group_norm(ctx, h, 32, 1e-6f, n2_w, n2_b);
+    if (h == nullptr) return nullptr;
+    h = ggml_silu(ctx, h);
+    h = codec_conv1d(ctx, h, c2_w, c2_b, 1, 1, 1);
+    if (h == nullptr) return nullptr;
+    return ggml_add(ctx, x_tc, h);
+}
+
+ggml_tensor * codec_op_roformer_block_ct(
+    ggml_context * ctx,
+    ggml_tensor * x_ct,
+    ggml_tensor * att_norm_w,
+    ggml_tensor * ffn_norm_w,
+    ggml_tensor * c_attn_w,
+    ggml_tensor * c_proj_w,
+    ggml_tensor * fc1_w,
+    ggml_tensor * fc2_w,
+    int32_t head_dim,
+    int32_t n_heads,
+    float rope_theta) {
+
+    if (ctx == nullptr || x_ct == nullptr || att_norm_w == nullptr || ffn_norm_w == nullptr ||
+        c_attn_w == nullptr || c_proj_w == nullptr || fc1_w == nullptr || fc2_w == nullptr) {
+        return nullptr;
+    }
+
+    const int32_t hidden_dim = (int32_t) x_ct->ne[0];
+    if (hidden_dim != head_dim * n_heads) {
+        return nullptr;
+    }
+
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ct, 1e-6f, att_norm_w);
+    if (h == nullptr) return nullptr;
+
+    ggml_tensor * qkv = ggml_mul_mat(ctx, c_attn_w, h);                                  // [3*hidden, t]
+    if (qkv == nullptr) return nullptr;
+
+    const int64_t t = qkv->ne[1];
+    ggml_tensor * q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden_dim, t, qkv->nb[1], 0));
+    ggml_tensor * k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden_dim, t, qkv->nb[1], (size_t) hidden_dim * qkv->nb[0]));
+    ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden_dim, t, qkv->nb[1], (size_t) hidden_dim * qkv->nb[0] * 2));
+
+    ggml_tensor * q_dht = ggml_reshape_3d(ctx, q, head_dim, n_heads, t);                  // [d, h, t]
+    ggml_tensor * k_dht = ggml_reshape_3d(ctx, k, head_dim, n_heads, t);
+    ggml_tensor * v_dth = ggml_permute(ctx, ggml_reshape_3d(ctx, v, head_dim, n_heads, t),
+                                       0, 2, 1, 3);                                       // [d, t, h]
+
+    ggml_tensor * q_rope_dht = codec_op_rope(ctx, q_dht, head_dim, rope_theta, 1.0f, CODEC_ROPE_MODE_NORMAL);
+    ggml_tensor * k_rope_dht = codec_op_rope(ctx, k_dht, head_dim, rope_theta, 1.0f, CODEC_ROPE_MODE_NORMAL);
+    if (q_rope_dht == nullptr || k_rope_dht == nullptr) return nullptr;
+    ggml_tensor * q_rope = ggml_cont(ctx, ggml_permute(ctx, q_rope_dht, 0, 2, 1, 3));     // [d, t, h]
+    ggml_tensor * k_rope = ggml_cont(ctx, ggml_permute(ctx, k_rope_dht, 0, 2, 1, 3));     // [d, t, h]
+
+    codec_lm_attn_params attn_p = {};
+    attn_p.scale = 1.0f / std::sqrt((float) head_dim);
+    attn_p.causal = false;
+    ggml_tensor * attn_ctx = codec_op_lm_attn_ctx_dth(ctx, q_rope, k_rope, v_dth, &attn_p); // [d, t, h]
+    if (attn_ctx == nullptr) return nullptr;
+
+    ggml_tensor * attn_ct = ggml_reshape_2d(
+        ctx,
+        ggml_cont(ctx, ggml_permute(ctx, attn_ctx, 0, 2, 1, 3)),
+        hidden_dim,
+        t);
+    ggml_tensor * attn_proj = ggml_mul_mat(ctx, c_proj_w, attn_ct);                       // [hidden, t]
+    if (attn_proj == nullptr) return nullptr;
+    x_ct = ggml_add(ctx, x_ct, attn_proj);
+
+    ggml_tensor * m = codec_op_rms_norm_ct(ctx, x_ct, 1e-6f, ffn_norm_w);
+    if (m == nullptr) return nullptr;
+    ggml_tensor * ff = ggml_mul_mat(ctx, fc1_w, m);
+    ff = ggml_silu(ctx, ff);
+    ff = ggml_mul_mat(ctx, fc2_w, ff);
+    if (ff == nullptr) return nullptr;
+    return ggml_add(ctx, x_ct, ff);
 }
 
 ggml_tensor * codec_op_espnet_rel_pos_emb(

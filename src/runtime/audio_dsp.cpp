@@ -89,6 +89,163 @@ bool codec_runtime_istft_from_head(
 }
 
 
+bool codec_runtime_w2v_bert_features(
+    const std::vector<float> & pcm,
+    const std::vector<float> & mel_filters,
+    int32_t n_freq,
+    int32_t n_mels,
+    const std::vector<float> & window,
+    int32_t n_fft,
+    int32_t win,
+    int32_t hop,
+    float preemphasis,
+    float mel_floor,
+    int32_t stride,
+    std::vector<float> * out_features,
+    int32_t * out_n_frames,
+    std::string * err) {
+
+    if (out_features == nullptr || out_n_frames == nullptr) {
+        if (err != nullptr) *err = "null output";
+        return false;
+    }
+    if (n_fft <= 0 || win <= 0 || hop <= 0 || n_mels <= 0 || stride <= 0) {
+        if (err != nullptr) *err = "invalid mel-fbank arguments";
+        return false;
+    }
+    if ((int32_t) window.size() != win) {
+        if (err != nullptr) *err = "window size mismatch";
+        return false;
+    }
+    if (n_freq != n_fft / 2 + 1 ||
+        (int32_t) mel_filters.size() != n_freq * n_mels) {
+        if (err != nullptr) *err = "mel filter shape mismatch";
+        return false;
+    }
+    const int64_t n = (int64_t) pcm.size();
+    if (n < win) {
+        if (err != nullptr) *err = "input shorter than win";
+        return false;
+    }
+
+    const int32_t n_frames = (int32_t) ((n - win) / hop + 1);
+    if (n_frames <= 0) {
+        if (err != nullptr) *err = "no frames";
+        return false;
+    }
+
+    // Compute log-mel features per frame.  Matches transformers' reference
+    // exactly (kaldi-compliance scale 2^15, per-frame DC remove, preemphasis,
+    // window, FFT, |X|^2 mel, log(max(., mel_floor))).
+    const float pi = 3.14159265358979323846f;
+    std::vector<float> log_mel((size_t) n_frames * (size_t) n_mels, 0.0f);
+    std::vector<double> buffer((size_t) n_fft, 0.0);
+    std::vector<double> re_v((size_t) n_freq, 0.0);
+    std::vector<double> im_v((size_t) n_freq, 0.0);
+
+    // Precompute DFT basis (real + imag) at double precision for parity.
+    std::vector<double> dft_cos((size_t) n_freq * (size_t) n_fft, 0.0);
+    std::vector<double> dft_sin((size_t) n_freq * (size_t) n_fft, 0.0);
+    for (int32_t k = 0; k < n_freq; ++k) {
+        for (int32_t m = 0; m < n_fft; ++m) {
+            const double ang = -2.0 * pi * (double) k * (double) m / (double) n_fft;
+            dft_cos[(size_t) k * (size_t) n_fft + (size_t) m] = std::cos(ang);
+            dft_sin[(size_t) k * (size_t) n_fft + (size_t) m] = std::sin(ang);
+        }
+    }
+
+    for (int32_t ti = 0; ti < n_frames; ++ti) {
+        // 1. Extract frame (Kaldi-compliance: scale by 2^15) into a double buffer.
+        const int64_t off = (int64_t) ti * hop;
+        std::fill(buffer.begin(), buffer.end(), 0.0);
+        for (int32_t k = 0; k < win; ++k) {
+            buffer[(size_t) k] = (double) pcm[(size_t) (off + k)] * 32768.0;
+        }
+        // 2. Remove DC offset (subtract mean over the win samples).
+        double mean = 0.0;
+        for (int32_t k = 0; k < win; ++k) mean += buffer[(size_t) k];
+        mean /= (double) win;
+        for (int32_t k = 0; k < win; ++k) buffer[(size_t) k] -= mean;
+        // 3. Pre-emphasis applied IN-FRAME (note: must go from k=win-1 down to k=1
+        //    to avoid clobbering buffer[k-1] before it's used).
+        for (int32_t k = win - 1; k >= 1; --k) {
+            buffer[(size_t) k] -= (double) preemphasis * buffer[(size_t) (k - 1)];
+        }
+        buffer[0] *= (double) (1.0f - preemphasis);
+        // 4. Window.
+        for (int32_t k = 0; k < win; ++k) buffer[(size_t) k] *= (double) window[(size_t) k];
+
+        // 5. DFT (zero-padded to n_fft, but win <= n_fft so trailing slots are 0).
+        for (int32_t k = 0; k < n_freq; ++k) {
+            double re = 0.0, im = 0.0;
+            const double * cos_row = &dft_cos[(size_t) k * (size_t) n_fft];
+            const double * sin_row = &dft_sin[(size_t) k * (size_t) n_fft];
+            for (int32_t m = 0; m < n_fft; ++m) {
+                re += buffer[(size_t) m] * cos_row[(size_t) m];
+                im += buffer[(size_t) m] * sin_row[(size_t) m];
+            }
+            re_v[(size_t) k] = re;
+            im_v[(size_t) k] = im;
+        }
+        // 6. Power spectrogram |X|^2 then mel matmul.
+        for (int32_t mi = 0; mi < n_mels; ++mi) {
+            double acc = 0.0;
+            for (int32_t k = 0; k < n_freq; ++k) {
+                const double power = re_v[(size_t) k] * re_v[(size_t) k] +
+                                     im_v[(size_t) k] * im_v[(size_t) k];
+                acc += power * (double) mel_filters[(size_t) k * (size_t) n_mels + (size_t) mi];
+            }
+            // 7. log(max(., mel_floor)).
+            if (acc < (double) mel_floor) acc = (double) mel_floor;
+            log_mel[(size_t) ti * (size_t) n_mels + (size_t) mi] = (float) std::log(acc);
+        }
+    }
+
+    // 8. Per-mel-bin (time) zero-mean unit-variance normalize.  ddof=1 sample
+    //    variance to match torch/numpy reference.
+    if (n_frames > 1) {
+        for (int32_t mi = 0; mi < n_mels; ++mi) {
+            double sum = 0.0;
+            for (int32_t ti = 0; ti < n_frames; ++ti) {
+                sum += (double) log_mel[(size_t) ti * (size_t) n_mels + (size_t) mi];
+            }
+            const double m = sum / (double) n_frames;
+            double var = 0.0;
+            for (int32_t ti = 0; ti < n_frames; ++ti) {
+                const double d = (double) log_mel[(size_t) ti * (size_t) n_mels + (size_t) mi] - m;
+                var += d * d;
+            }
+            var /= (double) (n_frames - 1);  // ddof=1
+            const double s = 1.0 / std::sqrt(var + 1e-7);
+            for (int32_t ti = 0; ti < n_frames; ++ti) {
+                const float x = log_mel[(size_t) ti * (size_t) n_mels + (size_t) mi];
+                log_mel[(size_t) ti * (size_t) n_mels + (size_t) mi] = (float) (((double) x - m) * s);
+            }
+        }
+    }
+
+    // 9. Stride-2 stacking: drop trailing remainder, reshape (T, n_mels) →
+    //    (T/stride, n_mels * stride).  Memory layout is identical (contiguous
+    //    row-major), so we just truncate and reinterpret the buffer.
+    const int32_t remainder = n_frames % stride;
+    const int32_t n_frames_kept = n_frames - remainder;
+    const int32_t n_frames_out = n_frames_kept / stride;
+    const int32_t out_dim = n_mels * stride;
+
+    out_features->assign((size_t) n_frames_out * (size_t) out_dim, 0.0f);
+    for (int32_t ti = 0; ti < n_frames_out; ++ti) {
+        for (int32_t s = 0; s < stride; ++s) {
+            for (int32_t mi = 0; mi < n_mels; ++mi) {
+                (*out_features)[(size_t) ti * (size_t) out_dim + (size_t) (s * n_mels + mi)] =
+                    log_mel[(size_t) (ti * stride + s) * (size_t) n_mels + (size_t) mi];
+            }
+        }
+    }
+    *out_n_frames = n_frames_out;
+    (void) err;
+    return true;
+}
+
 void codec_runtime_periodic_hann_window(int32_t n_fft, std::vector<float> * out) {
     if (out == nullptr || n_fft <= 0) return;
     out->assign((size_t) n_fft, 0.0f);

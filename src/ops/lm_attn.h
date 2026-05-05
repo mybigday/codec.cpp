@@ -39,3 +39,21 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     ggml_tensor * pos_bias_v,
     const codec_lm_attn_params * params);
 
+// Shaw-style relative-key self-attention (used by Wav2Vec2-Bert /
+// SeamlessM4T conformer). Adds Q · D[bucket(j-i)] / sqrt(d) on top of the
+// standard q@k.T / sqrt(d) attention scores, where D is a learned distance
+// embedding shared across heads.
+//   q_dth, k_dth, v_dth: [head_dim, t, n_heads]
+//   dist_emb_dn:         [head_dim, n_buckets]  (n_buckets = left_max+right_max+1)
+//   bucket_idx_1d:       int32 [t*t]  with row-major layout (t_k inner, t_q outer)
+//                        and value `clamp(t_k - t_q, -left_max, right_max) + left_max`.
+// Returns context tensor [head_dim, t, n_heads].
+ggml_tensor * codec_op_lm_attn_rel_key_dth(
+    ggml_context * ctx,
+    ggml_tensor * q_dth,
+    ggml_tensor * k_dth,
+    ggml_tensor * v_dth,
+    ggml_tensor * dist_emb_dn,
+    ggml_tensor * bucket_idx_1d,
+    const codec_lm_attn_params * params);
+

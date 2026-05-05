@@ -55,6 +55,40 @@ void codec_runtime_istft_synthesis_basis(
     std::vector<float> * out_re,
     std::vector<float> * out_im);
 
+// Wav2Vec2-Bert / SeamlessM4T mel-fbank feature extractor (CPU-side).
+// Reproduces `SeamlessM4TFeatureExtractor.__call__` exactly: per-frame
+// remove-DC, preemphasis (0.97), Povey window, |FFT|^2 spectrogram, Kaldi
+// triangle mel-filter, log, then per-mel-bin (time) zero-mean unit-variance
+// normalization with `ddof=1`, finally stride-2 stacking.
+//
+// Inputs:
+//   pcm: raw waveform (mono).
+//   mel_filters: (n_freq=n_fft/2+1, n_mels) mel filterbank.
+//   window: (win,) Povey window (already powered to 0.85).
+//   n_fft, win, hop, n_mels, mel_floor, preemphasis, stride: feature config
+//   from the GGUF metadata (codec.mel.*).
+//
+// Output `out_features` is laid out row-major as
+//   `[n_frames_after_stride, n_mels * stride]` flattened, where
+//   `n_frames_after_stride = (n_frames_raw // stride)` and a stride-2 frame
+//   stacks two consecutive mel frames into a single 160-d feature vector.
+//   `out_n_frames` is set to `n_frames_after_stride`.
+bool codec_runtime_w2v_bert_features(
+    const std::vector<float> & pcm,
+    const std::vector<float> & mel_filters,
+    int32_t n_freq,
+    int32_t n_mels,
+    const std::vector<float> & window,
+    int32_t n_fft,
+    int32_t win,
+    int32_t hop,
+    float preemphasis,
+    float mel_floor,
+    int32_t stride,
+    std::vector<float> * out_features,
+    int32_t * out_n_frames,
+    std::string * err);
+
 // OLA identity kernel for ConvTranspose1d-based overlap-add. Output layout:
 // ggml ne = (k=n_fft, out=1, in=n_fft) with `weight[k=i, 0, in=i] = 1` and
 // zeros elsewhere. ConvTranspose1d with this kernel and stride=hop scatters

@@ -175,7 +175,14 @@ def run_and_log(
     return ret
 
 
-def ffmpeg_to_mono_wav(src: Path, dst: Path, sample_rate: int, log_path: Path, model_name: str) -> None:
+def ffmpeg_to_mono_wav(
+    src: Path,
+    dst: Path,
+    sample_rate: int,
+    log_path: Path,
+    model_name: str,
+    max_seconds: float | None = None,
+) -> None:
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -188,8 +195,10 @@ def ffmpeg_to_mono_wav(src: Path, dst: Path, sample_rate: int, log_path: Path, m
         "1",
         "-ar",
         str(sample_rate),
-        str(dst),
     ]
+    if max_seconds is not None and max_seconds > 0:
+        cmd.extend(["-t", f"{max_seconds:g}"])
+    cmd.append(str(dst))
     ret = run_and_log(cmd, log_path, model_name)
     if ret != 0:
         raise RuntimeError(f"ffmpeg failed for {src}")
@@ -472,6 +481,9 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     if spec.lower() in {"neucodec"}:
         return "neucodec", ""
 
+    if spec.lower() in {"xcodec2", "x-codec2", "x_codec2"}:
+        return "xcodec2", ""
+
     if spec.lower() in {"soprano"}:
         return "soprano", ""
 
@@ -596,6 +608,97 @@ def load_native_model(model_cfg: dict[str, Any], local_path: Path):
             return SimpleNamespace(audio_values=ref.decode(codes).cpu().numpy())
 
         return (ref, _encode, _decode)
+    if class_name == "xcodec2":
+        # HKUSTAudio/xcodec2 lacks an `auto_map` entry in config.json, so HF's
+        # trust_remote_code path can't auto-resolve. Use the local snapshot
+        # already mirrored under `models/<name>/`: it ships its own `vq/`
+        # package next to `modeling_xcodec2.py` / `configuration_bigcodec.py`.
+        import importlib.util
+
+        modeling = local_path / "modeling_xcodec2.py"
+        config_py = local_path / "configuration_bigcodec.py"
+        # The wrapper imports `from vq.codec_encoder import ...`; ensure the
+        # `vq/` package is mirrored locally (snapshot_download with file
+        # patterns is a no-op if everything is already cached).
+        if not modeling.is_file() or not config_py.is_file() or not (local_path / "vq").is_dir():
+            from huggingface_hub import snapshot_download as _snap
+            _snap(
+                repo_id=hf_repo_id,
+                cache_dir=cache_dir,
+                local_dir=str(local_path),
+                allow_patterns=[
+                    "vq/**", "modeling_xcodec2.py", "configuration_bigcodec.py",
+                    "model.safetensors", "config.json",
+                ],
+            )
+        sys.path.insert(0, str(local_path))
+
+        cfg_spec = importlib.util.spec_from_file_location("configuration_bigcodec", str(config_py))
+        cfg_mod = importlib.util.module_from_spec(cfg_spec)
+        cfg_spec.loader.exec_module(cfg_mod)
+
+        mdl_spec = importlib.util.spec_from_file_location("modeling_xcodec2", str(modeling))
+        mdl_mod = importlib.util.module_from_spec(mdl_spec)
+        mdl_spec.loader.exec_module(mdl_mod)
+
+        cfg = cfg_mod.BigCodecConfig()
+        model = mdl_mod.XCodec2Model(cfg)
+        from safetensors.torch import load_file as st_load_torch
+        st_path = local_path / "model.safetensors"
+        if st_path.is_file():
+            state = st_load_torch(str(st_path))
+        else:
+            state = torch.load(local_path / "pytorch_model.bin", map_location="cpu")
+        # The packaged checkpoint has stale `act.beta` keys for the encoder's
+        # SnakeBeta layer (current code expects `act.bias`). Decoder side loads
+        # cleanly; we only need the decoder for the e2e test. strict=False
+        # tolerates the encoder mismatch.
+        model.load_state_dict(state, strict=False)
+        model = model.eval()
+        sample_rate = int(model_cfg.get("sample_rate", 16000))
+
+        def _encode(audio_frames=None, **kwargs):
+            audio = audio_frames
+            if audio is None:
+                audio = kwargs.get("input_values")
+            if audio is None:
+                audio = kwargs.get("audio_values")
+            if audio is None:
+                raise RuntimeError("missing audio input for XCodec2 encode")
+            if isinstance(audio, torch.Tensor):
+                t = audio.detach().to(torch.float32).cpu()
+                if t.ndim == 3 and t.shape[1] == 1:
+                    t = t[:, 0, :]
+                elif t.ndim == 1:
+                    t = t.unsqueeze(0)
+            else:
+                t = torch.as_tensor(audio, dtype=torch.float32)
+                if t.ndim == 1:
+                    t = t.unsqueeze(0)
+            return model.encode_code(t)  # [B, T_frames]
+
+        def _decode(audio_codes=None, **kwargs):
+            codes = audio_codes
+            if codes is None:
+                codes = kwargs.get("audio_codes")
+            if codes is None:
+                raise RuntimeError("missing audio_codes for XCodec2 decode")
+            if isinstance(codes, torch.Tensor):
+                c = codes.to(dtype=torch.int64)
+            else:
+                c = torch.as_tensor(codes, dtype=torch.int64)
+            if c.ndim == 1:
+                c = c.unsqueeze(0)
+            elif c.ndim == 2 and c.shape[0] == 1 and c.shape[1] != 1:
+                pass
+            elif c.ndim == 2 and c.shape[0] != 1 and c.shape[-1] != 1:
+                # codes from `encode_decode_hf` may be (n_q=1, T); decode_code
+                # expects (B, T).
+                c = c
+            audio = model.decode_code(c)
+            return SimpleNamespace(audio_values=audio.cpu().numpy())
+
+        return (model, _encode, _decode)
     if class_name == "neucodec":
         sys.path.insert(0, str(REPO_ROOT / ".model-src" / "neucodec"))
         from neucodec import NeuCodec, DistillNeuCodec
@@ -759,6 +862,8 @@ def class_family(class_spec: str) -> str:
         return "nemo_nano_codec"
     if module_name == "neucodec":
         return "neucodec"
+    if module_name == "xcodec2":
+        return "xcodec2"
     if module_name == "soprano":
         return "soprano"
     if module_name == "qwen3_tts_tokenizer":
@@ -1154,7 +1259,10 @@ def run_model(
                 decoder_fn,
             )
         else:
-            ffmpeg_to_mono_wav(input_audio, input_wav, encode_sample_rate, log_path, name)
+            ffmpeg_to_mono_wav(
+                input_audio, input_wav, encode_sample_rate, log_path, name,
+                max_seconds=model_cfg.get("max_input_seconds"),
+            )
             encode_decode_hf(
                 model_cfg,
                 input_wav,
@@ -1176,6 +1284,12 @@ def run_model(
         n_q = int(model_cfg.get("n_q", 0))
         codec_env = dict(os.environ)
         # codec_env["GGML_DISABLE_VULKAN"] = "1"
+        if model_cfg.get("force_cpu_backend"):
+            # Some models (xcodec2 encode at full audio length) build very wide
+            # graphs whose peak intermediate buffers don't fit on integrated
+            # GPUs.  CPU-only avoids the SIGKILL while staying under sane RAM.
+            codec_env["GGML_VK_DISABLE"] = "1"
+            codec_env["GGML_DISABLE_VULKAN"] = "1"
         if model_cfg.get("latent_only"):
             run_decode_latent(gguf_path, hf_latent, cpp_out_wav, log_path, name, env=codec_env)
         elif model_cfg.get("decode_only"):

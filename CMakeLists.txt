@@ -60,6 +60,7 @@ add_library(codec STATIC
     src/models/soprano.cpp
     src/models/nemo_nano_codec.cpp
     src/models/neucodec.cpp
+    src/models/xcodec2.cpp
 )
 
 target_include_directories(codec

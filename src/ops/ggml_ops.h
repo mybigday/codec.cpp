@@ -124,6 +124,49 @@ ggml_tensor * codec_op_sinusoidal_time_emb(
     int32_t dim,
     float scale);
 
+// BigVGAN-style anti-aliased SnakeBeta activation (`alias_free_torch.Activation1d`).
+// Wraps `snake_beta` between a 2× Kaiser-FIR upsample and a matching downsample
+// so the non-linearity is computed at twice the input rate, suppressing
+// aliasing.  `x_tc` is `[t, c]`; output is also `[t, c]` (same length).
+// `alpha` and `inv_beta` are per-channel `[c]` (already exp-baked at convert
+// time).  `kernel_12` is the shared 12-tap symmetric Kaiser-sinc kernel
+// (palindromic and identical for up/down, see BigCodec checkpoint).
+ggml_tensor * codec_op_alias_free_snake_beta_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * alpha,
+    ggml_tensor * inv_beta,
+    ggml_tensor * kernel_12);
+
+// Vocos-style ResnetBlock1D: GroupNorm(32) → SiLU → Conv1d(k=3, p=1) → GroupNorm(32) → SiLU → Conv1d(k=3, p=1) + residual.
+// `x_tc` is `[t, c]`; both convs are kernel_size=3, stride=1, dilation=1, padding=1
+// (i.e. preserves time). Used by the Vocos backbone (prior_net + post_net) in
+// xcodec2 / NeuCodec / similar Vocos vocoders.
+ggml_tensor * codec_op_vocos_resnet_block_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * n1_w, ggml_tensor * n1_b,
+    ggml_tensor * c1_w, ggml_tensor * c1_b,
+    ggml_tensor * n2_w, ggml_tensor * n2_b,
+    ggml_tensor * c2_w, ggml_tensor * c2_b);
+
+// bs_roformer-style transformer block (RMSNorm pre-attn, RoPE on Q/K, full
+// self-attention, MLP fc1→SiLU→fc2 with no bias). The attention matrix uses a
+// combined `c_attn` (`[3*h*d, h*d]`) as in Karpathy nanoGPT and the head dim
+// equals the RoPE dim. `x_ct` is `[c, t]`; output is `[c, t]`.
+ggml_tensor * codec_op_roformer_block_ct(
+    ggml_context * ctx,
+    ggml_tensor * x_ct,
+    ggml_tensor * att_norm_w,
+    ggml_tensor * ffn_norm_w,
+    ggml_tensor * c_attn_w,
+    ggml_tensor * c_proj_w,
+    ggml_tensor * fc1_w,
+    ggml_tensor * fc2_w,
+    int32_t head_dim,
+    int32_t n_heads,
+    float rope_theta);
+
 // Espnet-style relative positional encoding for a Conformer with `T` query
 // positions, built entirely in-graph. Output ne = (d_model, 2T-1):
 //   row r covers position p_r ∈ [T-1, T-2, ..., 0, -1, ..., -(T-1)]

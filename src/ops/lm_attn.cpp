@@ -131,3 +131,57 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     return ggml_mul_mat(ctx, v_tdh, attn_w);
 }
 
+ggml_tensor * codec_op_lm_attn_rel_key_dth(
+    ggml_context * ctx,
+    ggml_tensor * q_dth,
+    ggml_tensor * k_dth,
+    ggml_tensor * v_dth,
+    ggml_tensor * dist_emb_dn,
+    ggml_tensor * bucket_idx_1d,
+    const codec_lm_attn_params * params) {
+    if (ctx == nullptr || q_dth == nullptr || k_dth == nullptr || v_dth == nullptr ||
+        dist_emb_dn == nullptr || bucket_idx_1d == nullptr) {
+        return nullptr;
+    }
+    const int64_t head_dim = q_dth->ne[0];
+    const int64_t t = q_dth->ne[1];
+    const int64_t h = q_dth->ne[2];
+    if (k_dth->ne[0] != head_dim || v_dth->ne[0] != head_dim ||
+        k_dth->ne[1] != t || v_dth->ne[1] != t ||
+        k_dth->ne[2] != h || v_dth->ne[2] != h ||
+        dist_emb_dn->ne[0] != head_dim ||
+        bucket_idx_1d->ne[0] != t * t) {
+        return nullptr;
+    }
+    const float scale = (params != nullptr && params->scale > 0.0f)
+        ? params->scale
+        : (1.0f / std::sqrt((float) std::max<int64_t>(1, head_dim)));
+
+    // Standard attention scores: [t_k, t_q, h].
+    ggml_tensor * ac = ggml_mul_mat(ctx, ggml_cont(ctx, k_dth), q_dth);
+    if (ac == nullptr) return nullptr;
+
+    // Gather E[d, t_k * t_q] = D[d, bucket(t_k, t_q)]. The bucket index is laid
+    // out row-major with t_k inner, t_q outer, so reshape to (t_k, t_q).
+    ggml_tensor * E_flat = ggml_get_rows(ctx, dist_emb_dn, bucket_idx_1d);  // [d, t*t]
+    if (E_flat == nullptr) return nullptr;
+    ggml_tensor * E_3d = ggml_reshape_3d(ctx, E_flat, head_dim, t, t);      // [d, t_k, t_q]
+
+    // Permute Q to per-t_q batch: [d, t_q, h] -> [d, h, t_q].
+    ggml_tensor * q_dh_tq = ggml_cont(ctx, ggml_permute(ctx, q_dth, 0, 2, 1, 3));  // [d, h, t_q]
+
+    // Per-t_q batched mul_mat: result ne=(t_k, h, t_q). mul_mat contracts d.
+    ggml_tensor * rel = ggml_mul_mat(ctx, E_3d, q_dh_tq);                          // [t_k, h, t_q]
+    if (rel == nullptr) return nullptr;
+
+    // Permute to [t_k, t_q, h] to align with `ac`.
+    rel = ggml_cont(ctx, ggml_permute(ctx, rel, 0, 2, 1, 3));
+
+    ggml_tensor * scores = ggml_add(ctx, ac, rel);
+    scores = ggml_scale(ctx, scores, scale);
+    ggml_tensor * probs = ggml_soft_max(ctx, scores);
+
+    ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
+    return ggml_mul_mat(ctx, v_tdh, probs);
+}
+

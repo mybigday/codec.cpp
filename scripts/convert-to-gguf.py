@@ -54,6 +54,12 @@ def detect_model_type_from_config(config_path: Path) -> str:
         if "distill" in model_type:
             return "distill_neucodec"
         return "neucodec"
+    elif "xcodec2" in model_type or "x-codec2" in model_type:
+        return "xcodec2"
+    elif "bigcodec" in model_type:
+        # HKUSTAudio/xcodec2 declares model_type "xcodec2" via its custom config,
+        # but earlier snapshots used "bigcodec".
+        return "xcodec2"
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
@@ -77,7 +83,9 @@ def detect_model_type_from_config(config_path: Path) -> str:
             if "distill" in arch:
                 return "distill_neucodec"
             return "neucodec"
-    
+        elif "xcodec2" in arch or "bigcodec" in arch:
+            return "xcodec2"
+
     raise ValueError(f"Unknown model type: {model_type}. Cannot auto-detect.")
 
 
@@ -104,6 +112,8 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         if 'distill' in name_lower:
             return 'distill_neucodec'
         return 'neucodec'
+    elif 'xcodec2' in name_lower or 'x-codec2' in name_lower or 'x_codec2' in name_lower:
+        return 'xcodec2'
     return None
 
 

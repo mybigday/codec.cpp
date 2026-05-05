@@ -11,6 +11,7 @@ from .chatterbox import ChatterboxS3TConverter, ChatterboxS3GConverter
 from .soprano import SopranoConverter
 from .nemo_nano_codec import NemoNanoCodecConverter
 from .neucodec import NeuCodecConverter, DistillNeuCodecConverter
+from .xcodec2 import XCodec2Converter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -24,6 +25,7 @@ _CONVERTER_REGISTRY = {
     'nemo_nano_codec': NemoNanoCodecConverter,
     'neucodec': NeuCodecConverter,
     'distill_neucodec': DistillNeuCodecConverter,
+    'xcodec2': XCodec2Converter,
 }
 
 
