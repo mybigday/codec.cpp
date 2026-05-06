@@ -60,6 +60,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
         # HKUSTAudio/xcodec2 declares model_type "xcodec2" via its custom config,
         # but earlier snapshots used "bigcodec".
         return "xcodec2"
+    elif "snac" in model_type:
+        return "snac"
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
@@ -85,6 +87,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
             return "neucodec"
         elif "xcodec2" in arch or "bigcodec" in arch:
             return "xcodec2"
+        elif "snac" in arch:
+            return "snac"
 
     raise ValueError(f"Unknown model type: {model_type}. Cannot auto-detect.")
 
@@ -114,6 +118,8 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         return 'neucodec'
     elif 'xcodec2' in name_lower or 'x-codec2' in name_lower or 'x_codec2' in name_lower:
         return 'xcodec2'
+    elif 'snac' in name_lower:
+        return 'snac'
     return None
 
 

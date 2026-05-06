@@ -484,6 +484,9 @@ def parse_model_class(class_spec: str) -> tuple[str, str]:
     if spec.lower() in {"xcodec2", "x-codec2", "x_codec2"}:
         return "xcodec2", ""
 
+    if spec.lower() in {"snac", "snac_24khz"}:
+        return "snac", ""
+
     if spec.lower() in {"soprano"}:
         return "soprano", ""
 
@@ -608,6 +611,75 @@ def load_native_model(model_cfg: dict[str, Any], local_path: Path):
             return SimpleNamespace(audio_values=ref.decode(codes).cpu().numpy())
 
         return (ref, _encode, _decode)
+    if class_name == "snac":
+        # SNAC ships its own pip package; load via SNAC.from_pretrained.  The
+        # decoder's NoiseBlock samples random noise on every forward, so for
+        # deterministic parity we monkey-patch it to identity (matching the
+        # noise=0 path the C++ runtime uses).
+        from snac import SNAC
+        import snac.layers as snac_layers
+
+        def _identity(self, x):
+            return x
+        snac_layers.NoiseBlock.forward = _identity
+
+        snac_model = SNAC.from_pretrained(hf_repo_id, cache_dir=cache_dir).eval()
+
+        def _encode(audio_frames=None, **kwargs):
+            audio = audio_frames
+            if audio is None:
+                audio = kwargs.get("input_values")
+            if audio is None:
+                audio = kwargs.get("audio_values")
+            if audio is None:
+                raise RuntimeError("missing audio input for SNAC encode")
+            if isinstance(audio, torch.Tensor):
+                t = audio.detach().to(torch.float32).cpu()
+                if t.ndim == 3 and t.shape[1] == 1:
+                    pass
+                elif t.ndim == 2:
+                    t = t.unsqueeze(1)
+                elif t.ndim == 1:
+                    t = t.view(1, 1, -1)
+            else:
+                t = torch.as_tensor(audio, dtype=torch.float32).view(1, 1, -1)
+            with torch.no_grad():
+                codes = snac_model.encode(t)  # list of 3 tensors at strides [4, 2, 1]
+            # Pack into the (n_q=3, n_frames) layout the C++ side uses:
+            # row 0 = level-0 codes ×4, row 1 = level-1 ×2, row 2 = level-2.
+            c0 = codes[0].squeeze().cpu().numpy().astype(np.int32)
+            c1 = codes[1].squeeze().cpu().numpy().astype(np.int32)
+            c2 = codes[2].squeeze().cpu().numpy().astype(np.int32)
+            n_frames = c2.shape[0]
+            out = np.zeros((3, n_frames), dtype=np.int32)
+            out[0] = np.repeat(c0, 4)[:n_frames]
+            out[1] = np.repeat(c1, 2)[:n_frames]
+            out[2] = c2
+            return torch.from_numpy(out)
+
+        def _decode(audio_codes=None, **kwargs):
+            codes = audio_codes
+            if codes is None:
+                codes = kwargs.get("audio_codes")
+            if codes is None:
+                raise RuntimeError("missing audio_codes for SNAC decode")
+            if isinstance(codes, torch.Tensor):
+                arr = codes.detach().cpu().numpy()
+            else:
+                arr = np.asarray(codes)
+            if arr.ndim == 3:
+                arr = arr.reshape(arr.shape[0] * arr.shape[1], arr.shape[-1]) if arr.shape[0] != 1 else arr[0]
+            if arr.ndim != 2 or arr.shape[0] != 3:
+                raise RuntimeError(f"unsupported SNAC code shape: {tuple(arr.shape)}")
+            n_frames = arr.shape[1]
+            c0 = torch.from_numpy(arr[0, ::4].astype(np.int64)).unsqueeze(0)
+            c1 = torch.from_numpy(arr[1, ::2].astype(np.int64)).unsqueeze(0)
+            c2 = torch.from_numpy(arr[2, :].astype(np.int64)).unsqueeze(0)
+            with torch.no_grad():
+                rec = snac_model.decode([c0, c1, c2])
+            return SimpleNamespace(audio_values=rec.cpu().numpy())
+
+        return (snac_model, _encode, _decode)
     if class_name == "xcodec2":
         # HKUSTAudio/xcodec2 lacks an `auto_map` entry in config.json, so HF's
         # trust_remote_code path can't auto-resolve. Use the local snapshot
@@ -864,6 +936,8 @@ def class_family(class_spec: str) -> str:
         return "neucodec"
     if module_name == "xcodec2":
         return "xcodec2"
+    if module_name == "snac":
+        return "snac"
     if module_name == "soprano":
         return "soprano"
     if module_name == "qwen3_tts_tokenizer":

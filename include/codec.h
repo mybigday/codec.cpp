@@ -24,6 +24,7 @@ enum codec_arch {
     CODEC_ARCH_CHATTERBOX_S3T = 9,
     CODEC_ARCH_CHATTERBOX_S3G = 10,
     CODEC_ARCH_XCODEC2 = 11,
+    CODEC_ARCH_SNAC = 12,
 };
 
 enum codec_status {

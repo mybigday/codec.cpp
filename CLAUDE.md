@@ -1,6 +1,6 @@
 # codec.cpp
 
-This repository is a C/C++ library + CLI that runs several neural audio codecs (currently WavTokenizer-Large, DAC, Mimi, Soprano, NeuCodec, NeMo Nano, Qwen3-TTS-Tokenizer, Chatterbox-S3T, Chatterbox-S3G, XCodec2) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.).
+This repository is a C/C++ library + CLI that runs several neural audio codecs (currently WavTokenizer-Large, DAC, Mimi, Soprano, NeuCodec, NeMo Nano, Qwen3-TTS-Tokenizer, Chatterbox-S3T, Chatterbox-S3G, XCodec2, SNAC) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.).
 
 The intended architecture is **llama.cpp-style**:
 - Build model forward passes as **ggml graphs (ops)**.
@@ -140,6 +140,8 @@ These recur often enough that they're worth checking *before* you debug a parity
 - **HiFi-GAN iSTFT trim ≠ Vocos iSTFT trim**. `codec_runtime_istft_from_head`'s default trim is `(n_fft − hop)/2` (Vocos/Wavtokenizer). HiFi-GAN's `torch.istft` with `center=True` removes `n_fft/2` per side; pass `trim_pad_override = n_fft/2`.
 - **periodic vs symmetric Hann**. `scipy.get_window("hann", n, fftbins=True)` is `0.5 − 0.5·cos(2πn/N)` (periodic). The default Hann in `codec_runtime_istft_from_head` is symmetric (`/(N-1)`); pass an explicit window if the reference uses periodic.
 - **Espnet rel-pos PE is interleaved**. `pe[r, 2k] = sin`, `pe[r, 2k+1] = cos` (not `concat([sin, cos])`). To build it in-graph, stack into `[half, 2, n_rows]` then `permute(1, 0, 2, 3) → cont` so the contiguous flatten gives the interleaved layout.
+- **`codec_op_snake` clamps alpha to positive — wrong for SNAC**.  The shared helper does `clamp(alpha, eps, FLT_MAX)` (BigVGAN convention), which flips negative-alpha channels into a near-singular `1/eps` factor.  SNAC's reference formula is `(alpha + 1e-9).reciprocal()` and the trained checkpoints have negative alphas.  Use a local Snake variant that preserves sign (multiply-then-add-eps in the denominator) instead of reaching for `codec_op_snake`.
+- **codec_token_buffer uses (T, Q) interleaved layout**, not (Q, T).  `codec_example_load_npy_i32_2d_tq` transposes a (n_q, n_frames) NPY into `data[t*n_q + q]`, and the save helper expects the same.  When implementing a multi-codebook model, mirror NeuCodec/XCodec2's `tokens->data[t*n_q + q]` access pattern — `data[q*n_frames + t]` reads garbage.
 - **strict=False state-dict loads can hide silent default-init**. The HKUSTAudio/xcodec2 checkpoint stores `act.beta` (per BigVGAN) but the upstream `SnakeBeta` was renamed to `act.bias`; HF's `load_state_dict(strict=False)` silently drops the unmatched key and runs the activation with `bias=0` → effective `inv_beta = 1`. If you bake the trained beta into your converter, you'll diverge from the reference. Always cross-check `load_state_dict` reports for unexpected keys, especially when the upstream code does the load with `strict=False`.
 - **clangd noise is NOT real**. The codebase shows constant `Adding 'string' to a string does not append` and `lambda has no matching call` diagnostics from clangd because there's no compile_commands.json wired up. **Trust `cmake --build`** — if cmake compiles, the code is fine.
 
@@ -177,6 +179,14 @@ If you need to add/replace an op:
 - The unified graph builder is the only Mimi encode graph path (`frontend -> transformer -> downsample -> unrolled RVQ`).
 - Split/legacy graph kinds for Mimi encode stages are removed from runtime graph enums.
 - Mimi encode weight writing now targets only the canonical encode graph path.
+
+## SNAC Status
+
+- Single-graph encode + decode for hubertsiuzdak/snac_24khz (BigVGAN-style depthwise SNAC, no LocalMHA, 3-level Residual VQ at strides [4, 2, 1]).
+- Encode 100% bit-exact against the HF reference on the full e2e clip; decode bit-perfect (corr 0.99999963).  Roundtrip audio corr 0.9993.
+- Codes packed as `codec_token_buffer` (n_q=3, n_frames=T/512): row 0 = level-0 ×4, row 1 = level-1 ×2, row 2 = level-2 raw.  The decode entry sub-samples each row at its native stride to recover the (T/2048, T/1024, T/512) compact triple.
+- `NoiseBlock` is run as identity for deterministic parity; the e2e test monkey-patches `snac.layers.NoiseBlock.forward` to match.
+- `codec_op_snake` cannot be used directly (it clamps alpha to be positive); SNAC's trained alphas include negative values, so `snac.cpp` ships a local snake helper using `(alpha + 1e-9).reciprocal()` (sign-preserving).
 
 ## XCodec2 Status
 

@@ -121,6 +121,25 @@
         "encode_roundtrip_mse_max": 0.001,
         "encode_roundtrip_length_diff_max": 320
       }
+    },
+    {
+      "name": "snac",
+      "hf_repo_id": "hubertsiuzdak/snac_24khz",
+      "hf_file": null,
+      "class": "snac",
+      "n_q": 3,
+      "encode_sample_rate": 24000,
+      "decode_sample_rate": 24000,
+      "gguf": "models/snac/snac.gguf",
+      "converter": "snac",
+      "force_cpu_backend": true,
+      "thresholds": {
+        "corr_min": 0.99,
+        "mse_max": 0.0005,
+        "encode_roundtrip_corr_min": 0.99,
+        "encode_roundtrip_mse_max": 0.001,
+        "encode_roundtrip_length_diff_max": 1024
+      }
     }
   ]
 }

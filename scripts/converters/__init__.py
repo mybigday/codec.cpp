@@ -12,6 +12,7 @@ from .soprano import SopranoConverter
 from .nemo_nano_codec import NemoNanoCodecConverter
 from .neucodec import NeuCodecConverter, DistillNeuCodecConverter
 from .xcodec2 import XCodec2Converter
+from .snac import SnacConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -26,6 +27,7 @@ _CONVERTER_REGISTRY = {
     'neucodec': NeuCodecConverter,
     'distill_neucodec': DistillNeuCodecConverter,
     'xcodec2': XCodec2Converter,
+    'snac': SnacConverter,
 }
 
 

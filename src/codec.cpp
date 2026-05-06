@@ -11,6 +11,7 @@
 #include "models/neucodec.h"
 #include "models/wavtokenizer.h"
 #include "models/xcodec2.h"
+#include "models/snac.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
 #include "runtime/gguf_kv.h"
@@ -125,6 +126,9 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "xcodec2" || arch == "x-codec2" || arch == "x_codec2") {
         return CODEC_ARCH_XCODEC2;
     }
+    if (arch == "snac" || arch == "snac_24khz") {
+        return CODEC_ARCH_SNAC;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -153,6 +157,8 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_chatterbox_s3g_vtable();
         case CODEC_ARCH_XCODEC2:
             return codec_xcodec2_vtable();
+        case CODEC_ARCH_SNAC:
+            return codec_snac_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -172,6 +178,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_CHATTERBOX_S3T:     return "Chatterbox-S3T";
         case CODEC_ARCH_CHATTERBOX_S3G:     return "Chatterbox-S3G";
         case CODEC_ARCH_XCODEC2:            return "XCodec2";
+        case CODEC_ARCH_SNAC:               return "SNAC";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }
