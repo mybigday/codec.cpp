@@ -119,7 +119,14 @@ ggml_tensor * codec_conv1d(
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
         y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
     }
-    return ggml_cont(ctx, y);
+    y = ggml_cont(ctx, y);
+    // Squeeze the trailing batch dim when input was 2D so callers don't
+    // need to manually reshape after every non-pointwise conv (the im2col
+    // path always returns ne=(t_out, c_out, 1)).
+    if (x->ne[2] <= 1 && y->ne[2] == 1 && y->ne[3] == 1) {
+        y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
+    }
+    return y;
 }
 
 ggml_tensor * codec_conv1d_depthwise(

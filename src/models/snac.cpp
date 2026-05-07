@@ -114,24 +114,7 @@ ggml_tensor * codec_snac_residual_unit_tc(
     return ggml_add(ctx, x_tc, h);
 }
 
-// L2-normalize each frame of an [t, c] tensor along the channel axis.  This
-// is the runtime-side equivalent of `torch.nn.functional.normalize(x, dim=1)`
-// applied to a (B, C, T) tensor (per-T-frame normalize).
-ggml_tensor * codec_snac_l2_normalize_tc(ggml_context * ctx, ggml_tensor * x_tc, float eps) {
-    if (ctx == nullptr || x_tc == nullptr) return nullptr;
-    // Move to CT so ggml_sum_rows (reduces ne[0]) sums the channel axis.
-    ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, x_tc));            // [c, t]
-    ggml_tensor * sq = ggml_mul(ctx, x_ct, x_ct);                              // [c, t]
-    ggml_tensor * sum_sq = ggml_sum_rows(ctx, sq);                             // [1, t]
-    sum_sq = ggml_scale_bias(ctx, sum_sq, 1.0f, eps);                          // add eps
-    ggml_tensor * norm = ggml_sqrt(ctx, sum_sq);                               // [1, t]
-    // 1/norm via `ones / norm`, where ones is a constant tensor matching norm.
-    ggml_tensor * ones = ggml_scale_bias(ctx, norm, 0.0f, 1.0f);               // 0*norm + 1
-    ggml_tensor * inv = ggml_div(ctx, ones, norm);                              // [1, t]
-    ggml_tensor * inv_rep = ggml_repeat(ctx, inv, x_ct);                        // [c, t]
-    ggml_tensor * x_n = ggml_mul(ctx, x_ct, inv_rep);                           // [c, t]
-    return ggml_cont(ctx, ggml_transpose(ctx, x_n));                            // [t, c]
-}
+// (Shared `codec_op_l2_normalize_tc` lives in src/ops/ggml_ops.{cpp,h}.)
 
 // Repeat-interleave along the time axis for a TC tensor.  Each input frame
 // is expanded to `factor` consecutive output frames.  Layout-wise this is
@@ -242,7 +225,7 @@ static ggml_tensor * codec_snac_quantize_level(
     if (z_e == nullptr) return nullptr;
 
     // 3) L2-normalize z_e per t-step.
-    ggml_tensor * z_n = codec_snac_l2_normalize_tc(ctx_eval, z_e, /*eps=*/1e-12f);
+    ggml_tensor * z_n = codec_op_l2_normalize_tc(ctx_eval, z_e, /*eps=*/1e-12f);
     if (z_n == nullptr) return nullptr;
 
     // 4) Cosine-NN against the pre-baked L2-normalized codebook.  Codebook

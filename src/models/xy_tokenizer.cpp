@@ -40,231 +40,13 @@
 #include <string>
 #include <vector>
 
-// =====================================================================
-// Forward declarations of helpers defined later in this TU.
-// =====================================================================
-namespace {
+// (Whisper-style transformer layer + sliced-pos-emb-add helpers live in
+// `src/ops/ggml_ops.{cpp,h}` as `codec_op_whisper_encoder_layer_tc` and
+// `codec_op_add_sliced_pos_emb_tc`.)
 
-ggml_tensor * xy_op_whisper_layer_tc(
-    ggml_context * ctx,
-    ggml_tensor * x_tc,
-    ggml_tensor * n1w, ggml_tensor * n1b,
-    ggml_tensor * qw,  ggml_tensor * qb,
-    ggml_tensor * kw,
-    ggml_tensor * vw,  ggml_tensor * vb,
-    ggml_tensor * ow,  ggml_tensor * ob,
-    ggml_tensor * n2w, ggml_tensor * n2b,
-    ggml_tensor * fc1w, ggml_tensor * fc1b,
-    ggml_tensor * fc2w, ggml_tensor * fc2b,
-    int32_t head_dim,
-    int32_t n_heads,
-    int32_t n_valid);
-
-}  // namespace
-
-// =====================================================================
-// Mel-fbank (Whisper feature extractor)
-// =====================================================================
-//
-// Reproduces transformers.WhisperFeatureExtractor exactly:
-//   1. Pad / truncate input PCM to chunk_length seconds (default 30 s = 480000
-//      samples at 16 kHz).
-//   2. STFT with n_fft=400, hop=160, periodic-Hann window, center=True (so
-//      the first/last frames have reflection-padded context).
-//   3. |spec|^2 power spectrogram.
-//   4. Mel filterbank (Slaney triangular, max-of-max=1, 0..8000 Hz).
-//   5. log10(max(1e-10, mel)).
-//   6. Clamp to (max - 8.0, max), then (x + 4.0) / 4.0.
-//
-// Output layout: row-major `[n_mels=80, n_frames]` (channels-first), exactly
-// what the encoder graph's `conv1` expects on its inner stride.
-
-static void xy_periodic_hann(int32_t n, std::vector<float> * out) {
-    out->resize((size_t) n);
-    for (int32_t i = 0; i < n; ++i) {
-        (*out)[i] = 0.5f - 0.5f * std::cos(2.0f * (float) M_PI * (float) i / (float) n);
-    }
-}
-
-// Build the Slaney mel filterbank used by Whisper:
-// `librosa.filters.mel(sr=16000, n_fft=400, n_mels=80, fmin=0, fmax=8000,
-//  htk=False, norm='slaney')`.  The output shape is (n_mels, n_freq) with
-// n_freq = n_fft/2 + 1 = 201.
-static void xy_slaney_mel_filterbank(
-    int32_t sr, int32_t n_fft, int32_t n_mels, float fmin, float fmax,
-    std::vector<float> * out) {
-    const int32_t n_freq = n_fft / 2 + 1;
-    out->assign((size_t) n_mels * (size_t) n_freq, 0.0f);
-
-    auto hz_to_mel_slaney = [](float hz) -> float {
-        const float f_min = 0.0f, f_sp = 200.0f / 3.0f;
-        const float min_log_hz = 1000.0f;
-        const float min_log_mel = (min_log_hz - f_min) / f_sp;
-        const float logstep = std::log(6.4f) / 27.0f;
-        if (hz >= min_log_hz) {
-            return min_log_mel + std::log(hz / min_log_hz) / logstep;
-        }
-        return (hz - f_min) / f_sp;
-    };
-    auto mel_to_hz_slaney = [](float mel) -> float {
-        const float f_min = 0.0f, f_sp = 200.0f / 3.0f;
-        const float min_log_hz = 1000.0f;
-        const float min_log_mel = (min_log_hz - f_min) / f_sp;
-        const float logstep = std::log(6.4f) / 27.0f;
-        if (mel >= min_log_mel) {
-            return min_log_hz * std::exp(logstep * (mel - min_log_mel));
-        }
-        return f_min + f_sp * mel;
-    };
-
-    const float mmin = hz_to_mel_slaney(fmin);
-    const float mmax = hz_to_mel_slaney(fmax);
-    std::vector<float> bin_freqs((size_t) n_mels + 2);
-    for (int32_t i = 0; i < n_mels + 2; ++i) {
-        const float m = mmin + (mmax - mmin) * (float) i / (float) (n_mels + 1);
-        bin_freqs[(size_t) i] = mel_to_hz_slaney(m);
-    }
-    std::vector<float> fft_freqs((size_t) n_freq);
-    for (int32_t k = 0; k < n_freq; ++k) {
-        fft_freqs[(size_t) k] = (float) sr * (float) k / (float) n_fft;
-    }
-
-    for (int32_t m = 0; m < n_mels; ++m) {
-        const float left   = bin_freqs[(size_t) m];
-        const float center = bin_freqs[(size_t) m + 1];
-        const float right  = bin_freqs[(size_t) m + 2];
-        const float enorm  = 2.0f / (right - left);
-        for (int32_t k = 0; k < n_freq; ++k) {
-            const float f = fft_freqs[(size_t) k];
-            float w = 0.0f;
-            if (f >= left && f < center) {
-                w = (f - left) / (center - left);
-            } else if (f >= center && f <= right) {
-                w = (right - f) / (right - center);
-            }
-            (*out)[(size_t) m * (size_t) n_freq + (size_t) k] = w * enorm;
-        }
-    }
-}
-
-// FFT helper: real-input radix-2 mixed Cooley–Tukey.  Input length must be
-// `n_fft`, output is the half-spectrum (n_fft/2 + 1) complex bins as
-// alternating (re, im) floats.  This is enough for STFT magnitudes; we do
-// not need a fast plan since the smoke test inputs are short.
-static void xy_rfft_naive(const float * in, int32_t n, std::vector<float> * out_re, std::vector<float> * out_im) {
-    const int32_t n_freq = n / 2 + 1;
-    out_re->assign((size_t) n_freq, 0.0f);
-    out_im->assign((size_t) n_freq, 0.0f);
-    // Use complex DFT (O(N^2)); for n=400 this is ~80k mults / frame which
-    // is well within the smoke test's tolerance.  A pre-built numpy/Eigen
-    // FFT would be faster but adds dependency surface.
-    for (int32_t k = 0; k < n_freq; ++k) {
-        double sum_re = 0.0, sum_im = 0.0;
-        const double w = -2.0 * M_PI * (double) k / (double) n;
-        for (int32_t t = 0; t < n; ++t) {
-            const double a = w * (double) t;
-            sum_re += (double) in[t] * std::cos(a);
-            sum_im += (double) in[t] * std::sin(a);
-        }
-        (*out_re)[(size_t) k] = (float) sum_re;
-        (*out_im)[(size_t) k] = (float) sum_im;
-    }
-}
-
-// Whisper-style mel-fbank.  Output: (n_mels, n_frames) channels-first.
-//
-// Unlike the HF feature extractor (which pads every input out to
-// `chunk_length=30s` and relies on an attention mask in the encoder), we
-// pad up to the next multiple of `pad_to_samples` so the encoder sees only
-// real audio + a tiny zero tail.  That avoids the attention-mask plumbing
-// and still matches HF for the valid frames within ~1 LSB of FP noise.
-static void xy_whisper_mel_features(
-    const std::vector<float> & pcm,
-    int32_t sr,
-    int32_t n_fft,
-    int32_t hop,
-    int32_t n_mels,
-    int32_t /*chunk_seconds*/,
-    int32_t pad_to_samples,
-    std::vector<float> * out_features,
-    int32_t * out_n_frames) {
-
-    const int32_t pad_to = std::max(1, pad_to_samples);
-    const int32_t in_n  = (int32_t) pcm.size();
-    // Pad UP to the next multiple of pad_to so we never truncate input
-    // audio; the encoder uses an attention mask to ignore the padded tail
-    // (see `n_mel_valid` in xy_build_encode).
-    const int32_t target_len = ((in_n + pad_to - 1) / pad_to) * pad_to;
-    std::vector<float> x = pcm;
-    if ((int32_t) x.size() < target_len) {
-        x.resize((size_t) target_len, 0.0f);
-    }
-
-    // Reflection pad by n_fft/2 on each side for `center=True` STFT.  numpy/
-    // PyTorch `mode='reflect'` does NOT repeat the edge: left[i]=x[p-i] and
-    // right[i]=x[L-2-i] for i ∈ [0, p).
-    const int32_t pad = n_fft / 2;
-    std::vector<float> xp((size_t) target_len + (size_t) 2 * pad, 0.0f);
-    for (int32_t i = 0; i < target_len; ++i) {
-        xp[(size_t) (i + pad)] = x[(size_t) i];
-    }
-    for (int32_t i = 0; i < pad; ++i) {
-        const int32_t l = pad - i;
-        if (l < target_len) xp[(size_t) i] = x[(size_t) l];
-        const int32_t r = target_len - 2 - i;
-        if (r >= 0) xp[(size_t) (target_len + pad + i)] = x[(size_t) r];
-    }
-
-    std::vector<float> hann;
-    xy_periodic_hann(n_fft, &hann);
-
-    std::vector<float> mel_fb;
-    xy_slaney_mel_filterbank(sr, n_fft, n_mels, 0.0f, (float) sr / 2.0f, &mel_fb);
-    const int32_t n_freq = n_fft / 2 + 1;
-
-    // Whisper produces (chunk_seconds * sr) / hop frames + 1 minus 1 if
-    // center=True.  In practice HF returns nb_max_frames = 3000 = chunk_seconds *
-    // sr / hop = 30*16000/160.
-    const int32_t n_frames = target_len / hop;
-
-    out_features->assign((size_t) n_mels * (size_t) n_frames, 0.0f);
-
-    std::vector<float> frame((size_t) n_fft, 0.0f);
-    std::vector<float> spec_re, spec_im;
-    std::vector<float> mel_frame((size_t) n_mels, 0.0f);
-    float global_max = -INFINITY;
-    for (int32_t f = 0; f < n_frames; ++f) {
-        const int32_t start = f * hop;
-        for (int32_t i = 0; i < n_fft; ++i) {
-            frame[(size_t) i] = xp[(size_t) (start + i)] * hann[(size_t) i];
-        }
-        xy_rfft_naive(frame.data(), n_fft, &spec_re, &spec_im);
-        for (int32_t m = 0; m < n_mels; ++m) {
-            double s = 0.0;
-            const float * fb = &mel_fb[(size_t) m * (size_t) n_freq];
-            for (int32_t k = 0; k < n_freq; ++k) {
-                const float re = spec_re[(size_t) k];
-                const float im = spec_im[(size_t) k];
-                s += (double) fb[k] * (double) (re * re + im * im);
-            }
-            float v = std::log10(std::max(1e-10, s));
-            mel_frame[(size_t) m] = v;
-            if (v > global_max) global_max = v;
-        }
-        for (int32_t m = 0; m < n_mels; ++m) {
-            (*out_features)[(size_t) m * (size_t) n_frames + (size_t) f] = mel_frame[(size_t) m];
-        }
-    }
-    // Final normalise: clamp to (max - 8.0) lower bound, then (x + 4) / 4.
-    const float lo = global_max - 8.0f;
-    for (size_t i = 0; i < out_features->size(); ++i) {
-        float v = (*out_features)[i];
-        if (v < lo) v = lo;
-        (*out_features)[i] = (v + 4.0f) / 4.0f;
-    }
-
-    if (out_n_frames) *out_n_frames = n_frames;
-}
+// (Whisper-style mel-fbank lives in `src/runtime/audio_dsp.{cpp,h}` as
+// `codec_runtime_whisper_mel_features` — it bundles Slaney triangular
+// filterbank + reflection-pad center-True STFT + log10/normalise.)
 
 // =====================================================================
 // Init from GGUF
@@ -348,94 +130,6 @@ namespace {
 // and `< t`, attention scores for keys at positions `>= n_valid` are masked
 // to -inf and rows for queries `>= n_valid` are zeroed (mirrors HF's
 // `valid_k`/`valid_q` SDPA bias path).
-ggml_tensor * xy_op_whisper_layer_tc(
-    ggml_context * ctx,
-    ggml_tensor * x_tc,
-    ggml_tensor * n1w, ggml_tensor * n1b,
-    ggml_tensor * qw,  ggml_tensor * qb,
-    ggml_tensor * kw,
-    ggml_tensor * vw,  ggml_tensor * vb,
-    ggml_tensor * ow,  ggml_tensor * ob,
-    ggml_tensor * n2w, ggml_tensor * n2b,
-    ggml_tensor * fc1w, ggml_tensor * fc1b,
-    ggml_tensor * fc2w, ggml_tensor * fc2b,
-    int32_t head_dim,
-    int32_t n_heads,
-    int32_t n_valid) {
-
-    if (ctx == nullptr || x_tc == nullptr) return nullptr;
-    const int64_t t = x_tc->ne[0];
-    const int32_t hidden = head_dim * n_heads;
-
-    // ----- Pre-norm + attention -----
-    ggml_tensor * res = x_tc;
-    ggml_tensor * h = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, n1w, n1b);
-    if (h == nullptr) return nullptr;
-    ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, h));     // [c, t]
-
-    auto linear_with_bias = [&](ggml_tensor * w, ggml_tensor * b) -> ggml_tensor * {
-        ggml_tensor * y = ggml_mul_mat(ctx, w, h_ct);                 // [out, t]
-        if (y == nullptr) return nullptr;
-        if (b != nullptr) {
-            ggml_tensor * b2 = ggml_reshape_2d(ctx, b, b->ne[0], 1);
-            ggml_tensor * br = ggml_repeat(ctx, b2, y);
-            y = ggml_add(ctx, y, br);
-        }
-        return y;
-    };
-
-    ggml_tensor * q = linear_with_bias(qw, qb);                       // [hidden, t]
-    ggml_tensor * k = linear_with_bias(kw, nullptr);                  // k_proj: bias=False
-    ggml_tensor * v = linear_with_bias(vw, vb);
-    if (q == nullptr || k == nullptr || v == nullptr) return nullptr;
-
-    ggml_tensor * q3 = ggml_reshape_3d(ctx, q, head_dim, n_heads, t); // [d, h, t]
-    ggml_tensor * k3 = ggml_reshape_3d(ctx, k, head_dim, n_heads, t);
-    ggml_tensor * v3 = ggml_reshape_3d(ctx, v, head_dim, n_heads, t);
-    ggml_tensor * q_dth = ggml_cont(ctx, ggml_permute(ctx, q3, 0, 2, 1, 3));
-    ggml_tensor * k_dth = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3));
-    ggml_tensor * v_dth = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
-
-    // Reuse the canonical attention helper (non-causal here, but the n_valid
-    // mask works regardless of `causal`).
-    codec_lm_attn_params attn_p = {};
-    attn_p.scale   = 1.0f / std::sqrt((float) head_dim);
-    attn_p.causal  = false;
-    attn_p.window  = 0;
-    attn_p.n_valid = n_valid;
-    ggml_tensor * attn_dth = codec_op_lm_attn_ctx_dth(ctx, q_dth, k_dth, v_dth, &attn_p);
-    if (attn_dth == nullptr) return nullptr;
-    ggml_tensor * attn_dht = ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3));
-    ggml_tensor * attn_ct  = ggml_reshape_2d(ctx, attn_dht, hidden, t);
-
-    ggml_tensor * out_ct = ggml_mul_mat(ctx, ow, attn_ct);             // [hidden, t]
-    if (ob != nullptr) {
-        ggml_tensor * ob_2d = ggml_reshape_2d(ctx, ob, ob->ne[0], 1);
-        ggml_tensor * obr = ggml_repeat(ctx, ob_2d, out_ct);
-        out_ct = ggml_add(ctx, out_ct, obr);
-    }
-    ggml_tensor * out_tc = ggml_cont(ctx, ggml_transpose(ctx, out_ct));
-    x_tc = ggml_add(ctx, res, out_tc);
-
-    // ----- Pre-norm + MLP -----
-    res = x_tc;
-    h = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, n2w, n2b);
-    h_ct = ggml_cont(ctx, ggml_transpose(ctx, h));
-
-    ggml_tensor * f1 = linear_with_bias(fc1w, fc1b);                   // [ffn, t]
-    ggml_tensor * f1_tc = ggml_cont(ctx, ggml_transpose(ctx, f1));
-    f1_tc = ggml_gelu_erf(ctx, f1_tc);
-    f1 = ggml_cont(ctx, ggml_transpose(ctx, f1_tc));                   // [ffn, t]
-    ggml_tensor * f2 = ggml_mul_mat(ctx, fc2w, f1);                    // [hidden, t]
-    if (fc2b != nullptr) {
-        ggml_tensor * b2 = ggml_reshape_2d(ctx, fc2b, fc2b->ne[0], 1);
-        ggml_tensor * br = ggml_repeat(ctx, b2, f2);
-        f2 = ggml_add(ctx, f2, br);
-    }
-    ggml_tensor * f2_tc = ggml_cont(ctx, ggml_transpose(ctx, f2));
-    return ggml_add(ctx, res, f2_tc);
-}
-
 // Whisper-style encoder block: pos_emb add + N transformer layers + final LN.
 // Inputs come in as `x_tc = [t, hidden]`; pos_emb is `[max_pos, hidden]`.
 ggml_tensor * xy_op_whisper_module_tc(
@@ -452,22 +146,11 @@ ggml_tensor * xy_op_whisper_module_tc(
         return codec_graph_weight(ctx, model, nm);
     };
 
-    const int64_t t = x_tc->ne[0];
-    ggml_tensor * pos = W(base + ".pos_emb");
-    if (pos != nullptr) {
-        // PyTorch saves positional_embedding as (max_pos, d_model); GGUF
-        // reverses to ggml ne=(d_model, max_pos).  We need rows 0..t-1 along
-        // ne[1] then transpose to (t, d_model) so it adds element-wise to
-        // x_tc which has ne=(t, d_model).
-        ggml_tensor * pos_view = ggml_view_2d(
-            ctx, pos, pos->ne[0], t, pos->nb[1], 0);
-        ggml_tensor * pos_tc = ggml_cont(ctx, ggml_transpose(ctx, pos_view));
-        x_tc = ggml_add(ctx, x_tc, pos_tc);
-    }
+    x_tc = codec_op_add_sliced_pos_emb_tc(ctx, x_tc, W(base + ".pos_emb"));
 
     for (int32_t li = 0; li < n_layers; ++li) {
         const std::string lp = base + ".l" + std::to_string(li);
-x_tc = xy_op_whisper_layer_tc(ctx, x_tc,
+        x_tc = codec_op_whisper_encoder_layer_tc(ctx, x_tc,
             W(lp + ".norm1.w"), W(lp + ".norm1.b"),
             W(lp + ".attn.q.w"), W(lp + ".attn.q.b"),
             W(lp + ".attn.k.w"),
@@ -525,22 +208,6 @@ namespace {
 // (equivalent to ggml_conv_transpose_1d(stride=k, p=0, d=1)).  That's exactly
 // what `ggml_conv_transpose_1d` returns when `s0 == kernel`.
 
-// Apply a positional-embedding tensor (saved as ne=(d_model, max_pos)) to a
-// (t, d_model) input by slicing to the first `t` rows along ne[1].
-ggml_tensor * xy_add_pos_emb_tc(ggml_context * ctx, ggml_tensor * x_tc, ggml_tensor * pos) {
-    if (pos == nullptr) return x_tc;
-    const int64_t t = x_tc->ne[0];
-    ggml_tensor * pos_view = ggml_view_2d(ctx, pos, pos->ne[0], t, pos->nb[1], 0);
-    ggml_tensor * pos_tc   = ggml_cont(ctx, ggml_transpose(ctx, pos_view));
-    return ggml_add(ctx, x_tc, pos_tc);
-}
-
-// Apply a learnable Linear with bias.  Input may be (t, c).  Output is (t, out).
-ggml_tensor * xy_linear_tc(ggml_context * ctx, ggml_tensor * x_tc,
-                           ggml_tensor * w, ggml_tensor * b) {
-    return codec_op_linear_tc(ctx, x_tc, w, b);
-}
-
 // Run an OmniAudioEncoder body: input (mel, n_frames) → conv1+conv2 stride=2
 // → pos_emb add → 12 transformer layers → final LN → output (T_mel, d_model).
 ggml_tensor * xy_omni_encoder_module_tc(
@@ -567,13 +234,11 @@ ggml_tensor * xy_omni_encoder_module_tc(
     if (x == nullptr) return nullptr;
 // codec_conv1d returns ne=(t, c_out, 1) (im2col path keeps a batch dim).
     // Squeeze to 2D so pos_emb adds element-wise.
-    if (x->ne[2] == 1) x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
 x = ggml_gelu_erf(ctx, x);
     x = codec_conv1d(ctx, x,
                      W(base + ".conv2.w"), W(base + ".conv2.b"),
                      /*stride=*/2, /*dilation=*/1, /*padding=*/1);
     if (x == nullptr) return nullptr;
-if (x->ne[2] == 1) x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
     x = ggml_gelu_erf(ctx, x);                                   // (T_mel, d_model)
 // The transformer module helper adds pos_emb internally — don't add again.
     x = xy_op_whisper_module_tc(ctx, x, model, base, n_layers,
@@ -599,7 +264,7 @@ ggml_tensor * xy_adapter_module_tc(
 
     ggml_tensor * proj_w = W(base + ".proj.w");
     if (proj_w != nullptr) {
-        x_tc = xy_linear_tc(ctx, x_tc, proj_w, W(base + ".proj.b"));
+        x_tc = codec_op_linear_tc(ctx, x_tc, proj_w, W(base + ".proj.b"));
         if (x_tc == nullptr) return nullptr;
     }
     // pos_emb is added inside xy_op_whisper_module_tc; don't add again here.
@@ -608,7 +273,7 @@ ggml_tensor * xy_adapter_module_tc(
     if (x_tc == nullptr) return nullptr;
     ggml_tensor * out_w = W(base + ".out_proj.w");
     if (out_w != nullptr) {
-        x_tc = xy_linear_tc(ctx, x_tc, out_w, W(base + ".out_proj.b"));
+        x_tc = codec_op_linear_tc(ctx, x_tc, out_w, W(base + ".out_proj.b"));
     }
     return x_tc;
 }
@@ -640,8 +305,6 @@ ggml_tensor * gate = codec_conv1d(ctx, x_tc, gate_w, nullptr,
     ggml_tensor * up   = codec_conv1d(ctx, x_tc, W("xy.downsample.up.w"),   nullptr,
                                       /*stride=*/avg_pooler, /*dilation=*/1, /*padding=*/0);
     if (gate == nullptr || up == nullptr) return nullptr;
-    if (gate->ne[2] == 1) gate = ggml_reshape_2d(ctx, gate, gate->ne[0], gate->ne[1]);
-    if (up->ne[2] == 1)   up   = ggml_reshape_2d(ctx, up,   up->ne[0],   up->ne[1]);
     // gate / up have ggml ne=(T/4, intermediate) which is *channel-first* in
     // PyTorch terms (the inner stride is the time index).  Move to CT layout
     // (ne=(intermediate, T/4)) so the upcoming reshape of x_tc to
@@ -818,7 +481,6 @@ static bool xy_build_encode(ggml_context * ctx, void * user_data, ggml_tensor **
                                    W("xy.q.in_proj.b"),
                                    /*stride=*/1, /*dilation=*/1, /*padding=*/0);
     if (z == nullptr) return false;
-    if (z->ne[2] == 1) z = ggml_reshape_2d(ctx, z, z->ne[0], z->ne[1]);
 
     // 8-level RVQ.  Build per-level argmax + accumulate residuals.
     const int32_t n_q = cfg.n_q;
@@ -886,7 +548,6 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
                                    W("xy.q.out_proj.b"),
                                    /*stride=*/1, /*dilation=*/1, /*padding=*/0);
     if (x == nullptr) return false;
-    if (x->ne[2] == 1) x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
 // post_rvq_adapter: Linear 3072→768 + pos_emb + 4 layers + final LN +
     // Linear 768→3072.
     x = xy_adapter_module_tc(ctx, x, p->model, "xy.post_rvq_adapter",
@@ -903,7 +564,6 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
             ctx, W("xy.upsample.up_conv.w"), x,
             /*s0=*/cfg.upsample_stride, /*p0=*/0, /*d0=*/1);
         if (up == nullptr) return false;
-        if (up->ne[2] == 1) up = ggml_reshape_2d(ctx, up, up->ne[0], up->ne[1]);
         x = up;   // (t*4, 768) tc
 }
 
@@ -923,7 +583,6 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
             ctx, W("xy.acoust_dec.deconv1.w"), x,
             /*s0=*/2, /*p0=*/0, /*d0=*/1);
         if (d1 == nullptr) return false;
-        if (d1->ne[2] == 1) d1 = ggml_reshape_2d(ctx, d1, d1->ne[0], d1->ne[1]);
         // ggml_conv_transpose_1d doesn't add bias automatically.
         ggml_tensor * d1_b = W("xy.acoust_dec.deconv1.b");
         if (d1_b != nullptr) {
@@ -936,7 +595,6 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
             ctx, W("xy.acoust_dec.deconv2.w"), d1,
             /*s0=*/1, /*p0=*/0, /*d0=*/1);
         if (d2 == nullptr) return false;
-        if (d2->ne[2] == 1) d2 = ggml_reshape_2d(ctx, d2, d2->ne[0], d2->ne[1]);
         ggml_tensor * d2_b = W("xy.acoust_dec.deconv2.b");
         if (d2_b != nullptr) {
             ggml_tensor * d2_b_2d = ggml_reshape_2d(ctx, d2_b, 1, d2_b->ne[0]);
@@ -960,7 +618,6 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
                                            W("xy.vocos.embed.b"),
                                            /*stride=*/1, /*dilation=*/1, /*padding=*/3);
         if (embed == nullptr) return false;
-        if (embed->ne[2] == 1) embed = ggml_reshape_2d(ctx, embed, embed->ne[0], embed->ne[1]);
 // Initial LayerNorm in CT layout to match ConvNeXt block convention.
         ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, embed));
         h_ct = codec_op_layer_norm_ct(ctx, h_ct, 1e-6f,
@@ -1007,25 +664,25 @@ static enum codec_status codec_xy_encode(
     }
     codec_xy_tokenizer & cfg = *static_cast<codec_xy_tokenizer *>(ctx->model->impl);
 
-    // Compute mel features on CPU.
+    // Compute mel features on CPU (shared helper in audio_dsp).
     std::vector<float> mel;
     int32_t n_frames = 0;
-    xy_whisper_mel_features(pcm,
-                             cfg.encode_sample_rate,
-                             cfg.mel_n_fft,
-                             cfg.mel_hop_length,
-                             cfg.mel_n_mels,
-                             cfg.mel_chunk_length_s,
-                             /*pad_to_samples=*/cfg.encoder_downsample_rate,
-                             &mel, &n_frames);
+    std::string mel_err;
+    if (!codec_runtime_whisper_mel_features(
+            pcm,
+            cfg.encode_sample_rate,
+            cfg.mel_n_fft,
+            cfg.mel_hop_length,
+            cfg.mel_n_mels,
+            /*pad_to_samples=*/cfg.encoder_downsample_rate,
+            &mel, &n_frames, &mel_err)) {
+        codec_context_set_error(ctx, mel_err.empty() ? "XY-Tokenizer: mel-fbank failed" : mel_err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
     if (n_frames <= 0) {
         codec_context_set_error(ctx, "XY-Tokenizer: empty mel features");
         return CODEC_STATUS_INVALID_ARG;
     }
-    // Optional: load mel features from a raw float32 file (set via env var).
-    // Used to bisect mel-fbank parity issues — if loading HF's mel directly
-    // gives matching codes, the encoder graph is correct and only the mel
-    // feature extractor differs.
     // Number of valid (non-padded) mel frames.  HF reports this as
     // `attention_mask.sum() == pcm_size_orig / hop`; we reproduce it from the
     // original PCM length here so the encoder masks attention correctly and

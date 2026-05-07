@@ -317,3 +317,170 @@ void codec_runtime_ola_identity_kernel(int32_t n_fft, std::vector<float> * out) 
     }
 }
 
+void codec_runtime_slaney_mel_filterbank(
+    int32_t sr,
+    int32_t n_fft,
+    int32_t n_mels,
+    float fmin,
+    float fmax,
+    std::vector<float> * out) {
+    if (out == nullptr || sr <= 0 || n_fft <= 0 || n_mels <= 0) return;
+    const int32_t n_freq = n_fft / 2 + 1;
+    out->assign((size_t) n_mels * (size_t) n_freq, 0.0f);
+
+    auto hz_to_mel = [](float hz) -> float {
+        const float f_sp = 200.0f / 3.0f;
+        const float min_log_hz = 1000.0f;
+        const float min_log_mel = min_log_hz / f_sp;
+        const float logstep = std::log(6.4f) / 27.0f;
+        if (hz >= min_log_hz) {
+            return min_log_mel + std::log(hz / min_log_hz) / logstep;
+        }
+        return hz / f_sp;
+    };
+    auto mel_to_hz = [](float mel) -> float {
+        const float f_sp = 200.0f / 3.0f;
+        const float min_log_hz = 1000.0f;
+        const float min_log_mel = min_log_hz / f_sp;
+        const float logstep = std::log(6.4f) / 27.0f;
+        if (mel >= min_log_mel) {
+            return min_log_hz * std::exp(logstep * (mel - min_log_mel));
+        }
+        return f_sp * mel;
+    };
+
+    const float mmin = hz_to_mel(fmin);
+    const float mmax = hz_to_mel(fmax);
+    std::vector<float> bin_freqs((size_t) n_mels + 2);
+    for (int32_t i = 0; i < n_mels + 2; ++i) {
+        const float m = mmin + (mmax - mmin) * (float) i / (float) (n_mels + 1);
+        bin_freqs[(size_t) i] = mel_to_hz(m);
+    }
+    std::vector<float> fft_freqs((size_t) n_freq);
+    for (int32_t k = 0; k < n_freq; ++k) {
+        fft_freqs[(size_t) k] = (float) sr * (float) k / (float) n_fft;
+    }
+    for (int32_t m = 0; m < n_mels; ++m) {
+        const float left   = bin_freqs[(size_t) m];
+        const float center = bin_freqs[(size_t) m + 1];
+        const float right  = bin_freqs[(size_t) m + 2];
+        const float enorm  = 2.0f / (right - left);
+        for (int32_t k = 0; k < n_freq; ++k) {
+            const float f = fft_freqs[(size_t) k];
+            float w = 0.0f;
+            if (f >= left && f < center) {
+                w = (f - left) / (center - left);
+            } else if (f >= center && f <= right) {
+                w = (right - f) / (right - center);
+            }
+            (*out)[(size_t) m * (size_t) n_freq + (size_t) k] = w * enorm;
+        }
+    }
+}
+
+// O(N²) real-input DFT (small n_fft → tolerable for one-shot FE).
+static void codec_runtime_rfft_naive(const float * in, int32_t n,
+                                      std::vector<float> * out_re,
+                                      std::vector<float> * out_im) {
+    const int32_t n_freq = n / 2 + 1;
+    out_re->assign((size_t) n_freq, 0.0f);
+    out_im->assign((size_t) n_freq, 0.0f);
+    for (int32_t k = 0; k < n_freq; ++k) {
+        double sum_re = 0.0, sum_im = 0.0;
+        const double w = -2.0 * M_PI * (double) k / (double) n;
+        for (int32_t t = 0; t < n; ++t) {
+            const double a = w * (double) t;
+            sum_re += (double) in[t] * std::cos(a);
+            sum_im += (double) in[t] * std::sin(a);
+        }
+        (*out_re)[(size_t) k] = (float) sum_re;
+        (*out_im)[(size_t) k] = (float) sum_im;
+    }
+}
+
+bool codec_runtime_whisper_mel_features(
+    const std::vector<float> & pcm,
+    int32_t sr,
+    int32_t n_fft,
+    int32_t hop,
+    int32_t n_mels,
+    int32_t pad_to_samples,
+    std::vector<float> * out_features,
+    int32_t * out_n_frames,
+    std::string * err) {
+    if (out_features == nullptr || out_n_frames == nullptr) {
+        if (err) *err = "null output";
+        return false;
+    }
+    if (sr <= 0 || n_fft <= 0 || hop <= 0 || n_mels <= 0) {
+        if (err) *err = "invalid mel-fbank arguments";
+        return false;
+    }
+    const int32_t pad_to = std::max(1, pad_to_samples);
+    const int32_t in_n   = (int32_t) pcm.size();
+    const int32_t target_len = ((in_n + pad_to - 1) / pad_to) * pad_to;
+    std::vector<float> x = pcm;
+    if ((int32_t) x.size() < target_len) {
+        x.resize((size_t) target_len, 0.0f);
+    }
+
+    // Reflection pad (PyTorch/numpy 'reflect' mode: edge value not repeated).
+    const int32_t pad = n_fft / 2;
+    std::vector<float> xp((size_t) target_len + (size_t) 2 * pad, 0.0f);
+    for (int32_t i = 0; i < target_len; ++i) {
+        xp[(size_t) (i + pad)] = x[(size_t) i];
+    }
+    for (int32_t i = 0; i < pad; ++i) {
+        const int32_t l = pad - i;
+        if (l < target_len) xp[(size_t) i] = x[(size_t) l];
+        const int32_t r = target_len - 2 - i;
+        if (r >= 0) xp[(size_t) (target_len + pad + i)] = x[(size_t) r];
+    }
+
+    std::vector<float> hann;
+    codec_runtime_periodic_hann_window(n_fft, &hann);
+
+    std::vector<float> mel_fb;
+    codec_runtime_slaney_mel_filterbank(sr, n_fft, n_mels, 0.0f, (float) sr / 2.0f, &mel_fb);
+    const int32_t n_freq = n_fft / 2 + 1;
+
+    const int32_t n_frames = target_len / hop;
+    out_features->assign((size_t) n_mels * (size_t) n_frames, 0.0f);
+
+    std::vector<float> frame((size_t) n_fft, 0.0f);
+    std::vector<float> spec_re, spec_im;
+    std::vector<float> mel_frame((size_t) n_mels, 0.0f);
+    float global_max = -INFINITY;
+    for (int32_t f = 0; f < n_frames; ++f) {
+        const int32_t start = f * hop;
+        for (int32_t i = 0; i < n_fft; ++i) {
+            frame[(size_t) i] = xp[(size_t) (start + i)] * hann[(size_t) i];
+        }
+        codec_runtime_rfft_naive(frame.data(), n_fft, &spec_re, &spec_im);
+        for (int32_t m = 0; m < n_mels; ++m) {
+            double s = 0.0;
+            const float * fb = &mel_fb[(size_t) m * (size_t) n_freq];
+            for (int32_t k = 0; k < n_freq; ++k) {
+                const float re = spec_re[(size_t) k];
+                const float im = spec_im[(size_t) k];
+                s += (double) fb[k] * (double) (re * re + im * im);
+            }
+            float v = std::log10(std::max(1e-10, s));
+            mel_frame[(size_t) m] = v;
+            if (v > global_max) global_max = v;
+        }
+        for (int32_t m = 0; m < n_mels; ++m) {
+            (*out_features)[(size_t) m * (size_t) n_frames + (size_t) f] = mel_frame[(size_t) m];
+        }
+    }
+    const float lo = global_max - 8.0f;
+    for (size_t i = 0; i < out_features->size(); ++i) {
+        float v = (*out_features)[i];
+        if (v < lo) v = lo;
+        (*out_features)[i] = (v + 4.0f) / 4.0f;
+    }
+    *out_n_frames = n_frames;
+    (void) err;
+    return true;
+}
+

@@ -112,6 +112,50 @@ ggml_tensor * codec_op_basic_transformer_block_tc(
     int32_t head_dim,
     int32_t num_heads);
 
+// Whisper / `nn.MultiheadAttention`-style encoder layer (HF Whisper, XY-Tokenizer
+// `OmniWhisperTransformerLayer`, etc.):
+//   x = x + out_proj(attn(LN(x)))     (q has bias, k bias-free, v has bias)
+//   x = x + fc2(GELU-erf(fc1(LN(x)))) (both fc1 and fc2 carry biases)
+//
+// Non-causal, sliceable via `n_valid` (when 0 < n_valid < t, attention scores
+// for keys at positions ≥ n_valid are -inf-masked and rows for queries
+// ≥ n_valid are zeroed — matches HF's `valid_q`/`valid_k` SDPA bias path).
+// Pass `n_valid = 0` (or t) to disable masking.  GELU is the *exact* erf-based
+// variant (matches PyTorch `F.gelu` with default `approximate='none'`).
+//
+// `x_tc` is `[t, c=hidden]`.  Returns `[t, c=hidden]`.
+ggml_tensor * codec_op_whisper_encoder_layer_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * n1w, ggml_tensor * n1b,
+    ggml_tensor * qw,  ggml_tensor * qb,
+    ggml_tensor * kw,
+    ggml_tensor * vw,  ggml_tensor * vb,
+    ggml_tensor * ow,  ggml_tensor * ob,
+    ggml_tensor * n2w, ggml_tensor * n2b,
+    ggml_tensor * fc1w, ggml_tensor * fc1b,
+    ggml_tensor * fc2w, ggml_tensor * fc2b,
+    int32_t head_dim,
+    int32_t n_heads,
+    int32_t n_valid);
+
+// Slice the first `t = x_tc->ne[0]` rows of `pos` (saved with PyTorch shape
+// `(max_pos, d_model)`, hence ggml ne=(d_model, max_pos)) and add to `x_tc`.
+// Returns `x_tc + pos[:t]`.  Fundamental "sinusoidal pos-emb add" pattern
+// shared by Whisper-style encoders.
+ggml_tensor * codec_op_add_sliced_pos_emb_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    ggml_tensor * pos);
+
+// L2-normalize each frame of an `[t, c]` tensor along the channel axis
+// (`torch.nn.functional.normalize(x, dim=1)` on a (B, C, T) tensor).
+// Used by every cosine-NN RVQ codec (SNAC, MOSS-Audio, …).
+ggml_tensor * codec_op_l2_normalize_tc(
+    ggml_context * ctx,
+    ggml_tensor * x_tc,
+    float eps);
+
 // Sinusoidal time embedding (Diffusion / flow-matching SinusoidalPosEmb).
 // Builds the embedding entirely in-graph from `ggml_arange + sin/cos`:
 //   half = dim/2;  freq[k] = exp(-k * log(10000)/(half-1))

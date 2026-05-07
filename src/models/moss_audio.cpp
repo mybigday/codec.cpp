@@ -348,16 +348,10 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
                                          1, 1, 0);
         if (z_e == nullptr) return false;
 
-        // L2-normalize per t-step.  ne=(t, cb_dim).
-        ggml_tensor * z_e_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_e));   // [cb_dim, t]
-        ggml_tensor * sq = ggml_mul(ctx_eval, z_e_ct, z_e_ct);
-        ggml_tensor * sum_sq = ggml_sum_rows(ctx_eval, sq);                          // [1, t]
-        sum_sq = ggml_scale_bias(ctx_eval, sum_sq, 1.0f, 1e-12f);
-        ggml_tensor * norm = ggml_sqrt(ctx_eval, sum_sq);
-        ggml_tensor * ones = ggml_scale_bias(ctx_eval, norm, 0.0f, 1.0f);
-        ggml_tensor * inv = ggml_div(ctx_eval, ones, norm);
-        ggml_tensor * inv_rep = ggml_repeat(ctx_eval, inv, z_e_ct);
-        ggml_tensor * z_n_ct = ggml_mul(ctx_eval, z_e_ct, inv_rep);                  // [cb_dim, t]
+        // L2-normalize per t-step (shared helper), then move to CT for the
+        // upcoming mul_mat against the codebook.
+        ggml_tensor * z_n = codec_op_l2_normalize_tc(ctx_eval, z_e, 1e-12f);          // [t, cb_dim]
+        ggml_tensor * z_n_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_n));    // [cb_dim, t]
 
         // Cosine sims: (cb_size, cb_dim) @ (cb_dim, t) → (cb_size, t).  Use
         // mul_mat which contracts ne[0]=cb_dim.

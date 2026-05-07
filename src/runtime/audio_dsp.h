@@ -95,4 +95,38 @@ bool codec_runtime_w2v_bert_features(
 // each input frame back to a length-`n_fft` slot offset by `hop`.
 void codec_runtime_ola_identity_kernel(int32_t n_fft, std::vector<float> * out);
 
+// Slaney triangular mel filterbank, matching
+// `librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax, htk=False, norm='slaney')`.
+// Output is row-major `[n_mels, n_freq]` where `n_freq = n_fft / 2 + 1`.
+// Used by the Whisper-style mel-fbank below; also exposed standalone for
+// codecs that want to fold the filterbank into a graph weight.
+void codec_runtime_slaney_mel_filterbank(
+    int32_t sr,
+    int32_t n_fft,
+    int32_t n_mels,
+    float fmin,
+    float fmax,
+    std::vector<float> * out);
+
+// Whisper-style mel-fbank feature extractor (HF `WhisperFeatureExtractor`).
+//   1. Reflection-pad PCM by n_fft/2 each side ('center=True').
+//   2. Frame with stride `hop`, window with periodic Hann (length n_fft).
+//   3. |FFT|^2 power spectrogram, Slaney mel filterbank.
+//   4. log10(max(1e-10, x)) compression.
+//   5. Clamp to (max - 8.0, max), then `(x + 4.0) / 4.0`.
+// Output `out_features` is row-major `[n_mels, n_frames]` (mel-major) with
+// `n_frames = pcm.size() / hop` after the input has been padded UP to a
+// multiple of `pad_to_samples` (set to 1 to disable; pass the codec's
+// downsample step otherwise).  `out_n_frames` is set to `n_frames`.
+bool codec_runtime_whisper_mel_features(
+    const std::vector<float> & pcm,
+    int32_t sr,
+    int32_t n_fft,
+    int32_t hop,
+    int32_t n_mels,
+    int32_t pad_to_samples,
+    std::vector<float> * out_features,
+    int32_t * out_n_frames,
+    std::string * err);
+
 #endif
