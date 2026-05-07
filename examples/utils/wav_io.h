@@ -12,6 +12,6 @@ struct codec_example_wav_data {
 };
 
 bool codec_example_load_wav_pcm16(const char * path, codec_example_wav_data * out, std::string * err);
-bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err);
+bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err, int32_t n_channels = 1);
 
 #endif

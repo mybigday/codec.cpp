@@ -62,6 +62,7 @@ add_library(codec STATIC
     src/models/neucodec.cpp
     src/models/xcodec2.cpp
     src/models/snac.cpp
+    src/models/moss_audio.cpp
 )
 
 target_include_directories(codec

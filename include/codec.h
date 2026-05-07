@@ -25,6 +25,7 @@ enum codec_arch {
     CODEC_ARCH_CHATTERBOX_S3G = 10,
     CODEC_ARCH_XCODEC2 = 11,
     CODEC_ARCH_SNAC = 12,
+    CODEC_ARCH_MOSS_AUDIO = 13,
 };
 
 enum codec_status {

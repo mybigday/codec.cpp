@@ -260,10 +260,10 @@ class GGUFWriter:
             elif elem_type == KV_FLOAT32:
                 for item in payload:
                     out += struct.pack("<f", float(item))
-                else:
-                    raise ValueError(f"Unsupported array element type: {elem_type}")
             else:
-                raise ValueError(f"Unsupported KV type: {t}")
+                raise ValueError(f"Unsupported array element type: {elem_type}")
+        else:
+            raise ValueError(f"Unsupported KV type: {t}")
         return bytes(out)
 
     def write_all(self):

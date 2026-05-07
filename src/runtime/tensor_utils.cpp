@@ -164,24 +164,30 @@ bool codec_prepare_mono_f32(const struct codec_audio * audio, std::vector<float>
         return false;
     }
 
-    if (audio->n_channels != 1) {
+    if (audio->n_channels < 1) {
         if (error != nullptr) {
-            *error = "codec core currently requires mono input (n_channels must be 1)";
+            *error = "audio.n_channels must be >= 1";
         }
         return false;
     }
 
-    mono->resize((size_t)audio->n_samples);
+    // The output buffer is `n_samples * n_channels` floats laid out
+    // interleaved (L0, R0, L1, R1, …) — i.e. the standard WAV memory order.
+    // Mono codecs see a length-`n_samples` vector unchanged; multi-channel
+    // models (e.g. MOSS-Audio-Tokenizer with `enable_channel_interleave=true`)
+    // can fold this directly into their per-channel-interleaved input stream.
+    const size_t total = (size_t) audio->n_samples * (size_t) audio->n_channels;
+    mono->resize(total);
 
     if (audio->pcm_type == CODEC_PCM_TYPE_F32) {
         const float * src = static_cast<const float *>(audio->data);
-        std::copy(src, src + audio->n_samples, mono->begin());
+        std::copy(src, src + total, mono->begin());
         return true;
     }
 
     if (audio->pcm_type == CODEC_PCM_TYPE_I16) {
         const int16_t * src = static_cast<const int16_t *>(audio->data);
-        for (int32_t i = 0; i < audio->n_samples; ++i) {
+        for (size_t i = 0; i < total; ++i) {
             (*mono)[i] = std::max(-1.0f, std::min(1.0f, src[i] / 32768.0f));
         }
         return true;

@@ -23,6 +23,8 @@ enum codec_graph_kind {
     CODEC_GRAPH_XCODEC2_ENCODE = 19,
     CODEC_GRAPH_SNAC_ENCODE    = 20,
     CODEC_GRAPH_SNAC_DECODE    = 21,
+    CODEC_GRAPH_MOSS_AUDIO_ENCODE = 22,
+    CODEC_GRAPH_MOSS_AUDIO_DECODE = 23,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

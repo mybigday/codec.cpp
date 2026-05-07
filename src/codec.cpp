@@ -12,6 +12,7 @@
 #include "models/wavtokenizer.h"
 #include "models/xcodec2.h"
 #include "models/snac.h"
+#include "models/moss_audio.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
 #include "runtime/gguf_kv.h"
@@ -129,6 +130,9 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "snac" || arch == "snac_24khz") {
         return CODEC_ARCH_SNAC;
     }
+    if (arch == "moss_audio_tokenizer" || arch == "moss-audio-tokenizer" || arch == "moss_audio") {
+        return CODEC_ARCH_MOSS_AUDIO;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -159,6 +163,8 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_xcodec2_vtable();
         case CODEC_ARCH_SNAC:
             return codec_snac_vtable();
+        case CODEC_ARCH_MOSS_AUDIO:
+            return codec_moss_audio_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -179,6 +185,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_CHATTERBOX_S3G:     return "Chatterbox-S3G";
         case CODEC_ARCH_XCODEC2:            return "XCodec2";
         case CODEC_ARCH_SNAC:               return "SNAC";
+        case CODEC_ARCH_MOSS_AUDIO:         return "MOSS-Audio-Tokenizer";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }
@@ -503,6 +510,13 @@ static enum codec_status codec_encode_impl(
         std::ostringstream oss;
         oss << "sample_rate mismatch: got " << audio->sample_rate << ", expected " << expect_sr
             << " (resample before codec_encode)";
+        codec_context_set_error(ctx, oss.str());
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const int32_t expect_ch = ctx->model->expected_channels > 0 ? ctx->model->expected_channels : 1;
+    if (audio->n_channels != expect_ch) {
+        std::ostringstream oss;
+        oss << "n_channels mismatch: got " << audio->n_channels << ", expected " << expect_ch;
         codec_context_set_error(ctx, oss.str());
         return CODEC_STATUS_INVALID_ARG;
     }

@@ -134,6 +134,25 @@ void codec_read_i32_array_kv(struct gguf_context * gf, const char * key, int32_t
     }
 }
 
+void codec_read_f32_array_kv(struct gguf_context * gf, const char * key, float * dst, int32_t dst_n) {
+    if (gf == nullptr || key == nullptr || dst == nullptr || dst_n <= 0) {
+        return;
+    }
+    const int key_id = gguf_find_key(gf, key);
+    if (key_id < 0 || gguf_get_kv_type(gf, key_id) != GGUF_TYPE_ARRAY) {
+        return;
+    }
+    const enum gguf_type arr_t = gguf_get_arr_type(gf, key_id);
+    const size_t n = gguf_get_arr_n(gf, key_id);
+    const size_t n_copy = std::min(n, (size_t) dst_n);
+    if (arr_t == GGUF_TYPE_FLOAT32) {
+        const float * src = static_cast<const float *>(gguf_get_arr_data(gf, key_id));
+        if (src != nullptr) {
+            for (size_t i = 0; i < n_copy; ++i) dst[i] = src[i];
+        }
+    }
+}
+
 void codec_read_i32_array_kv_vec(struct gguf_context * gf, const char * key, std::vector<int32_t> * dst) {
     if (gf == nullptr || key == nullptr || dst == nullptr) {
         return;

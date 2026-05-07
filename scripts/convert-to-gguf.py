@@ -62,6 +62,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
         return "xcodec2"
     elif "snac" in model_type:
         return "snac"
+    elif "moss-audio" in model_type or "moss_audio" in model_type or "mossaudio" in model_type:
+        return "moss_audio"
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
@@ -89,6 +91,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
             return "xcodec2"
         elif "snac" in arch:
             return "snac"
+        elif "moss" in arch and "audio" in arch:
+            return "moss_audio"
 
     raise ValueError(f"Unknown model type: {model_type}. Cannot auto-detect.")
 
@@ -120,6 +124,8 @@ def infer_model_type_from_filename(filename: str) -> str | None:
         return 'xcodec2'
     elif 'snac' in name_lower:
         return 'snac'
+    elif 'moss' in name_lower and 'audio' in name_lower:
+        return 'moss_audio'
     return None
 
 

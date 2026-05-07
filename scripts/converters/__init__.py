@@ -13,6 +13,7 @@ from .nemo_nano_codec import NemoNanoCodecConverter
 from .neucodec import NeuCodecConverter, DistillNeuCodecConverter
 from .xcodec2 import XCodec2Converter
 from .snac import SnacConverter
+from .moss_audio import MossAudioConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -28,6 +29,8 @@ _CONVERTER_REGISTRY = {
     'distill_neucodec': DistillNeuCodecConverter,
     'xcodec2': XCodec2Converter,
     'snac': SnacConverter,
+    'moss_audio': MossAudioConverter,
+    'moss_audio_nano': MossAudioConverter,
 }
 
 

@@ -333,7 +333,7 @@ static int cmd_e2e(const e2e_args & args) {
     }
 
     std::string write_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &write_err)) {
+    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &write_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", write_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_latent_buffer_free(&latent);
@@ -411,7 +411,7 @@ static int cmd_decode(const decode_args & args) {
     }
 
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
+    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_free(ctx);
@@ -476,7 +476,7 @@ static int cmd_decode_latent(const decode_latent_args & args) {
     }
 
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
+    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_free(ctx);

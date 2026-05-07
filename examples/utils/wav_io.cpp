@@ -113,7 +113,7 @@ bool codec_example_load_wav_pcm16(const char * path, codec_example_wav_data * ou
     return true;
 }
 
-bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err) {
+bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err, int32_t n_channels) {
     FILE * fp = std::fopen(path, "wb");
     if (fp == nullptr) {
         if (err != nullptr) {
@@ -123,9 +123,9 @@ bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t
     }
 
     const uint16_t audio_format = 1;
-    const uint16_t n_channels = 1;
+    const uint16_t nch = (uint16_t) std::max(1, n_channels);
     const uint16_t bits_per_sample = 16;
-    const uint16_t block_align = n_channels * bits_per_sample / 8;
+    const uint16_t block_align = nch * bits_per_sample / 8;
     const uint32_t byte_rate = (uint32_t) sample_rate * block_align;
     const uint32_t data_size = (uint32_t) n_samples * block_align;
     const uint32_t riff_size = 36 + data_size;
@@ -137,7 +137,7 @@ bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t
     const uint32_t fmt_size = 16;
     std::fwrite(&fmt_size, 4, 1, fp);
     std::fwrite(&audio_format, 2, 1, fp);
-    std::fwrite(&n_channels, 2, 1, fp);
+    std::fwrite(&nch, 2, 1, fp);
     std::fwrite(&sample_rate, 4, 1, fp);
     std::fwrite(&byte_rate, 4, 1, fp);
     std::fwrite(&block_align, 2, 1, fp);
@@ -145,7 +145,8 @@ bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t
     std::fwrite("data", 1, 4, fp);
     std::fwrite(&data_size, 4, 1, fp);
 
-    for (int32_t i = 0; i < n_samples; ++i) {
+    const int32_t n_total = n_samples * (int32_t) nch;
+    for (int32_t i = 0; i < n_total; ++i) {
         const float x = std::max(-1.0f, std::min(1.0f, pcm[i]));
         const int32_t q = (int32_t) std::lround(x * 32767.0f);
         const int16_t s = (int16_t) std::max(-32768, std::min(32767, q));

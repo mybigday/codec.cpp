@@ -5,6 +5,17 @@
 struct codec_lm_attn_params {
     float scale = 0.0f;   // if <= 0, use 1 / sqrt(head_dim)
     bool causal = false;
+    // Optional sliding-window limit on causal attention.  If `>0`, query
+    // position i attends only to keys j ∈ [i - window + 1, i].  Set to 0
+    // (default) to disable; only meaningful when `causal` is true.  Used by
+    // MOSS-Audio-Tokenizer's per-block context budgets.
+    int32_t window = 0;
+    // Optional padding mask: if `n_valid > 0` and `n_valid < t`, attention
+    // scores for keys at positions `>= n_valid` are set to -inf, and the
+    // output rows for queries at positions `>= n_valid` are forced to zero.
+    // Set to 0 (default) to disable.  Used by MOSS-Audio-Tokenizer to honour
+    // `input_lengths` after PCM padding.
+    int32_t n_valid = 0;
 };
 
 // q_dth, k_dth, v_dth are [head_dim, t, n_heads]
