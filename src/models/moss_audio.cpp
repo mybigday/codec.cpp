@@ -206,15 +206,14 @@ ggml_tensor * codec_moss_projected_transformer_ct(
         return codec_graph_weight(ctx, model, name);
     };
 
-    // input_proj weight ggml ne=(1=k_dummy?, in_dim, d_model)?  Actually it's
-    // a `nn.Linear(in_dim, d_model)` with PyTorch shape (d_model, in_dim).
-    // After GGUF reverses, ggml ne=(in_dim, d_model).  We use ggml_mul_mat
-    // directly: contraction on ne[0]=in_dim, output (d_model, t).
-    ggml_tensor * in_w = W(base + ".input_proj.w");
+    // input_proj/output_proj are `nn.Linear` when `input_dim != d_model` /
+    // `d_model != output_dim`, otherwise `nn.Identity()`.  The converter
+    // emits the weight only when the source Linear exists; treat absence as
+    // identity (in_dim == d_model, etc.).
+    ggml_tensor * in_w  = W(base + ".input_proj.w");
     ggml_tensor * out_w = W(base + ".output_proj.w");
-    if (in_w == nullptr || out_w == nullptr) return nullptr;
 
-    ggml_tensor * h_ct = ggml_mul_mat(ctx, in_w, x_ct);   // [d_model, t]
+    ggml_tensor * h_ct = (in_w != nullptr) ? ggml_mul_mat(ctx, in_w, x_ct) : x_ct;
     if (h_ct == nullptr) return nullptr;
     ggml_tensor * h_tc = ggml_cont(ctx, ggml_transpose(ctx, h_ct));   // [t, d_model]
     (void) d_model;
@@ -237,6 +236,7 @@ ggml_tensor * codec_moss_projected_transformer_ct(
     }
 
     h_ct = ggml_cont(ctx, ggml_transpose(ctx, h_tc));     // [d_model, t]
+    if (out_w == nullptr) return h_ct;
     return ggml_mul_mat(ctx, out_w, h_ct);                // [out_dim, t]
     (void) out_dim;
 }
@@ -336,8 +336,8 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
     //   z_q_e = embedding (codebook[idx]) → out_proj → [t, rvq_dim]
     //   residual -= z_q_e
     ggml_tensor * residual = x_tc;
-    ggml_tensor * codes_per_level[16] = { nullptr };
-    if (p->n_q > 16) return false;
+    ggml_tensor * codes_per_level[64] = { nullptr };
+    if (p->n_q > 64) return false;
     for (int32_t qi = 0; qi < p->n_q; ++qi) {
         const std::string base = "moss.q." + std::to_string(qi);
 

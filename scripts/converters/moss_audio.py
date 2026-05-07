@@ -252,17 +252,40 @@ class MossAudioConverter(BaseConverter):
             if (prefix + ".bias") in sd:
                 self._add_tensor(writer, out_name + ".b", _t(prefix + ".bias"), "F32")
 
+        def _first_present(*names: str) -> str:
+            for n in names:
+                if n in sd:
+                    return n
+            raise KeyError(f"none of {names} found in state_dict")
+
         def add_transformer_layer(prefix: str, out_name: str) -> None:
             add_layernorm(prefix + ".norm1", out_name + ".norm1")
             add_layernorm(prefix + ".norm2", out_name + ".norm2")
-            self._add_tensor(writer, out_name + ".attn.qkv.w",
-                             _t(prefix + ".self_attn.in_proj.weight"))
-            self._add_tensor(writer, out_name + ".attn.out.w",
-                             _t(prefix + ".self_attn.out_proj.weight"))
-            self._add_tensor(writer, out_name + ".ffn.fc1.w",
-                             _t(prefix + ".ffn.0.weight"))
-            self._add_tensor(writer, out_name + ".ffn.fc2.w",
-                             _t(prefix + ".ffn.2.weight"))
+            # Nano stores `self_attn.in_proj.weight`; full uses
+            # `self_attn.in_projs.0.weight` (a ModuleList wrapper supporting
+            # weights-per-step, even when only index 0 is populated).
+            qkv_name = _first_present(
+                prefix + ".self_attn.in_proj.weight",
+                prefix + ".self_attn.in_projs.0.weight",
+            )
+            out_name_in = _first_present(
+                prefix + ".self_attn.out_proj.weight",
+                prefix + ".self_attn.out_projs.0.weight",
+            )
+            self._add_tensor(writer, out_name + ".attn.qkv.w", _t(qkv_name))
+            self._add_tensor(writer, out_name + ".attn.out.w", _t(out_name_in))
+            # Nano: `ffn.0` / `ffn.2` (sequential gelu sandwich); full:
+            # `linear1` / `linear2` (no Sequential wrapper).
+            fc1_name = _first_present(
+                prefix + ".ffn.0.weight",
+                prefix + ".linear1.weight",
+            )
+            fc2_name = _first_present(
+                prefix + ".ffn.2.weight",
+                prefix + ".linear2.weight",
+            )
+            self._add_tensor(writer, out_name + ".ffn.fc1.w", _t(fc1_name))
+            self._add_tensor(writer, out_name + ".ffn.fc2.w", _t(fc2_name))
             self._add_tensor(writer, out_name + ".ls1",
                              _t(prefix + ".layer_scale_1.scale"), "F32")
             self._add_tensor(writer, out_name + ".ls2",
@@ -277,8 +300,15 @@ class MossAudioConverter(BaseConverter):
                     continue
                 base_in = ("encoder" if side == "enc" else "decoder") + f".{mi}"
                 base_out = f"moss.{side}.b{mi}"
-                add_linear(base_in + ".input_proj", base_out + ".input_proj")
-                add_linear(base_in + ".output_proj", base_out + ".output_proj")
+                # Full MOSS-Audio-Tokenizer uses nn.Identity for input/output
+                # projections when `input_dim == d_model` / `d_model ==
+                # output_dim`, so the corresponding weight is absent from the
+                # state-dict.  Emit only when the source weight exists; the
+                # runtime treats missing projection tensors as identity.
+                if (base_in + ".input_proj.weight") in sd:
+                    add_linear(base_in + ".input_proj", base_out + ".input_proj")
+                if (base_in + ".output_proj.weight") in sd:
+                    add_linear(base_in + ".output_proj", base_out + ".output_proj")
                 for li in range(int(mod["num_layers"])):
                     add_transformer_layer(
                         base_in + f".transformer.layers.{li}",
