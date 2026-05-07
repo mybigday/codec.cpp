@@ -466,10 +466,11 @@ static ggml_tensor * codec_neu_local_mha_tc(
     ggml_tensor * w_out,
     int32_t heads,
     int32_t head_dim,
-    const codec_local_attn_params * attn_params,
+    ggml_tensor * mask_score_kqh,
     float ln_eps) {
 
-    if (ctx_eval == nullptr || x_tc == nullptr || w_qkv == nullptr || w_out == nullptr || attn_params == nullptr) {
+    if (ctx_eval == nullptr || x_tc == nullptr || w_qkv == nullptr || w_out == nullptr ||
+        mask_score_kqh == nullptr) {
         return nullptr;
     }
     ggml_tensor * h_tc = x_tc;
@@ -511,7 +512,7 @@ static ggml_tensor * codec_neu_local_mha_tc(
     ggml_tensor * k_dth = ggml_cont(ctx_eval, ggml_permute(ctx_eval, k_dht, 0, 2, 1, 3));
     ggml_tensor * v_dth = ggml_cont(ctx_eval, ggml_permute(ctx_eval, v_dht, 0, 2, 1, 3));
 
-    ggml_tensor * attn_dth = codec_op_local_attn(ctx_eval, q_dth, k_dth, v_dth, attn_params);
+    ggml_tensor * attn_dth = codec_op_local_attn(ctx_eval, q_dth, k_dth, v_dth, mask_score_kqh, head_dim, heads);
     if (attn_dth == nullptr) {
         return nullptr;
     }
@@ -885,15 +886,24 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
     int32_t depth,
     int32_t heads,
     int32_t head_dim,
-    const codec_local_attn_params * attn_params) {
+    const char * mask_tensor_name) {
 
-    if (ctx_eval == nullptr || model == nullptr || x_tc == nullptr || depth <= 0 || attn_params == nullptr) {
+    if (ctx_eval == nullptr || model == nullptr || x_tc == nullptr || depth <= 0 ||
+        mask_tensor_name == nullptr) {
         return nullptr;
     }
 
     const int32_t dim = (int32_t) x_tc->ne[1];
     (void) dim;
     const int32_t inner_dim = (int32_t) ((int32_t) x_tc->ne[1] * 4 * 2 / 3);
+
+    // Per-trans-stage local-attention score-bias leaf, shared across all
+    // `depth` LocalMHA layers (they all see the same t and the same
+    // `attn_params`).  Filled CPU-side by the encoder's runtime path before
+    // graph compute.
+    const int32_t t = (int32_t) x_tc->ne[0];
+    ggml_tensor * mask_kqh = ggml_new_tensor_3d(ctx_eval, GGML_TYPE_F32, t, t, heads);
+    ggml_set_name(mask_kqh, mask_tensor_name);
 
     for (int32_t li = 0; li < depth; ++li) {
         const std::string lp = prefix + ".layers." + std::to_string(li);
@@ -906,7 +916,7 @@ static ggml_tensor * codec_neu_build_distill_local_trans(
             return nullptr;
         }
 
-        ggml_tensor * attn = codec_neu_local_mha_tc(ctx_eval, x_tc, ln_w, ln_b, w_qkv, w_out, heads, head_dim, attn_params, 1e-5f);
+        ggml_tensor * attn = codec_neu_local_mha_tc(ctx_eval, x_tc, ln_w, ln_b, w_qkv, w_out, heads, head_dim, mask_kqh, 1e-5f);
         if (attn == nullptr) {
             return nullptr;
         }
@@ -1014,7 +1024,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         2,
         6,
         512 / 4,
-        p->down_attn);
+        "neucodec.encode.distill.down_mask");
     if (x == nullptr) {
         return false;
     }
@@ -1032,7 +1042,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
         3,
         6,
         512 / 4,
-        p->local_attn);
+        "neucodec.encode.distill.local_mask");
     if (x == nullptr) {
         return false;
     }
@@ -1502,6 +1512,24 @@ static enum codec_status codec_neu_encode_graph(
 
     const float basis_vals[8] = { 1, 4, 16, 64, 256, 1024, 4096, 16384 };
     if (!codec_runtime_write_tensor(t_basis, basis_vals, sizeof(basis_vals), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // Local-attention score-bias masks (causal + block window + per-head
+    // rel-pos bias).  Built CPU-side from the cached `attn_params`, then
+    // written to graph leaves before compute.
+    auto write_local_attn_mask = [&](const char * tname,
+                                      const codec_local_attn_params & ap) -> bool {
+        ggml_tensor * t_mask = codec_graph_get_tensor(ctx, entry, tname);
+        if (t_mask == nullptr) return true;   // distill stage not built (e.g. legacy graph)
+        const int32_t t_len = (int32_t) t_mask->ne[0];
+        std::vector<float> mask((size_t) t_len * (size_t) t_len * (size_t) ap.heads, 0.0f);
+        codec_local_attn_fill_mask(&ap, t_len, mask.data());
+        return codec_runtime_write_tensor(t_mask, mask.data(), mask.size() * sizeof(float), &err);
+    };
+    if (!write_local_attn_mask("neucodec.encode.distill.down_mask",  neu.distill_attn_down) ||
+        !write_local_attn_mask("neucodec.encode.distill.local_mask", neu.distill_attn_local)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
