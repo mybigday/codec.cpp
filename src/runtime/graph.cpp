@@ -68,7 +68,7 @@ void codec_graph_release(codec_context * ctx) {
     ctx->eval_graph = nullptr;
     ctx->eval_output = nullptr;
     ctx->eval_entry = nullptr;
-    ctx->eval_alloc_entry = nullptr;
+    ctx->eval_graph_allocated = false;
 }
 
 static bool codec_graph_ensure_eval_arena(codec_context * ctx, size_t required_size, std::string * error) {
@@ -144,7 +144,6 @@ bool codec_graph_cache_get_or_build(
         entry.build_fn = build_fn;
         entry.last_graph_size = 0;
         entry.last_sched_graph_size = 0;
-        entry.allocated = false;
         if (user_data_size > 0) {
             const uint8_t * src = static_cast<const uint8_t *>(user_data);
             entry.build_user_data.assign(src, src + user_data_size);
@@ -183,6 +182,27 @@ bool codec_graph_cache_get_or_build(
         codec_graph_release(ctx);
         return false;
     }
+
+    // Mark every unallocated leaf as a graph input so galloc keeps it persistent
+    // and we can write to it via codec_runtime_write_tensor between alloc and
+    // compute.  Model weights live in a different context with buffers already
+    // attached, so they're skipped naturally.  Also mark every named non-leaf as
+    // output: the codebase convention is to name only tensors that the runtime
+    // reads back via codec_graph_get_tensor + codec_runtime_read_tensor, and
+    // without OUTPUT flagging galloc reuses their buffers after their last
+    // graph use (e.g. snac's three RVQ code tensors).
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx->eval_ctx); t != nullptr;
+         t = ggml_get_next_tensor(ctx->eval_ctx, t)) {
+        if (t->buffer != nullptr || t->view_src != nullptr) {
+            continue;
+        }
+        if (t->op == GGML_OP_NONE) {
+            ggml_set_input(t);
+        } else if (t->name[0] != '\0') {
+            ggml_set_output(t);
+        }
+    }
+    ggml_set_output(out);
 
     const codec_graph_count_state counts = codec_graph_count_exact(out);
     size_t graph_size = 0;

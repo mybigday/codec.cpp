@@ -71,7 +71,6 @@ struct codec_graph_cache_entry {
     std::vector<uint8_t> build_user_data;
     int32_t last_graph_size = 0; // exact ggml graph capacity: max(n_nodes, n_leafs)
     int32_t last_sched_graph_size = 0; // exact scheduler base size: n_nodes + n_leafs
-    bool allocated = false; // whether this entry's graph has been allocated in the backend scheduler
 };
 
 struct codec_context {
@@ -88,9 +87,8 @@ struct codec_context {
     ggml_cgraph * eval_graph = nullptr;
     ggml_tensor * eval_output = nullptr;
     codec_graph_cache_entry * eval_entry = nullptr;
-    codec_graph_cache_entry * eval_alloc_entry = nullptr;
+    bool eval_graph_allocated = false; // sched_alloc_graph done for current eval_ctx
     int32_t sched_reserved_graph_size = 0;
-    bool sched_needs_reset = false;
 };
 
 struct codec_model_vtable {

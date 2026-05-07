@@ -101,9 +101,7 @@ bool codec_runtime_init(codec_context * ctx, std::string * error) {
     ctx->eval_graph = nullptr;
     ctx->eval_output = nullptr;
     ctx->eval_entry = nullptr;
-    ctx->eval_alloc_entry = nullptr;
     ctx->sched_reserved_graph_size = 0;
-    ctx->sched_needs_reset = false;
     if (ctx->backend == nullptr) {
         if (error != nullptr) {
             *error = "model backend is null";
@@ -137,41 +135,38 @@ bool codec_graph_prepare_io(
         return false;
     }
 
-    if (ctx->eval_alloc_entry == entry) {
+    // The scheduler must be sized large enough for this graph before we can
+    // alloc into it.  galloc-managed memory reuse depends on the topological
+    // analysis happening on the same graph that we're about to compute, so we
+    // alloc here (after build, before write_tensor) and compute later.
+    int32_t required = entry->last_sched_graph_size;
+    if (required <= 0) {
+        required = std::max(1, ggml_graph_n_nodes(ctx->eval_graph));
+    }
+    if (!codec_sched_ensure_capacity(ctx, required, error)) {
+        return false;
+    }
+
+    if (ctx->eval_graph_allocated) {
         return true;
     }
 
-    // If we previously allocated a graph in the scheduler and we are about to allocate a different one,
-    // we must reset the scheduler to avoid dangling allocations (see ggml-backend.h docs).
-    if (ctx->sched_needs_reset && !entry->allocated) {
-        ggml_backend_sched_reset(ctx->sched);
-        ctx->sched_needs_reset = false;
-        // All previous allocations are invalid after reset.
-        for (codec_graph_cache_entry & e : ctx->graph_cache) {
-            e.allocated = false;
-        }
-    }
-
-    // Allocate all tensors in the context to the backend buffer using ggml_backend_alloc_ctx_tensors
-    ggml_backend_t cpu_backend = codec_get_default_backend(ctx);
-    if (cpu_backend == nullptr || ctx->eval_ctx == nullptr) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, ctx->eval_graph)) {
         if (error != nullptr) {
-            *error = "no CPU backend or eval context";
+            *error = "failed to allocate graph in scheduler";
         }
         return false;
     }
+    ctx->eval_graph_allocated = true;
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx->eval_ctx, cpu_backend);
-    if (buf == nullptr) {
-        if (error != nullptr) {
-            *error = "failed to allocate tensors to backend";
-        }
-        return false;
+    {
+        char det[80];
+        const size_t bytes = ggml_backend_sched_get_buffer_size(ctx->sched, codec_get_default_backend(ctx));
+        std::snprintf(det, sizeof(det), "kind=%d bytes=%zu", entry->key.kind, bytes);
+        codec_perf_event("graph_alloc_buf", det);
     }
 
-    entry->allocated = true;
-    ctx->eval_alloc_entry = entry;
-    ctx->sched_needs_reset = true;
     return true;
 }
 
@@ -198,14 +193,6 @@ bool codec_graph_compute(
     codec_backend_set_n_threads(ctx->backend, n_threads);
     if (ctx->cpu_backend != nullptr) {
         codec_backend_set_n_threads(ctx->cpu_backend, n_threads);
-    }
-
-    int32_t required = entry->last_sched_graph_size;
-    if (required <= 0) {
-        required = std::max(1, ggml_graph_n_nodes(ctx->eval_graph));
-    }
-    if (!codec_sched_ensure_capacity(ctx, required, error)) {
-        return false;
     }
 
     if (!codec_graph_prepare_io(ctx, entry, error)) {
