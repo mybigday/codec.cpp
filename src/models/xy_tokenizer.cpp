@@ -707,8 +707,6 @@ static enum codec_status codec_xy_encode(
         return CODEC_STATUS_INVALID_ARG;
     }
 
-    const size_t mem = (size_t) 4 * 1024 * 1024 * 1024 +
-                       (size_t) n_frames * (size_t) cfg.sem_enc_d_model * 64;
     codec_graph_eval_guard guard(ctx);
     std::string err;
     codec_graph_cache_entry * entry = nullptr;
@@ -716,8 +714,7 @@ static enum codec_status codec_xy_encode(
             ctx,
             { CODEC_GRAPH_XY_TOKENIZER_ENCODE, /*n_frames=*/n_codes,
               /*n_q=*/cfg.n_q, /*hop=*/cfg.encoder_downsample_rate,
-              /*n_in=*/n_frames, /*latent_dim=*/cfg.latent_dim },
-            mem, xy_build_encode, &build, sizeof(build), &entry, &err)) {
+              /*n_in=*/n_frames, /*latent_dim=*/cfg.latent_dim }, xy_build_encode, &build, sizeof(build), &entry, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -799,8 +796,6 @@ static enum codec_status codec_xy_decode(
     build.cfg = &cfg;
     build.model = ctx->model;
 
-    const size_t mem = (size_t) 4 * 1024 * 1024 * 1024 +
-                       (size_t) n_codes * (size_t) cfg.sem_enc_d_model * 256;
     codec_graph_eval_guard guard(ctx);
     std::string err;
     codec_graph_cache_entry * entry = nullptr;
@@ -808,8 +803,7 @@ static enum codec_status codec_xy_decode(
             ctx,
             { CODEC_GRAPH_XY_TOKENIZER_DECODE, /*n_frames=*/n_codes,
               /*n_q=*/cfg.n_q, /*hop=*/cfg.decoder_upsample_rate,
-              /*n_in=*/0, /*latent_dim=*/cfg.latent_dim },
-            mem, xy_build_decode, &build, sizeof(build), &entry, &err)) {
+              /*n_in=*/0, /*latent_dim=*/cfg.latent_dim }, xy_build_decode, &build, sizeof(build), &entry, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }

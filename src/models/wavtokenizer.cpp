@@ -998,7 +998,6 @@ static enum codec_status codec_wt_decode_graph(
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
     const int32_t hop = std::max(1, wt.hop_size);
-    const size_t mem = 32 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
 
@@ -1012,7 +1011,6 @@ static enum codec_status codec_wt_decode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_WT_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             codec_wt_build_decode,
             &build,
             sizeof(build),
@@ -1128,7 +1126,6 @@ enum codec_status codec_wavtokenizer_encode(
     const int32_t hop = std::max(1, params.hop_size > 0 ? params.hop_size : wt.hop_size);
     const int32_t n_in = (int32_t) pcm.size();
 
-    const size_t mem = 32 * 1024 * 1024 + (size_t) n_in * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
     const int32_t codebook_dim = std::max(1, wt.codebook_dim);
     const int32_t codebook_size = std::max(2, wt.codebook_size);
@@ -1138,7 +1135,6 @@ enum codec_status codec_wavtokenizer_encode(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_WT_ENCODE, /*n_frames=*/0, /*n_q=*/use_n_q, /*hop=*/hop, /*n_in=*/n_in, /*latent_dim=*/codebook_dim },
-            mem,
             codec_wt_build_encode,
             &build,
             sizeof(build),

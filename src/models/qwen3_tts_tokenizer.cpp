@@ -604,8 +604,6 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
 
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
-    const size_t mem = 256 * 1024 * 1024 + (size_t) q3.num_hidden_layers * 16 * 1024 * 1024;
-
     codec_graph_eval_guard eval_guard(ctx);
     q3t_decode_build build = {};
     std::string err;
@@ -617,7 +615,6 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_Q3T_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/build.codebook_dim, /*n_in=*/0, /*latent_dim=*/build.latent_dim },
-            mem,
             codec_q3t_build_decode,
             &build,
             sizeof(build),

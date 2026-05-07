@@ -97,10 +97,19 @@ static bool codec_graph_ensure_eval_arena(codec_context * ctx, size_t required_s
     return true;
 }
 
+// Default arena size for ggml metadata.  ggml_init in no_alloc mode
+// pre-allocates this many bytes for the eval context's tensor / op /
+// graph metadata; the actual data lives in the scheduler's galloc-managed
+// buffer.  Largest observed usage across all models is chatterbox_s3g's
+// 48 MB unrolled-CFM graph (2026-05-07), so 128 MB has ~2.5× headroom.
+// The arena is mostly virtual: pages are committed on touch, so an
+// oversized default doesn't materially affect RSS — but it bloats VIRT
+// and is wasteful if a future backend pre-faults arena pages.
+static constexpr size_t kCodecGraphDefaultArenaBytes = (size_t) 128 * 1024 * 1024;
+
 bool codec_graph_cache_get_or_build(
     codec_context * ctx,
     codec_graph_cache_key key,
-    size_t mem_size,
     codec_graph_build_fn build_fn,
     const void * user_data,
     size_t user_data_size,
@@ -140,7 +149,7 @@ bool codec_graph_cache_get_or_build(
     if (cached == nullptr) {
         codec_graph_cache_entry entry;
         entry.key = key;
-        entry.required_mem_size = mem_size;
+        entry.required_mem_size = kCodecGraphDefaultArenaBytes;
         entry.build_fn = build_fn;
         entry.last_graph_size = 0;
         entry.last_sched_graph_size = 0;
@@ -150,8 +159,6 @@ bool codec_graph_cache_get_or_build(
         }
         ctx->graph_cache.push_back(entry);
         cached = &ctx->graph_cache.back();
-    } else {
-        cached->required_mem_size = std::max(cached->required_mem_size, mem_size);
     }
 
     if (!codec_graph_ensure_eval_arena(ctx, cached->required_mem_size, error)) {
@@ -221,7 +228,15 @@ bool codec_graph_cache_get_or_build(
     ctx->eval_output = out;
     ctx->eval_entry = cached;
 
-    cached->required_mem_size = std::max(cached->required_mem_size, ggml_used_mem(ctx->eval_ctx));
+    // Ratchet up the arena ceiling if this graph needed more than the default
+    // — the next call for this entry will allocate enough on its own.  We
+    // never shrink: the eval arena is reused across cache entries and a
+    // realloc-down would just churn since the next entry might want the
+    // larger size again.
+    const size_t used_mem = ggml_used_mem(ctx->eval_ctx);
+    if (used_mem > cached->required_mem_size) {
+        cached->required_mem_size = used_mem;
+    }
     cached->last_graph_size = (int32_t) graph_size;
     cached->last_sched_graph_size = (int32_t) std::max<size_t>(1, counts.n_nodes + counts.n_leafs);
     *out_entry = cached;

@@ -532,7 +532,6 @@ static enum codec_status codec_snac_run_encode(
     build.n_levels = 3;
     build.model    = ctx->model;
 
-    const size_t mem = (size_t) 256 * 1024 * 1024 + (size_t) n_pcm * sizeof(float) * 64;
     codec_graph_eval_guard guard(ctx);
     std::string err;
 
@@ -542,7 +541,6 @@ static enum codec_status codec_snac_run_encode(
             { CODEC_GRAPH_SNAC_ENCODE,
               /*n_frames=*/n_super, /*n_q=*/3, /*hop=*/sn.hop_size,
               /*n_in=*/n_pcm, /*latent_dim=*/sn.latent_dim },
-            mem,
             codec_snac_build_encode,
             &build,
             sizeof(build),
@@ -674,9 +672,6 @@ static enum codec_status codec_snac_run_decode(
     build.apply_noise = false;
     build.model       = ctx->model;
 
-    const size_t mem = (size_t) 256 * 1024 * 1024 +
-                       (size_t) n_super * sizeof(float) * 64 +
-                       (size_t) n_frames * sn.hop_size * sizeof(float) * 16;
     codec_graph_eval_guard guard(ctx);
     std::string err;
 
@@ -686,7 +681,6 @@ static enum codec_status codec_snac_run_decode(
             { CODEC_GRAPH_SNAC_DECODE,
               /*n_frames=*/n_super, /*n_q=*/3, /*hop=*/sn.hop_size,
               /*n_in=*/0, /*latent_dim=*/sn.latent_dim },
-            mem,
             codec_snac_build_decode,
             &build,
             sizeof(build),

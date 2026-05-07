@@ -178,7 +178,6 @@ static enum codec_status codec_x2_decode_graph(
     const int32_t t   = tokens->n_frames;
     const int32_t q   = use_n_q;
     const int32_t hop = std::max(1, x2.hop_size);
-    const size_t mem = (size_t) 64 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 64;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
 
@@ -205,7 +204,6 @@ static enum codec_status codec_x2_decode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_XCODEC2_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             codec_x2_build_decode,
             &build,
             sizeof(build),
@@ -817,9 +815,6 @@ static enum codec_status codec_x2_encode_graph(
     // gathered-distance-embedding tensor.  Budget grows roughly linearly with
     // T_pcm for the BigCodec stack and quadratically with T_sem for the
     // attention rel-key gather, so size both terms generously.
-    const size_t mem = (size_t) 1024 * 1024 * 1024 +
-                       (size_t) n_sem_frames * (size_t) n_sem_frames * sizeof(float) * 64 +
-                       (size_t) n_pcm * sizeof(float) * 64;
     codec_graph_eval_guard eval_guard(ctx);
 
     codec_graph_cache_entry * entry = nullptr;
@@ -828,7 +823,6 @@ static enum codec_status codec_x2_encode_graph(
             { CODEC_GRAPH_XCODEC2_ENCODE,
               /*n_frames=*/n_codes, /*n_q=*/1, /*hop=*/hop,
               /*n_in=*/n_pcm, /*latent_dim=*/n_sem_frames },
-            mem,
             codec_x2_build_encode,
             &build,
             sizeof(build),

@@ -1265,7 +1265,6 @@ static enum codec_status codec_neu_decode_graph(
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
     const int32_t hop = std::max(1, neu.hop_size);
-    const size_t mem = 64 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 64;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
 
@@ -1280,7 +1279,6 @@ static enum codec_status codec_neu_decode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_NEUCODEC_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             codec_neu_build_decode,
             &build,
             sizeof(build),
@@ -1465,7 +1463,6 @@ static enum codec_status codec_neu_encode_graph(
     std::vector<float> sem_pad((size_t) n_in_sem, 0.0f);
     std::memcpy(sem_pad.data() + 160, pcm_pad.data(), pcm_pad.size() * sizeof(float));
 
-    const size_t mem = 512 * 1024 * 1024;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
 
@@ -1480,7 +1477,6 @@ static enum codec_status codec_neu_encode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_NEUCODEC_ENCODE, /*n_frames=*/0, /*n_q=*/build.n_q, /*hop=*/0, /*n_in=*/n_in_pad, /*latent_dim=*/0 },
-            mem,
             codec_neu_build_encode,
             &build,
             sizeof(build),

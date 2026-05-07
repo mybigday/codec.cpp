@@ -938,7 +938,6 @@ static enum codec_status codec_dac_decode_tokens_graph(
 
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
-    const size_t mem = 32 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
 
@@ -952,7 +951,6 @@ static enum codec_status codec_dac_decode_tokens_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_DAC_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop_size, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             codec_dac_build_decode,
             &build,
             sizeof(build),
@@ -1036,7 +1034,6 @@ enum codec_status codec_dac_decode_latent(
     }
 
     const int32_t hop = std::max(1, dac.hop_size);
-    const size_t mem = 32 * 1024 * 1024 + (size_t) n_frames * (size_t) latent_dim * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
 
     dac_decode_latent_build build = { n_frames, latent_dim, hop };
@@ -1045,7 +1042,6 @@ enum codec_status codec_dac_decode_latent(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_DAC_DECODE_LATENT, /*n_frames=*/n_frames, /*n_q=*/0, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/latent_dim },
-            mem,
             codec_dac_build_decode_latent,
             &build,
             sizeof(build),
@@ -1208,7 +1204,6 @@ enum codec_status codec_dac_encode(
     const int32_t hop = std::max(1, params.hop_size > 0 ? params.hop_size : dac.hop_size);
     const int32_t n_in = (int32_t) pcm.size();
 
-    const size_t mem = 32 * 1024 * 1024 + (size_t) n_in * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
     dac_encode_build build = {};
@@ -1221,7 +1216,6 @@ enum codec_status codec_dac_encode(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_DAC_ENCODE, /*n_frames=*/0, /*n_q=*/use_n_q, /*hop=*/hop, /*n_in=*/n_in, /*latent_dim=*/build.hidden_dim },
-            mem,
             codec_dac_build_encode,
             &build,
             sizeof(build),

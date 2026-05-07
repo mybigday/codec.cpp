@@ -389,7 +389,6 @@ static enum codec_status nemo_encode_graph(
     const int32_t codebook_dim = std::max(1, nemo.codebook_dim);
     const int32_t codebook_size = std::max(2, nemo.codebook_size);
 
-    const size_t mem = 64 * 1024 * 1024 + (size_t) n_in * sizeof(float) * 24;
     codec_graph_eval_guard eval_guard(ctx);
     nemo_encode_build build = { n_in, hop_size, n_q, codebook_dim, codebook_size, ctx->model };
     codec_graph_cache_entry * entry = nullptr;
@@ -397,7 +396,6 @@ static enum codec_status nemo_encode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_NEMO_NANO_ENCODE, /*n_frames=*/0, /*n_q=*/n_q, /*hop=*/hop_size, /*n_in=*/n_in, /*latent_dim=*/codebook_dim },
-            mem,
             nemo_build_encode,
             &build,
             sizeof(build),
@@ -474,7 +472,6 @@ static enum codec_status nemo_decode_graph(
     const int32_t q = use_n_q;
     const int32_t codebook_dim = std::max(1, nemo.codebook_dim);
     const int32_t codebook_size = std::max(2, nemo.codebook_size);
-    const size_t mem = 64 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
 
     nemo_decode_build build = { t, q, codebook_dim, codebook_size, ctx->model };
@@ -483,7 +480,6 @@ static enum codec_status nemo_decode_graph(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_NEMO_NANO_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop_size, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             nemo_build_decode,
             &build,
             sizeof(build),

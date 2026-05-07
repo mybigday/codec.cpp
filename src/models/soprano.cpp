@@ -254,7 +254,6 @@ enum codec_status codec_soprano_decode_latent(
     }
 
     const int32_t hop = std::max(1, sop.hop_size);
-    const size_t mem = 32 * 1024 * 1024 + (size_t) t_up * (size_t) latent_dim * sizeof(float) * 8;
     codec_graph_eval_guard eval_guard(ctx);
     std::string err;
     sop_decode_build build = {};
@@ -267,7 +266,6 @@ enum codec_status codec_soprano_decode_latent(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_SOPRANO_DECODE, /*n_frames=*/t_up, /*n_q=*/0, /*hop=*/hop, /*n_in=*/0, /*latent_dim=*/latent_dim },
-            mem,
             codec_sop_build_decode,
             &build,
             sizeof(build),

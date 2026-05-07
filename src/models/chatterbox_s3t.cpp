@@ -519,13 +519,11 @@ enum codec_status codec_chatterbox_s3t_encode(
     build.rope_theta = s3t.rope_theta;
     build.model = ctx->model;
 
-    const size_t mem = 512 * 1024 * 1024;
     codec_graph_eval_guard eval_guard(ctx);
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_CHATTERBOX_S3T_ENCODE, /*n_frames=*/t_tok, /*n_q=*/1, /*hop=*/s3t.hop_size, /*n_in=*/t_mel, /*latent_dim=*/build.hidden },
-            mem,
             codec_chatterbox_s3t_build_encode,
             &build,
             sizeof(build),

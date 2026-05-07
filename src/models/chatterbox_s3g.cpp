@@ -994,7 +994,6 @@ enum codec_status codec_chatterbox_s3g_decode(
     if (!codec_graph_cache_get_or_build(
             ctx,
             {CODEC_GRAPH_CHATTERBOX_S3G_DECODE, T_tok, 0, 0, mel_len1, kFlowEncoderHidden},
-            /*mem=*/(size_t) 8 * 1024 * 1024 * 1024,
             codec_s3g_build_flow,
             &build, sizeof(build), &entry, &err)) {
         codec_context_set_error(ctx, err);

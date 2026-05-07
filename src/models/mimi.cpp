@@ -1057,7 +1057,6 @@ enum codec_status codec_mimi_decode_with(
     const int32_t t = tokens->n_frames;
     const int32_t q = use_n_q;
 
-    const size_t mem = 48 * 1024 * 1024 + (size_t) t * (size_t) q * sizeof(float) * 16;
     codec_graph_eval_guard eval_guard(ctx);
     const int32_t n_sem = std::max(1, std::min(mm.num_semantic_quantizers, q));
     mimi_decode_build build = {};
@@ -1070,7 +1069,6 @@ enum codec_status codec_mimi_decode_with(
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_MIMI_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/build.hop, /*n_in=*/0, /*latent_dim=*/0 },
-            mem,
             codec_mimi_build_decode,
             &build,
             sizeof(build),
@@ -1189,16 +1187,11 @@ enum codec_status codec_mimi_encode_with(
 
     // Eval arena only needs to hold ggml tensor metadata (no_alloc=true), which scales
     // with graph size, not tensor element counts. Avoid huge allocations for long inputs.
-    const size_t mem =
-        256 * 1024 * 1024 +
-        (size_t) build.transformer.n_layers * 16 * 1024 * 1024 +
-        (size_t) build.frontend.conv.size() * 4 * 1024 * 1024;
     codec_graph_eval_guard eval_guard(ctx);
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
             ctx,
             { CODEC_GRAPH_MIMI_ENCODE, /*n_frames=*/0, /*n_q=*/build.n_q, /*hop=*/0, /*n_in=*/n_in, /*latent_dim=*/build.transformer.c },
-            mem,
             codec_mimi_build_encode,
             &build,
             sizeof(build),

@@ -538,8 +538,6 @@ static enum codec_status codec_moss_run_encode(
     build.cfg        = &cfg;
     build.model      = ctx->model;
 
-    const size_t mem = (size_t) 1024 * 1024 * 1024 +
-                       (size_t) n_total * sizeof(float) * 32;
     codec_graph_eval_guard guard(ctx);
     std::string err;
 
@@ -549,7 +547,6 @@ static enum codec_status codec_moss_run_encode(
             { CODEC_GRAPH_MOSS_AUDIO_ENCODE,
               /*n_frames=*/n_codes, /*n_q=*/cfg.n_q, /*hop=*/cfg.hop_size,
               /*n_in=*/n_total, /*latent_dim=*/cfg.latent_dim },
-            mem,
             codec_moss_build_encode,
             &build,
             sizeof(build),
@@ -643,8 +640,6 @@ static enum codec_status codec_moss_run_decode(
     build.cfg        = &cfg;
     build.model      = ctx->model;
 
-    const size_t mem = (size_t) 1024 * 1024 * 1024 +
-                       (size_t) n_codes * cfg.hop_size * sizeof(float) * 16;
     codec_graph_eval_guard guard(ctx);
     std::string err;
 
@@ -654,7 +649,6 @@ static enum codec_status codec_moss_run_decode(
             { CODEC_GRAPH_MOSS_AUDIO_DECODE,
               /*n_frames=*/n_codes, /*n_q=*/cfg.n_q, /*hop=*/cfg.hop_size,
               /*n_in=*/0, /*latent_dim=*/cfg.latent_dim },
-            mem,
             codec_moss_build_decode,
             &build,
             sizeof(build),

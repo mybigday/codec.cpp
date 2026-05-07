@@ -35,7 +35,6 @@ void codec_runtime_free(codec_context * ctx);
 bool codec_graph_cache_get_or_build(
     codec_context * ctx,
     codec_graph_cache_key key,
-    size_t mem_size,
     codec_graph_build_fn build_fn,
     const void * user_data,
     size_t user_data_size,
