@@ -191,15 +191,18 @@ bool codec_graph_cache_get_or_build(
     // reads back via codec_graph_get_tensor + codec_runtime_read_tensor, and
     // without OUTPUT flagging galloc reuses their buffers after their last
     // graph use (e.g. snac's three RVQ code tensors).
+    // Auto-flag inputs only: leafs without a buffer are tensors the runtime
+    // will write to via codec_runtime_write_tensor.  Auto-flagging outputs by
+    // "non-leaf with a non-empty name" is too coarse — ggml internally names
+    // many op outputs (views, conts, reshapes, etc.) after their source
+    // tensor, so the heuristic flags hundreds of intermediate tensors and
+    // bloats the persistent buffer (xcodec2 encode: 1340 names → 5.8 GB
+    // pinned).  Models that read non-terminal outputs must call
+    // ggml_set_output explicitly inside their build_fn (see snac.cpp).
     for (ggml_tensor * t = ggml_get_first_tensor(ctx->eval_ctx); t != nullptr;
          t = ggml_get_next_tensor(ctx->eval_ctx, t)) {
-        if (t->buffer != nullptr || t->view_src != nullptr) {
-            continue;
-        }
-        if (t->op == GGML_OP_NONE) {
+        if (t->op == GGML_OP_NONE && t->buffer == nullptr && t->view_src == nullptr) {
             ggml_set_input(t);
-        } else if (t->name[0] != '\0') {
-            ggml_set_output(t);
         }
     }
     ggml_set_output(out);

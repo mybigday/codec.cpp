@@ -319,8 +319,11 @@ static bool codec_snac_build_encode(ggml_context * ctx_eval, void * user_data, g
     ggml_set_name(codes_out[0], codec_snac_name_codes_0());
     ggml_set_name(codes_out[1], codec_snac_name_codes_1());
     ggml_set_name(codes_out[2], codec_snac_name_codes_2());
-    // Return the fine-grained codes as the graph "output" so the cache key is
-    // consistent.  The other two are still reachable by name.
+    // codes_out[2] is the build_fn return value and is auto-flagged as an
+    // output by the runtime; the first two have to be flagged here so galloc
+    // doesn't reuse their buffers after the residual `sub` consumes them.
+    ggml_set_output(codes_out[0]);
+    ggml_set_output(codes_out[1]);
     *out = codes_out[2];
     return true;
 }
