@@ -6,6 +6,12 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import importlib.util  # NOTE: keep at module level — a local
+                       # `import importlib.util` inside load_native_model
+                       # would shadow the global `importlib` for the
+                       # whole function (Python static scope) and break
+                       # the earlier `importlib.import_module(...)` calls
+                       # with UnboundLocalError.
 import json
 import math
 import multiprocessing
@@ -685,8 +691,6 @@ def load_native_model(model_cfg: dict[str, Any], local_path: Path):
         # trust_remote_code path can't auto-resolve. Use the local snapshot
         # already mirrored under `models/<name>/`: it ships its own `vq/`
         # package next to `modeling_xcodec2.py` / `configuration_bigcodec.py`.
-        import importlib.util
-
         modeling = local_path / "modeling_xcodec2.py"
         config_py = local_path / "configuration_bigcodec.py"
         # The wrapper imports `from vq.codec_encoder import ...`; ensure the
