@@ -41,6 +41,7 @@ add_library(codec STATIC
     src/runtime/audio_dsp.cpp
     src/runtime/graph.cpp
     src/runtime/graph_exec.cpp
+    src/runtime/perf_log.cpp
     src/ops/safe_math.cpp
     src/ops/ggml_ops.cpp
     src/ops/lm_attn.cpp

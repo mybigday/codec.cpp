@@ -1,0 +1,18 @@
+{
+  "_comment": "Benchmark model registry. Each entry runs the listed ops against the GGUF + input wav (auto-resampled to `input_sample_rate` / `input_channels` if set; otherwise used as-is). The harness skips entries whose GGUF is missing.",
+  "models": [
+    { "name": "wavtokenizer",         "gguf": "models/wavtokenizer/wavtokenizer.gguf", "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 24000, "input_channels": 1 },
+    { "name": "dac",                  "gguf": "models/dac/dac.gguf",                  "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 16000, "input_channels": 1 },
+    { "name": "mimi",                 "gguf": "models/mimi/mimi.gguf",                "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 24000, "input_channels": 1 },
+    { "name": "snac",                 "gguf": "models/snac/snac.gguf",                "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 24000, "input_channels": 1 },
+    { "name": "soprano",              "gguf": "models/soprano/soprano.gguf",          "ops": [], "_comment": "decode-only model with no in-tree encode primer; skip from default bench" },
+    { "name": "neucodec",             "gguf": "models/neucodec/neucodec.gguf",        "ops": [], "_comment": "encoder_type=non-distill not implemented; skip" },
+    { "name": "distill_neucodec",     "gguf": "models/distill_neucodec/distill_neucodec.gguf", "ops": ["encode"], "input_wav": "test.wav", "input_sample_rate": 16000, "input_channels": 1, "_comment": "16 kHz encode → 24 kHz decode rate makes e2e CLI reject the codes; benchmark encode only" },
+    { "name": "nemo_nano_codec",      "gguf": "models/nemo_nano_codec/nemo_nano_codec.gguf",   "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 22050, "input_channels": 1 },
+    { "name": "qwen3_tts_tokenizer",  "gguf": "models/qwen3_tts_tokenizer/qwen3_tts_tokenizer.gguf", "ops": [], "_comment": "decode-only model with no in-tree encode primer; skip from default bench" },
+    { "name": "xcodec2",              "gguf": "models/xcodec2/xcodec2.gguf",          "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 16000, "input_channels": 1 },
+    { "name": "moss_audio_nano",      "gguf": "models/moss_audio_nano/moss_audio_nano.gguf",   "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 48000, "input_channels": 2, "nq": 16 },
+    { "name": "moss_audio_full",      "gguf": "models/moss_audio_full/moss_audio_full.gguf",   "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 24000, "input_channels": 1, "nq": 32 },
+    { "name": "xy_tokenizer",         "gguf": "models/xy_tokenizer/xy_tokenizer.gguf",         "ops": ["e2e"], "input_wav": "test.wav", "input_sample_rate": 16000, "input_channels": 1, "nq": 8 }
+  ]
+}

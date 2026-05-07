@@ -54,4 +54,7 @@ checkpoints/
 /models/
 /tests/e2e/reports/
 
+# Benchmark input cache (regenerated from test.wav per (sr, ch, max_seconds))
+/benchmarks/_input_cache/
+
 /.model-src

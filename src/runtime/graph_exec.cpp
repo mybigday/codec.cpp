@@ -1,5 +1,7 @@
 #include "graph_exec.h"
 
+#include "perf_log.h"
+
 #include <ggml-alloc.h>
 #include <ggml.h>
 
@@ -127,6 +129,7 @@ bool codec_graph_prepare_io(
     codec_context * ctx,
     codec_graph_cache_entry * entry,
     std::string * error) {
+    CODEC_PERF_SCOPE("graph_prepare_io");
     if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->backend == nullptr) {
         if (error != nullptr) {
             *error = "invalid graph prepare arguments";
@@ -177,6 +180,13 @@ bool codec_graph_compute(
     codec_graph_cache_entry * entry,
     int32_t n_threads,
     std::string * error) {
+
+    char detail_buf[64];
+    std::snprintf(detail_buf, sizeof(detail_buf),
+                  "kind=%d nodes=%d",
+                  entry ? entry->key.kind : -1,
+                  ctx && ctx->eval_graph ? ggml_graph_n_nodes(ctx->eval_graph) : 0);
+    CODEC_PERF_SCOPE_D("graph_compute", detail_buf);
 
     if (ctx == nullptr || entry == nullptr || ctx->eval_entry != entry || ctx->eval_graph == nullptr || ctx->backend == nullptr) {
         if (error != nullptr) {

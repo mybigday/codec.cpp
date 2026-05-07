@@ -1,4 +1,5 @@
 #include "graph.h"
+#include "perf_log.h"
 
 #include <algorithm>
 #include <array>
@@ -105,6 +106,12 @@ bool codec_graph_cache_get_or_build(
     size_t user_data_size,
     codec_graph_cache_entry ** out_entry,
     std::string * error) {
+
+    char detail_buf[96];
+    std::snprintf(detail_buf, sizeof(detail_buf),
+                  "kind=%d n_frames=%d n_q=%d n_in=%d",
+                  key.kind, key.n_frames, key.n_q, key.n_in);
+    CODEC_PERF_SCOPE_D("graph_build", detail_buf);
 
     if (ctx == nullptr || build_fn == nullptr || out_entry == nullptr) {
         if (error != nullptr) {

@@ -1,5 +1,6 @@
 #include "codec_internal.h"
 
+#include "runtime/perf_log.h"
 #include "batch/batch.h"
 #include "models/dac.h"
 #include "models/mimi.h"
@@ -502,6 +503,8 @@ static enum codec_status codec_encode_impl(
     struct codec_latent_buffer * out_latent,
     struct codec_encode_params params) {
 
+    CODEC_PERF_SCOPE("encode_total");
+
     if (ctx == nullptr || ctx->model == nullptr || audio == nullptr || out_tokens == nullptr) {
         return CODEC_STATUS_INVALID_ARG;
     }
@@ -569,6 +572,8 @@ enum codec_status codec_decode(
     const struct codec_token_buffer * tokens,
     struct codec_pcm_buffer * out_pcm,
     struct codec_decode_params params) {
+
+    CODEC_PERF_SCOPE("decode_total");
 
     if (ctx == nullptr || ctx->model == nullptr || tokens == nullptr || out_pcm == nullptr) {
         return CODEC_STATUS_INVALID_ARG;
