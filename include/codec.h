@@ -26,6 +26,7 @@ enum codec_arch {
     CODEC_ARCH_XCODEC2 = 11,
     CODEC_ARCH_SNAC = 12,
     CODEC_ARCH_MOSS_AUDIO = 13,
+    CODEC_ARCH_XY_TOKENIZER = 14,
 };
 
 enum codec_status {

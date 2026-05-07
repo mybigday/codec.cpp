@@ -13,6 +13,7 @@
 #include "models/xcodec2.h"
 #include "models/snac.h"
 #include "models/moss_audio.h"
+#include "models/xy_tokenizer.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
 #include "runtime/gguf_kv.h"
@@ -133,6 +134,9 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "moss_audio_tokenizer" || arch == "moss-audio-tokenizer" || arch == "moss_audio") {
         return CODEC_ARCH_MOSS_AUDIO;
     }
+    if (arch == "xy_tokenizer" || arch == "xy-tokenizer") {
+        return CODEC_ARCH_XY_TOKENIZER;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -165,6 +169,8 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_snac_vtable();
         case CODEC_ARCH_MOSS_AUDIO:
             return codec_moss_audio_vtable();
+        case CODEC_ARCH_XY_TOKENIZER:
+            return codec_xy_tokenizer_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -186,6 +192,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_XCODEC2:            return "XCodec2";
         case CODEC_ARCH_SNAC:               return "SNAC";
         case CODEC_ARCH_MOSS_AUDIO:         return "MOSS-Audio-Tokenizer";
+        case CODEC_ARCH_XY_TOKENIZER:       return "XY-Tokenizer";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }

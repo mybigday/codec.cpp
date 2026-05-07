@@ -63,6 +63,7 @@ add_library(codec STATIC
     src/models/xcodec2.cpp
     src/models/snac.cpp
     src/models/moss_audio.cpp
+    src/models/xy_tokenizer.cpp
 )
 
 target_include_directories(codec
