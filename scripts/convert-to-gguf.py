@@ -25,13 +25,41 @@ sys.path.insert(0, str(Path(__file__).parent))
 from converters import get_converter_for_model, list_supported_models
 
 
+# LM source `architectures[0]` -> codec converter to pair with.  Used when
+# auto-detection sees an LM-only config (no codec); the runner then sets
+# model_type to the codec, and lm_source to the input itself.
+#
+# MOSS-TTSD v1.0 / MOSS-TTS pair with `OpenMOSS-Team/MOSS-Audio-Tokenizer`
+# (per their processor's default `codec_path`), not XY-Tokenizer like
+# v0.5 / v0.7.  Different codec lineage in the same family.
+LM_SOURCE_TO_CODEC: dict = {
+    "MossTTSDForCausalLM":  "xy_tokenizer",   # MOSS-TTSD v0.5 / v0.7
+    "AsteroidTTSModel":     "xy_tokenizer",   # MOSS-TTSD v0 (early prototype)
+    "MossTTSDelayModel":    "moss_audio",     # MOSS-TTSD v1.0 / MOSS-TTS
+    # MossTTSNanoForCausalLM uses a depth-AR (local_transformer) adaptor;
+    # pending codec_lm M3 (residual_depth_ar).
+}
+
+# Codec converters that accept an `lm_source=...` kwarg.  Currently both
+# MOSS-Audio-Tokenizer and XY-Tokenizer pair with MOSS-TTS-family LMs;
+# more codecs will join when M3+ adds residual_depth_ar models.
+LM_SOURCE_CAPABLE_CONVERTERS = {"xy_tokenizer", "moss_audio"}
+
+
 def detect_model_type_from_config(config_path: Path) -> str:
     """Detect model type from config.json."""
     import json
-    
+
     with open(config_path, 'r') as f:
         config = json.load(f)
-    
+
+    # LM-source auto-detection: if architectures[0] matches a known LM
+    # family, return the *codec* it pairs with.  Caller then sets
+    # lm_source to the same input.
+    for a in (config.get("architectures") or []):
+        if a in LM_SOURCE_TO_CODEC:
+            return LM_SOURCE_TO_CODEC[a]
+
     model_type = config.get("model_type", "").lower()
     
     if "mimi" in model_type:
@@ -135,6 +163,22 @@ def infer_model_type_from_filename(filename: str) -> str | None:
     return None
 
 
+def _is_lm_source_config(config_path: Path) -> bool:
+    """True iff config.json's architectures[0] is in LM_SOURCE_TO_CODEC.
+    Lets convert-to-gguf default --lm-source to the input when the user
+    points at a MOSS-TTSD-style LM checkpoint directly."""
+    import json
+    try:
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    for a in (cfg.get("architectures") or []):
+        if a in LM_SOURCE_TO_CODEC:
+            return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert audio codec models to GGUF format",
@@ -216,7 +260,19 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
         type=str,
         help="Path to WavTokenizer source repository"
     )
-    
+
+    parser.add_argument(
+        "--lm-source",
+        type=str,
+        default=None,
+        help="Optional path or HF repo id for an LM-side adaptor checkpoint "
+             "to bundle into the same GGUF (e.g. fnlp/MOSS-TTSD-v0.5, "
+             "OpenMOSS-Team/MOSS-TTSD-v1.0). The codec converter writes "
+             "codec.* tensors and metadata; lm.* adaptor weights + "
+             "codec.lm.* metadata are appended via the right per-arch "
+             "handler in scripts/converters/lm_adaptor/."
+    )
+
     args = parser.parse_args()
     
     # Determine input path and model type
@@ -236,6 +292,12 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
                 model_type = detect_model_type_from_config(Path(config_path))
                 if args.verbose:
                     print(f"Auto-detected model type: {model_type}")
+                # If the input was an LM-source checkpoint, default
+                # --lm-source to it (caller can still override).
+                if args.lm_source is None and _is_lm_source_config(Path(config_path)):
+                    args.lm_source = args.model_id
+                    if args.verbose:
+                        print(f"Auto-set lm_source = {args.model_id}")
             except Exception as e:
                 raise ValueError(f"Cannot auto-detect model type for {args.model_id}. Please specify --model-type.") from e
     else:
@@ -259,6 +321,10 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
                 model_type = detect_model_type_from_config(config_path)
                 if args.verbose:
                     print(f"Auto-detected model type from config: {model_type}")
+                if args.lm_source is None and _is_lm_source_config(config_path):
+                    args.lm_source = str(input_path)
+                    if args.verbose:
+                        print(f"Auto-set lm_source = {input_path}")
             else:
                 # Try to infer from directory name
                 model_type = infer_model_type_from_filename(input_path.name)
@@ -284,7 +350,19 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
         converter_kwargs["config_path"] = args.config_path
         if args.wavtokenizer_source:
             converter_kwargs["wavtokenizer_source"] = args.wavtokenizer_source
-    
+
+    if args.lm_source is not None:
+        if model_type not in LM_SOURCE_CAPABLE_CONVERTERS:
+            raise ValueError(
+                f"--lm-source is not supported with --model-type {model_type!r}. "
+                f"Supported codecs: {sorted(LM_SOURCE_CAPABLE_CONVERTERS)}. "
+                f"Other codec converters can opt in by adding an "
+                f"`lm_source` __init__ arg and calling `dump_lm_into` after "
+                f"writing their codec section (see XYTokenizerConverter / "
+                f"MossAudioConverter for reference)."
+            )
+        converter_kwargs["lm_source"] = args.lm_source
+
     converter = converter_class(**converter_kwargs)
     
     # Load model

@@ -1,0 +1,116 @@
+#ifndef CODEC_LM_INTERNAL_H
+#define CODEC_LM_INTERNAL_H
+
+#include "codec_lm.h"
+
+#include "../codec_internal.h"
+#include "../runtime/graph.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct codec_lm_kind_vtable;
+
+struct codec_lm {
+    // Borrowed; not freed by codec_lm_free.  All weights and the
+    // ggml_backend live on this codec_model.
+    codec_model * codec = nullptr;
+
+    enum codec_lm_kind kind = CODEC_LM_KIND_UNKNOWN;
+    const codec_lm_kind_vtable * vtable = nullptr;
+    void * impl = nullptr;     // per-kind opaque data
+
+    // Backing storage for codec_lm_info pointer fields.
+    std::vector<int32_t> codebook_sizes_buf;
+    std::vector<int32_t> delay_pattern_buf;
+    std::string          host_arch_buf;
+
+    codec_lm_info info = {};
+
+    std::string last_error;
+};
+
+struct codec_lm_state {
+    codec_lm * lm = nullptr;
+    void * impl = nullptr;     // per-kind opaque data
+
+    // Each state owns its own codec_context for graph cache + scheduler.
+    // The context borrows codec->backend / codec->weights, so weights are
+    // shared across all states.  Independent eval_ctx + scheduler means
+    // multiple states can run concurrently without interfering.
+    codec_context * ctx = nullptr;
+
+    // Per-step bookkeeping (kind-agnostic).  Codes pushed via
+    // codec_lm_step_push_code accumulate here; codec_lm_step_finish
+    // copies them out.  `next_cb` is the index of the codebook whose
+    // logits will be returned by the next codec_lm_step_logits call,
+    // and it advances on each push_code.  step_in_progress goes true
+    // on step_begin and false on step_finish.
+    std::vector<int32_t> codes_buf;
+    int32_t next_cb        = 0;
+    bool    step_in_progress = false;
+    // logits_pending == true after step_logits; cleared by push_code.
+    // Used to enforce the alternating logits/push_code order.
+    bool    logits_pending = false;
+
+    std::string last_error;
+};
+
+// One vtable per kind.  Functions may be NULL when not applicable to a
+// kind (e.g. kinds that do not need state_reset).
+struct codec_lm_kind_vtable {
+    enum codec_lm_kind kind;
+    const char * name;
+
+    // Lifecycle.  init returns false on failure (missing tensors, bad
+    // metadata); the create path then frees the codec_lm and returns
+    // NULL to the user.
+    bool (*init)(codec_lm * lm);
+    void (*free)(codec_lm * lm);
+
+    bool (*state_init)(codec_lm_state * st);
+    void (*state_free)(codec_lm_state * st);
+    void (*state_reset)(codec_lm_state * st);
+
+    // Step machine.  Per-kind responsibilities documented in codec_lm.h.
+    enum codec_status (*step_begin)(codec_lm_state * st, const float * h_in);
+    bool              (*step_pending)(const codec_lm_state * st);
+    const float *     (*step_logits)(codec_lm_state * st, int32_t * out_cb_idx, int32_t * out_n);
+    enum codec_status (*step_push_code)(codec_lm_state * st, int32_t code);
+    enum codec_status (*step_finish)(codec_lm_state * st, int32_t * out_codes);
+
+    // Audio embd (kind-specific because the table layout — fused vs
+    // unfused — varies, even though the v1 schema standardises on
+    // unfused per-cb tables).
+    const float *     (*audio_embd)(codec_lm * lm, int32_t cb_idx, int32_t code);
+    enum codec_status (*compose_audio_embd)(codec_lm * lm, const int32_t * codes, float * out_embd);
+};
+
+// Map between the GGUF string and the C enum.  Returns
+// CODEC_LM_KIND_UNKNOWN for unrecognised strings.
+enum codec_lm_kind          codec_lm_kind_from_string(const char * s);
+const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind);
+
+// Per-kind vtables, exposed to lm.cpp's dispatch table.
+extern const codec_lm_kind_vtable codec_lm_vtable_parallel_heads_delay;
+
+// Read a string KV from the codec_model's GGUF.  Returns empty string
+// if the key is absent.
+std::string codec_lm_read_string_kv(const codec_model * codec, const char * key);
+
+// Validate that all `lm.audio_embd_{i}.weight` (and optionally
+// `lm.heads_{i}.weight`) tensors exist with the expected shapes.  Used
+// by parallel_heads_delay at init time.  Any missing or wrong-shape
+// tensor sets `lm->last_error` and returns false.
+//
+// When `tied_heads` is true, `lm.heads_{i}.weight` is not required (the
+// runtime will reuse `lm.audio_embd_{i}.weight` as the head weight —
+// matches the `tie_word_embeddings`-style convention upstream).
+bool codec_lm_check_unfused_audio_tables(
+    codec_lm * lm,
+    int32_t hidden_dim,
+    const std::vector<int32_t> & codebook_sizes,
+    bool tied_heads);
+
+#endif // CODEC_LM_INTERNAL_H

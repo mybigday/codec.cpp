@@ -27,6 +27,10 @@ enum codec_graph_kind {
     CODEC_GRAPH_MOSS_AUDIO_DECODE = 23,
     CODEC_GRAPH_XY_TOKENIZER_ENCODE = 24,
     CODEC_GRAPH_XY_TOKENIZER_DECODE = 25,
+
+    // codec_lm graph kinds (auxiliary, per-state).
+    CODEC_GRAPH_LM_PARALLEL_HEADS_LOGITS  = 26,
+    CODEC_GRAPH_LM_PARALLEL_HEADS_COMPOSE = 27,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

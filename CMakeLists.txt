@@ -65,6 +65,8 @@ add_library(codec STATIC
     src/models/snac.cpp
     src/models/moss_audio.cpp
     src/models/xy_tokenizer.cpp
+    src/lm/lm.cpp
+    src/lm/parallel_heads_delay.cpp
 )
 
 target_include_directories(codec

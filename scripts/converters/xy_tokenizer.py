@@ -121,6 +121,28 @@ def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
 
 
 class XYTokenizerConverter(BaseConverter):
+    """Converter for the XY-Tokenizer codec (used by MOSS-TTS-family TTS LMs).
+
+    Optionally bundles an LM-side adaptor (`lm.*` tensors + `codec.lm.*`
+    metadata) into the same GGUF when `lm_source` is supplied — this is
+    how MOSS-TTSD-v0.5/v0.7/v1.0/MOSS-TTS get converted.  The LM source
+    is auto-detected from its `config.json` and dispatched to the right
+    handler in `scripts/converters/lm_adaptor/`."""
+
+    def __init__(
+        self,
+        quantization: str = "F16",
+        quantize_codebook: bool = False,
+        verbose: bool = False,
+        lm_source=None,
+    ):
+        super().__init__(
+            quantization=quantization,
+            quantize_codebook=quantize_codebook,
+            verbose=verbose,
+        )
+        self.lm_source = lm_source
+
     @property
     def model_type(self) -> str:
         return "xy_tokenizer"
@@ -148,14 +170,31 @@ class XYTokenizerConverter(BaseConverter):
         self.load_from_checkpoint(Path(local))
 
     def convert_and_save(self, output_path: Path) -> None:
+        writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
+        self.write_into(writer)
+        if self.lm_source is not None:
+            from .lm_adaptor import dump_lm_into
+            dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+        self._warn_if_no_quantized()
+        writer.write()
+        if self.lm_source is None:
+            self.log(f"Wrote XY-Tokenizer GGUF to {output_path}")
+        else:
+            self.log(f"Wrote XY-Tokenizer codec + LM adaptor GGUF to {output_path} "
+                     f"(lm_source={self.lm_source})")
+
+    def write_into(self, writer: GGUFWriter) -> None:
+        """Write XY-Tokenizer codec metadata + tensors into a caller-supplied
+        GGUFWriter.  Lets a higher-level invocation bundle the codec section
+        alongside `lm.*` tensors in a single output GGUF (passed via
+        `lm_source`).  Caller owns the writer's lifecycle (creation + final
+        `write()`)."""
         if self.state_dict is None or self.config is None:
             raise RuntimeError("No model loaded.")
         sd = self.state_dict
         cfg = self.config
         params = cfg["params"]
-
-        writer = GGUFWriter(output_path, self.architecture)
-        self._reset_quant_stats()
 
         # ---- top-level metadata ------------------------------------------
         in_sr = int(cfg["input_sample_rate"])
@@ -250,10 +289,6 @@ class XYTokenizerConverter(BaseConverter):
             sq = (cb * cb).sum(axis=1).astype(np.float32)  # (codebook_size,)
             self._add_tensor(writer, f"xy.q.{qi}.codebook",         cb, "F32")
             self._add_tensor(writer, f"xy.q.{qi}.codebook_sq_norm", sq, "F32")
-
-        self._warn_if_no_quantized()
-        writer.write()
-        self.log(f"Wrote XY-Tokenizer GGUF to {output_path}")
 
     # ------------------------------------------------------------------
     # Helpers — Whisper-style transformer modules

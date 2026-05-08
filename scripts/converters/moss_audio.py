@@ -82,6 +82,28 @@ def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
 
 
 class MossAudioConverter(BaseConverter):
+    """MOSS-Audio-Tokenizer (Nano + full) converter.
+
+    Optionally bundles an LM-side adaptor (`lm.*` tensors + `codec.lm.*`
+    metadata) into the same GGUF when `lm_source` is supplied — used by
+    MOSS-TTSD-v1.0 / MOSS-TTS, which pair their `MossTTSDelayModel` LM
+    with this codec.  v0.5 / v0.7 use XY-Tokenizer instead, see
+    `XYTokenizerConverter`."""
+
+    def __init__(
+        self,
+        quantization: str = "F16",
+        quantize_codebook: bool = False,
+        verbose: bool = False,
+        lm_source=None,
+    ):
+        super().__init__(
+            quantization=quantization,
+            quantize_codebook=quantize_codebook,
+            verbose=verbose,
+        )
+        self.lm_source = lm_source
+
     @property
     def model_type(self) -> str:
         return "moss_audio"
@@ -330,6 +352,14 @@ class MossAudioConverter(BaseConverter):
             self._add_tensor(writer, o + ".codebook", cb, "F16")
             self._add_tensor(writer, o + ".codebook_norm", cb_norm, "F16")
 
+        if self.lm_source is not None:
+            from .lm_adaptor import dump_lm_into
+            dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+
         self._warn_if_no_quantized()
         writer.write()
-        self.log(f"Wrote MOSS-Audio-Tokenizer GGUF to {output_path}")
+        if self.lm_source is None:
+            self.log(f"Wrote MOSS-Audio-Tokenizer GGUF to {output_path}")
+        else:
+            self.log(f"Wrote MOSS-Audio-Tokenizer codec + LM adaptor GGUF to {output_path} "
+                     f"(lm_source={self.lm_source})")

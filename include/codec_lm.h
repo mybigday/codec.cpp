@@ -1,0 +1,251 @@
+#ifndef CODEC_LM_H
+#define CODEC_LM_H
+
+#include "codec.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// =====================================================================
+// codec_lm — adaptor between a host LLM (running in llama.cpp) and a
+// codec (running in codec.cpp).  The host LLM is a standard transformer
+// llama.cpp can load; this layer turns its hidden state into the audio
+// codebook tokens that the codec consumes, and turns codes back into the
+// audio embedding the caller has to feed into the host LLM at the next
+// AR step.
+//
+// Scope is intentionally narrow.  codec_lm does:
+//   * audio-codebook lookup `(cb_idx, code) -> [hidden_dim]` row
+//   * sum-of-codebook compose: `codes[N] -> [hidden_dim]`
+//   * per-step state machine: hidden -> N codebook logits, with intra-
+//     step conditioning when the kind requires it (residual_depth_ar)
+//
+// codec_lm does NOT do:
+//   * load any GGUF (it borrows everything from a `codec_model` that
+//     was already loaded by codec.cpp's regular loader)
+//   * sample (caller picks logits up and runs whatever sampler — e.g.
+//     `llama_sampler_apply` on a constructed `llama_token_data_array` —
+//     and pushes the chosen code back in)
+//   * touch the text path — text token embeddings live in the host
+//     LLM's `tok_embd`, accessed via llama.cpp's normal `b.token` flow
+//     (or, for models that mix text + audio at the same position, the
+//     caller extracts the text embedding table out-of-band)
+//   * decide which positions are text vs audio — that's per-model glue
+//     in the caller, not a generic library concern
+//
+// All weights live in the same GGUF the codec is loaded from, under
+// the `lm.*` tensor namespace, plus a few `codec.lm.*` metadata keys.
+// =====================================================================
+
+// Adaptor kinds.  GGUF stores `codec.lm.kind` as a string for forward
+// compatibility (old runtimes can fail gracefully on unknown kind names
+// from newer GGUFs).  The loader maps string -> enum at codec_lm_create
+// time; an unrecognised string yields CODEC_LM_KIND_UNKNOWN and
+// codec_lm_create returns NULL.
+//
+// CODEC_LM_KIND_PARALLEL_HEADS_DELAY  — N parallel `Linear(hidden, vocab_i)`
+//                                       heads off a backbone hidden state
+//                                       the caller hands in, no intra-step
+//                                       dependency.  Optional per-cb
+//                                       `delay[N]` shift register.
+//                                       Compose-input is
+//                                       `sum_i audio_embd_i[codes[i]]`.
+//                                       Models: MOSS-TTSD.
+//
+// CODEC_LM_KIND_RESIDUAL_DEPTH_AR     — Backbone (in llama.cpp) emits c0
+//                                       from a linear head off the backbone
+//                                       hidden the caller hands in;
+//                                       codec_lm runs a small AR depth
+//                                       transformer (4-6 Llama-style
+//                                       layers) with its own KV cache
+//                                       (reset every backbone step) and
+//                                       emits c1..c_{N-1} sequentially,
+//                                       conditioned on the backbone hidden
+//                                       + previously sampled cb embeddings.
+//                                       Models: CSM, Qwen3-TTS,
+//                                       Qwen3-Omni-MoE Talker, Moshi,
+//                                       LFM2-Audio.
+
+enum codec_lm_kind {
+    CODEC_LM_KIND_UNKNOWN              = 0,
+    CODEC_LM_KIND_PARALLEL_HEADS_DELAY = 1,
+    CODEC_LM_KIND_RESIDUAL_DEPTH_AR    = 2,
+};
+
+// Returns the canonical GGUF-string name of the kind ("parallel_heads_delay"
+// / "residual_depth_ar" / "unknown").  Useful for logging.
+const char * codec_lm_kind_name(enum codec_lm_kind kind);
+
+struct codec_model;       // from codec.h
+struct codec_lm;
+struct codec_lm_state;
+
+struct codec_lm_info {
+    enum codec_lm_kind kind;
+
+    // Hidden dimension expected from the host LLM and emitted by the
+    // audio embedding.  Caller is responsible for verifying this
+    // matches `llama_model_n_embd(host_model)`.
+    int32_t         hidden_dim;
+
+    // Audio embedding dimension (the dim of vectors returned by
+    // codec_lm_audio_embd / codec_lm_compose_audio_embd).  Equal to
+    // hidden_dim in every model integrated to date, but exposed
+    // separately so the spec doesn't lie if a future model differs.
+    int32_t         audio_embed_dim;
+
+    // Number of audio codebooks the model emits per AR step.
+    int32_t         n_codebook;
+
+    // Per-codebook vocabulary size; pointer valid for the lifetime of
+    // the codec_lm.  For some models the first codebook is a text
+    // vocabulary (MOSS-TTSD channel 0 = text, channels 1..7 = audio);
+    // codec_lm itself doesn't care, it just sizes the logits arrays.
+    const int32_t * codebook_sizes;     // [n_codebook]
+
+    // Per-codebook delay offset in AR steps; zeros if not applicable.
+    // Caller is expected to apply the delay externally when assembling
+    // the prompt; codec_lm only uses this to size internal state.
+    const int32_t * delay_pattern;      // [n_codebook]
+
+    // Informational: the host LLM architecture name written by the
+    // converter (e.g., "llama", "qwen3", "lfm2").  codec_lm does not
+    // enforce a match — caller is expected to load the right backbone.
+    const char *    host_arch;
+};
+
+// Return CODEC_STATUS_NOT_SUPPORTED via NULL when the codec_model has
+// no LM adaptor section (the `codec.lm.has_adaptor` GGUF metadata key
+// is absent or false).  Borrows everything from `codec`: backend, mmap,
+// weights ggml_context, eval scheduler.  Does not duplicate weights.
+struct codec_lm * codec_lm_create(struct codec_model * codec);
+void              codec_lm_free  (struct codec_lm * lm);
+
+// Returned struct lives for the lifetime of the codec_lm.
+const struct codec_lm_info * codec_lm_get_info(const struct codec_lm * lm);
+
+// Per-generation state.  Holds:
+//   * residual_depth_ar — KV cache for the depth decoder (reset every
+//     `codec_lm_step_begin` since CSM/Moshi/etc. reset the depth
+//     decoder cache per AR step) and intermediate hidden states for
+//     intra-step conditioning.
+//   * parallel_heads_delay — delay shift register (`prev_codes[i]`
+//     buffered for `delay[i]` steps before they're visible at the
+//     codebook-i output position).
+// Multiple states can coexist on the same codec_lm for parallel
+// generations, each with their own caches.
+struct codec_lm_state * codec_lm_state_new (struct codec_lm * lm);
+void                    codec_lm_state_free(struct codec_lm_state * st);
+void                    codec_lm_state_reset(struct codec_lm_state * st);
+
+// ─────────────────────────────────────────────────────────────────────
+// Audio embedding lookup.
+// ─────────────────────────────────────────────────────────────────────
+
+// Look up the audio embedding row for codebook `cb_idx` and code
+// `code`.  Returns a pointer into the model's weight buffer (read-only;
+// lifetime = lifetime of `lm`).  Returns NULL when the arguments are
+// out of range.
+//
+// `code == -1` is reserved for "skip / pad" by callers and is rejected
+// by this lookup with NULL — use codec_lm_compose_audio_embd to do a
+// pad-aware sum.
+const float * codec_lm_audio_embd(
+    struct codec_lm * lm,
+    int32_t           cb_idx,
+    int32_t           code);
+
+// Sum-of-codebook compose: write `sum_i audio_embd[i][codes[i]]` into
+// `out_embd[hidden_dim]`.  `codes[i] == -1` means "skip codebook i"
+// (treated as a zero contribution — same as multiplying that channel's
+// embedding by zero).  All-skip is allowed and writes a zero buffer.
+//
+// Caller must size `out_embd` to at least `info->hidden_dim` floats.
+enum codec_status codec_lm_compose_audio_embd(
+    struct codec_lm *  lm,
+    const int32_t *    codes,        // [n_codebook]
+    float *            out_embd);    // [hidden_dim]
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-AR-step state machine: hidden -> codebook logits -> codes.
+//
+// Usage:
+//
+//   codec_lm_step_begin(state, h);
+//   for (int k = 0; k < info->n_codebook; ++k) {
+//       int32_t cb_idx, n;
+//       const float * logits = codec_lm_step_logits(state, &cb_idx, &n);
+//       int32_t code = caller_sample(cb_idx, logits, n);
+//       codec_lm_step_push_code(state, code);
+//   }
+//   int32_t codes[N];
+//   codec_lm_step_finish(state, codes);
+//
+// Invariants:
+//   * Exactly one `step_begin`, then `step_logits + step_push_code`
+//     called in that order `n_codebook` times, then exactly one
+//     `step_finish`.  Calling out of order returns INVALID_STATE.
+//   * For `parallel_heads_delay`, all N logits arrays are computed
+//     during `step_begin`; `step_logits` just hands out pointers and
+//     `step_push_code` records the sampled value into the delay
+//     register.
+//   * For `residual_depth_ar`, `step_logits(k=0)` returns c0 logits
+//     computed from the backbone hidden alone; `step_push_code(c0)`
+//     advances the depth decoder by one position; the next
+//     `step_logits` returns c1 logits, and so on.
+//   * Logits pointers returned by `step_logits` are owned by the state
+//     and remain valid only until the next `step_logits` /
+//     `step_push_code` / `step_finish` / `step_begin` call.
+//
+// Sampling is intentionally outside the API: caller wraps the returned
+// logits in whatever sampler stack they want.  The expected pattern
+// for llama.cpp users is:
+//
+//   llama_token_data * arr = alloca(n * sizeof *arr);
+//   for (int i = 0; i < n; ++i) arr[i] = (llama_token_data){i, logits[i], 0};
+//   llama_token_data_array cur = { arr, (size_t)n, -1, false };
+//   llama_sampler_apply(audio_chains[cb_idx], &cur);
+//   int32_t code = arr[cur.selected].id;
+// ─────────────────────────────────────────────────────────────────────
+
+enum codec_status codec_lm_step_begin(
+    struct codec_lm_state * st,
+    const float *           h_in);   // [hidden_dim]
+
+bool codec_lm_step_pending(const struct codec_lm_state * st);
+
+// Returns logits for the next codebook in sequence.  Out-params
+// receive the codebook index (always 0,1,2,... in order) and the
+// length of the logits array (= codebook_sizes[cb_idx]).  Returns
+// NULL when called out of phase (e.g., before step_begin or after
+// step_finish, or before push_code for the prior codebook on a kind
+// that requires it).
+const float * codec_lm_step_logits(
+    struct codec_lm_state * st,
+    int32_t *               out_cb_idx,
+    int32_t *               out_n);
+
+// Push the code sampled from the most recent step_logits.  Code value
+// must be in `[0, codebook_sizes[cb_idx])`.  Returns INVALID_ARG for
+// out-of-range codes; INVALID_STATE if no step_logits is pending.
+enum codec_status codec_lm_step_push_code(
+    struct codec_lm_state * st,
+    int32_t                 code);
+
+// Read all sampled codes for this step into `out_codes[n_codebook]`
+// and reset the state machine to "between steps".  After this call,
+// step_begin can be invoked again.  Returns INVALID_STATE if not all
+// codebooks have been pushed.
+enum codec_status codec_lm_step_finish(
+    struct codec_lm_state * st,
+    int32_t *               out_codes);  // [n_codebook]
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // CODEC_LM_H

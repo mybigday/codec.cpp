@@ -1,0 +1,479 @@
+#include "lm_internal.h"
+
+#include "../runtime/graph.h"
+#include "../runtime/graph_exec.h"
+#include "../runtime/tensor_utils.h"
+
+#include <ggml.h>
+#include <gguf.h>
+
+#include <cstring>
+#include <new>
+#include <string>
+
+// =====================================================================
+// codec_lm — public API entry, kind dispatch, state lifecycle.
+//
+// Every state owns its own codec_context (graph cache + scheduler) but
+// shares the codec_model's backend + weights.  This lets multiple
+// generations run in parallel and keeps the graph caches per-state, so
+// a kind's per-step graphs (e.g. parallel_heads_delay's matmul cluster)
+// only build once per state.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// kind <-> string mapping
+// ---------------------------------------------------------------------
+
+static const char * codec_lm_kind_name_internal(enum codec_lm_kind kind) {
+    switch (kind) {
+        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY: return "parallel_heads_delay";
+        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return "residual_depth_ar";
+        case CODEC_LM_KIND_UNKNOWN:              break;
+    }
+    return "unknown";
+}
+
+const char * codec_lm_kind_name(enum codec_lm_kind kind) {
+    return codec_lm_kind_name_internal(kind);
+}
+
+enum codec_lm_kind codec_lm_kind_from_string(const char * s) {
+    if (s == nullptr || s[0] == '\0') {
+        return CODEC_LM_KIND_UNKNOWN;
+    }
+    if (std::strcmp(s, "parallel_heads_delay") == 0) {
+        return CODEC_LM_KIND_PARALLEL_HEADS_DELAY;
+    }
+    if (std::strcmp(s, "residual_depth_ar") == 0) {
+        return CODEC_LM_KIND_RESIDUAL_DEPTH_AR;
+    }
+    return CODEC_LM_KIND_UNKNOWN;
+}
+
+const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind) {
+    switch (kind) {
+        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY: return &codec_lm_vtable_parallel_heads_delay;
+        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return nullptr;  // not implemented yet (M3)
+        case CODEC_LM_KIND_UNKNOWN:              break;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------
+// GGUF metadata helpers (codec.lm.* namespace)
+// ---------------------------------------------------------------------
+
+std::string codec_lm_read_string_kv(const codec_model * codec, const char * key) {
+    if (codec == nullptr || codec->gguf == nullptr || key == nullptr) {
+        return std::string();
+    }
+    const int kid = gguf_find_key(codec->gguf, key);
+    if (kid < 0) {
+        return std::string();
+    }
+    return codec_gguf_value_to_string(codec->gguf, kid);
+}
+
+// ---------------------------------------------------------------------
+// Tensor shape validation (shared between kinds that use unfused per-cb
+// audio embedding / output head tables).
+// ---------------------------------------------------------------------
+
+bool codec_lm_check_unfused_audio_tables(
+    codec_lm * lm,
+    int32_t hidden_dim,
+    const std::vector<int32_t> & codebook_sizes,
+    bool tied_heads) {
+
+    if (lm == nullptr || lm->codec == nullptr || lm->codec->weights == nullptr) {
+        return false;
+    }
+    if (hidden_dim <= 0 || codebook_sizes.empty()) {
+        lm->last_error = "invalid hidden_dim or n_codebook";
+        return false;
+    }
+
+    char buf[64];
+    for (size_t i = 0; i < codebook_sizes.size(); ++i) {
+        const int32_t v = codebook_sizes[i];
+        if (v <= 0) {
+            lm->last_error = "codec.lm.codebook_sizes contains a non-positive entry";
+            return false;
+        }
+
+        std::snprintf(buf, sizeof(buf), "lm.audio_embd_%zu.weight", i);
+        ggml_tensor * t_e = ggml_get_tensor(lm->codec->weights, buf);
+        if (t_e == nullptr) {
+            lm->last_error = std::string("missing tensor: ") + buf;
+            return false;
+        }
+        if (t_e->ne[0] != hidden_dim || t_e->ne[1] != v) {
+            lm->last_error = std::string("shape mismatch on ") + buf +
+                             " (expected [hidden, vocab])";
+            return false;
+        }
+
+        if (!tied_heads) {
+            std::snprintf(buf, sizeof(buf), "lm.heads_%zu.weight", i);
+            ggml_tensor * t_h = ggml_get_tensor(lm->codec->weights, buf);
+            if (t_h == nullptr) {
+                lm->last_error = std::string("missing tensor: ") + buf;
+                return false;
+            }
+            if (t_h->ne[0] != hidden_dim || t_h->ne[1] != v) {
+                lm->last_error = std::string("shape mismatch on ") + buf +
+                                 " (expected [hidden, vocab])";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// codec_lm lifecycle
+// ---------------------------------------------------------------------
+
+static bool codec_lm_populate_info(codec_lm * lm) {
+    gguf_context * gf = lm->codec->gguf;
+    if (gf == nullptr) {
+        lm->last_error = "codec_model has no GGUF context";
+        return false;
+    }
+
+    if (!codec_read_bool_kv(gf, "codec.lm.has_adaptor", false)) {
+        lm->last_error = "codec.lm.has_adaptor is absent or false";
+        return false;
+    }
+
+    const std::string kind_s = codec_lm_read_string_kv(lm->codec, "codec.lm.kind");
+    lm->kind = codec_lm_kind_from_string(kind_s.c_str());
+    if (lm->kind == CODEC_LM_KIND_UNKNOWN) {
+        lm->last_error = "unrecognised codec.lm.kind: '" + kind_s + "'";
+        return false;
+    }
+    lm->vtable = codec_lm_vtable_for_kind(lm->kind);
+    if (lm->vtable == nullptr) {
+        lm->last_error = "no implementation for codec.lm.kind: " + kind_s;
+        return false;
+    }
+
+    const int32_t hidden       = codec_read_i32_kv(gf, "codec.lm.hidden_dim", 0);
+    const int32_t audio_embd_d = codec_read_i32_kv(gf, "codec.lm.audio_embed_dim", hidden);
+    const int32_t n_cb         = codec_read_i32_kv(gf, "codec.lm.n_codebook", 0);
+    if (hidden <= 0 || audio_embd_d <= 0 || n_cb <= 0) {
+        lm->last_error = "codec.lm metadata: hidden_dim / audio_embed_dim / n_codebook must be > 0";
+        return false;
+    }
+
+    codec_read_i32_array_kv_vec(gf, "codec.lm.codebook_sizes", &lm->codebook_sizes_buf);
+    if ((int32_t) lm->codebook_sizes_buf.size() != n_cb) {
+        lm->last_error = "codec.lm.codebook_sizes length must equal n_codebook";
+        return false;
+    }
+
+    lm->delay_pattern_buf.assign((size_t) n_cb, 0);
+    codec_read_i32_array_kv(gf, "codec.lm.delay_pattern", lm->delay_pattern_buf.data(), n_cb);
+    // (absent => left as zeros, which is the correct default)
+
+    lm->host_arch_buf = codec_lm_read_string_kv(lm->codec, "codec.lm.host_arch");
+
+    lm->info.kind             = lm->kind;
+    lm->info.hidden_dim       = hidden;
+    lm->info.audio_embed_dim  = audio_embd_d;
+    lm->info.n_codebook       = n_cb;
+    lm->info.codebook_sizes   = lm->codebook_sizes_buf.data();
+    lm->info.delay_pattern    = lm->delay_pattern_buf.data();
+    lm->info.host_arch        = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
+    return true;
+}
+
+struct codec_lm * codec_lm_create(struct codec_model * codec) {
+    if (codec == nullptr) {
+        return nullptr;
+    }
+    codec_lm * lm = new (std::nothrow) codec_lm();
+    if (lm == nullptr) {
+        return nullptr;
+    }
+    lm->codec = codec;
+
+    if (!codec_lm_populate_info(lm)) {
+        delete lm;
+        return nullptr;
+    }
+
+    if (lm->vtable->init == nullptr || !lm->vtable->init(lm)) {
+        if (lm->vtable->free != nullptr) {
+            lm->vtable->free(lm);
+        }
+        delete lm;
+        return nullptr;
+    }
+
+    return lm;
+}
+
+void codec_lm_free(struct codec_lm * lm) {
+    if (lm == nullptr) {
+        return;
+    }
+    if (lm->vtable != nullptr && lm->vtable->free != nullptr) {
+        lm->vtable->free(lm);
+    }
+    delete lm;
+}
+
+const struct codec_lm_info * codec_lm_get_info(const struct codec_lm * lm) {
+    return lm == nullptr ? nullptr : &lm->info;
+}
+
+// ---------------------------------------------------------------------
+// codec_lm_state lifecycle
+// ---------------------------------------------------------------------
+
+struct codec_lm_state * codec_lm_state_new(struct codec_lm * lm) {
+    if (lm == nullptr || lm->vtable == nullptr) {
+        return nullptr;
+    }
+    codec_lm_state * st = new (std::nothrow) codec_lm_state();
+    if (st == nullptr) {
+        return nullptr;
+    }
+    st->lm = lm;
+
+    // Each state owns a codec_context that borrows the codec_model's
+    // backend and weights but has its own graph cache and scheduler.
+    codec_context * ctx = new (std::nothrow) codec_context();
+    if (ctx == nullptr) {
+        delete st;
+        return nullptr;
+    }
+    ctx->model   = lm->codec;
+    ctx->backend = lm->codec->backend;
+    ctx->params  = codec_context_default_params();
+    std::string err;
+    if (!codec_runtime_init(ctx, &err)) {
+        delete ctx;
+        delete st;
+        return nullptr;
+    }
+    st->ctx = ctx;
+
+    st->codes_buf.assign((size_t) lm->info.n_codebook, 0);
+    st->next_cb            = 0;
+    st->step_in_progress   = false;
+    st->logits_pending     = false;
+
+    if (lm->vtable->state_init != nullptr && !lm->vtable->state_init(st)) {
+        if (lm->vtable->state_free != nullptr) {
+            lm->vtable->state_free(st);
+        }
+        codec_runtime_free(ctx);
+        delete ctx;
+        delete st;
+        return nullptr;
+    }
+    return st;
+}
+
+void codec_lm_state_free(struct codec_lm_state * st) {
+    if (st == nullptr) {
+        return;
+    }
+    if (st->lm != nullptr && st->lm->vtable != nullptr && st->lm->vtable->state_free != nullptr) {
+        st->lm->vtable->state_free(st);
+    }
+    if (st->ctx != nullptr) {
+        codec_runtime_free(st->ctx);
+        delete st->ctx;
+    }
+    delete st;
+}
+
+void codec_lm_state_reset(struct codec_lm_state * st) {
+    if (st == nullptr) {
+        return;
+    }
+    st->next_cb            = 0;
+    st->step_in_progress   = false;
+    st->logits_pending     = false;
+    std::fill(st->codes_buf.begin(), st->codes_buf.end(), 0);
+    if (st->lm != nullptr && st->lm->vtable != nullptr && st->lm->vtable->state_reset != nullptr) {
+        st->lm->vtable->state_reset(st);
+    }
+}
+
+// ---------------------------------------------------------------------
+// audio embed lookup + compose — delegate to vtable
+// ---------------------------------------------------------------------
+
+const float * codec_lm_audio_embd(struct codec_lm * lm, int32_t cb_idx, int32_t code) {
+    if (lm == nullptr || lm->vtable == nullptr || lm->vtable->audio_embd == nullptr) {
+        return nullptr;
+    }
+    if (cb_idx < 0 || cb_idx >= lm->info.n_codebook) {
+        return nullptr;
+    }
+    if (code < 0 || code >= lm->info.codebook_sizes[cb_idx]) {
+        return nullptr;
+    }
+    return lm->vtable->audio_embd(lm, cb_idx, code);
+}
+
+enum codec_status codec_lm_compose_audio_embd(
+    struct codec_lm * lm,
+    const int32_t * codes,
+    float * out_embd) {
+    if (lm == nullptr || codes == nullptr || out_embd == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (lm->vtable == nullptr || lm->vtable->compose_audio_embd == nullptr) {
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    return lm->vtable->compose_audio_embd(lm, codes, out_embd);
+}
+
+// ---------------------------------------------------------------------
+// step machine — delegate to vtable, with a thin layer of state-machine
+// invariant checking so kind impls don't have to repeat it.
+// ---------------------------------------------------------------------
+
+enum codec_status codec_lm_step_begin(
+    struct codec_lm_state * st,
+    const float * h_in) {
+    if (st == nullptr || st->lm == nullptr || st->lm->vtable == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (h_in == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (st->step_in_progress) {
+        st->last_error = "codec_lm_step_begin called twice without step_finish";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (st->lm->vtable->step_begin == nullptr) {
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+
+    st->next_cb            = 0;
+    st->logits_pending     = false;
+    std::fill(st->codes_buf.begin(), st->codes_buf.end(), 0);
+
+    enum codec_status rc = st->lm->vtable->step_begin(st, h_in);
+    if (rc != CODEC_STATUS_SUCCESS) {
+        return rc;
+    }
+    st->step_in_progress = true;
+    return CODEC_STATUS_SUCCESS;
+}
+
+bool codec_lm_step_pending(const struct codec_lm_state * st) {
+    if (st == nullptr || !st->step_in_progress) {
+        return false;
+    }
+    return st->next_cb < (st->lm != nullptr ? st->lm->info.n_codebook : 0);
+}
+
+const float * codec_lm_step_logits(
+    struct codec_lm_state * st,
+    int32_t * out_cb_idx,
+    int32_t * out_n) {
+    if (st == nullptr || st->lm == nullptr || st->lm->vtable == nullptr) {
+        return nullptr;
+    }
+    if (!st->step_in_progress) {
+        st->last_error = "codec_lm_step_logits called outside a step (no step_begin)";
+        return nullptr;
+    }
+    if (st->logits_pending) {
+        st->last_error = "codec_lm_step_logits called twice without push_code";
+        return nullptr;
+    }
+    if (st->next_cb >= st->lm->info.n_codebook) {
+        st->last_error = "codec_lm_step_logits called past n_codebook";
+        return nullptr;
+    }
+    if (st->lm->vtable->step_logits == nullptr) {
+        return nullptr;
+    }
+
+    int32_t cb_idx = -1;
+    int32_t n      = 0;
+    const float * lg = st->lm->vtable->step_logits(st, &cb_idx, &n);
+    if (lg == nullptr) {
+        return nullptr;
+    }
+    if (cb_idx != st->next_cb) {
+        st->last_error = "kind step_logits returned wrong cb_idx (state machine corrupted)";
+        return nullptr;
+    }
+    if (out_cb_idx != nullptr) *out_cb_idx = cb_idx;
+    if (out_n      != nullptr) *out_n      = n;
+    st->logits_pending = true;
+    return lg;
+}
+
+enum codec_status codec_lm_step_push_code(
+    struct codec_lm_state * st,
+    int32_t code) {
+    if (st == nullptr || st->lm == nullptr || st->lm->vtable == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (!st->step_in_progress) {
+        st->last_error = "codec_lm_step_push_code called outside a step";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (!st->logits_pending) {
+        st->last_error = "codec_lm_step_push_code called without a preceding step_logits";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    const int32_t cb = st->next_cb;
+    if (code < 0 || code >= st->lm->info.codebook_sizes[cb]) {
+        st->last_error = "code out of range for codebook";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    if (st->lm->vtable->step_push_code != nullptr) {
+        enum codec_status rc = st->lm->vtable->step_push_code(st, code);
+        if (rc != CODEC_STATUS_SUCCESS) {
+            return rc;
+        }
+    }
+    st->codes_buf[(size_t) cb] = code;
+    st->next_cb           += 1;
+    st->logits_pending     = false;
+    return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status codec_lm_step_finish(
+    struct codec_lm_state * st,
+    int32_t * out_codes) {
+    if (st == nullptr || st->lm == nullptr || out_codes == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (!st->step_in_progress) {
+        st->last_error = "codec_lm_step_finish called without step_begin";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (st->next_cb != st->lm->info.n_codebook) {
+        st->last_error = "codec_lm_step_finish called before all codebooks were pushed";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (st->logits_pending) {
+        st->last_error = "codec_lm_step_finish called with a pending logits read";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (st->lm->vtable != nullptr && st->lm->vtable->step_finish != nullptr) {
+        enum codec_status rc = st->lm->vtable->step_finish(st, out_codes);
+        if (rc != CODEC_STATUS_SUCCESS) {
+            return rc;
+        }
+    } else {
+        std::memcpy(out_codes, st->codes_buf.data(),
+                    (size_t) st->lm->info.n_codebook * sizeof(int32_t));
+    }
+    st->step_in_progress = false;
+    return CODEC_STATUS_SUCCESS;
+}
