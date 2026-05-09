@@ -34,7 +34,7 @@ set(GGML_CPU ON)
 
 add_subdirectory(ggml)
 
-add_library(codec STATIC
+set(CODEC_SOURCES
     src/codec.cpp
     src/runtime/gguf_kv.cpp
     src/runtime/tensor_utils.cpp
@@ -69,17 +69,36 @@ add_library(codec STATIC
     src/lm/parallel_heads_delay.cpp
 )
 
+# Build the codec library as both static (linked into the example binaries
+# in this tree) and shared (loadable via Python ctypes for parity tests
+# and external integrations).  Use OBJECT to compile sources once.
+add_library(codec_objs OBJECT ${CODEC_SOURCES})
+set_target_properties(codec_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)
+add_library(codec_shared SHARED $<TARGET_OBJECTS:codec_objs>)
+set_target_properties(codec_shared PROPERTIES OUTPUT_NAME codec)
+
+target_include_directories(codec_objs
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+)
 target_include_directories(codec
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
-
-target_link_libraries(codec
+target_include_directories(codec_shared
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-        ggml
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
+
+target_link_libraries(codec        PRIVATE ggml)
+target_link_libraries(codec_shared PRIVATE ggml)
 
 add_executable(inspect-codec
     examples/inspect-codec.cpp
