@@ -82,11 +82,37 @@ def _looks_like_path(s) -> bool:
 
 def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
     """Load a state-dict from a directory that contains either a single
-    `model.safetensors` or a sharded `model.safetensors.index.json` set."""
-    from safetensors.numpy import load_file as load_st_numpy
+    `model.safetensors` or a sharded `model.safetensors.index.json` set.
+
+    Goes through safetensors.torch to handle bfloat16 (numpy has no
+    native bf16 type) — every tensor is decoded to torch and cast to
+    float32 before being handed back as a numpy array.  Per-arch
+    handlers can downcast back to F16 / quantize as needed via the
+    GGUFWriter pipeline.
+    """
+    try:
+        import torch
+    except ImportError as e:
+        raise ImportError(
+            "torch is required for LM-source loading "
+            "(needed to decode bfloat16 safetensors that `safetensors.numpy` "
+            "can't handle natively)"
+        ) from e
+    from safetensors.torch import load_file as load_st_torch
+
+    def _shard_to_numpy(shard_path: Path) -> Dict[str, np.ndarray]:
+        sd_torch = load_st_torch(str(shard_path))
+        out: Dict[str, np.ndarray] = {}
+        for k, v in sd_torch.items():
+            # bfloat16 -> float32 is the only safe round-trip via numpy.
+            # Per-arch handlers downcast as needed during writing.
+            if v.dtype == torch.bfloat16:
+                v = v.to(torch.float32)
+            out[k] = v.detach().cpu().numpy()
+        return out
 
     if path.is_file() and path.suffix == ".safetensors":
-        return load_st_numpy(str(path))
+        return _shard_to_numpy(path)
 
     if path.is_dir():
         idx = path / "model.safetensors.index.json"
@@ -97,10 +123,10 @@ def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
             shards = sorted({path / fn for fn in index.get("weight_map", {}).values()})
             sd: Dict[str, np.ndarray] = {}
             for shard in shards:
-                sd.update(load_st_numpy(str(shard)))
+                sd.update(_shard_to_numpy(shard))
             return sd
         if single.is_file():
-            return load_st_numpy(str(single))
+            return _shard_to_numpy(single)
 
     raise FileNotFoundError(
         f"could not find safetensors at {path}; expected model.safetensors "

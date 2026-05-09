@@ -128,6 +128,12 @@ void              codec_lm_free  (struct codec_lm * lm);
 // Returned struct lives for the lifetime of the codec_lm.
 const struct codec_lm_info * codec_lm_get_info(const struct codec_lm * lm);
 
+// Returns a pointer to the last-error string (empty when no error has
+// been recorded).  For diagnostic use; the buffer lives as long as
+// `lm` does.
+const char * codec_lm_get_last_error(const struct codec_lm * lm);
+const char * codec_lm_state_get_last_error(const struct codec_lm_state * st);
+
 // Per-generation state.  Holds:
 //   * residual_depth_ar — KV cache for the depth decoder (reset every
 //     `codec_lm_step_begin` since CSM/Moshi/etc. reset the depth

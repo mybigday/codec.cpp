@@ -229,6 +229,14 @@ const struct codec_lm_info * codec_lm_get_info(const struct codec_lm * lm) {
     return lm == nullptr ? nullptr : &lm->info;
 }
 
+const char * codec_lm_get_last_error(const struct codec_lm * lm) {
+    return lm == nullptr ? "" : lm->last_error.c_str();
+}
+
+const char * codec_lm_state_get_last_error(const struct codec_lm_state * st) {
+    return st == nullptr ? "" : st->last_error.c_str();
+}
+
 // ---------------------------------------------------------------------
 // codec_lm_state lifecycle
 // ---------------------------------------------------------------------

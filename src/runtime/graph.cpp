@@ -214,17 +214,52 @@ bool codec_graph_cache_get_or_build(
     }
     ggml_set_output(out);
 
-    const codec_graph_count_state counts = codec_graph_count_exact(out);
     size_t graph_size = 0;
     if (ctx->model != nullptr && ctx->model->vtable != nullptr && ctx->model->vtable->graph_size != nullptr) {
         graph_size = ctx->model->vtable->graph_size(ctx->model, &cached->key, build_data, out);
     }
-    if (graph_size == 0) {
-        graph_size = std::max<size_t>(1, std::max(counts.n_nodes, counts.n_leafs));
+
+    // Side-output tensors (extra ggml_set_output calls inside build_fn,
+    // not reachable from `out`) need to be expanded into the graph as
+    // separate roots — without that, sched_alloc_graph never sees them
+    // and their `t->buffer` stays NULL, making the runtime fail on
+    // codec_runtime_read_tensor.  Walk eval_ctx, collect them.
+    std::vector<ggml_tensor *> side_outputs;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx->eval_ctx); t != nullptr;
+         t = ggml_get_next_tensor(ctx->eval_ctx, t)) {
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) && t != out) {
+            side_outputs.push_back(t);
+        }
     }
 
+    // Count the union of nodes/leafs reachable from `out` AND every
+    // side-output, sharing one visited set so shared sub-DAG (e.g.
+    // h_in feeding all N parallel heads) is counted once.  This walks
+    // through external `src` pointers too (e.g. weights in model->weights
+    // referenced from eval_ctx ops), which ggml's graph builder also
+    // visits — so the count matches the actual graph hash-set demand.
+    codec_graph_count_state counts;
+    codec_graph_count_visit(out, &counts);
+    for (ggml_tensor * t : side_outputs) {
+        codec_graph_count_visit(t, &counts);
+    }
+    // ggml's internal hash set sizes from this; sum (rather than max)
+    // of nodes + leafs is the correct bound for what ggml_visit_parents
+    // will insert.  Take the larger of (vtable hint, side-output-aware
+    // count) — the vtable hint typically only walks from `out` and so
+    // undercounts when build_fn flagged extra ggml_set_output side
+    // branches (e.g. parallel_heads_delay's N parallel logit roots).
+    {
+        const size_t side_aware = std::max<size_t>(1, counts.n_nodes + counts.n_leafs);
+        if (graph_size < side_aware) {
+            graph_size = side_aware;
+        }
+    }
     ctx->eval_graph = ggml_new_graph_custom(ctx->eval_ctx, graph_size, false);
     ggml_build_forward_expand(ctx->eval_graph, out);
+    for (ggml_tensor * t : side_outputs) {
+        ggml_build_forward_expand(ctx->eval_graph, t);
+    }
     ctx->eval_output = out;
     ctx->eval_entry = cached;
 

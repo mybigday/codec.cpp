@@ -90,25 +90,24 @@ bool phd_build_logits(ggml_context * ctx_eval, void * user_data, ggml_tensor ** 
 
     // For each codebook, compute logits = head @ h.  ggml_mul_mat
     // contracts on ne[0] of both operands; head has ne=[hidden, vocab],
-    // h has ne=[hidden, 1], so result is [vocab, 1].
+    // h has ne=[hidden, 1], so result is [vocab, 1].  Mark every per-cb
+    // logits tensor as a graph output so galloc keeps each row pinned
+    // (only the terminal is auto-flagged by the runtime; the other N-1
+    // would otherwise be reused after their last graph use).
     ggml_tensor * last = nullptr;
     char buf[64];
     for (int32_t i = 0; i < impl->n_codebook; ++i) {
         ggml_tensor * head = impl->heads[(size_t) i];
-        ggml_tensor * head_in_ctx = head;
-        // Cast to F32 in eval ctx if needed (helper handles types).
-        head_in_ctx = codec_graph_cast_f32(ctx_eval, head_in_ctx);
+        ggml_tensor * head_in_ctx = codec_graph_cast_f32(ctx_eval, head);
         ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_in_ctx, t_h);
         std::snprintf(buf, sizeof(buf), "lm.step.logits_%d", i);
         ggml_set_name(logits, buf);
+        ggml_set_output(logits);
         last = logits;
     }
     if (last == nullptr) {
         return false;
     }
-    // Use the last codebook's logits as the terminal.  The other
-    // logits tensors are name-marked so the runtime auto-flags them
-    // as outputs (see codec_graph_cache_get_or_build).
     *out_terminal = last;
     return true;
 }

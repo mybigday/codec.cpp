@@ -40,6 +40,16 @@ LM_SOURCE_TO_CODEC: dict = {
     # pending codec_lm M3 (residual_depth_ar).
 }
 
+# When the user points at an LM source directly (e.g. `--model-id
+# fnlp/MOSS-TTSD-v0.5`), we still need to load the codec from somewhere.
+# Each LM family pins a specific codec repo (per the upstream release);
+# this is the default we fetch unless the user passes --codec-source.
+LM_SOURCE_DEFAULT_CODEC_REPO: dict = {
+    "MossTTSDForCausalLM":  "fnlp/XY_Tokenizer_TTSD_V0_hf",      # v0.5 / v0.7 README pin
+    "AsteroidTTSModel":     "fnlp/XY_Tokenizer_TTSD_V0_hf",
+    "MossTTSDelayModel":    "OpenMOSS-Team/MOSS-Audio-Tokenizer", # v1.0 / MOSS-TTS processor default
+}
+
 # Codec converters that accept an `lm_source=...` kwarg.  Currently both
 # MOSS-Audio-Tokenizer and XY-Tokenizer pair with MOSS-TTS-family LMs;
 # more codecs will join when M3+ adds residual_depth_ar models.
@@ -273,6 +283,17 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
              "handler in scripts/converters/lm_adaptor/."
     )
 
+    parser.add_argument(
+        "--codec-source",
+        type=str,
+        default=None,
+        help="Override the codec source when --model-id / --checkpoint-path "
+             "points at an LM checkpoint instead of a codec.  Defaults to "
+             "the LM family's pinned codec (fnlp/XY_Tokenizer_TTSD_V0_hf for "
+             "MOSS-TTSD-v0.5/v0.7, OpenMOSS-Team/MOSS-Audio-Tokenizer for "
+             "MOSS-TTSD-v1.0 / MOSS-TTS)."
+    )
+
     args = parser.parse_args()
     
     # Determine input path and model type
@@ -289,15 +310,33 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
                 from huggingface_hub import hf_hub_download
                 import json
                 config_path = hf_hub_download(args.model_id, "config.json")
-                model_type = detect_model_type_from_config(Path(config_path))
-                if args.verbose:
-                    print(f"Auto-detected model type: {model_type}")
-                # If the input was an LM-source checkpoint, default
-                # --lm-source to it (caller can still override).
-                if args.lm_source is None and _is_lm_source_config(Path(config_path)):
-                    args.lm_source = args.model_id
+                # If the input is an LM source (e.g. MOSS-TTSD-v0.5), the
+                # caller pointed at the LM, not the codec.  Auto-set
+                # --lm-source = that input, redirect --model-id to the
+                # LM family's default codec repo.
+                if _is_lm_source_config(Path(config_path)):
+                    with open(config_path) as f:
+                        cfg = json.load(f)
+                    arch = (cfg.get("architectures") or [""])[0]
+                    model_type = LM_SOURCE_TO_CODEC[arch]
+                    if args.lm_source is None:
+                        args.lm_source = args.model_id
+                    if args.codec_source is None:
+                        args.codec_source = LM_SOURCE_DEFAULT_CODEC_REPO.get(arch)
+                        if args.codec_source is None:
+                            raise ValueError(
+                                f"no default codec known for LM arch {arch!r}; "
+                                f"pass --codec-source explicitly"
+                            )
+                    args.model_id = args.codec_source  # codec converter loads this
                     if args.verbose:
-                        print(f"Auto-set lm_source = {args.model_id}")
+                        print(f"Detected LM source ({arch}); "
+                              f"lm_source={args.lm_source} codec={args.codec_source} "
+                              f"model_type={model_type}")
+                else:
+                    model_type = detect_model_type_from_config(Path(config_path))
+                    if args.verbose:
+                        print(f"Auto-detected model type: {model_type}")
             except Exception as e:
                 raise ValueError(f"Cannot auto-detect model type for {args.model_id}. Please specify --model-type.") from e
     else:
@@ -318,13 +357,36 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
             # Directory - try to find config.json
             config_path = input_path / "config.json"
             if config_path.exists():
-                model_type = detect_model_type_from_config(config_path)
-                if args.verbose:
-                    print(f"Auto-detected model type from config: {model_type}")
-                if args.lm_source is None and _is_lm_source_config(config_path):
-                    args.lm_source = str(input_path)
+                if _is_lm_source_config(config_path):
+                    import json
+                    with open(config_path) as f:
+                        cfg = json.load(f)
+                    arch = (cfg.get("architectures") or [""])[0]
+                    model_type = LM_SOURCE_TO_CODEC[arch]
+                    if args.lm_source is None:
+                        args.lm_source = str(input_path)
+                    if args.codec_source is None:
+                        # Local LM checkpoint without an explicit codec —
+                        # fall back to fetching the LM family's pinned codec
+                        # from HF (still local-first via HF cache).
+                        args.codec_source = LM_SOURCE_DEFAULT_CODEC_REPO.get(arch)
+                        if args.codec_source is None:
+                            raise ValueError(
+                                f"no default codec known for LM arch {arch!r}; "
+                                f"pass --codec-source explicitly"
+                            )
                     if args.verbose:
-                        print(f"Auto-set lm_source = {input_path}")
+                        print(f"Detected LM source ({arch}); "
+                              f"lm_source={args.lm_source} "
+                              f"codec={args.codec_source} model_type={model_type}")
+                    # Re-route the codec load through HF instead of the
+                    # local LM checkpoint dir.
+                    checkpoint_path = None
+                    args.model_id = args.codec_source
+                else:
+                    model_type = detect_model_type_from_config(config_path)
+                    if args.verbose:
+                        print(f"Auto-detected model type from config: {model_type}")
             else:
                 # Try to infer from directory name
                 model_type = infer_model_type_from_filename(input_path.name)
