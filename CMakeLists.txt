@@ -98,6 +98,12 @@ add_executable(codec-cli
 
 target_link_libraries(codec-cli PRIVATE codec codec-example-utils)
 
+add_executable(codec-lm-cli
+    examples/codec-lm-cli.cpp
+)
+
+target_link_libraries(codec-lm-cli PRIVATE codec codec-example-utils)
+
 add_executable(codec-batch-decode
     examples/codec-batch-decode.cpp
 )

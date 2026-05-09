@@ -305,3 +305,54 @@ bool codec_example_save_npy_i32_2d_qt(const char * path, const int32_t * data_tq
 
     return true;
 }
+
+static bool codec_example_save_npy_1d(
+    const char * path, const void * data, size_t elem_size,
+    int32_t n, const char * descr, std::string * err) {
+
+    if (path == nullptr || data == nullptr || n < 0) {
+        if (err != nullptr) *err = "invalid npy save args";
+        return false;
+    }
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        if (err != nullptr) *err = "failed to open output npy file";
+        return false;
+    }
+
+    const char magic[] = "\x93NUMPY";
+    ofs.write(magic, 6);
+    ofs.put((char) 1);  // major
+    ofs.put((char) 0);  // minor
+
+    char header[160];
+    std::snprintf(header, sizeof(header),
+                  "{'descr': '%s', 'fortran_order': False, 'shape': (%d,), }",
+                  descr, n);
+    std::string hdr = header;
+    const size_t preamble = 6 + 2 + 2;
+    const size_t total = preamble + hdr.size();
+    const size_t pad = (16 - (total % 16)) % 16;
+    hdr.append(pad, ' ');
+    hdr.push_back('\n');
+
+    const uint16_t hlen = (uint16_t) hdr.size();
+    ofs.write(reinterpret_cast<const char *>(&hlen), sizeof(hlen));
+    ofs.write(hdr.data(), (std::streamsize) hdr.size());
+    if (n > 0) {
+        ofs.write(reinterpret_cast<const char *>(data), (std::streamsize)((size_t) n * elem_size));
+    }
+    if (!ofs.good()) {
+        if (err != nullptr) *err = "failed to write npy data";
+        return false;
+    }
+    return true;
+}
+
+bool codec_example_save_npy_f32_1d(const char * path, const float * data, int32_t n, std::string * err) {
+    return codec_example_save_npy_1d(path, data, sizeof(float), n, "<f4", err);
+}
+
+bool codec_example_save_npy_i32_1d(const char * path, const int32_t * data, int32_t n, std::string * err) {
+    return codec_example_save_npy_1d(path, data, sizeof(int32_t), n, "<i4", err);
+}
