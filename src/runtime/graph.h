@@ -31,6 +31,11 @@ enum codec_graph_kind {
     // codec_lm graph kinds (auxiliary, per-state).
     CODEC_GRAPH_LM_PARALLEL_HEADS_LOGITS  = 26,
     CODEC_GRAPH_LM_PARALLEL_HEADS_COMPOSE = 27,
+
+    CODEC_GRAPH_LM_RDA_C0_HEAD     = 28,
+    CODEC_GRAPH_LM_RDA_DEPTH_STEP  = 29,
+    CODEC_GRAPH_LM_RDA_COMPOSE     = 30,
+    CODEC_GRAPH_LM_RDA_IN_PROJ     = 31,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

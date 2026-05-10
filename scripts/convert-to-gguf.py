@@ -72,7 +72,9 @@ def detect_model_type_from_config(config_path: Path) -> str:
 
     model_type = config.get("model_type", "").lower()
     
-    if "mimi" in model_type:
+    if "csm" == model_type:
+        return "csm"
+    elif "mimi" in model_type:
         return "mimi"
     elif "dac" in model_type or "descript" in model_type:
         return "dac"
@@ -107,7 +109,9 @@ def detect_model_type_from_config(config_path: Path) -> str:
     else:
         # Try to infer from architecture or other fields
         arch = config.get("architectures", [""])[0].lower() if config.get("architectures") else ""
-        if "mimi" in arch:
+        if "csmforconditionalgeneration" in arch:
+            return "csm"
+        elif "mimi" in arch:
             return "mimi"
         elif "dac" in arch:
             return "dac"

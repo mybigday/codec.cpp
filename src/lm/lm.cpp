@@ -54,7 +54,7 @@ enum codec_lm_kind codec_lm_kind_from_string(const char * s) {
 const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind) {
     switch (kind) {
         case CODEC_LM_KIND_PARALLEL_HEADS_DELAY: return &codec_lm_vtable_parallel_heads_delay;
-        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return nullptr;  // not implemented yet (M3)
+        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return &codec_lm_vtable_residual_depth_ar;
         case CODEC_LM_KIND_UNKNOWN:              break;
     }
     return nullptr;

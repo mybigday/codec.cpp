@@ -15,6 +15,7 @@ from .xcodec2 import XCodec2Converter
 from .snac import SnacConverter
 from .moss_audio import MossAudioConverter
 from .xy_tokenizer import XYTokenizerConverter
+from .csm import CsmConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -33,6 +34,7 @@ _CONVERTER_REGISTRY = {
     'moss_audio': MossAudioConverter,
     'moss_audio_nano': MossAudioConverter,
     'xy_tokenizer': XYTokenizerConverter,
+    'csm': CsmConverter,
 }
 
 

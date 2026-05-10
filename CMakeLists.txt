@@ -67,6 +67,7 @@ set(CODEC_SOURCES
     src/models/xy_tokenizer.cpp
     src/lm/lm.cpp
     src/lm/parallel_heads_delay.cpp
+    src/lm/residual_depth_ar.cpp
 )
 
 # Build the codec library as both static (linked into the example binaries

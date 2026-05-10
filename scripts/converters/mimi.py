@@ -205,6 +205,33 @@ def map_tensor_names(key: str) -> List[str]:
 
 
 class MimiConverter(BaseConverter):
+    """Mimi codec converter (kyutai/mimi).
+
+    Optionally bundles an LM-side adaptor (`lm.*` tensors + `codec.lm.*`
+    metadata) into the same GGUF when `lm_source` is supplied — used by
+    CSM (Sesame), which pairs `residual_depth_ar` with Mimi.  The CSM
+    checkpoint actually bundles the codec under a `codec_model.*` prefix,
+    so the workflow is:
+
+        # CsmConverter loads CSM, extracts the codec sub-state-dict,
+        # configures a MimiConverter with it, and adds lm_source pointing
+        # back at the same CSM checkpoint.  See scripts/converters/csm.py.
+    """
+
+    def __init__(
+        self,
+        quantization: str = "F16",
+        quantize_codebook: bool = False,
+        verbose: bool = False,
+        lm_source=None,
+    ):
+        super().__init__(
+            quantization=quantization,
+            quantize_codebook=quantize_codebook,
+            verbose=verbose,
+        )
+        self.lm_source = lm_source
+
     @property
     def model_type(self) -> str:
         return "mimi"
@@ -304,14 +331,30 @@ class MimiConverter(BaseConverter):
         self._add_tensor(writer, "mimi.encode.kernel", kernel)
 
     def convert_and_save(self, output_path: Path) -> None:
+        writer = GGUFWriter(output_path, self.architecture)
+        self._reset_quant_stats()
+        self.write_into(writer)
+        if self.lm_source is not None:
+            from .lm_adaptor import dump_lm_into
+            dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+        self._warn_if_no_quantized()
+        writer.write()
+        if self.lm_source is None:
+            self.log(f"Wrote Mimi GGUF to {output_path}")
+        else:
+            self.log(f"Wrote Mimi codec + LM adaptor GGUF to {output_path} "
+                     f"(lm_source={self.lm_source})")
+
+    def write_into(self, writer: GGUFWriter) -> None:
+        """Write Mimi codec metadata + tensors into a caller-supplied writer.
+        Lets a higher-level converter (e.g. CSM) bundle the codec section
+        alongside its own `lm.*` tensors in the same GGUF."""
         if self.state_dict is None or self.config is None:
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
 
         keys = sorted(self.state_dict.keys())
         weight_transforms = build_weight_transforms(keys)
 
-        writer = GGUFWriter(output_path, self.architecture)
-        self._reset_quant_stats()
         writer.add_name("Mimi")
         sr = int(self.config.get("sampling_rate", 24000))
         hop_size = int(round(sr / float(self.config.get("frame_rate", 12.5))))
@@ -339,6 +382,3 @@ class MimiConverter(BaseConverter):
 
         self._add_codebook_embed_tensors(writer, used_names)
         self._add_kernel_tensors(writer, hop_size)
-        self._warn_if_no_quantized()
-        writer.write()
-        self.log(f"Wrote Mimi GGUF to {output_path}")
