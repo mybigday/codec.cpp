@@ -150,11 +150,13 @@ ggml_tensor * rda_depth_layer(
         k = rda_rms_norm(ctx, k, w.k_norm, rms_eps);
     }
 
-    // RoPE on q and k along the head_dim axis.  Mode is NORMAL (Llama
-    // uses interleaved cos/sin pairs, which is the GGML "normal" mode
-    // — NEOX is the half-rotation variant).
+    // RoPE on q and k along the head_dim axis.  Mode is NEOX — HF Llama
+    // (and CSM, which inherits Llama's RoPE) uses the half-rotation
+    // variant (`rotate_half(x) = cat(-x[D/2:], x[:D/2])`), which is what
+    // ggml calls NEOX.  GGML_ROPE_TYPE_NORMAL is interleaved pairs
+    // (GPT-J style) and produces a different rotation pattern.
     const int32_t rope_n_dims = head_dim;     // rotate the full head dim
-    const int32_t rope_mode   = GGML_ROPE_TYPE_NORMAL;
+    const int32_t rope_mode   = GGML_ROPE_TYPE_NEOX;
     const int32_t n_ctx_orig  = 2048;          // unused when no YaRN extension
     const float   freq_scale  = 1.0f;
     const float   ext_factor  = 0.0f;
