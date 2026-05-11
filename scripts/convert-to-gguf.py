@@ -33,9 +33,10 @@ from converters import get_converter_for_model, list_supported_models
 # (per their processor's default `codec_path`), not XY-Tokenizer like
 # v0.5 / v0.7.  Different codec lineage in the same family.
 LM_SOURCE_TO_CODEC: dict = {
-    "MossTTSDForCausalLM":  "xy_tokenizer",   # MOSS-TTSD v0.5 / v0.7
-    "AsteroidTTSModel":     "xy_tokenizer",   # MOSS-TTSD v0 (early prototype)
-    "MossTTSDelayModel":    "moss_audio",     # MOSS-TTSD v1.0 / MOSS-TTS
+    "MossTTSDForCausalLM":             "xy_tokenizer",         # MOSS-TTSD v0.5 / v0.7
+    "AsteroidTTSModel":                "xy_tokenizer",         # MOSS-TTSD v0 (early prototype)
+    "MossTTSDelayModel":               "moss_audio",           # MOSS-TTSD v1.0 / MOSS-TTS
+    "Qwen3TTSForConditionalGeneration":"qwen3_tts_tokenizer",  # Qwen3-TTS-12Hz-* (residual_depth_ar)
     # MossTTSNanoForCausalLM uses a depth-AR (local_transformer) adaptor;
     # pending codec_lm M3 (residual_depth_ar).
 }
@@ -45,15 +46,16 @@ LM_SOURCE_TO_CODEC: dict = {
 # Each LM family pins a specific codec repo (per the upstream release);
 # this is the default we fetch unless the user passes --codec-source.
 LM_SOURCE_DEFAULT_CODEC_REPO: dict = {
-    "MossTTSDForCausalLM":  "fnlp/XY_Tokenizer_TTSD_V0_hf",      # v0.5 / v0.7 README pin
-    "AsteroidTTSModel":     "fnlp/XY_Tokenizer_TTSD_V0_hf",
-    "MossTTSDelayModel":    "OpenMOSS-Team/MOSS-Audio-Tokenizer", # v1.0 / MOSS-TTS processor default
+    "MossTTSDForCausalLM":              "fnlp/XY_Tokenizer_TTSD_V0_hf",      # v0.5 / v0.7 README pin
+    "AsteroidTTSModel":                 "fnlp/XY_Tokenizer_TTSD_V0_hf",
+    "MossTTSDelayModel":                "OpenMOSS-Team/MOSS-Audio-Tokenizer", # v1.0 / MOSS-TTS processor default
+    "Qwen3TTSForConditionalGeneration": "Qwen/Qwen3-TTS-Tokenizer-12Hz",     # Qwen3-TTS-12Hz-* official codec pairing
 }
 
 # Codec converters that accept an `lm_source=...` kwarg.  Currently both
 # MOSS-Audio-Tokenizer and XY-Tokenizer pair with MOSS-TTS-family LMs;
 # more codecs will join when M3+ adds residual_depth_ar models.
-LM_SOURCE_CAPABLE_CONVERTERS = {"xy_tokenizer", "moss_audio"}
+LM_SOURCE_CAPABLE_CONVERTERS = {"xy_tokenizer", "moss_audio", "qwen3_tts_tokenizer"}
 
 
 def detect_model_type_from_config(config_path: Path) -> str:

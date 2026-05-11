@@ -91,6 +91,29 @@ def _snakebeta_inv_beta(beta: np.ndarray) -> np.ndarray:
 
 
 class Qwen3TTSTokenizerConverter(BaseConverter):
+    """Converter for the Qwen3-TTS-Tokenizer codec (the audio codec that
+    pairs with Qwen/Qwen3-TTS-12Hz-*).
+
+    Optionally bundles an LM-side adaptor (`lm.*` tensors + `codec.lm.*`
+    metadata) into the same GGUF when `lm_source` is supplied — mirrors
+    the XYTokenizer/MOSS-Audio + MOSS-TTSD flow.  The LM source is
+    auto-detected from its `config.json` and dispatched to the right
+    handler in `scripts/converters/lm_adaptor/`."""
+
+    def __init__(
+        self,
+        quantization: str = "F16",
+        quantize_codebook: bool = False,
+        verbose: bool = False,
+        lm_source=None,
+    ):
+        super().__init__(
+            quantization=quantization,
+            quantize_codebook=quantize_codebook,
+            verbose=verbose,
+        )
+        self.lm_source = lm_source
+
     @property
     def model_type(self) -> str:
         return "qwen3_tts_tokenizer"
@@ -455,6 +478,15 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
         self._write_encoder_weights(writer, used)
         self._write_decoder_weights(writer, used)
 
+        if self.lm_source is not None:
+            from .lm_adaptor import dump_lm_into
+            dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+
         self._warn_if_no_quantized()
         writer.write_all()
+        if self.lm_source is None:
+            self.log(f"Wrote Qwen3-TTS-Tokenizer GGUF to {output_path}")
+        else:
+            self.log(f"Wrote Qwen3-TTS-Tokenizer codec + LM adaptor GGUF to {output_path} "
+                     f"(lm_source={self.lm_source})")
         self.log(f"Wrote Qwen3-TTS-Tokenizer GGUF to {output_path}")

@@ -83,6 +83,8 @@ struct rda_impl {
     ggml_tensor * c0_head           = nullptr;
     std::vector<ggml_tensor *> depth_heads;   // [n_codebook-1]
     ggml_tensor * in_proj           = nullptr; // optional
+    ggml_tensor * in_proj_bias      = nullptr; // optional (Qwen3-TTS's
+                                                // small_to_mtp_projection has bias)
     ggml_tensor * depth_output_norm = nullptr;
     ggml_tensor * rope_freq_factors = nullptr; // optional (llama3 scaling)
     std::vector<rda_layer_w> layers;          // [depth_layers]
@@ -423,6 +425,25 @@ bool init(codec_lm * lm) {
     if (impl->has_in_proj) {
         impl->in_proj = find_required(lm, "lm.depth.in_proj.weight");
         if (!impl->in_proj) { delete impl; return false; }
+        // Optional bias (Qwen3-TTS's `small_to_mtp_projection` has bias=True;
+        // CSM's `inputs_embeds_projector` doesn't).  Look it up but don't
+        // require it.
+        impl->in_proj_bias = ggml_get_tensor(lm->codec->weights, "lm.depth.in_proj.bias");
+    } else {
+        // Identity in_proj (e.g. Qwen3-TTS-0.6B-Base where talker hidden
+        // equals depth_hidden = 1024).  Requires hidden_dim == depth_hidden
+        // AND audio_embed_dim == depth_hidden so the raw vectors land in
+        // the depth-decoder input space directly.
+        if (impl->hidden_dim != impl->depth_hidden ||
+            impl->audio_embed_dim != impl->depth_hidden) {
+            char buf2[160];
+            std::snprintf(buf2, sizeof(buf2),
+                "depth_has_in_proj=false requires hidden_dim==depth_hidden=="
+                "audio_embed_dim, got hidden=%d depth_hidden=%d audio_embed=%d",
+                impl->hidden_dim, impl->depth_hidden, impl->audio_embed_dim);
+            lm->last_error = buf2;
+            delete impl; return false;
+        }
     }
 
     impl->depth_output_norm = find_required(lm, "lm.depth.output_norm.weight");
@@ -568,10 +589,20 @@ enum codec_status run_depth_step(codec_lm_state * st, int32_t current_k) {
     // ready to copy into the graph's input tensor.
     std::vector<float> x_prefix((size_t) impl->depth_hidden * (size_t) T, 0.0f);
 
-    // Helper: project an arbitrary [hidden_dim] vector through in_proj.
-    // We do this via a dedicated single-position graph each call (cheap;
-    // the graph's small matmul is cached).
+    // Helper: project an arbitrary [hidden_dim] (or [audio_embed_dim]) vector
+    // through in_proj into [depth_hidden].  When in_proj is absent
+    // (`has_in_proj=false`, e.g. Qwen3-TTS-0.6B where talker hidden ==
+    // depth_hidden), this is a plain memcpy — init() guarantees the dims
+    // match.  When in_proj has a bias (Qwen3-TTS's `small_to_mtp_projection`),
+    // it's added after the matmul.
     auto project = [&](const float * src, float * dst) -> enum codec_status {
+        if (impl->in_proj == nullptr) {
+            // Identity projection — caller's input is already in the
+            // depth_hidden space (audio_embed_dim == depth_hidden checked
+            // at init()).
+            std::memcpy(dst, src, (size_t) impl->depth_hidden * sizeof(float));
+            return CODEC_STATUS_SUCCESS;
+        }
         // Cache key uses CODEC_GRAPH_LM_RDA_IN_PROJ + hidden_dim as
         // discriminators; same graph regardless of layer or step.
         struct in_proj_build { rda_impl * impl; };
@@ -588,6 +619,10 @@ enum codec_status run_depth_step(codec_lm_state * st, int32_t current_k) {
             ggml_set_name(t_in, "lm.in_proj.in");
             ggml_tensor * w = codec_graph_cast_f32(ctx_e, bb->impl->in_proj);
             ggml_tensor * y = ggml_mul_mat(ctx_e, w, t_in);
+            if (bb->impl->in_proj_bias != nullptr) {
+                ggml_tensor * bv = codec_graph_cast_f32(ctx_e, bb->impl->in_proj_bias);
+                y = ggml_add(ctx_e, y, bv);
+            }
             ggml_set_name(y, "lm.in_proj.out");
             *out = y;
             return true;

@@ -32,6 +32,10 @@ def dump_lm_into(writer, lm_source, *, verbose: bool = False) -> None:
         from . import moss_ttsd
         moss_ttsd.dump(writer, sd, cfg, arch_name=arch, verbose=verbose)
         return
+    if arch == "Qwen3TTSForConditionalGeneration":
+        from . import qwen3_tts
+        qwen3_tts.dump(writer, sd, cfg, verbose=verbose)
+        return
     if arch == "MossTTSNanoForCausalLM":
         # Pending residual_depth_ar runtime support (M3) — Nano uses a
         # `local_transformer` (depth-AR) decoder, not a parallel-heads
