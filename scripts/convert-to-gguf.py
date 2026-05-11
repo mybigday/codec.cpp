@@ -76,6 +76,8 @@ def detect_model_type_from_config(config_path: Path) -> str:
     
     if "csm" == model_type:
         return "csm"
+    if model_type == "moshi":
+        return "moshi"
     elif "mimi" in model_type:
         return "mimi"
     elif "dac" in model_type or "descript" in model_type:

@@ -54,6 +54,12 @@ struct codec_lm_state {
     // Used to enforce the alternating logits/push_code order.
     bool    logits_pending = false;
 
+    // Optional pre-step context for `c0_input_modality="text"` models
+    // (Moshi).  Caller stashes the text token sampled from the backbone
+    // here before calling step_begin; the residual_depth_ar runtime
+    // reads it at depth position 0.  Sentinel `-1` = unset.
+    int32_t text_token_context = -1;
+
     std::string last_error;
 };
 

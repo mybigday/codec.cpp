@@ -77,17 +77,43 @@ struct rda_impl {
     float   depth_rms_eps    = 0.0f;
     bool    has_in_proj      = false;
     bool    has_qk_norm      = false;
+    bool    has_output_norm  = true;   // most models have one; Moshi doesn't
+    bool    use_rope         = true;   // most models apply RoPE; Moshi doesn't
+    bool    is_flexible      = false;  // false = shared (CSM/Qwen3-TTS),
+                                       // true = flexible (Moshi: per-pos weights)
+    bool    c0_is_text       = false;  // c0_input_modality="text" (Moshi)
+    int32_t depth_text_vocab = 0;      // text vocab for the c0_is_text input
 
     // Tensor handles (live in codec->weights).
-    std::vector<ggml_tensor *> audio_embds;   // [n_codebook]
-    ggml_tensor * c0_head           = nullptr;
-    std::vector<ggml_tensor *> depth_heads;   // [n_codebook-1]
-    ggml_tensor * in_proj           = nullptr; // optional
-    ggml_tensor * in_proj_bias      = nullptr; // optional (Qwen3-TTS's
-                                                // small_to_mtp_projection has bias)
-    ggml_tensor * depth_output_norm = nullptr;
-    ggml_tensor * rope_freq_factors = nullptr; // optional (llama3 scaling)
-    std::vector<rda_layer_w> layers;          // [depth_layers]
+    //
+    // Shared mode (is_flexible=false):
+    //   - `audio_embds[0..N-1]`: 2D embedding tables, one per codebook;
+    //     used for both compose_audio_embd (sum across cb) AND depth-
+    //     position embed lookup.
+    //   - `c0_head`: separate 2D head for cb 0.
+    //   - `depth_heads[0..N-2]`: 2D heads for cb 1..N-1.
+    //   - `layers[*]`: 2D per-layer weights (rda_layer_w).
+    //
+    // Flexible mode (is_flexible=true):
+    //   - `text_embd`: 2D embedding table for depth pos 0 (text vocab).
+    //   - `audio_embds[0..N-2]`: 2D audio embed tables (N-1 of them),
+    //     used at depth pos 1..N-1.  No compose_audio_embd path —
+    //     caller handles backbone-side composition.
+    //   - `flex_heads`: single 3D tensor (N, V_audio, H_d); per-position
+    //     head at depth position p uses `flex_heads[p]`.
+    //   - `flex_layers[*]`: 3D per-layer weights (rda_flex_layer_w).
+    std::vector<ggml_tensor *> audio_embds;   // shared: [N]; flexible: [N-1]
+    ggml_tensor * text_embd         = nullptr; // flexible only
+    ggml_tensor * c0_head           = nullptr; // shared only
+    std::vector<ggml_tensor *> depth_heads;    // shared only [N-1]
+    ggml_tensor * flex_heads        = nullptr; // flexible only (3D)
+    ggml_tensor * in_proj           = nullptr; // shared (2D) or flexible (3D)
+    ggml_tensor * in_proj_bias      = nullptr; // shared only (Qwen3-TTS bias)
+    ggml_tensor * depth_output_norm = nullptr; // shared only (Moshi omits)
+    ggml_tensor * rope_freq_factors = nullptr; // shared only (llama3 scaling)
+    std::vector<rda_layer_w> layers;           // shared mode [depth_layers]
+    std::vector<rda_layer_w> flex_layers;      // flexible mode [depth_layers]
+                                                // (same struct, 3D tensors)
 
     // Lazily-allocated codec_context for `compose_audio_embd` graphs;
     // kept separate from per-state ctx so concurrent step + compose
@@ -331,6 +357,189 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
     return true;
 }
 
+// Flexible (Moshi) depth-step graph.  Inputs:
+//   t_x_prefix: (depth_hidden, T) — token embeddings, one per depth
+//               position.  Host-side builds them by indexing
+//               `text_embd` at pos 0 and `audio_embd_{p-1}` at pos p>=1.
+//   t_h_in:     (hidden_dim,)     — backbone hidden, shared across all
+//               positions (Moshi adds in_proj[p] @ h_in to each pos).
+//
+// The graph:
+//   - Computes per-position in_proj projection via batched mul_mat over
+//     a sliced 3D weight (slice [0..T-1] of (in, out, N_max)).
+//   - Adds projected h_in to the prefix.
+//   - Runs L flexible-weight transformer layers (per-position q/k/v/o
+//     and fc1/fc2 via batched mul_mat; shared RMSNorms; standard causal
+//     attention; no RoPE; no output norm).
+//   - Applies the per-position lm_head slice [T-1] to the last
+//     position's hidden state, yielding (audio_vocab,) logits for cb T-1.
+struct rda_flex_step_build {
+    rda_impl * impl;
+    int32_t    T;
+};
+
+// Slice the first T positions of a 3D weight tensor with HF shape
+// (N, out, in) — ggml ne = (in, out, N).  Returns a view of (in, out, T).
+static inline ggml_tensor * rda_flex_weight_slice(
+        ggml_context * ctx, ggml_tensor * w_3d, int32_t T) {
+    return ggml_view_3d(
+        ctx, w_3d,
+        w_3d->ne[0], w_3d->ne[1], (int64_t) T,
+        w_3d->nb[1], w_3d->nb[2],
+        /*offset=*/0);
+}
+
+// Apply per-position linear: `out[:, p] = w[p] @ x[:, p]` for p in 0..T-1.
+// w has HF shape (N, out_dim, in_dim), x has (in_dim, T).
+// Returns (out_dim, T) as a 2D tensor.
+//
+// ggml_mul_mat(a, b) requires `b.ne[2] % a.ne[2] == 0` for the batch
+// dim (only `a` may broadcast); so we put the input `x` as `a` and the
+// weight as `b`.  Then result ne = (M=1, N=out_dim, T), which reshapes
+// contiguously to (out_dim, T).  Math:
+//   result[0, n, t] = sum_k x[k, t] * w_slice[k, n, t]
+//                   = sum_k x[k, t] * w_HF[t, n, k]
+//                   = (w_HF[t] @ x[:, t])[n]
+static inline ggml_tensor * rda_flex_apply_linear(
+        ggml_context * ctx, ggml_tensor * w_3d, ggml_tensor * x_2d,
+        int32_t out_dim, int32_t T) {
+    ggml_tensor * w_f32   = codec_graph_cast_f32(ctx, w_3d);
+    ggml_tensor * w_slice = rda_flex_weight_slice(ctx, w_f32, T);
+    const int64_t in_dim  = x_2d->ne[0];
+    ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x_2d, in_dim, 1, (int64_t) T);
+    ggml_tensor * y_3d    = ggml_mul_mat(ctx, x_3d, w_slice);
+    return ggml_reshape_2d(ctx, y_3d, (int64_t) out_dim, (int64_t) T);
+}
+
+bool rda_build_depth_step_flexible(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
+    auto * b = static_cast<rda_flex_step_build *>(ud);
+    if (!ctx_eval || !b || !b->impl || !out) return false;
+    rda_impl * impl = b->impl;
+    const int32_t T = b->T;
+    if (T < 1 || T > impl->n_codebook) return false;
+
+    // --- inputs ----------------------------------------------------------
+    ggml_tensor * t_x = ggml_new_tensor_2d(
+        ctx_eval, GGML_TYPE_F32, impl->depth_hidden, T);
+    ggml_set_name(t_x, "lm.flex.x");
+    ggml_tensor * t_h_in = ggml_new_tensor_1d(
+        ctx_eval, GGML_TYPE_F32, impl->hidden_dim);
+    ggml_set_name(t_h_in, "lm.flex.h_in");
+
+    // --- in_proj per position: y[:, p] = in_proj[p] @ h_in ---------------
+    // in_proj has HF shape (N, depth_hidden, hidden_dim) -> ggml
+    // ne=(hidden_dim, depth_hidden, N).  Slice [0..T-1].
+    //
+    // h_in is constant across all depth positions, so we use mul_mat's
+    // batch broadcast on `a` (a.ne[2]=1 broadcasts to b.ne[2]=T).  This
+    // requires putting h_in as `a` and the weight as `b` — the same
+    // operand order as `rda_flex_apply_linear` uses.
+    ggml_tensor * in_proj_f32 = codec_graph_cast_f32(ctx_eval, impl->in_proj);
+    ggml_tensor * in_proj_sl  = rda_flex_weight_slice(ctx_eval, in_proj_f32, T);
+    ggml_tensor * h_in_3d   = ggml_reshape_3d(
+        ctx_eval, t_h_in, impl->hidden_dim, 1, 1);
+    // mul_mat(a=h_in_3d, b=in_proj_sl): a.ne=(H_b, 1, 1) broadcasts to
+    // batch T from b.  Output (1, depth_hidden, T) -> reshape (H_d, T).
+    ggml_tensor * proj_h_3d = ggml_mul_mat(ctx_eval, h_in_3d, in_proj_sl);
+    ggml_tensor * proj_h    = ggml_reshape_2d(
+        ctx_eval, proj_h_3d, impl->depth_hidden, T);
+
+    // Residual stream starts at the token embeddings plus projected h_in.
+    ggml_tensor * x = ggml_add(ctx_eval, t_x, proj_h);
+
+    // --- flexible transformer layers -------------------------------------
+    const float rms_eps = impl->depth_rms_eps;
+    for (int32_t l = 0; l < impl->depth_layers; ++l) {
+        rda_layer_w wl = impl->flex_layers[(size_t) l];
+
+        // --- attention ---
+        ggml_tensor * attn_norm_f32 = codec_graph_cast_f32(ctx_eval, wl.attn_norm);
+        ggml_tensor * h_attn = rda_rms_norm(ctx_eval, x, attn_norm_f32, rms_eps);
+
+        ggml_tensor * q_2d = rda_flex_apply_linear(
+            ctx_eval, wl.q, h_attn, impl->depth_n_heads * impl->depth_head_dim, T);
+        ggml_tensor * k_2d = rda_flex_apply_linear(
+            ctx_eval, wl.k, h_attn, impl->depth_n_kv_heads * impl->depth_head_dim, T);
+        ggml_tensor * v_2d = rda_flex_apply_linear(
+            ctx_eval, wl.v, h_attn, impl->depth_n_kv_heads * impl->depth_head_dim, T);
+
+        // (out, T) -> (head_dim, n_heads, T)
+        ggml_tensor * q = ggml_reshape_3d(
+            ctx_eval, q_2d, impl->depth_head_dim, impl->depth_n_heads, T);
+        ggml_tensor * k = ggml_reshape_3d(
+            ctx_eval, k_2d, impl->depth_head_dim, impl->depth_n_kv_heads, T);
+        ggml_tensor * v = ggml_reshape_3d(
+            ctx_eval, v_2d, impl->depth_head_dim, impl->depth_n_kv_heads, T);
+
+        // No RoPE in flexible (Moshi sets use_rope=False on MoshiDecoderLayer).
+
+        // Attention: q_p = (head_dim, T, n_heads), k_p = (head_dim, T, n_kv_heads).
+        ggml_tensor * q_p = ggml_permute(ctx_eval, q, 0, 2, 1, 3);
+        ggml_tensor * k_p = ggml_permute(ctx_eval, k, 0, 2, 1, 3);
+        q_p = ggml_cont(ctx_eval, q_p);
+        k_p = ggml_cont(ctx_eval, k_p);
+
+        ggml_tensor * scores = ggml_mul_mat(ctx_eval, k_p, q_p);
+        scores = ggml_scale(ctx_eval, scores,
+                            1.0f / std::sqrt((float) impl->depth_head_dim));
+        scores = ggml_diag_mask_inf(ctx_eval, scores, /*n_past=*/0);
+        scores = ggml_soft_max(ctx_eval, scores);
+
+        ggml_tensor * v_p = ggml_permute(ctx_eval, v, 1, 2, 0, 3);
+        v_p = ggml_cont(ctx_eval, v_p);
+        ggml_tensor * attn = ggml_mul_mat(ctx_eval, v_p, scores);
+        attn = ggml_permute(ctx_eval, attn, 0, 2, 1, 3);
+        attn = ggml_cont(ctx_eval, attn);
+        attn = ggml_reshape_2d(
+            ctx_eval, attn, impl->depth_head_dim * impl->depth_n_heads, T);
+
+        ggml_tensor * o = rda_flex_apply_linear(
+            ctx_eval, wl.o, attn, impl->depth_hidden, T);
+        x = ggml_add(ctx_eval, x, o);
+
+        // --- FFN (SwiGLU) ---
+        ggml_tensor * ffn_norm_f32 = codec_graph_cast_f32(ctx_eval, wl.ffn_norm);
+        ggml_tensor * h_ffn = rda_rms_norm(ctx_eval, x, ffn_norm_f32, rms_eps);
+
+        ggml_tensor * gate = rda_flex_apply_linear(
+            ctx_eval, wl.ffn_gate, h_ffn, impl->depth_inter, T);
+        ggml_tensor * up   = rda_flex_apply_linear(
+            ctx_eval, wl.ffn_up,   h_ffn, impl->depth_inter, T);
+        ggml_tensor * act  = ggml_mul(ctx_eval, ggml_silu(ctx_eval, gate), up);
+        ggml_tensor * down = rda_flex_apply_linear(
+            ctx_eval, wl.ffn_down, act, impl->depth_hidden, T);
+        x = ggml_add(ctx_eval, x, down);
+    }
+
+    // No final norm — Moshi applies lm_heads directly to the last
+    // layer's residual stream.
+    if (impl->has_output_norm && impl->depth_output_norm != nullptr) {
+        ggml_tensor * onorm_f32 = codec_graph_cast_f32(ctx_eval, impl->depth_output_norm);
+        x = rda_rms_norm(ctx_eval, x, onorm_f32, rms_eps);
+    }
+
+    // --- lm_heads slice [T-1] at the last position -----------------------
+    // flex_heads HF shape (N, audio_vocab, depth_hidden) -> ggml
+    // ne=(depth_hidden, audio_vocab, N).  We need slice index T-1.
+    ggml_tensor * heads_f32 = codec_graph_cast_f32(ctx_eval, impl->flex_heads);
+    ggml_tensor * head_slice = ggml_view_2d(
+        ctx_eval, heads_f32,
+        heads_f32->ne[0], heads_f32->ne[1],
+        heads_f32->nb[1],
+        (size_t) (T - 1) * heads_f32->nb[2]);
+
+    // x at last position (depth_hidden,)
+    ggml_tensor * x_last = ggml_view_1d(
+        ctx_eval, x, impl->depth_hidden,
+        (size_t) (T - 1) * impl->depth_hidden * sizeof(float));
+    x_last = ggml_cont(ctx_eval, x_last);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_slice, x_last);
+    ggml_set_name(logits, "lm.flex.ck_logits");
+    *out = logits;
+    return true;
+}
+
 // compose_audio_embd graph: get_rows on each cb's table, sum.  Same
 // pattern as parallel_heads_delay's compose graph.
 struct rda_compose_build {
@@ -393,6 +602,23 @@ bool init(codec_lm * lm) {
     impl->depth_rms_eps    = codec_read_f32_kv(gf, "codec.lm.residual.depth_rms_norm_eps", 1e-5f);
     impl->has_in_proj      = codec_read_bool_kv(gf, "codec.lm.residual.depth_has_in_proj", false);
     impl->has_qk_norm      = codec_read_bool_kv(gf, "codec.lm.residual.depth_has_qk_norm", false);
+    impl->has_output_norm  = codec_read_bool_kv(gf, "codec.lm.residual.depth_has_output_norm", true);
+    impl->use_rope         = codec_read_bool_kv(gf, "codec.lm.residual.depth_use_rope", true);
+    impl->depth_text_vocab = codec_read_i32_kv (gf, "codec.lm.residual.depth_text_vocab", 0);
+
+    // weight_layout dispatch.  "shared" (CSM, Qwen3-TTS): one transformer
+    // reused at every depth position.  "flexible" (Moshi): N transformer
+    // weight tensors per layer, gathered by depth position.
+    {
+        std::string wl = codec_lm_read_string_kv(
+            lm->codec, "codec.lm.residual.weight_layout");
+        impl->is_flexible = (wl == "flexible");
+    }
+    {
+        std::string m = codec_lm_read_string_kv(
+            lm->codec, "codec.lm.residual.c0_input_modality");
+        impl->c0_is_text = (m == "text");
+    }
 
     if (impl->depth_layers <= 0 || impl->depth_hidden <= 0 ||
         impl->depth_n_heads <= 0 || impl->depth_head_dim <= 0 ||
@@ -402,24 +628,48 @@ bool init(codec_lm * lm) {
         return false;
     }
 
-    // Audio embedding tables (per-cb).
-    impl->audio_embds.resize((size_t) impl->n_codebook, nullptr);
     char buf[80];
-    for (int32_t i = 0; i < impl->n_codebook; ++i) {
-        std::snprintf(buf, sizeof(buf), "lm.audio_embd_%d.weight", i);
-        impl->audio_embds[(size_t) i] = find_required(lm, buf);
-        if (impl->audio_embds[(size_t) i] == nullptr) { delete impl; return false; }
-    }
 
-    impl->c0_head = find_required(lm, "lm.c0_head.weight");
-    if (!impl->c0_head) { delete impl; return false; }
+    if (!impl->is_flexible) {
+        // ---- shared mode (CSM, Qwen3-TTS) ------------------------------
+        // Audio embedding tables (per-cb).
+        impl->audio_embds.resize((size_t) impl->n_codebook, nullptr);
+        for (int32_t i = 0; i < impl->n_codebook; ++i) {
+            std::snprintf(buf, sizeof(buf), "lm.audio_embd_%d.weight", i);
+            impl->audio_embds[(size_t) i] = find_required(lm, buf);
+            if (impl->audio_embds[(size_t) i] == nullptr) { delete impl; return false; }
+        }
 
-    // Depth heads (n_codebook - 1).
-    impl->depth_heads.resize((size_t) (impl->n_codebook - 1), nullptr);
-    for (int32_t i = 0; i < impl->n_codebook - 1; ++i) {
-        std::snprintf(buf, sizeof(buf), "lm.depth.heads_%d.weight", i);
-        impl->depth_heads[(size_t) i] = find_required(lm, buf);
-        if (impl->depth_heads[(size_t) i] == nullptr) { delete impl; return false; }
+        impl->c0_head = find_required(lm, "lm.c0_head.weight");
+        if (!impl->c0_head) { delete impl; return false; }
+
+        // Depth heads (n_codebook - 1).
+        impl->depth_heads.resize((size_t) (impl->n_codebook - 1), nullptr);
+        for (int32_t i = 0; i < impl->n_codebook - 1; ++i) {
+            std::snprintf(buf, sizeof(buf), "lm.depth.heads_%d.weight", i);
+            impl->depth_heads[(size_t) i] = find_required(lm, buf);
+            if (impl->depth_heads[(size_t) i] == nullptr) { delete impl; return false; }
+        }
+    } else {
+        // ---- flexible mode (Moshi) -------------------------------------
+        // Depth pos 0 input table.  Moshi: text vocab.
+        if (impl->c0_is_text) {
+            impl->text_embd = find_required(lm, "lm.depth.text_embd.weight");
+            if (!impl->text_embd) { delete impl; return false; }
+        }
+
+        // Depth pos 1..N-1 input tables — N-1 audio embed tables.
+        // (The last codebook is never an input.)
+        impl->audio_embds.resize((size_t) (impl->n_codebook - 1), nullptr);
+        for (int32_t i = 0; i < impl->n_codebook - 1; ++i) {
+            std::snprintf(buf, sizeof(buf), "lm.depth.audio_embd_%d.weight", i);
+            impl->audio_embds[(size_t) i] = find_required(lm, buf);
+            if (impl->audio_embds[(size_t) i] == nullptr) { delete impl; return false; }
+        }
+
+        // Single 3D heads tensor; slice[p] applied at depth position p.
+        impl->flex_heads = find_required(lm, "lm.depth.heads.weight");
+        if (!impl->flex_heads) { delete impl; return false; }
     }
 
     if (impl->has_in_proj) {
@@ -427,9 +677,16 @@ bool init(codec_lm * lm) {
         if (!impl->in_proj) { delete impl; return false; }
         // Optional bias (Qwen3-TTS's `small_to_mtp_projection` has bias=True;
         // CSM's `inputs_embeds_projector` doesn't).  Look it up but don't
-        // require it.
-        impl->in_proj_bias = ggml_get_tensor(lm->codec->weights, "lm.depth.in_proj.bias");
+        // require it.  Not used in flexible mode (Moshi's input_projections
+        // has no bias either).
+        if (!impl->is_flexible) {
+            impl->in_proj_bias = ggml_get_tensor(lm->codec->weights, "lm.depth.in_proj.bias");
+        }
     } else {
+        if (impl->is_flexible) {
+            lm->last_error = "flexible weight_layout requires depth_has_in_proj=true";
+            delete impl; return false;
+        }
         // Identity in_proj (e.g. Qwen3-TTS-0.6B-Base where talker hidden
         // equals depth_hidden = 1024).  Requires hidden_dim == depth_hidden
         // AND audio_embed_dim == depth_hidden so the raw vectors land in
@@ -446,16 +703,22 @@ bool init(codec_lm * lm) {
         }
     }
 
-    impl->depth_output_norm = find_required(lm, "lm.depth.output_norm.weight");
-    if (!impl->depth_output_norm) { delete impl; return false; }
+    if (impl->has_output_norm) {
+        impl->depth_output_norm = find_required(lm, "lm.depth.output_norm.weight");
+        if (!impl->depth_output_norm) { delete impl; return false; }
+    }
 
-    // Optional llama3 RoPE freq factors.
-    impl->rope_freq_factors = ggml_get_tensor(lm->codec->weights, "lm.depth.rope_freq_factors");
+    // Optional llama3 RoPE freq factors (shared-mode only).
+    if (!impl->is_flexible) {
+        impl->rope_freq_factors = ggml_get_tensor(lm->codec->weights, "lm.depth.rope_freq_factors");
+    }
 
-    // Per-layer weights.
-    impl->layers.resize((size_t) impl->depth_layers);
+    // Per-layer weights — same tensor names, different shapes (2D vs 3D)
+    // between shared / flexible.
+    std::vector<rda_layer_w> & layers_out = impl->is_flexible ? impl->flex_layers : impl->layers;
+    layers_out.resize((size_t) impl->depth_layers);
     for (int32_t l = 0; l < impl->depth_layers; ++l) {
-        rda_layer_w & w = impl->layers[(size_t) l];
+        rda_layer_w & w = layers_out[(size_t) l];
         std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.attn_norm.weight", l);
         w.attn_norm = find_required(lm, buf); if (!w.attn_norm) { delete impl; return false; }
         std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.q.weight", l);
@@ -738,11 +1001,165 @@ enum codec_status run_depth_step(codec_lm_state * st, int32_t current_k) {
     return CODEC_STATUS_SUCCESS;
 }
 
+// Flexible (Moshi) depth step.  Builds a (depth_hidden, T) token-
+// embedding prefix on the host, runs the flexible graph (which adds
+// per-position in_proj(h_in) and runs L flexible-weight layers + the
+// per-position head slice), and writes the ck logits into the state.
+//
+// `current_k` is the cb index whose logits we want (0..N-1).  Prefix
+// length is T = current_k + 1.  At depth pos 0 the input embedding is
+// `text_embd[text_token_context]` (the caller must have stashed
+// text_token_context via `codec_lm_state_set_text_context`).  At depth
+// pos p>=1 the input is `audio_embds[p-1][codes_buf[p-1]]`.
+enum codec_status run_depth_step_flexible(codec_lm_state * st, int32_t current_k) {
+    rda_impl  * impl = static_cast<rda_impl  *>(st->lm->impl);
+    rda_state * sst  = static_cast<rda_state *>(st->impl);
+    if (current_k < 0 || current_k >= impl->n_codebook) {
+        st->last_error = "flex depth step: cb index out of range";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    const int32_t T = current_k + 1;
+
+    if (impl->c0_is_text && st->text_token_context < 0) {
+        st->last_error =
+            "flex depth step: c0_input_modality=text but no text context "
+            "set; call codec_lm_state_set_text_context before step_begin";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (impl->c0_is_text && impl->depth_text_vocab > 0 &&
+        st->text_token_context >= impl->depth_text_vocab + 1) {
+        // text_embd table has `vocab + 1` rows (Moshi pads with one row);
+        // accept anything in [0, vocab].  Negative was checked above.
+        st->last_error = "flex depth step: text_token_context out of range";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+
+    // ---- Build the (depth_hidden, T) prefix host-side ------------------
+    std::vector<float> x_prefix((size_t) impl->depth_hidden * (size_t) T, 0.0f);
+
+    auto copy_embd_row = [&](ggml_tensor * tbl, int32_t row_id, float * dst,
+                             const char * tag) -> bool {
+        if (tbl == nullptr) {
+            st->last_error = std::string("flex depth step: missing embed table for ") + tag;
+            return false;
+        }
+        const int64_t n_rows  = tbl->ne[1];
+        if (row_id < 0 || (int64_t) row_id >= n_rows) {
+            st->last_error = std::string("flex depth step: row id out of range for ") + tag;
+            return false;
+        }
+        const size_t row_bytes = (size_t) impl->depth_hidden * sizeof(float);
+        if (tbl->type == GGML_TYPE_F32 &&
+            (tbl->buffer == nullptr || ggml_backend_buffer_is_host(tbl->buffer))) {
+            const float * data = static_cast<const float *>(ggml_get_data(tbl));
+            std::memcpy(dst, data + (size_t) row_id * impl->depth_hidden, row_bytes);
+        } else {
+            std::vector<float> all;
+            if (!codec_tensor_as_vec_f32(tbl, &all)) {
+                st->last_error = std::string("flex depth step: dequant failed for ") + tag;
+                return false;
+            }
+            std::memcpy(dst, all.data() + (size_t) row_id * impl->depth_hidden, row_bytes);
+        }
+        return true;
+    };
+
+    // Position 0: token embedding for the c0_input_modality input.
+    if (impl->c0_is_text) {
+        if (!copy_embd_row(impl->text_embd, st->text_token_context,
+                            x_prefix.data(), "text_embd@pos0")) {
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    } else {
+        // Flexible + audio c0: pos 0 input is the c0 code itself (unused
+        // by Moshi; included for completeness).  This requires N audio
+        // embed tables when c0_is_text=false.
+        if (impl->audio_embds.empty() || impl->audio_embds[0] == nullptr) {
+            st->last_error =
+                "flex depth step: c0_input_modality=audio not supported "
+                "(no model exercises this path yet)";
+            return CODEC_STATUS_INVALID_STATE;
+        }
+        if (!copy_embd_row(impl->audio_embds[0], st->codes_buf[0],
+                            x_prefix.data(), "audio_embd@pos0")) {
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    // Positions 1..T-1: audio_embd_{p-1}[codes_buf[p-1]].
+    for (int32_t p = 1; p < T; ++p) {
+        const int32_t embd_idx = p - 1;
+        if ((size_t) embd_idx >= impl->audio_embds.size() ||
+            impl->audio_embds[(size_t) embd_idx] == nullptr) {
+            st->last_error =
+                "flex depth step: missing audio_embd for prefix position";
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        if (!copy_embd_row(impl->audio_embds[(size_t) embd_idx],
+                            st->codes_buf[(size_t) embd_idx],
+                            x_prefix.data() + (size_t) p * impl->depth_hidden,
+                            "audio_embd")) {
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    // ---- Run the flexible depth graph ----------------------------------
+    rda_flex_step_build build = { impl, T };
+    codec_graph_eval_guard guard(st->ctx);
+    std::string err;
+    codec_graph_cache_entry * entry = nullptr;
+    codec_graph_cache_key key = {};
+    key.kind     = (int32_t) CODEC_GRAPH_LM_RDA_FLEX_STEP;
+    key.n_frames = T;
+
+    if (!codec_graph_cache_get_or_build(
+            st->ctx, key, rda_build_depth_step_flexible,
+            &build, sizeof(build), &entry, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    ggml_tensor * t_x    = codec_graph_get_tensor(st->ctx, entry, "lm.flex.x");
+    ggml_tensor * t_h_in = codec_graph_get_tensor(st->ctx, entry, "lm.flex.h_in");
+    ggml_tensor * t_lg   = codec_graph_get_tensor(st->ctx, entry, "lm.flex.ck_logits");
+    if (!t_x || !t_h_in || !t_lg) {
+        st->last_error = "flex depth graph missing tensors";
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_graph_prepare_io(st->ctx, entry, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_runtime_write_tensor(t_x, x_prefix.data(),
+                                    x_prefix.size() * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_runtime_write_tensor(t_h_in, sst->h_in_buf.data(),
+                                    (size_t) impl->hidden_dim * sizeof(float),
+                                    &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    const int32_t nt = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
+    if (!codec_graph_compute(st->ctx, entry, nt, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    const int32_t vk = st->lm->info.codebook_sizes[current_k];
+    if (!codec_runtime_read_tensor(t_lg, sst->logits_buf[(size_t) current_k].data(),
+                                   (size_t) vk * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    return CODEC_STATUS_SUCCESS;
+}
+
 enum codec_status step_begin(codec_lm_state * st, const float * h_in) {
     if (!st || !h_in) return CODEC_STATUS_INVALID_ARG;
     rda_impl * impl = static_cast<rda_impl *>(st->lm->impl);
     rda_state * sst = static_cast<rda_state *>(st->impl);
     std::memcpy(sst->h_in_buf.data(), h_in, (size_t) impl->hidden_dim * sizeof(float));
+    if (impl->is_flexible) {
+        // Flexible models compute c0 inside the depth decoder (no separate
+        // c0_head).  Defer the actual graph until step_logits(0), which
+        // builds a T=1 prefix and runs the flexible graph.
+        return CODEC_STATUS_SUCCESS;
+    }
     return run_c0_head(st, h_in);
 }
 
@@ -752,14 +1169,20 @@ bool step_pending(const codec_lm_state * st) {
 
 const float * step_logits(codec_lm_state * st, int32_t * out_cb_idx, int32_t * out_n) {
     if (!st || !st->impl) return nullptr;
-    rda_state * sst = static_cast<rda_state *>(st->impl);
+    rda_impl  * impl = static_cast<rda_impl  *>(st->lm->impl);
+    rda_state * sst  = static_cast<rda_state *>(st->impl);
     const int32_t k = st->next_cb;
     if (k >= st->lm->info.n_codebook) return nullptr;
 
-    if (k >= 1) {
-        // Lazily run the depth step that produces ck_logits.  Earlier
-        // codes already pushed are in st->codes_buf (the generic dispatch
-        // records them on push_code).
+    if (impl->is_flexible) {
+        // All N codebooks come from the depth decoder in flexible mode
+        // (Moshi has no separate c0_head; lm_heads[0] predicts c0).
+        if (run_depth_step_flexible(st, k) != CODEC_STATUS_SUCCESS) {
+            return nullptr;
+        }
+    } else if (k >= 1) {
+        // Shared mode: c0 was computed at step_begin via c0_head;
+        // c1..c_{N-1} come from the shared depth decoder.
         if (run_depth_step(st, k) != CODEC_STATUS_SUCCESS) {
             return nullptr;
         }
@@ -790,8 +1213,11 @@ enum codec_status step_finish(codec_lm_state * st, int32_t * out_codes) {
 const float * audio_embd(codec_lm * lm, int32_t cb_idx, int32_t code) {
     rda_impl * impl = static_cast<rda_impl *>(lm->impl);
     if (!impl) return nullptr;
-    if (cb_idx < 0 || cb_idx >= impl->n_codebook) return nullptr;
+    // Vector size depends on mode: shared = N, flexible = N-1 (the
+    // last codebook is never an input under Moshi's flexible layout).
+    if (cb_idx < 0 || (size_t) cb_idx >= impl->audio_embds.size()) return nullptr;
     ggml_tensor * t = impl->audio_embds[(size_t) cb_idx];
+    if (t == nullptr) return nullptr;
     const float * data = codec_tensor_data_f32(t);
     if (!data) return nullptr;
     return data + (size_t) code * impl->audio_embed_dim;
@@ -800,6 +1226,16 @@ const float * audio_embd(codec_lm * lm, int32_t cb_idx, int32_t code) {
 enum codec_status compose_audio_embd(codec_lm * lm, const int32_t * codes, float * out_embd) {
     if (!lm || !lm->impl || !codes || !out_embd) return CODEC_STATUS_INVALID_ARG;
     rda_impl * impl = static_cast<rda_impl *>(lm->impl);
+    if (impl->is_flexible) {
+        // Flexible models (Moshi) compose the next-step backbone input
+        // out-of-band: the backbone has its own dual-stream embedding
+        // tables (model + user audio + text) and the caller owns the
+        // sum.  codec_lm doesn't have the user-side audio tables here.
+        lm->last_error =
+            "compose_audio_embd: not supported in flexible weight_layout "
+            "(caller composes backbone input directly)";
+        return CODEC_STATUS_INVALID_STATE;
+    }
     for (int32_t i = 0; i < impl->n_codebook; ++i) {
         if (codes[i] < 0 || codes[i] >= lm->info.codebook_sizes[i]) {
             return CODEC_STATUS_INVALID_ARG;

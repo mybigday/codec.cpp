@@ -134,6 +134,13 @@ const struct codec_lm_info * codec_lm_get_info(const struct codec_lm * lm);
 const char * codec_lm_get_last_error(const struct codec_lm * lm);
 const char * codec_lm_state_get_last_error(const struct codec_lm_state * st);
 
+// Returns the most recent `codec_lm_create` failure reason on the
+// current thread, or an empty string if no recent failure was recorded.
+// Useful for surfacing the gate / init error when create returned NULL
+// and the caller has no lm handle to query.  Lives in thread-local
+// storage; subsequent successful or failed creates overwrite it.
+const char * codec_lm_get_create_error(void);
+
 // Per-generation state.  Holds:
 //   * residual_depth_ar — KV cache for the depth decoder (reset every
 //     `codec_lm_step_begin` since CSM/Moshi/etc. reset the depth
@@ -147,6 +154,15 @@ const char * codec_lm_state_get_last_error(const struct codec_lm_state * st);
 struct codec_lm_state * codec_lm_state_new (struct codec_lm * lm);
 void                    codec_lm_state_free(struct codec_lm_state * st);
 void                    codec_lm_state_reset(struct codec_lm_state * st);
+
+// For models with `c0_input_modality="text"` (Moshi), the caller must
+// stash the text token (sampled from the backbone's text head) before
+// calling `codec_lm_step_begin`.  The token is consumed at depth
+// position 0.  Always succeeds for text-modality models; a no-op for
+// audio-modality models (the value is recorded but unused).
+enum codec_status codec_lm_state_set_text_context(
+    struct codec_lm_state * st,
+    int32_t                 text_token);
 
 // ─────────────────────────────────────────────────────────────────────
 // Audio embedding lookup.

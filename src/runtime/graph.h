@@ -36,6 +36,10 @@ enum codec_graph_kind {
     CODEC_GRAPH_LM_RDA_DEPTH_STEP  = 29,
     CODEC_GRAPH_LM_RDA_COMPOSE     = 30,
     CODEC_GRAPH_LM_RDA_IN_PROJ     = 31,
+
+    // residual_depth_ar with weight_layout="flexible" (Moshi):
+    // per-position 3D weight gather, no RoPE, applies lm_heads inline.
+    CODEC_GRAPH_LM_RDA_FLEX_STEP   = 32,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

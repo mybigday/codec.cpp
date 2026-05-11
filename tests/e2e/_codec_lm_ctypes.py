@@ -77,6 +77,8 @@ lib.codec_lm_get_last_error.argtypes       = [ctypes.c_void_p]
 lib.codec_lm_get_last_error.restype        = ctypes.c_char_p
 lib.codec_lm_state_get_last_error.argtypes = [ctypes.c_void_p]
 lib.codec_lm_state_get_last_error.restype  = ctypes.c_char_p
+lib.codec_lm_get_create_error.argtypes     = []
+lib.codec_lm_get_create_error.restype      = ctypes.c_char_p
 
 lib.codec_lm_state_new.argtypes  = [ctypes.c_void_p]
 lib.codec_lm_state_new.restype   = ctypes.c_void_p
@@ -87,6 +89,9 @@ lib.codec_lm_state_reset.restype  = None
 
 lib.codec_lm_step_begin.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
 lib.codec_lm_step_begin.restype  = ctypes.c_int
+
+lib.codec_lm_state_set_text_context.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+lib.codec_lm_state_set_text_context.restype  = ctypes.c_int
 
 lib.codec_lm_step_pending.argtypes = [ctypes.c_void_p]
 lib.codec_lm_step_pending.restype  = ctypes.c_bool
@@ -190,6 +195,12 @@ class CodecLMState:
         if rc != CODEC_STATUS_SUCCESS:
             err = (lib.codec_lm_state_get_last_error(self.ptr) or b"").decode()
             raise RuntimeError(f"step_begin rc={rc}, err='{err}'")
+
+    def set_text_context(self, text_token: int) -> None:
+        rc = lib.codec_lm_state_set_text_context(self.ptr, ctypes.c_int32(int(text_token)))
+        if rc != CODEC_STATUS_SUCCESS:
+            err = (lib.codec_lm_state_get_last_error(self.ptr) or b"").decode()
+            raise RuntimeError(f"set_text_context rc={rc}, err='{err}'")
 
     def step_logits(self):
         cb_idx = ctypes.c_int32(0)

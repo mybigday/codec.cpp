@@ -16,6 +16,7 @@ from .snac import SnacConverter
 from .moss_audio import MossAudioConverter
 from .xy_tokenizer import XYTokenizerConverter
 from .csm import CsmConverter
+from .moshi import MoshiConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -35,6 +36,7 @@ _CONVERTER_REGISTRY = {
     'moss_audio_nano': MossAudioConverter,
     'xy_tokenizer': XYTokenizerConverter,
     'csm': CsmConverter,
+    'moshi': MoshiConverter,
 }
 
 

@@ -189,22 +189,34 @@ static bool codec_lm_populate_info(codec_lm * lm) {
     return true;
 }
 
+// Thread-local fallback for the most recent codec_lm_create failure.
+// Callers that get NULL back from `codec_lm_create` can read the reason
+// via `codec_lm_get_create_error` without a valid lm handle.
+static thread_local std::string s_codec_lm_create_error;
+
 struct codec_lm * codec_lm_create(struct codec_model * codec) {
+    s_codec_lm_create_error.clear();
     if (codec == nullptr) {
+        s_codec_lm_create_error = "codec_lm_create: codec is NULL";
         return nullptr;
     }
     codec_lm * lm = new (std::nothrow) codec_lm();
     if (lm == nullptr) {
+        s_codec_lm_create_error = "codec_lm_create: out of memory";
         return nullptr;
     }
     lm->codec = codec;
 
     if (!codec_lm_populate_info(lm)) {
+        s_codec_lm_create_error = lm->last_error;
         delete lm;
         return nullptr;
     }
 
     if (lm->vtable->init == nullptr || !lm->vtable->init(lm)) {
+        s_codec_lm_create_error = lm->last_error.empty()
+            ? "codec_lm_create: init returned false (no detail)"
+            : lm->last_error;
         if (lm->vtable->free != nullptr) {
             lm->vtable->free(lm);
         }
@@ -213,6 +225,10 @@ struct codec_lm * codec_lm_create(struct codec_model * codec) {
     }
 
     return lm;
+}
+
+const char * codec_lm_get_create_error(void) {
+    return s_codec_lm_create_error.c_str();
 }
 
 void codec_lm_free(struct codec_lm * lm) {
@@ -307,10 +323,21 @@ void codec_lm_state_reset(struct codec_lm_state * st) {
     st->next_cb            = 0;
     st->step_in_progress   = false;
     st->logits_pending     = false;
+    st->text_token_context = -1;
     std::fill(st->codes_buf.begin(), st->codes_buf.end(), 0);
     if (st->lm != nullptr && st->lm->vtable != nullptr && st->lm->vtable->state_reset != nullptr) {
         st->lm->vtable->state_reset(st);
     }
+}
+
+enum codec_status codec_lm_state_set_text_context(
+        struct codec_lm_state * st, int32_t text_token) {
+    if (st == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    st->text_token_context = text_token;
+    st->last_error.clear();
+    return CODEC_STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------
