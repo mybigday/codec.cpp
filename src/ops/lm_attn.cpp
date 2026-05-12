@@ -1,4 +1,6 @@
 #include "lm_attn.h"
+#include "ggml_ops.h"
+#include "../runtime/tensor_utils.h"
 
 #include <cmath>
 
@@ -263,5 +265,131 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
     return ggml_mul_mat(ctx, v_tdh, probs);
+}
+
+
+// View the first `T` slices of a 3D `(in, out, N)` weight along ne[2].
+static inline ggml_tensor * lm_per_pos_weight_slice(
+        ggml_context * ctx, ggml_tensor * w_3d, int32_t T) {
+    return ggml_view_3d(
+        ctx, w_3d,
+        w_3d->ne[0], w_3d->ne[1], (int64_t) T,
+        w_3d->nb[1], w_3d->nb[2],
+        /*offset=*/0);
+}
+
+ggml_tensor * codec_op_lm_per_pos_linear(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * x_2d,
+        int32_t out_dim,
+        int32_t T) {
+    if (ctx == nullptr || w == nullptr || x_2d == nullptr) return nullptr;
+    ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
+    // 2D weights have ne[2] == 1 (ggml tensors are internally 4D with
+    // missing dims set to 1).  3D per-pos weights have ne[2] = N >= T.
+    if (w_f32->ne[2] <= 1) {
+        // Shared: plain matmul, gives (out_dim, T).
+        return ggml_mul_mat(ctx, w_f32, x_2d);
+    }
+    ggml_tensor * w_slice = lm_per_pos_weight_slice(ctx, w_f32, T);
+    const int64_t in_dim  = x_2d->ne[0];
+    ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x_2d, in_dim, 1, (int64_t) T);
+    // ggml's batch broadcast requires `b.ne[2] % a.ne[2] == 0` — only
+    // `a` may broadcast.  Putting the input as `a` keeps the rule
+    // satisfied for both balanced (a.ne[2] == b.ne[2] == T) and
+    // broadcast-from-1 (when x is a single position repeated) cases.
+    ggml_tensor * y_3d    = ggml_mul_mat(ctx, x_3d, w_slice);
+    return ggml_reshape_2d(ctx, y_3d, (int64_t) out_dim, (int64_t) T);
+}
+
+ggml_tensor * codec_op_lm_llama_depth_block(
+        ggml_context * ctx,
+        ggml_tensor * x_ht,
+        ggml_tensor * attn_norm_w,
+        ggml_tensor * qw, ggml_tensor * kw, ggml_tensor * vw, ggml_tensor * ow,
+        ggml_tensor * q_norm_w, ggml_tensor * k_norm_w,
+        ggml_tensor * t_pos, ggml_tensor * freq_factors,
+        ggml_tensor * ffn_norm_w,
+        ggml_tensor * ffn_gate, ggml_tensor * ffn_up, ggml_tensor * ffn_down,
+        int32_t head_dim,
+        int32_t n_heads,
+        int32_t n_kv_heads,
+        float   rope_theta,
+        float   rms_eps,
+        int32_t rope_mode,
+        bool    use_rope) {
+    if (ctx == nullptr || x_ht == nullptr) return nullptr;
+
+    const int64_t T      = x_ht->ne[1];
+    const int32_t q_dim  = n_heads    * head_dim;
+    const int32_t kv_dim = n_kv_heads * head_dim;
+
+    // ── Attention ──────────────────────────────────────────────────
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, attn_norm_w);
+
+    ggml_tensor * q = codec_op_lm_per_pos_linear(ctx, qw, h, q_dim,  T);
+    ggml_tensor * k = codec_op_lm_per_pos_linear(ctx, kw, h, kv_dim, T);
+    ggml_tensor * v = codec_op_lm_per_pos_linear(ctx, vw, h, kv_dim, T);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads,    T);
+    k = ggml_reshape_3d(ctx, k, head_dim, n_kv_heads, T);
+    v = ggml_reshape_3d(ctx, v, head_dim, n_kv_heads, T);
+
+    if (q_norm_w != nullptr && k_norm_w != nullptr) {
+        // Per-head RMSNorm on q/k (Qwen3 family, LFM2-Audio).
+        q = codec_op_rms_norm_ct(ctx, q, rms_eps, q_norm_w);
+        k = codec_op_rms_norm_ct(ctx, k, rms_eps, k_norm_w);
+    }
+
+    if (use_rope) {
+        const int32_t rope_n_dims = head_dim;
+        const int32_t n_ctx_orig  = 2048;
+        const float   freq_scale  = 1.0f;
+        const float   ext_factor  = 0.0f;
+        const float   attn_factor = 1.0f;
+        const float   beta_fast   = 32.0f;
+        const float   beta_slow   = 1.0f;
+
+        q = ggml_rope_ext(ctx, q, t_pos, freq_factors, rope_n_dims, rope_mode,
+                          n_ctx_orig, rope_theta, freq_scale, ext_factor,
+                          attn_factor, beta_fast, beta_slow);
+        k = ggml_rope_ext(ctx, k, t_pos, freq_factors, rope_n_dims, rope_mode,
+                          n_ctx_orig, rope_theta, freq_scale, ext_factor,
+                          attn_factor, beta_fast, beta_slow);
+    }
+
+    // GQA via ggml_mul_mat's automatic n_kv_heads -> n_heads broadcast
+    // on the batch axis (n_heads must be a multiple of n_kv_heads).
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
+    scores = ggml_diag_mask_inf(ctx, scores, /*n_past=*/0);
+    scores = ggml_soft_max(ctx, scores);
+
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, (int64_t) q_dim, T);
+
+    const int32_t hidden = (int32_t) x_ht->ne[0];
+    ggml_tensor * o = codec_op_lm_per_pos_linear(ctx, ow, attn, hidden, T);
+    x_ht = ggml_add(ctx, x_ht, o);
+
+    // ── FFN (SwiGLU) ───────────────────────────────────────────────
+    h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, ffn_norm_w);
+
+    // ffn_gate / ffn_up output dim = `ne[1]` of either weight (2D) or
+    // `ne[1]` of the 3D weight slice (same number).
+    const int32_t inter = (int32_t) ffn_gate->ne[1];
+    ggml_tensor * gate = codec_op_lm_per_pos_linear(ctx, ffn_gate, h, inter, T);
+    ggml_tensor * up   = codec_op_lm_per_pos_linear(ctx, ffn_up,   h, inter, T);
+    ggml_tensor * mlp  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor * down = codec_op_lm_per_pos_linear(ctx, ffn_down, mlp, hidden, T);
+    x_ht = ggml_add(ctx, x_ht, down);
+
+    return x_ht;
 }
 

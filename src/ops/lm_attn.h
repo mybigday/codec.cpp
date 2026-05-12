@@ -68,3 +68,69 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
     ggml_tensor * bucket_idx_1d,
     const codec_lm_attn_params * params);
 
+
+// Per-position / shared Linear projection.
+//
+// Applies `out[:, t] = w_t @ x[:, t]` to an `(in_dim, T)` sequence and
+// returns an `(out_dim, T)` 2D tensor.  The weight `w` may be either:
+//   - 2D `(in_dim, out_dim)`: SHARED across all T positions.  Math
+//     reduces to a plain `ggml_mul_mat(w, x)`.
+//   - 3D `(in_dim, out_dim, N)` with `N >= T`: PER-POSITION (Moshi
+//     flexible weights, LFM2-Audio per-position in_proj).  The op
+//     slices the first T weight positions and applies per-pos via a
+//     batched mul_mat (with the input as the LHS operand because
+//     ggml's batch-broadcast rule only lets `a` broadcast).
+//
+// Casts `w` to F32 internally if it isn't already; the caller can pass
+// the raw GGUF weight tensor.  Used by codec_lm depth-decoder graphs
+// to keep the shared and flexible runtime paths on one helper.
+ggml_tensor * codec_op_lm_per_pos_linear(
+    ggml_context * ctx,
+    ggml_tensor * w,
+    ggml_tensor * x_2d,
+    int32_t out_dim,
+    int32_t T);
+
+
+// Llama-style depth-decoder transformer block:
+//   x = x + o_proj(GQA-attn(RMSNorm_1(x) -> q/k/v, optional QK-norm,
+//                           optional RoPE))
+//   x = x + ffn_down(SiLU(ffn_gate(RMSNorm_2(x))) * ffn_up(RMSNorm_2(x)))
+//
+// All of `qw / kw / vw / ow / ffn_gate / ffn_up / ffn_down` may be 2D
+// (shared across positions, CSM/Qwen3-TTS/LFM2-Audio) or 3D
+// `(in_dim, out_dim, N>=T)` (per-position, Moshi flexible) —
+// `codec_op_lm_per_pos_linear` handles either case internally.  Norm
+// weights are 1D: `head_dim` for q/k-norm, `hidden` for attn / ffn
+// norm.  Weights may be F16 / quantized; the op casts them to F32 on
+// the fly via `codec_graph_cast_f32`.
+//
+// Optional knobs:
+//   - `q_norm_w` / `k_norm_w`: per-head RMSNorm on q/k (Qwen3 family,
+//     LFM2-Audio).  Pass `nullptr` to skip.
+//   - `use_rope`: when true, `ggml_rope_ext` is applied to q and k with
+//     mode `rope_mode` (`GGML_ROPE_TYPE_NEOX` for Llama family,
+//     `GGML_ROPE_TYPE_NORMAL` for GPT-J pair layout / LFM2-Audio),
+//     positions `t_pos`, and optional `freq_factors` (for llama3 RoPE
+//     scaling).  Pass `false` (and `nullptr` t_pos / freq_factors) to
+//     skip RoPE entirely (Moshi).
+//
+// Input `x_ht` shape is `(hidden, T)`; output same.  GQA: `n_heads`
+// must be a multiple of `n_kv_heads`.
+ggml_tensor * codec_op_lm_llama_depth_block(
+    ggml_context * ctx,
+    ggml_tensor * x_ht,
+    ggml_tensor * attn_norm_w,
+    ggml_tensor * qw, ggml_tensor * kw, ggml_tensor * vw, ggml_tensor * ow,
+    ggml_tensor * q_norm_w, ggml_tensor * k_norm_w,
+    ggml_tensor * t_pos, ggml_tensor * freq_factors,
+    ggml_tensor * ffn_norm_w,
+    ggml_tensor * ffn_gate, ggml_tensor * ffn_up, ggml_tensor * ffn_down,
+    int32_t head_dim,
+    int32_t n_heads,
+    int32_t n_kv_heads,
+    float   rope_theta,
+    float   rms_eps,
+    int32_t rope_mode,
+    bool    use_rope);
+

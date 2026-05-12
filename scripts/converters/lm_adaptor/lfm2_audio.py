@@ -186,6 +186,40 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     # to (depth_hidden, T) via broadcast.
     writer.add_tensor("lm.depth.in_proj.bias", in_proj_bias_2d, st_dtype="F32")
 
+    # --- backbone-side compose embedding -------------------------------
+    # `audio_embedding.embedding` is used by `LFM2AudioModel.generate_*`
+    # to embed the just-sampled audio frame back into the BACKBONE for
+    # the next AR step.  Per liquid_audio's `_sample_audio_frame` +
+    # `generate_sequential` (line 231 of lfm2_audio.py):
+    #
+    #   in_emb = audio_embedding(next_token + codebook_offsets).sum(0)
+    #
+    # where `next_token` is the (N,) sampled cb codes and
+    # `codebook_offsets = arange(N) * (audio_vocab + 1)`.  The result is
+    # a single (backbone_hidden,) vector that becomes the next backbone
+    # input embed.  We keep this table in the codec_lm GGUF so
+    # `codec_lm_compose_audio_embd` can produce the next-step embed
+    # without the caller having to dig it out of the original checkpoint.
+    if "audio_embedding.embedding.weight" not in sd:
+        raise RuntimeError(
+            "missing audio_embedding.embedding.weight — needed for TTS "
+            "compose; please re-download the checkpoint")
+    compose_w = sd["audio_embedding.embedding.weight"]
+    expected_rows = (audio_vocab) * n_codebook  # 2049 * 8 = 16392
+    if compose_w.shape != (expected_rows, backbone_hid):
+        raise RuntimeError(
+            f"audio_embedding.embedding shape {compose_w.shape} != "
+            f"({expected_rows}, {backbone_hid})")
+    writer.add_tensor("lm.compose.audio_embd.weight",
+                      compose_w.astype(np.float32), st_dtype="F16")
+    # The compose table is in BACKBONE-hidden-dim space (not depth_hidden).
+    # Runtime publishes this via codec_lm_info.compose_audio_embed_dim.
+    writer.add_uint32("codec.lm.compose.audio_embed_dim", backbone_hid)
+    # Codebook offsets are `i * audio_vocab` (= 2049 for LFM2; the +1 for
+    # EOS is already baked into audio_vocab here).  Stride is uniform so
+    # the runtime can compute on the fly — we store it for clarity.
+    writer.add_uint32("codec.lm.compose.codebook_stride", audio_vocab)
+
     # --- per-cb audio embed + heads + pre-head norm ---------------------
     for i in range(n_codebook):
         emb = sd[f"depth_embeddings.{i}.embedding.weight"]

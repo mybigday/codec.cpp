@@ -93,10 +93,20 @@ struct codec_lm_info {
     int32_t         hidden_dim;
 
     // Audio embedding dimension (the dim of vectors returned by
-    // codec_lm_audio_embd / codec_lm_compose_audio_embd).  Equal to
-    // hidden_dim in every model integrated to date, but exposed
-    // separately so the spec doesn't lie if a future model differs.
+    // codec_lm_audio_embd).  Used to size the depth-side audio embed
+    // rows; equals hidden_dim for shared / in_proj-on-prefix models
+    // (CSM / Qwen3-TTS) and depth_hidden for in_proj_per_pos models
+    // (Moshi / LFM2).
     int32_t         audio_embed_dim;
+
+    // Output dimension of `codec_lm_compose_audio_embd`.  When the
+    // model has a backbone-side compose table separate from the depth-
+    // side audio embeds (LFM2-Audio's `audio_embedding`), this differs
+    // from audio_embed_dim.  Zero when compose isn't supported (Moshi:
+    // caller composes via the backbone's own embed tables).  For
+    // models without a separate compose table this equals
+    // audio_embed_dim.
+    int32_t         compose_audio_embed_dim;
 
     // Number of audio codebooks the model emits per AR step.
     int32_t         n_codebook;

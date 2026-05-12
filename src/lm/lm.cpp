@@ -161,6 +161,15 @@ static bool codec_lm_populate_info(codec_lm * lm) {
 
     const int32_t hidden       = codec_read_i32_kv(gf, "codec.lm.hidden_dim", 0);
     const int32_t audio_embd_d = codec_read_i32_kv(gf, "codec.lm.audio_embed_dim", hidden);
+    // Optional separate compose embed dim (LFM2-Audio).  When absent /
+    // zero, compose output matches the depth-side audio_embed_dim
+    // (CSM/Qwen3-TTS) or the model doesn't support compose at all
+    // (Moshi — caller composes via backbone).  The default below picks
+    // audio_embed_dim, which is the right answer for CSM/Qwen3-TTS;
+    // Moshi GGUFs do nothing to expose compose either way, so this
+    // field is informational only.
+    const int32_t compose_embd_d = codec_read_i32_kv(
+        gf, "codec.lm.compose.audio_embed_dim", audio_embd_d);
     const int32_t n_cb         = codec_read_i32_kv(gf, "codec.lm.n_codebook", 0);
     if (hidden <= 0 || audio_embd_d <= 0 || n_cb <= 0) {
         lm->last_error = "codec.lm metadata: hidden_dim / audio_embed_dim / n_codebook must be > 0";
@@ -179,10 +188,11 @@ static bool codec_lm_populate_info(codec_lm * lm) {
 
     lm->host_arch_buf = codec_lm_read_string_kv(lm->codec, "codec.lm.host_arch");
 
-    lm->info.kind             = lm->kind;
-    lm->info.hidden_dim       = hidden;
-    lm->info.audio_embed_dim  = audio_embd_d;
-    lm->info.n_codebook       = n_cb;
+    lm->info.kind                    = lm->kind;
+    lm->info.hidden_dim              = hidden;
+    lm->info.audio_embed_dim         = audio_embd_d;
+    lm->info.compose_audio_embed_dim = compose_embd_d;
+    lm->info.n_codebook              = n_cb;
     lm->info.codebook_sizes   = lm->codebook_sizes_buf.data();
     lm->info.delay_pattern    = lm->delay_pattern_buf.data();
     lm->info.host_arch        = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();

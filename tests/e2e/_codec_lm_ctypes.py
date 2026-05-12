@@ -41,13 +41,14 @@ class codec_model_params(ctypes.Structure):
 
 class codec_lm_info(ctypes.Structure):
     _fields_ = [
-        ("kind",            ctypes.c_int),       # enum codec_lm_kind
-        ("hidden_dim",      ctypes.c_int32),
-        ("audio_embed_dim", ctypes.c_int32),
-        ("n_codebook",      ctypes.c_int32),
-        ("codebook_sizes",  ctypes.POINTER(ctypes.c_int32)),
-        ("delay_pattern",   ctypes.POINTER(ctypes.c_int32)),
-        ("host_arch",       ctypes.c_char_p),
+        ("kind",                    ctypes.c_int),   # enum codec_lm_kind
+        ("hidden_dim",              ctypes.c_int32),
+        ("audio_embed_dim",         ctypes.c_int32),
+        ("compose_audio_embed_dim", ctypes.c_int32),
+        ("n_codebook",              ctypes.c_int32),
+        ("codebook_sizes",          ctypes.POINTER(ctypes.c_int32)),
+        ("delay_pattern",           ctypes.POINTER(ctypes.c_int32)),
+        ("host_arch",               ctypes.c_char_p),
     ]
 
 
@@ -144,6 +145,7 @@ class CodecLM:
         self.n_cb        = int(self.info.n_codebook)
         self.hidden_dim  = int(self.info.hidden_dim)
         self.audio_embed_dim = int(self.info.audio_embed_dim)
+        self.compose_audio_embed_dim = int(self.info.compose_audio_embed_dim)
         self.codebook_sizes  = [int(self.info.codebook_sizes[i]) for i in range(self.n_cb)]
         self.delay_pattern   = [int(self.info.delay_pattern[i])  for i in range(self.n_cb)]
         self.host_arch       = (self.info.host_arch or b"").decode()
