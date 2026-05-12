@@ -115,8 +115,10 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def main() -> int:
-    must(GGUF.is_file(), f"missing GGUF: {GGUF}; "
-                        f"run scripts/extract_qwen3_backbone.py + convert_hf_to_gguf.py first")
+    must(GGUF.is_file(),
+         f"missing GGUF: {GGUF}; "
+         f"run `python scripts/convert-backbone-to-gguf.py "
+         f"--model-id fnlp/MOSS-TTSD-v0.5 --output {GGUF}` first")
     prompt = "[S1] Hello, this is a parity test."
     inputs_embeds, ref_hidden_seq, n_cb = hf_reference(prompt)
     cpp_hidden_seq = llamacpp_hidden_seq(inputs_embeds, GGUF)

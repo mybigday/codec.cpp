@@ -13,19 +13,18 @@ full free-running AR parity:
 
 How the GGUF gets there:
 
-    python scripts/extract_csm_backbone.py \\
-        --csm sesame/csm-1b --out /tmp/csm_backbone_hf
-    python scripts/convert_csm_backbone_to_gguf.py \\
-        --hf-dir /tmp/csm_backbone_hf \\
-        --out    models/csm/llama_backbone.gguf
+    python scripts/convert-backbone-to-gguf.py \\
+        --model-id sesame/csm-1b \\
+        --output   models/csm/llama_backbone.gguf
 
-The wrapper script is a thin one-liner around llama.cpp's
-`convert_hf_to_gguf.py` that monkey-patches the unrecognised-pre-
-tokenizer-hash branch.  CSM ships a Mistral-flavoured regex twist on
-top of Llama-3's tokenizer — same regex family but a different sha256.
-At inference the host LLM is fed embeddings via `llama_batch.embd`, so
-the tokenizer/BPE merges are unused; mapping the hash to `"llama-bpe"`
-is safe.
+That driver renames CSM's `backbone_model.*` tensors into the
+standalone Llama layout, synthesises a matching `config.json`, then
+calls llama.cpp's `convert_hf_to_gguf.py` in-process.  It also patches
+the unrecognised-pre-tokenizer-hash branch — CSM ships a Mistral-
+flavoured regex twist on top of Llama-3's tokenizer (same regex family,
+different sha256).  At inference the host LLM is fed embeddings via
+`llama_batch.embd`, so the tokenizer/BPE merges are unused; mapping
+the hash to `"llama-bpe"` is safe.
 
 Empirical numbers (F16 GGUF, F32 HF reference, T=24 positions through
 all 16 backbone layers):
@@ -157,7 +156,8 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 def main() -> int:
     must(GGUF.is_file(),
          f"missing GGUF: {GGUF}; "
-         f"run scripts/extract_csm_backbone.py + convert_hf_to_gguf.py first")
+         f"run `python scripts/convert-backbone-to-gguf.py "
+         f"--model-id sesame/csm-1b --output {GGUF}` first")
 
     # Deterministic synthetic text token IDs — content doesn't matter,
     # only that the same IDs go through both stacks.  Stay inside Llama-3

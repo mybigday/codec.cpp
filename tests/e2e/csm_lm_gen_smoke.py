@@ -242,8 +242,8 @@ def codec_lm_greedy_step(state, h_in: np.ndarray) -> list[int]:
 
 def run(text_token_ids: list[int], max_frames: int, mode: str) -> int:
     must(GGUF_BACKBONE.is_file(),
-         f"missing {GGUF_BACKBONE}; run scripts/extract_csm_backbone.py + "
-         f"convert_csm_backbone_to_gguf.py first")
+         f"missing {GGUF_BACKBONE}; run `python scripts/convert-backbone-to-gguf.py "
+         f"--model-id sesame/csm-1b --output {GGUF_BACKBONE}` first")
     must(GGUF_CODEC_LM.is_file(),
          f"missing {GGUF_CODEC_LM}; run scripts/convert-to-gguf.py on "
          f"sesame/csm-1b first")

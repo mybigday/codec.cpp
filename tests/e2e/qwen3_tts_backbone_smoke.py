@@ -18,10 +18,9 @@ numerically.
 
 How the GGUF gets there:
 
-    python scripts/extract_qwen3_tts_backbone.py \\
-        --qwen Qwen/Qwen3-TTS-12Hz-0.6B-Base --out /tmp/qwen3_tts_talker_hf
-    python <llama.cpp>/convert_hf_to_gguf.py /tmp/qwen3_tts_talker_hf \\
-        --outfile models/qwen3_tts/qwen3_tts_talker.gguf --outtype f16
+    python scripts/convert-backbone-to-gguf.py \\
+        --model-id Qwen/Qwen3-TTS-12Hz-0.6B-Base \\
+        --output   models/qwen3_tts/qwen3_tts_talker.gguf
 """
 
 from __future__ import annotations
@@ -142,7 +141,8 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 def main() -> int:
     must(GGUF.is_file(),
          f"missing GGUF: {GGUF}; "
-         f"run scripts/extract_qwen3_tts_backbone.py + convert_hf_to_gguf.py first")
+         f"run `python scripts/convert-backbone-to-gguf.py "
+         f"--model-id Qwen/Qwen3-TTS-12Hz-0.6B-Base --output {GGUF}` first")
 
     # Deterministic synthetic inputs_embeds — content doesn't matter,
     # only that the same embeddings go through both stacks.
