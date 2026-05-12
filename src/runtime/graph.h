@@ -40,6 +40,10 @@ enum codec_graph_kind {
     // residual_depth_ar with weight_layout="flexible" (Moshi):
     // per-position 3D weight gather, no RoPE, applies lm_heads inline.
     CODEC_GRAPH_LM_RDA_FLEX_STEP   = 32,
+
+    // residual_depth_ar with shared layers + per-pos in_proj + per-cb
+    // pre-head norm (LFM2-Audio).
+    CODEC_GRAPH_LM_RDA_LFM2_STEP   = 33,
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

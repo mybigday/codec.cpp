@@ -40,6 +40,10 @@ def dump_lm_into(writer, lm_source, *, verbose: bool = False) -> None:
         from . import moshi
         moshi.dump(writer, sd, cfg, verbose=verbose)
         return
+    if arch == "Lfm2AudioForConditionalGeneration":
+        from . import lfm2_audio
+        lfm2_audio.dump(writer, sd, cfg, verbose=verbose)
+        return
     if arch == "MossTTSNanoForCausalLM":
         # Pending residual_depth_ar runtime support (M3) — Nano uses a
         # `local_transformer` (depth-AR) decoder, not a parallel-heads
