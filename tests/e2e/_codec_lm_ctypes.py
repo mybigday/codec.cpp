@@ -118,6 +118,78 @@ lib.codec_lm_compose_audio_embd.argtypes = [
 lib.codec_lm_compose_audio_embd.restype  = ctypes.c_int
 
 
+# --- codec_model decode side (used by examples/tts.py to turn the
+#     codec_lm-emitted code stream into PCM via codec_decode) ----------
+
+class codec_decode_params(ctypes.Structure):
+    _fields_ = [
+        ("n_threads", ctypes.c_int32),
+        ("n_q",       ctypes.c_int32),
+    ]
+
+
+class codec_context_params(ctypes.Structure):
+    _fields_ = [
+        ("seed", ctypes.c_int32),
+    ]
+
+
+class codec_token_buffer(ctypes.Structure):
+    _fields_ = [
+        ("data",          ctypes.POINTER(ctypes.c_int32)),
+        ("n_tokens",      ctypes.c_int32),
+        ("n_frames",      ctypes.c_int32),
+        ("n_q",           ctypes.c_int32),
+        ("codebook_size", ctypes.c_int32),
+        ("sample_rate",   ctypes.c_int32),
+        ("hop_size",      ctypes.c_int32),
+    ]
+
+
+class codec_pcm_buffer(ctypes.Structure):
+    _fields_ = [
+        ("data",        ctypes.POINTER(ctypes.c_float)),
+        ("n_samples",   ctypes.c_int32),
+        ("sample_rate", ctypes.c_int32),
+        ("n_channels",  ctypes.c_int32),
+    ]
+
+
+lib.codec_context_default_params.restype = codec_context_params
+lib.codec_decode_default_params.restype  = codec_decode_params
+
+lib.codec_init_from_model.argtypes = [ctypes.c_void_p, codec_context_params]
+lib.codec_init_from_model.restype  = ctypes.c_void_p
+
+lib.codec_free.argtypes = [ctypes.c_void_p]
+lib.codec_free.restype  = None
+
+lib.codec_get_last_error.argtypes = [ctypes.c_void_p]
+lib.codec_get_last_error.restype  = ctypes.c_char_p
+
+lib.codec_decode.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(codec_token_buffer),
+    ctypes.POINTER(codec_pcm_buffer),
+    codec_decode_params,
+]
+lib.codec_decode.restype = ctypes.c_int
+
+lib.codec_pcm_buffer_free.argtypes = [ctypes.POINTER(codec_pcm_buffer)]
+lib.codec_pcm_buffer_free.restype  = None
+
+lib.codec_model_sample_rate.argtypes  = [ctypes.c_void_p]
+lib.codec_model_sample_rate.restype   = ctypes.c_int32
+lib.codec_model_n_q.argtypes          = [ctypes.c_void_p]
+lib.codec_model_n_q.restype           = ctypes.c_int32
+lib.codec_model_hop_size.argtypes     = [ctypes.c_void_p]
+lib.codec_model_hop_size.restype      = ctypes.c_int32
+lib.codec_model_codebook_size.argtypes = [ctypes.c_void_p]
+lib.codec_model_codebook_size.restype  = ctypes.c_int32
+lib.codec_model_has_decoder.argtypes  = [ctypes.c_void_p]
+lib.codec_model_has_decoder.restype   = ctypes.c_bool
+
+
 # --- pythonic wrapper ---
 
 CODEC_STATUS_SUCCESS = 0
@@ -236,6 +308,81 @@ class CodecLMState:
     def close(self) -> None:
         if getattr(self, "ptr", None):
             lib.codec_lm_state_free(self.ptr); self.ptr = None
+
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+
+
+class CodecDecoder:
+    """Wraps `codec_model + codec_context` for the decode side.
+
+    The audio codecs in this repo (Mimi, Qwen-codec, XY-Tokenizer, ...)
+    expose `codec_decode(ctx, tokens, pcm)` — this class hides the
+    ctypes plumbing for examples/tts.py.
+    """
+
+    def __init__(self, gguf_path, *, use_gpu: bool = False, n_threads: int | None = None):
+        mp = lib.codec_model_default_params()
+        mp.use_gpu   = bool(use_gpu)
+        mp.n_threads = int(n_threads) if n_threads else max(1, (os.cpu_count() or 1) // 2)
+        self.model = lib.codec_model_load_from_file(str(gguf_path).encode("utf-8"), mp)
+        if not self.model:
+            raise RuntimeError(f"codec_model_load_from_file failed for {gguf_path}")
+        if not lib.codec_model_has_decoder(self.model):
+            lib.codec_model_free(self.model); self.model = None
+            raise RuntimeError(f"{gguf_path} has no decoder")
+        cp = lib.codec_context_default_params()
+        self.ctx = lib.codec_init_from_model(self.model, cp)
+        if not self.ctx:
+            lib.codec_model_free(self.model); self.model = None
+            raise RuntimeError("codec_init_from_model failed")
+        self.sample_rate   = int(lib.codec_model_sample_rate(self.model))
+        self.n_q           = int(lib.codec_model_n_q(self.model))
+        self.hop_size      = int(lib.codec_model_hop_size(self.model))
+        self.codebook_size = int(lib.codec_model_codebook_size(self.model))
+
+    def decode(self, codes, *, n_q: int = 0, n_threads: int | None = None):
+        """codes: int32 (n_frames, n_q) ndarray; returns PCM float32 ndarray."""
+        import numpy as np
+        c = np.ascontiguousarray(np.asarray(codes, dtype=np.int32))
+        if c.ndim != 2:
+            raise ValueError(f"codes must be 2D (T,Q), got shape {c.shape}")
+        n_frames, q = c.shape
+
+        tb = codec_token_buffer()
+        tb.data          = c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        tb.n_q           = q
+        tb.n_frames      = n_frames
+        tb.n_tokens      = q * n_frames
+        tb.codebook_size = self.codebook_size
+        tb.sample_rate   = self.sample_rate
+        tb.hop_size      = self.hop_size
+
+        pcm = codec_pcm_buffer()
+        dp = lib.codec_decode_default_params()
+        dp.n_threads = int(n_threads) if n_threads else max(1, (os.cpu_count() or 1) // 2)
+        dp.n_q       = int(n_q)
+        rc = lib.codec_decode(self.ctx, ctypes.byref(tb), ctypes.byref(pcm), dp)
+        if rc != CODEC_STATUS_SUCCESS:
+            err = (lib.codec_get_last_error(self.ctx) or b"").decode()
+            raise RuntimeError(f"codec_decode rc={rc}, err='{err}'")
+        out = np.zeros(pcm.n_samples, dtype=np.float32)
+        ctypes.memmove(out.ctypes.data, pcm.data, pcm.n_samples * 4)
+        sr = int(pcm.sample_rate)
+        nc = int(pcm.n_channels)
+        lib.codec_pcm_buffer_free(ctypes.byref(pcm))
+        if nc > 1:
+            out = out.reshape(-1, nc)
+        return out, sr
+
+    def close(self) -> None:
+        if getattr(self, "ctx", None):
+            lib.codec_free(self.ctx); self.ctx = None
+        if getattr(self, "model", None):
+            lib.codec_model_free(self.model); self.model = None
+
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
 
     def __enter__(self): return self
     def __exit__(self, *a): self.close()
