@@ -128,6 +128,15 @@ class codec_decode_params(ctypes.Structure):
     ]
 
 
+class codec_encode_params(ctypes.Structure):
+    _fields_ = [
+        ("n_threads",  ctypes.c_int32),
+        ("frame_size", ctypes.c_int32),
+        ("hop_size",   ctypes.c_int32),
+        ("n_q",        ctypes.c_int32),
+    ]
+
+
 class codec_context_params(ctypes.Structure):
     _fields_ = [
         ("seed", ctypes.c_int32),
@@ -146,6 +155,16 @@ class codec_token_buffer(ctypes.Structure):
     ]
 
 
+class codec_audio(ctypes.Structure):
+    _fields_ = [
+        ("data",         ctypes.c_void_p),
+        ("n_samples",    ctypes.c_int32),
+        ("sample_rate",  ctypes.c_int32),
+        ("n_channels",   ctypes.c_int32),
+        ("pcm_type",     ctypes.c_int),     # enum codec_pcm_type
+    ]
+
+
 class codec_pcm_buffer(ctypes.Structure):
     _fields_ = [
         ("data",        ctypes.POINTER(ctypes.c_float)),
@@ -155,8 +174,13 @@ class codec_pcm_buffer(ctypes.Structure):
     ]
 
 
+CODEC_PCM_TYPE_F32 = 0
+CODEC_PCM_TYPE_I16 = 1
+
+
 lib.codec_context_default_params.restype = codec_context_params
 lib.codec_decode_default_params.restype  = codec_decode_params
+lib.codec_encode_default_params.restype  = codec_encode_params
 
 lib.codec_init_from_model.argtypes = [ctypes.c_void_p, codec_context_params]
 lib.codec_init_from_model.restype  = ctypes.c_void_p
@@ -175,8 +199,21 @@ lib.codec_decode.argtypes = [
 ]
 lib.codec_decode.restype = ctypes.c_int
 
-lib.codec_pcm_buffer_free.argtypes = [ctypes.POINTER(codec_pcm_buffer)]
-lib.codec_pcm_buffer_free.restype  = None
+lib.codec_encode.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(codec_audio),
+    ctypes.POINTER(codec_token_buffer),
+    codec_encode_params,
+]
+lib.codec_encode.restype = ctypes.c_int
+
+lib.codec_pcm_buffer_free.argtypes   = [ctypes.POINTER(codec_pcm_buffer)]
+lib.codec_pcm_buffer_free.restype    = None
+lib.codec_token_buffer_free.argtypes = [ctypes.POINTER(codec_token_buffer)]
+lib.codec_token_buffer_free.restype  = None
+
+lib.codec_model_has_encoder.argtypes = [ctypes.c_void_p]
+lib.codec_model_has_encoder.restype  = ctypes.c_bool
 
 lib.codec_model_sample_rate.argtypes  = [ctypes.c_void_p]
 lib.codec_model_sample_rate.restype   = ctypes.c_int32
@@ -314,11 +351,13 @@ class CodecLMState:
 
 
 class CodecDecoder:
-    """Wraps `codec_model + codec_context` for the decode side.
+    """Wraps `codec_model + codec_context` for encode + decode.
 
     The audio codecs in this repo (Mimi, Qwen-codec, XY-Tokenizer, ...)
-    expose `codec_decode(ctx, tokens, pcm)` — this class hides the
-    ctypes plumbing for examples/tts.py.
+    expose `codec_encode` / `codec_decode` — this class hides the
+    ctypes plumbing for examples/tts.py.  Name kept as "Decoder" for
+    historical reasons; `.encode()` is also supported when the codec
+    has an encoder.
     """
 
     def __init__(self, gguf_path, *, use_gpu: bool = False, n_threads: int | None = None):
@@ -328,22 +367,23 @@ class CodecDecoder:
         self.model = lib.codec_model_load_from_file(str(gguf_path).encode("utf-8"), mp)
         if not self.model:
             raise RuntimeError(f"codec_model_load_from_file failed for {gguf_path}")
-        if not lib.codec_model_has_decoder(self.model):
-            lib.codec_model_free(self.model); self.model = None
-            raise RuntimeError(f"{gguf_path} has no decoder")
         cp = lib.codec_context_default_params()
         self.ctx = lib.codec_init_from_model(self.model, cp)
         if not self.ctx:
             lib.codec_model_free(self.model); self.model = None
             raise RuntimeError("codec_init_from_model failed")
+        self.has_encoder   = bool(lib.codec_model_has_encoder(self.model))
+        self.has_decoder   = bool(lib.codec_model_has_decoder(self.model))
         self.sample_rate   = int(lib.codec_model_sample_rate(self.model))
         self.n_q           = int(lib.codec_model_n_q(self.model))
         self.hop_size      = int(lib.codec_model_hop_size(self.model))
         self.codebook_size = int(lib.codec_model_codebook_size(self.model))
 
     def decode(self, codes, *, n_q: int = 0, n_threads: int | None = None):
-        """codes: int32 (n_frames, n_q) ndarray; returns PCM float32 ndarray."""
+        """codes: int32 (n_frames, n_q) ndarray; returns (PCM, sr)."""
         import numpy as np
+        if not self.has_decoder:
+            raise RuntimeError("codec model has no decoder")
         c = np.ascontiguousarray(np.asarray(codes, dtype=np.int32))
         if c.ndim != 2:
             raise ValueError(f"codes must be 2D (T,Q), got shape {c.shape}")
@@ -374,6 +414,43 @@ class CodecDecoder:
         if nc > 1:
             out = out.reshape(-1, nc)
         return out, sr
+
+    def encode(self, pcm, sample_rate: int, *, n_q: int = 0,
+               n_threads: int | None = None):
+        """pcm: float32 (n_samples,) or (n_samples, n_channels); returns
+        codes int32 (n_frames, n_q)."""
+        import numpy as np
+        if not self.has_encoder:
+            raise RuntimeError("codec model has no encoder")
+        if pcm.ndim == 1:
+            n_ch = 1
+            arr = np.ascontiguousarray(pcm.astype(np.float32, copy=False))
+        elif pcm.ndim == 2:
+            n_ch = int(pcm.shape[1])
+            arr = np.ascontiguousarray(pcm.astype(np.float32, copy=False))
+        else:
+            raise ValueError(f"unsupported PCM shape {pcm.shape}")
+
+        audio = codec_audio()
+        audio.data        = arr.ctypes.data_as(ctypes.c_void_p)
+        audio.n_samples   = int(arr.shape[0])
+        audio.sample_rate = int(sample_rate)
+        audio.n_channels  = n_ch
+        audio.pcm_type    = CODEC_PCM_TYPE_F32
+
+        tb = codec_token_buffer()
+        ep = lib.codec_encode_default_params()
+        ep.n_threads = int(n_threads) if n_threads else max(1, (os.cpu_count() or 1) // 2)
+        ep.n_q       = int(n_q)
+        rc = lib.codec_encode(self.ctx, ctypes.byref(audio), ctypes.byref(tb), ep)
+        if rc != CODEC_STATUS_SUCCESS:
+            err = (lib.codec_get_last_error(self.ctx) or b"").decode()
+            raise RuntimeError(f"codec_encode rc={rc}, err='{err}'")
+        q  = int(tb.n_q); nf = int(tb.n_frames)
+        codes = np.empty((nf, q), dtype=np.int32)
+        ctypes.memmove(codes.ctypes.data, tb.data, nf * q * 4)
+        lib.codec_token_buffer_free(ctypes.byref(tb))
+        return codes
 
     def close(self) -> None:
         if getattr(self, "ctx", None):
