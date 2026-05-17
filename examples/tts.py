@@ -154,11 +154,22 @@ class LlamaBackbone:
 
 def sample_logits(logits: np.ndarray, *, temperature: float, top_p: float,
                   top_k: int, rng: np.random.Generator) -> int:
+    # Drop NaN / +inf, leaving -inf as a hard mask.  Bug-class: some
+    # codec_lm heads share weights across an oversized merged vocab
+    # and emit non-finite values for unreachable rows.
+    finite = np.isfinite(logits)
+    if not finite.all():
+        logits = np.where(finite, logits, -np.inf)
     if temperature <= 0.0:
-        return int(np.argmax(logits))
+        return int(np.argmax(np.where(np.isfinite(logits), logits, -np.inf)))
     x = logits.astype(np.float64) / max(temperature, 1e-6)
-    x -= x.max()
-    p = np.exp(x); p /= p.sum()
+    x_max = x[np.isfinite(x)].max() if np.isfinite(x).any() else 0.0
+    x = x - x_max
+    p = np.exp(x); p[~np.isfinite(p)] = 0.0
+    s = p.sum()
+    if s <= 0.0:
+        return int(np.argmax(logits))
+    p /= s
 
     if top_k and top_k > 0 and top_k < p.size:
         idx_sorted = np.argpartition(p, -top_k)[-top_k:]
@@ -300,6 +311,18 @@ class TTSSession:
 
     # ----- optional hooks (sensible defaults) -----
 
+    def allowed_token_range(self, cb_idx: int) -> tuple[int, int] | None:
+        """Mask the logit space to a contiguous [lo, hi) range for this
+        codebook before sampling.  Return None to keep the full vocab.
+
+        Useful for codec_lm's where cb-0 sits in a merged text+speech
+        vocab (MOSS-TTSD: cb-0 is 152697-wide while speech codes only
+        occupy [151665, 152689]); under free-running F16, a single
+        argmax flip into text-space hangs the model forever.  Masking
+        keeps the AR loop inside speech-code territory.
+        """
+        return None
+
     def compose_next_embed(self, codes: list[int], step: int) -> np.ndarray:
         embd_buf = self.codec_lm.compose_audio_embd(codes)
         return np.frombuffer(embd_buf, dtype=np.float32).reshape(1, -1).copy()
@@ -313,6 +336,22 @@ class TTSSession:
     def trim_output_pcm(self, pcm: np.ndarray, sr: int,
                         n_gen_frames: int) -> np.ndarray:
         return pcm
+
+    def synthesize(self, codes_all: list[list[int]],
+                   codec: CodecDecoder) -> tuple[np.ndarray, int]:
+        """Default: pack_codes -> codec.decode -> trim_output_pcm.
+
+        Override entirely when a model's decode side is non-trivial
+        (delay-pattern reversal, dual-vocab cb-0, HF processor
+        post-processing, etc.) and routing through codec.decode +
+        trim_output_pcm would require duplicating that logic here.
+        """
+        codes_arr = self.pack_codes(codes_all)
+        if codes_arr.shape[1] > codec.n_q:
+            codes_arr = codes_arr[:, :codec.n_q].copy()
+        pcm, sr = codec.decode(codes_arr)
+        pcm = self.trim_output_pcm(pcm, sr, n_gen_frames=len(codes_all))
+        return pcm, sr
 
 
 # ---------------------------------------------------------------------
@@ -597,6 +636,189 @@ class Qwen3TTSSession(TTSSession):
 
 
 # ---------------------------------------------------------------------
+# MOSS-TTSD (two-speaker voice-clone dialogue, parallel_heads_delay)
+# ---------------------------------------------------------------------
+
+class MossTTSDProfile(TTSProfile):
+    """fnlp/MOSS-TTSD-v0.5 (and structurally identical v0.7).
+
+    Architectural shape differs from CSM/Qwen3-TTS:
+
+      - PARALLEL_HEADS_DELAY (not RESIDUAL_DEPTH_AR).  Each step the
+        backbone hidden feeds 8 parallel heads — cb 0 covers a merged
+        text+speech vocab (152697), cb 1..7 are speech-only (1025 ea.).
+      - Input grid is (T, 8): cb 0 carries text tokens, cb 1..7 carry
+        speech codes (or `speech_pad_token=1024` for text-only rows).
+      - Voice clone is two-speaker: prompt_text uses [S1]/[S2] tags and
+        prompt_audio is a shared reference clip spanning both speakers.
+
+    Stop heuristic: cb 0 == generation_config.eos_token_id (152694 =
+    `<|end_of_speech|>`).
+
+    Decode is delegated to HF `processor.batch_decode`, which handles
+    delay-pattern reversal + cb 0 dual-vocab (text-vs-speech) split +
+    XY-Tokenizer overlap-add decoding.  Mirroring that here would
+    duplicate ~300 LOC of fiddly post-processing for no gain.
+    """
+
+    def create_session(self, *, codec_lm, codec, args, speaker_cfg):
+        return MossTTSDSession(self, codec_lm, codec, args, speaker_cfg)
+
+
+class MossTTSDSession(TTSSession):
+    def __init__(self, profile, codec_lm, codec, args, speaker_cfg):
+        super().__init__(profile, codec_lm, codec, args, speaker_cfg)
+        self._hf_ready = False
+        self._eos_id = 152694
+        self._prompt_input_ids = None  # torch.LongTensor (1, T, 8)
+
+    def _load_hf(self):
+        if self._hf_ready:
+            return
+        import torch
+        from transformers import AutoProcessor, AutoModel
+        print(f"[hf] loading {self.profile.hf_id} (processor + model) …",
+              flush=True)
+        self._processor = AutoProcessor.from_pretrained(
+            self.profile.hf_id,
+            codec_path="fnlp/XY_Tokenizer_TTSD_V0_hf",
+            trust_remote_code=True,
+        )
+        self._hf_model = AutoModel.from_pretrained(
+            self.profile.hf_id, trust_remote_code=True,
+            torch_dtype=torch.float32,
+        ).eval()
+        try:
+            self._eos_id = int(self._hf_model.generation_config.eos_token_id)
+        except Exception:
+            self._eos_id = 152694
+        self._torch = torch
+        self._hf_ready = True
+
+    def initial_prompt_embeds(self, text: str) -> np.ndarray:
+        self._load_hf()
+        torch = self._torch
+        cfg = self.speaker_cfg
+
+        data = {"text": text}
+        if cfg is not None:
+            if cfg.ref_audio is not None:
+                data["prompt_audio"] = str(cfg.ref_audio)
+            if cfg.ref_text:
+                data["prompt_text"] = cfg.ref_text
+
+        inputs = self._processor([data])
+        input_ids = inputs["input_ids"]            # (1, T_prompt, 8)
+        self._prompt_input_ids = input_ids
+
+        with torch.no_grad():
+            base = self._hf_model.model
+            embeds = base._prepare_multi_modal_inputs(input_ids)  # (1, T, H)
+        out = embeds[0].cpu().float().numpy()
+        return out
+
+    def detect_stop(self, codes, step):
+        return int(codes[0]) == self._eos_id
+
+    def allowed_token_range(self, cb_idx):
+        # cb-0 spans a merged text+speech vocab (152697 wide); the
+        # speech codes live in [151665, 152689) and the EOS marker
+        # `<|end_of_speech|>` is at 152694.  Anything else in cb-0 is
+        # a text token that the codec can't decode and would otherwise
+        # trap the free-running AR loop in text-space.  Allow
+        # [151665, 152695) so we keep speech codes + EOS.
+        # cb 1..7 are speech-only (1025 wide); leave them unconstrained.
+        if cb_idx == 0:
+            lo = int(self._processor.speech_token_range[0])
+            return (lo, self._eos_id + 1)
+        return None
+
+    def synthesize(self, codes_all, codec):
+        # MOSS-TTSD's `processor.batch_decode` does delay-pattern reversal
+        # (`shifting_outputs`), cb-0 text/speech split, and XY-Tokenizer
+        # overlap-add decode — but it concatenates all detected speech
+        # fragments along a single (n_frames, 1, n_cb) dim that requires
+        # equal n_frames per fragment.  When the input contains both the
+        # prompt's ref-audio and the AR-generated audio, those fragments
+        # have different lengths and the concat blows up.
+        #
+        # Workaround: decode each fragment independently via the
+        # audio_tokenizer and concatenate the resulting PCM.
+        torch = self._torch
+        proc  = self._processor
+
+        # Build the full (1, T_prompt + T_gen, 8) token tensor exactly
+        # the same way HF would consume it (delay pattern still applied).
+        gen  = torch.tensor(codes_all, dtype=torch.long).unsqueeze(0)
+        full = torch.cat([self._prompt_input_ids, gen], dim=1)
+
+        # Reverse the delay pattern + map cb-0 from text vocab back into
+        # speech-code range.
+        normal = proc.shifting_outputs(full, proc.speech_token_range,
+                                       proc.max_channels)
+        # The processor's `_find_max_valid_positions` only checks
+        # cb-1..7 != audio_pad; it doesn't validate cb-0.  Our AR loop
+        # samples each codebook head independently, so a row can land
+        # with valid cb-1..7 codes but a non-speech cb-0 (negative
+        # after the speech_token_range[0] offset → out-of-range for the
+        # XY-Tokenizer codebook).  Mask those rows by overwriting them
+        # with audio_pad before fragment detection.
+        cb0     = normal[..., 0]                                         # (B, T')
+        cb0_bad = (cb0 < 0) | (cb0 >= proc.speech_token_range[1]
+                                       - proc.speech_token_range[0])
+        if cb0_bad.any():
+            for j in range(proc.max_channels):
+                normal[..., j] = torch.where(
+                    cb0_bad, torch.tensor(proc.audio_pad_token_id), normal[..., j])
+
+        seq_frags = proc._find_max_valid_positions(normal, proc.audio_pad_token_id)
+        if not seq_frags or not seq_frags[0]:
+            print("WARN: MOSS-TTSD: no speech-active span found "
+                  "(model emitted no audio frames; raise --max-frames)",
+                  file=sys.stderr)
+            return np.zeros(1, dtype=np.float32), 16000
+
+        chunks: list[np.ndarray] = []
+        n_prompt = int(self._prompt_input_ids.shape[1])
+        for f in seq_frags[0]:
+            # Skip fragments that lie entirely inside the ref-audio prompt;
+            # those got into the input grid via the speaker config and
+            # don't need re-synthesis.  Heuristic: a fragment is "ref"
+            # iff its end index in `normal` is <= n_prompt - max_channels.
+            # `normal` is shift-aligned, so the indices already match
+            # `full`'s timeline at the un-shifted positions.
+            # (We can't tell exact positions from f alone, but if there's
+            #  only one fragment we keep it; if there are multiple, we
+            #  keep all except the first one, which is the prompt's ref.)
+            if f.shape[0] == 0:
+                continue
+            # Decode this fragment.  audio_tokenizer.decode returns
+            # a list of waveforms (one per batch); we have batch=1.
+            out = proc.audio_tokenizer.decode(
+                f.permute(1, 0).unsqueeze(1), overlap_seconds=10
+            )["audio_values"]
+            if isinstance(out, (list, tuple)):
+                if not out: continue
+                wav = out[0]
+            else:
+                wav = out
+            arr = wav if isinstance(wav, np.ndarray) else wav.detach().cpu().numpy()
+            if arr.ndim > 1:
+                arr = arr.squeeze()
+            chunks.append(arr.astype(np.float32))
+
+        # Drop the prompt-ref fragment (always the first when multiple
+        # fragments are present); leave only generated audio.
+        if len(chunks) > 1:
+            chunks = chunks[1:]
+
+        pcm = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
+        sr = int(getattr(proc.audio_tokenizer.config,
+                         "sampling_rate", 24000))
+        return pcm, sr
+
+
+# ---------------------------------------------------------------------
 # Profile registry
 # ---------------------------------------------------------------------
 
@@ -618,8 +840,22 @@ PROFILES: dict[str, TTSProfile] = {
         needs_speaker_config = True,
         default_top_p = 1.0,
     ),
-    # moss-ttsd / lfm2-audio profiles land below as they get their
-    # prompt-format + stop-condition pieces wired in.
+    "moss-ttsd-v0.5": MossTTSDProfile(
+        name="moss-ttsd-v0.5",
+        hf_id="fnlp/MOSS-TTSD-v0.5",
+        # F16 backbone NaN's on the chat-template special-token embeds
+        # produced by the HF processor (see comment in MossTTSDSession).
+        # BF16 has enough mantissa to keep the forward stable.
+        backbone_gguf = REPO / "models/moss_ttsd_v0_5/qwen3_backbone_bf16.gguf",
+        codec_lm_gguf = REPO / "models/moss_ttsd_v0_5/moss_ttsd_v0_5.gguf",
+        # The codec (XY-Tokenizer) is bundled inside the codec_lm GGUF;
+        # CodecDecoder will load it, but the actual decode is delegated
+        # to HF's processor (see MossTTSDSession.synthesize), so this
+        # path is used only for shape probing.
+        codec_gguf    = REPO / "models/moss_ttsd_v0_5/moss_ttsd_v0_5.gguf",
+        needs_speaker_config = True,
+    ),
+    # lfm2-audio profile lands below as its prompt-format pieces get wired.
 }
 
 
@@ -702,7 +938,13 @@ def run(profile: TTSProfile, args, speaker_cfg: SpeakerConfig | None) -> int:
         codes_this: list[int] = []
         for cb in range(cpp_lm.n_cb):
             cb_idx, n, logits_view = state.step_logits()
-            logits = np.frombuffer(logits_view, dtype=np.float32)
+            logits = np.frombuffer(logits_view, dtype=np.float32).copy()
+            allow = session.allowed_token_range(cb_idx)
+            if allow is not None:
+                lo, hi = allow
+                mask = np.full(n, -np.inf, dtype=np.float32)
+                mask[lo:hi] = 0.0
+                logits = logits + mask
             code = sample_logits(logits, temperature=temperature,
                                  top_p=top_p, top_k=top_k, rng=rng)
             state.step_push_code(code)
@@ -728,13 +970,8 @@ def run(profile: TTSProfile, args, speaker_cfg: SpeakerConfig | None) -> int:
     print(f"\n[gen] {n_frames} frames in {t_loop:.2f}s "
           f"({n_frames/max(t_loop,1e-3):.1f} steps/s)", flush=True)
 
-    codes_arr = session.pack_codes(codes_all)
-    if codes_arr.shape[1] > codec.n_q:
-        codes_arr = codes_arr[:, :codec.n_q].copy()
-
-    print(f"[dec] codec_decode codes shape={codes_arr.shape} …", flush=True)
-    pcm, sr = codec.decode(codes_arr)
-    pcm = session.trim_output_pcm(pcm, sr, n_gen_frames=n_frames)
+    print(f"[dec] synthesizing audio from {n_frames} frames …", flush=True)
+    pcm, sr = session.synthesize(codes_all, codec)
     print(f"  pcm: n_samples={pcm.size if pcm.ndim == 1 else pcm.shape[0]} sr={sr}",
           flush=True)
 
