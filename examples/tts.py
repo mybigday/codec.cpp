@@ -855,6 +855,16 @@ PROFILES: dict[str, TTSProfile] = {
         codec_gguf    = REPO / "models/moss_ttsd_v0_5/moss_ttsd_v0_5.gguf",
         needs_speaker_config = True,
     ),
+    "moss-ttsd-v0.7": MossTTSDProfile(
+        name="moss-ttsd-v0.7",
+        hf_id="fnlp/MOSS-TTSD-v0.7",
+        # Same architecture as v0.5 (`MossTTSDForCausalLM`, parallel_heads_delay,
+        # Qwen3 2B backbone), just retrained on more data.
+        backbone_gguf = REPO / "models/moss_ttsd_v0_7/qwen3_backbone_bf16.gguf",
+        codec_lm_gguf = REPO / "models/moss_ttsd_v0_7/moss_ttsd_v0_7.gguf",
+        codec_gguf    = REPO / "models/moss_ttsd_v0_7/moss_ttsd_v0_7.gguf",
+        needs_speaker_config = True,
+    ),
     # lfm2-audio profile lands below as its prompt-format pieces get wired.
 }
 
