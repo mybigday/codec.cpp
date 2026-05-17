@@ -44,13 +44,17 @@ def dump_lm_into(writer, lm_source, *, verbose: bool = False) -> None:
         from . import lfm2_audio
         lfm2_audio.dump(writer, sd, cfg, verbose=verbose)
         return
+    if arch == "MossTTSRealtime":
+        from . import moss_tts_local
+        moss_tts_local.dump(writer, sd, cfg, verbose=verbose)
+        return
     if arch == "MossTTSNanoForCausalLM":
-        # Pending residual_depth_ar runtime support (M3) — Nano uses a
-        # `local_transformer` (depth-AR) decoder, not a parallel-heads
-        # head set.
-        raise NotImplementedError(
-            "MOSS-TTS-Nano uses residual_depth_ar; pending codec_lm M3"
-        )
+        # Stub: GGUF emission is shaped, but the GPT-2 depth-block
+        # runtime (LayerNorm + GELU + fused c_attn split + abs wpe) is
+        # still pending — the dump() will raise until that lands.
+        from . import moss_tts_local
+        moss_tts_local.dump(writer, sd, cfg, verbose=verbose)
+        return
 
     raise NotImplementedError(
         f"unsupported LM-source architecture: {arch!r}; "

@@ -314,6 +314,72 @@ def prep_moss_ttsd(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
     return []
 
 
+# ---- MOSS-TTS-Realtime (Qwen3 language_model) --------------------------
+
+def prep_moss_tts_realtime(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
+    """Unwrap the Qwen3 language_model from MOSS-TTS-Realtime.
+
+    Layout in HF:
+      - language_model.{embed_tokens,layers.*,norm}     ← we want these
+      - embed_tokens.{0..16}                            ← compose embeds, go to codec_lm
+      - local_transformer.*                             ← depth decoder, goes to codec_lm
+
+    The language_model is a stock Qwen3 with `tie_word_embeddings=true`
+    inferred from the absence of a separate `lm_head.weight` tensor in
+    the checkpoint."""
+    archs = cfg.get("architectures") or []
+    if "MossTTSRealtime" not in archs:
+        raise SystemExit(f"unsupported source architectures={archs}")
+    if "language_config" not in cfg:
+        raise SystemExit("MOSS-TTS-Realtime config missing 'language_config'")
+
+    lcfg = cfg["language_config"]
+
+    sd = load_state_dict(src)
+    out_sd: Dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if k.startswith("language_model."):
+            out_sd["model." + k[len("language_model."):]] = v
+
+    if "model.embed_tokens.weight" not in out_sd:
+        raise SystemExit("missing language_model.embed_tokens.weight")
+
+    qwen3_cfg = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "vocab_size":              int(lcfg["vocab_size"]),
+        "hidden_size":             int(lcfg["hidden_size"]),
+        "intermediate_size":       int(lcfg["intermediate_size"]),
+        "num_hidden_layers":       int(lcfg["num_hidden_layers"]),
+        "num_attention_heads":     int(lcfg["num_attention_heads"]),
+        "num_key_value_heads":     int(lcfg["num_key_value_heads"]),
+        "head_dim":                int(lcfg["head_dim"]),
+        "max_position_embeddings": int(lcfg["max_position_embeddings"]),
+        "rms_norm_eps":            float(lcfg["rms_norm_eps"]),
+        "rope_theta":              float(lcfg["rope_theta"]),
+        "hidden_act":              lcfg.get("hidden_act", "silu"),
+        "attention_bias":          bool(lcfg.get("attention_bias", False)),
+        "attention_dropout":       float(lcfg.get("attention_dropout", 0.0)),
+        "initializer_range":       float(lcfg.get("initializer_range", 0.02)),
+        # No separate lm_head tensor in MOSS-TTS-Realtime safetensors → tied.
+        "tie_word_embeddings":     True,
+        "torch_dtype":             lcfg.get("dtype", "bfloat16"),
+        "use_cache":               True,
+        "bos_token_id":            lcfg.get("bos_token_id"),
+        "eos_token_id":            lcfg.get("eos_token_id"),
+    }
+    if lcfg.get("rope_scaling"):
+        qwen3_cfg["rope_scaling"] = lcfg["rope_scaling"]
+    if lcfg.get("sliding_window") is not None:
+        qwen3_cfg["sliding_window"] = lcfg["sliding_window"]
+    (dst / "config.json").write_text(json.dumps(qwen3_cfg, indent=2))
+
+    _save_state_dict(out_sd, dst)
+    _write_generation_config(dst, qwen3_cfg["bos_token_id"], qwen3_cfg["eos_token_id"])
+    _copy_tokenizer(src, dst)
+    return []
+
+
 # ---- LFM2-Audio (Lfm2-1.2B hybrid conv+attn) ---------------------------
 
 def prep_lfm2_audio(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
@@ -449,6 +515,7 @@ PREPARERS: Dict[str, Callable[[Path, Path, dict], list[tuple[str, str]]]] = {
     "Qwen3TTSForConditionalGeneration": prep_qwen3_tts,
     "MossTTSDForCausalLM":            prep_moss_ttsd,
     "AsteroidTTSModel":               prep_moss_ttsd,
+    "MossTTSRealtime":                prep_moss_tts_realtime,
     "Lfm2AudioForConditionalGeneration": prep_lfm2_audio,
     "MoshiForConditionalGeneration":  prep_moshi,
 }
