@@ -5,9 +5,9 @@
 
 | Model | Status | Commit |
 |---|---|---|
-| MOSS-TTS-Realtime | ✅ end-to-end working | c1c5f68 (profile), f14c771 (converters) |
+| MOSS-TTS-Realtime | ✅ end-to-end working via codec_lm + llama.cpp | c1c5f68 (profile), f14c771 (converters) |
 | LFM2-Audio (TTS-only) | ✅ pipeline working; quality needs tuning | a714dea |
-| MOSS-TTS-Nano-100M | ⏸ deferred — GPT-2 depth-block runtime pending | — |
+| MOSS-TTS-Nano-100M | 🟡 HF-driven AR loop + codec.cpp decode; native codec_lm pending | 12d5a53 |
 
 The Realtime + LFM2-Audio commits also produced shared infrastructure:
   - `decode_n_q` hook on TTSSession (lets profiles whose codec_lm has
