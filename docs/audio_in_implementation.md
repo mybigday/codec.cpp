@@ -7,6 +7,108 @@ continuation.  The output here is a concrete order of work for fitting
 all of these into the existing `LLM-backbone (llama.cpp) + lm_adaptor
 (codec_lm) + codec` shape.
 
+## 0. Critical update — llama.cpp MTMD already handles audio
+
+**Discovery:** `llama.cpp/tools/mtmd` (the "MultiModal Transformer
+Decoder" library that replaced `llava.cpp`) already supports audio
+input alongside images.  Public C API in `tools/mtmd/mtmd.h`:
+
+```c
+enum mtmd_input_chunk_type {
+    MTMD_INPUT_CHUNK_TYPE_TEXT,
+    MTMD_INPUT_CHUNK_TYPE_IMAGE,
+    MTMD_INPUT_CHUNK_TYPE_AUDIO,   // ← yes
+};
+
+MTMD_API bool          mtmd_support_audio(mtmd_context * ctx);
+MTMD_API int           mtmd_get_audio_sample_rate(mtmd_context * ctx);
+MTMD_API mtmd_bitmap * mtmd_bitmap_init_from_audio(size_t n_samples,
+                                                    const float * data);
+MTMD_API bool          mtmd_bitmap_is_audio(const mtmd_bitmap * bitmap);
+```
+
+Audio projector types already wired in `clip.cpp` and exposed via
+the standard `mmproj` GGUF artefact emitted by
+`convert_hf_to_gguf.py --mmproj`:
+
+| Projector | Model family |
+|---|---|
+| `PROJECTOR_TYPE_ULTRAVOX` | Ultravox (Whisper enc + stack-frames + MLP) |
+| `PROJECTOR_TYPE_VOXTRAL` | Voxtral-Mini, Voxtral-Small |
+| `PROJECTOR_TYPE_QWEN2A` | Qwen2-Audio |
+| `PROJECTOR_TYPE_GLMA` | GLM-Audio (GLM-4-Voice tokenizer path) |
+| `PROJECTOR_TYPE_LFM2A` | LFM2-Audio (audio-in side) |
+| `PROJECTOR_TYPE_MUSIC_FLAMINGO` | Music Flamingo |
+| `PROJECTOR_TYPE_QWEN25O` | Qwen2.5-Omni (dispatches to QWEN2A / QWEN25VL) |
+
+Plus the audio preprocessor (mel-spec parameters, chunk-length, FFT
+size, hop) is configurable from the mmproj GGUF — same workflow as
+for vision projectors today.
+
+### What this changes about the plan
+
+The clusters A+B+M from §2 (Whisper-encoder + MLP / FastConformer + MLP
+/ AuT) — which I'd scoped as **the most expensive Tier-1 work** in
+codec.cpp — are **already done in llama.cpp**.  Specifically:
+
+  - Cluster A (Whisper-large-v3 enc + 4× MLP) = `PROJECTOR_TYPE_VOXTRAL`
+    or `PROJECTOR_TYPE_ULTRAVOX` depending on stack-frames variant.
+  - Cluster B (FastConformer + MLP) = covered for LFM2-Audio via
+    `PROJECTOR_TYPE_LFM2A`.
+  - Cluster M (AuT) — needs to land in MTMD when Qwen3-Omni's full
+    arch is supported; structurally fits the existing projector flow.
+
+The remaining gaps (audio-OUTPUT side, codec_lm semantics, Talker
+transformer, duplex streaming, dual-codec input) are still squarely
+codec.cpp's responsibility — MTMD only covers the audio→hidden-embed
+path on the LLM-input side.
+
+### Revised division of labour
+
+```
+                    audio in        →   backbone        →   audio out
+                    ─────────           ───────────         ─────────
+LLM input adapter:  llama.cpp MTMD     llama.cpp           — (n/a for audio out)
+                    (clip.cpp /
+                     mtmd-audio.cpp)
+
+Backbone LLM:       —                  llama.cpp           —
+
+Per-step AR:        —                  codec_lm/llama.cpp  codec_lm
+                                       talker (new)
+
+Codec encode/dec:   — (raw PCM /        —                  codec.cpp codec_model
+                       mel input)                          (Mimi/SNAC/XY/…)
+```
+
+### Adjusted Tier 1 (was: "ship Whisper-encoder in codec.cpp")
+
+**Now:** ship a Python ctypes wrapper around `libmtmd.so` (parallels
+`tests/e2e/_codec_lm_ctypes.py`) and rewire `examples/asr.py` so
+each profile can run via either:
+
+  1. **Stage A (current):** stock HF transformers — what's in this
+     repo's `asr.py` today.
+  2. **Stage A.5 (new):** MTMD via the ctypes wrapper, consuming a
+     standalone GGUF + mmproj GGUF.  No HF dependency at inference.
+     Whisper/Voxtral/Qwen2-Audio/Ultravox/LFM2-Audio audio-in all
+     fall under this path.
+
+The original "Stage B = native encoder in codec.cpp" is now mostly
+deferred — only useful when MTMD doesn't yet cover a target encoder
+(e.g. Granite-Speech Q-former, Phi-4-MM Conformer+LoRA route,
+Gemma-3n USM, Qwen3-Omni AuT).  Those still need codec.cpp-side work
+*or* a parallel MTMD contribution.
+
+### What stays in codec.cpp regardless
+
+  - `codec_lm` for all audio-output AR (existing).
+  - Codec encode/decode for Mimi / SNAC / XY-Tokenizer / etc. (existing).
+  - New API surfaces from §4 that aren't about *encoder graphs* but
+    about *codec_lm semantics*: `position_kind` (sequential mode-switch),
+    `TALKER_TRANSFORMER` kind, dual user-audio-stream, streaming KV
+    persistence.  None of these are duplicated by MTMD.
+
 Status today (the 7 wired TTS profiles in `docs/tts_cli.md`): the
 output-side audio path is well-covered for both `parallel_heads_delay`
 and `residual_depth_ar` kinds.  **There is no audio-input adapter, no
