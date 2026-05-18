@@ -1,6 +1,24 @@
 # Plan: wiring MOSS-TTS-Nano, MOSS-TTS-Realtime, LFM2-Audio
         into the existing `backbone + lm_adaptor + codec` structure
 
+## Status snapshot
+
+| Model | Status | Commit |
+|---|---|---|
+| MOSS-TTS-Realtime | ✅ end-to-end working | c1c5f68 (profile), f14c771 (converters) |
+| LFM2-Audio (TTS-only) | ✅ pipeline working; quality needs tuning | a714dea |
+| MOSS-TTS-Nano-100M | ⏸ deferred — GPT-2 depth-block runtime pending | — |
+
+The Realtime + LFM2-Audio commits also produced shared infrastructure:
+  - `decode_n_q` hook on TTSSession (lets profiles whose codec_lm has
+    fewer codebooks than the codec exposes pass that down to
+    `codec.decode` — used by LFM2: 8 vs Mimi's 32).
+  - Bug fix in `_codec_lm_ctypes.CodecLM.compose_audio_embd` —
+    allocate the output buffer at `compose_audio_embed_dim` (not
+    `audio_embed_dim`) when the model publishes a separate compose dim.
+  - `_layout_moss_tts_local` shared between Realtime + Nano (Nano half
+    is stubbed `NotImplementedError` until the GPT-2 depth-block lands).
+
 Status as of this writing: 4 profiles wired (`csm`, `qwen3-tts`,
 `moss-ttsd-v0.5`, `moss-ttsd-v0.7`) per `docs/tts_cli.md`.  This doc
 maps the 3 remaining under-3B targets onto the existing structure
@@ -44,7 +62,23 @@ CSM works (where c0 is the audio LM head off `backbone_model.embed_tokens`);
 here it's the text LM head off `language_model.embed_tokens` instead.
 No new codec_lm kind needed.
 
-### MOSS-TTS-Nano-100M (~100M; GPT-2 backbone + 17-channel emission)
+### MOSS-TTS-Nano-100M (~100M; GPT-2 backbone + 17-channel emission) — DEFERRED
+
+After reading the actual modeling code, two surprises vs the original sketch:
+
+1. `position_embedding_type = "rope"`, NOT absolute.  The GPT-2 backbone
+   wraps RoPE inside the attention block (no `wpe` tensor in the
+   checkpoint).  This is not llama.cpp's default `gpt2` arch.  Either:
+   - Extend the standalone-GGUF converter to emit a custom `gpt2_rope`
+     arch (small fork from `gpt2`), OR
+   - Treat the backbone as a flavour of llama (RMSNorm → LayerNorm
+     swap, SwiGLU → GELU, RoPE kept) so llama.cpp can consume it via
+     a per-tensor mapping — but that mis-names ops in ggml.
+2. `local_transformer_layers = 1` (not 4 as the side-by-side claimed).
+   Smaller scope on the depth side: only 1 GPT-2 block to support
+   in `codec_op_lm_gpt2_depth_block` once added.
+
+Concrete remaining work:
 
 ```
 HF MossTTSNano:
