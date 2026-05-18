@@ -819,6 +819,156 @@ class MossTTSDSession(TTSSession):
 
 
 # ---------------------------------------------------------------------
+# MOSS-TTS-Realtime (streaming TTS, residual_depth_ar; 17-channel input)
+# ---------------------------------------------------------------------
+
+class MossTTSRealtimeProfile(TTSProfile):
+    """OpenMOSS-Team/MOSS-TTS-Realtime — streaming TTS, audio-only output.
+
+    Shape:
+      - backbone = Qwen3-2B (consumes a 17-channel grid)
+      - codec_lm = residual_depth_ar, n_cb=16 (audio only)
+      - text is INPUT only (no text emission); cb-0 of generated frames
+        is `<|audio_pad|>` (151654)
+
+    Per AR step:
+      1. backbone forward → hidden h
+      2. codec_lm depth-AR pass → 16 audio codes
+      3. compose next backbone input = text_pad_embed + sum_i audio_embed_i(c_i)
+      4. feed to backbone
+      5. stop when c_0 == audio_eos_token (1026)
+
+    Audio codes [(T, 16)] → codec.decode (uses first 16 of MOSS-Audio-
+    Tokenizer's 32 quantizers).
+
+    Prompt assembly via HF (no chat template available in tokenizer_config —
+    use a minimal `<|im_start|>user…<|audio_start|>` format).
+    """
+
+    def create_session(self, *, codec_lm, codec, args, speaker_cfg):
+        return MossTTSRealtimeSession(self, codec_lm, codec, args, speaker_cfg)
+
+
+class MossTTSRealtimeSession(TTSSession):
+    # Per the streaming class defaults + tokenizer special tokens:
+    TEXT_PAD_ID    = 151655   # <|text_pad|>
+    AUDIO_PAD_ID   = 151654   # <|audio_pad|>  (cb-0 sentinel for audio rows)
+    AUDIO_START_ID = 151652   # <|audio_start|>
+    AUDIO_END_ID   = 151653   # <|audio_end|>
+    IM_START_ID    = 151644
+    IM_END_ID      = 151645
+    AUDIO_CB_PAD   = 1024     # cb-1..16 pad code (during text-only rows)
+    AUDIO_CB_BOS   = 1025     # cb-1 bos for the first audio row
+    AUDIO_CB_EOS   = 1026     # audio EOS (model emits in cb-0 to stop)
+
+    def __init__(self, profile, codec_lm, codec, args, speaker_cfg):
+        super().__init__(profile, codec_lm, codec, args, speaker_cfg)
+        self._hf_ready = False
+        # cached row-embed for {text_pad in cb-0, audio_pad in cb-1..16}
+        # added to compose_audio_embd output at each AR continuation step.
+        self._continuation_pad_embed: np.ndarray | None = None
+
+    def _load_hf(self):
+        # MossTTSRealtime's modeling code imports `transformers.initialization`
+        # which was removed in newer transformers releases — so we skip the
+        # `AutoModel` path entirely and read the 17 embed tables straight
+        # out of the safetensors.  Tokenizer load is fine via AutoTokenizer.
+        if self._hf_ready:
+            return
+        import numpy as np
+        from transformers import AutoTokenizer
+        from huggingface_hub import snapshot_download
+        from safetensors.torch import load_file
+        import torch
+        print(f"[hf] loading {self.profile.hf_id} (tokenizer + embeds) …",
+              flush=True)
+        self._tok = AutoTokenizer.from_pretrained(
+            self.profile.hf_id, trust_remote_code=True)
+        local = snapshot_download(repo_id=self.profile.hf_id,
+                                  allow_patterns=["*.safetensors", "*.json"])
+        sd = load_file(f"{local}/model.safetensors")
+        n_cb = self.codec_lm.n_cb            # 16 audio cb
+        self._embed_tables = [
+            sd[f"embed_tokens.{i}.weight"].to(torch.float32).cpu().numpy()
+            for i in range(n_cb + 1)
+        ]
+        self._torch = torch
+        self._hf_ready = True
+
+    def _embed_row(self, cb_ids: list[int]) -> np.ndarray:
+        """Return (hidden,) embed for a single 17-channel row by summing
+        the per-channel embed tables: sum_i embed_tokens.{i}(cb_ids[i])."""
+        out = self._embed_tables[0][cb_ids[0]].astype(np.float32)
+        for i in range(1, len(cb_ids)):
+            out = out + self._embed_tables[i][cb_ids[i]]
+        return out
+
+    def initial_prompt_embeds(self, text: str) -> np.ndarray:
+        self._load_hf()
+        n_cb_audio = self.codec_lm.n_cb           # 16
+        n_cb_total = n_cb_audio + 1               # 17
+
+        # Build the prompt input_ids grid (T, 17):
+        # `<|im_start|>user\n[text]<|im_end|>\n<|im_start|>assistant\n<|audio_start|>`
+        # cb-0 carries the text token, cb-1..16 carry AUDIO_CB_PAD (1024).
+        text_ids = self._tok(
+            f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        )["input_ids"]
+        text_ids.append(self.AUDIO_START_ID)
+
+        T = len(text_ids)
+        prompt_embeds = np.empty((T, self.codec_lm.hidden_dim), dtype=np.float32)
+        # Per-row embed = text_embed(text_id) + sum_i audio_embed.i(pad)
+        # The audio-pad contribution is the same for every text-only row,
+        # so precompute it once.
+        pad_audio_sum = np.zeros(self.codec_lm.hidden_dim, dtype=np.float32)
+        for i in range(1, n_cb_total):
+            pad_audio_sum += self._embed_tables[i][self.AUDIO_CB_PAD]
+        for t, tid in enumerate(text_ids):
+            prompt_embeds[t] = self._embed_tables[0][tid] + pad_audio_sum
+
+        # Cache the per-step continuation pad embed: cb-0=text_pad, cb-1..16=audio_pad.
+        # This gets added to every audio AR step's compose output (which
+        # already includes the 16 audio embed contributions, but we still
+        # need the cb-0 text-pad embed).
+        self._continuation_pad_embed = self._embed_tables[0][self.TEXT_PAD_ID].copy()
+
+        return prompt_embeds
+
+    def compose_next_embed(self, codes, step):
+        # compose_audio_embd returns sum_i audio_embed_i(codes[i]) over
+        # the 16 audio cb (using the fused compose table baked at convert
+        # time, derived from outer embed_tokens.{1..16}).  Add the
+        # text-pad row embed for cb-0.
+        embd_buf = self.codec_lm.compose_audio_embd(codes)
+        audio = np.frombuffer(embd_buf, dtype=np.float32).reshape(1, -1).copy()
+        if self._continuation_pad_embed is not None:
+            # text-pad row contributes both cb-0 text-pad + 16 * audio-pad
+            # so add directly.
+            audio = audio + self._continuation_pad_embed[None, :]
+        return audio
+
+    def detect_stop(self, codes, step):
+        # Audio EOS sentinel on cb-0.
+        return int(codes[0]) == self.AUDIO_CB_EOS
+
+    def pack_codes(self, codes_all):
+        # codes_all is (T, 16) audio codes (codec_lm's n_cb).  The
+        # MOSS-Audio-Tokenizer codec has 32 quantizers; pad the upper
+        # 16 codebooks with audio_channel_pad so the codec accepts the
+        # buffer.  Realtime is trained against the first 16 quantizers,
+        # so the missing upper-half information is intentional —
+        # decode quality reflects what the model can express.
+        a = np.asarray(codes_all, dtype=np.int32)
+        T, q = a.shape
+        if q < self.codec.n_q:
+            pad_block = np.full((T, self.codec.n_q - q), self.AUDIO_CB_PAD,
+                                dtype=np.int32)
+            a = np.concatenate([a, pad_block], axis=1)
+        return a
+
+
+# ---------------------------------------------------------------------
 # Profile registry
 # ---------------------------------------------------------------------
 
@@ -864,6 +1014,14 @@ PROFILES: dict[str, TTSProfile] = {
         codec_lm_gguf = REPO / "models/moss_ttsd_v0_7/moss_ttsd_v0_7.gguf",
         codec_gguf    = REPO / "models/moss_ttsd_v0_7/moss_ttsd_v0_7.gguf",
         needs_speaker_config = True,
+    ),
+    "moss-tts-realtime": MossTTSRealtimeProfile(
+        name="moss-tts-realtime",
+        hf_id="OpenMOSS-Team/MOSS-TTS-Realtime",
+        backbone_gguf = REPO / "models/moss_tts_realtime/qwen3_backbone_bf16.gguf",
+        codec_lm_gguf = REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
+        codec_gguf    = REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
+        needs_speaker_config = False,   # no ref-audio voice clone in v1
     ),
     # lfm2-audio profile lands below as its prompt-format pieces get wired.
 }
