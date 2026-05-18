@@ -270,7 +270,13 @@ class CodecLM:
         codes = np.asarray(codes, dtype=np.int32)
         if codes.shape != (self.n_cb,):
             raise ValueError(f"codes shape must be ({self.n_cb},), got {codes.shape}")
-        out = (ctypes.c_float * self.audio_embed_dim)()
+        # When a model exposes a separate compose-output dim (e.g. LFM2-Audio
+        # where audio_embed_dim=1024 but compose writes a 2048-wide backbone
+        # embed), use that; fall back to audio_embed_dim otherwise.
+        out_dim = (self.compose_audio_embed_dim
+                   if self.compose_audio_embed_dim > 0
+                   else self.audio_embed_dim)
+        out = (ctypes.c_float * out_dim)()
         rc = lib.codec_lm_compose_audio_embd(
             self.lm,
             codes.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),

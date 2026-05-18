@@ -337,6 +337,14 @@ class TTSSession:
                         n_gen_frames: int) -> np.ndarray:
         return pcm
 
+    def decode_n_q(self, codec: CodecDecoder) -> int:
+        """How many codec quantizers to decode through.  Default: 0 means
+        "use codec's native n_q".  Profiles whose codec_lm covers fewer
+        codebooks than the codec exposes (LFM2-Audio: 8 vs Mimi 32)
+        should return that smaller number so the codec decoder skips
+        the unused upper quantizers."""
+        return 0
+
     def synthesize(self, codes_all: list[list[int]],
                    codec: CodecDecoder) -> tuple[np.ndarray, int]:
         """Default: pack_codes -> codec.decode -> trim_output_pcm.
@@ -349,7 +357,7 @@ class TTSSession:
         codes_arr = self.pack_codes(codes_all)
         if codes_arr.shape[1] > codec.n_q:
             codes_arr = codes_arr[:, :codec.n_q].copy()
-        pcm, sr = codec.decode(codes_arr)
+        pcm, sr = codec.decode(codes_arr, n_q=self.decode_n_q(codec))
         pcm = self.trim_output_pcm(pcm, sr, n_gen_frames=len(codes_all))
         return pcm, sr
 
@@ -969,6 +977,119 @@ class MossTTSRealtimeSession(TTSSession):
 
 
 # ---------------------------------------------------------------------
+# LFM2-Audio (chat model → TTS-only sub-mode)
+# ---------------------------------------------------------------------
+
+class Lfm2AudioProfile(TTSProfile):
+    """LiquidAI/LFM2-Audio-1.5B — chat model coerced into pure-TTS mode.
+
+    LFM2-Audio is natively an interleaved text/audio chat model.  For
+    TTS we frame the prompt as a user message + chat-template assistant
+    open + an `<|audio_start|>` token, which puts the model into audio
+    emission mode for the first AR step.  The decoder then emits 8-cb
+    audio frames until cb-0 == 2048 (audio EOS), no text emission.
+
+    Shape:
+      - Backbone: LFM2-1.5B (token-driven; we feed text-only embeddings
+        from `model.embed_tokens.weight` cached out of the backbone GGUF).
+      - codec_lm: residual_depth_ar, n_cb=8 (depth_emits_c0 + per-cb
+        embeds + Lfm2-style depth blocks — already shipped for M6).
+      - compose_audio_embd returns sum of 8 audio embeddings via the
+        fused `lm.compose.audio_embd` table (backbone-hidden dim).
+
+    Codec: Kyutai Mimi at 24 kHz (8 codebooks, semantic + 7 acoustic).
+    """
+
+    def create_session(self, *, codec_lm, codec, args, speaker_cfg):
+        return Lfm2AudioSession(self, codec_lm, codec, args, speaker_cfg)
+
+
+class Lfm2AudioSession(TTSSession):
+    AUDIO_START = 128     # <|audio_start|>
+    IM_END      = 7       # <|im_end|>
+    AUDIO_EOS   = 2048    # cb-0 == 2048 → end of audio segment
+
+    def __init__(self, profile, codec_lm, codec, args, speaker_cfg):
+        super().__init__(profile, codec_lm, codec, args, speaker_cfg)
+        self._wte: np.ndarray | None = None
+
+    def _load_wte(self) -> np.ndarray:
+        """Pull token_embd.weight out of the backbone GGUF as a (V, H)
+        float32 array.  LFM2 ties text head + embedding, so this table
+        suffices for prompt-embed building (TTS doesn't need text
+        emission, so no last_text_logits path required)."""
+        if self._wte is not None:
+            return self._wte
+        # Read the raw safetensors directly to avoid juggling the gguf
+        # reader's mmap lifetime + non-standard dtypes.
+        from safetensors.torch import load_file
+        from huggingface_hub import snapshot_download
+        import torch
+        print(f"[hf] fetching {self.profile.hf_id} model.safetensors for "
+              f"backbone wte …", flush=True)
+        local = snapshot_download(repo_id=self.profile.hf_id,
+                                  allow_patterns=["*.safetensors", "*.json"])
+        # Try sharded index first, fall back to single file.
+        from pathlib import Path
+        local_p = Path(local)
+        idx = local_p / "model.safetensors.index.json"
+        wte = None
+        if idx.is_file():
+            import json
+            mp = json.loads(idx.read_text())["weight_map"]
+            shard = mp.get("lfm.embed_tokens.weight")
+            if shard is None:
+                raise RuntimeError("backbone wte not in safetensors index")
+            sd = load_file(str(local_p / shard))
+        else:
+            sd = load_file(str(local_p / "model.safetensors"))
+        if "lfm.embed_tokens.weight" not in sd:
+            raise RuntimeError(
+                "lfm.embed_tokens.weight not in checkpoint — backbone "
+                "weight extraction path needs updating")
+        wte = sd["lfm.embed_tokens.weight"].to(torch.float32).cpu().numpy()
+        self._wte = np.ascontiguousarray(wte)
+        return self._wte
+
+    def initial_prompt_embeds(self, text: str) -> np.ndarray:
+        from transformers import AutoTokenizer
+        print(f"[hf] loading {self.profile.hf_id} tokenizer …", flush=True)
+        tok = AutoTokenizer.from_pretrained(
+            self.profile.hf_id, trust_remote_code=True)
+
+        ids = tok.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True, add_generation_prompt=True,
+        )
+        ids = list(ids) + [self.AUDIO_START]
+        wte = self._load_wte()
+        # Validate token IDs fit in the backbone vocab.
+        if max(ids) >= wte.shape[0]:
+            raise RuntimeError(
+                f"token id {max(ids)} >= backbone vocab {wte.shape[0]}; "
+                f"prompt encoding mismatch")
+        prompt_embeds = wte[np.asarray(ids, dtype=np.int64)].astype(np.float32)
+        return prompt_embeds
+
+    def detect_stop(self, codes, step):
+        # cb-0 == 2048 is LFM2-Audio's per-frame audio-EOS sentinel.
+        return int(codes[0]) == self.AUDIO_EOS
+
+    def pack_codes(self, codes_all):
+        # Drop the trailing EOS frame so its cb-0 = 2048 code (out of
+        # range for Mimi's [0, 2047] vocab) doesn't reach the decoder.
+        a = np.asarray(codes_all, dtype=np.int32)
+        if a.shape[0] > 0 and int(a[-1, 0]) == self.AUDIO_EOS:
+            a = a[:-1]
+        return a
+
+    def decode_n_q(self, codec):
+        # LFM2-Audio uses 8 Mimi codebooks (1 semantic + 7 acoustic);
+        # tell Mimi to decode through 8 quantizers, not its native 32.
+        return self.codec_lm.n_cb
+
+
+# ---------------------------------------------------------------------
 # Profile registry
 # ---------------------------------------------------------------------
 
@@ -1023,7 +1144,14 @@ PROFILES: dict[str, TTSProfile] = {
         codec_gguf    = REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
         needs_speaker_config = False,   # no ref-audio voice clone in v1
     ),
-    # lfm2-audio profile lands below as its prompt-format pieces get wired.
+    "lfm2-audio": Lfm2AudioProfile(
+        name="lfm2-audio",
+        hf_id="LiquidAI/LFM2-Audio-1.5B",
+        backbone_gguf = REPO / "models/lfm2_audio/lfm_backbone.gguf",
+        codec_lm_gguf = REPO / "models/lfm2_audio/lfm2_audio.gguf",
+        codec_gguf    = REPO / "models/mimi/mimi.gguf",
+        needs_speaker_config = False,
+    ),
 }
 
 
