@@ -109,6 +109,211 @@ Gemma-3n USM, Qwen3-Omni AuT).  Those still need codec.cpp-side work
     `TALKER_TRANSFORMER` kind, dual user-audio-stream, streaming KV
     persistence.  None of these are duplicated by MTMD.
 
+### MTMD streaming verdict
+
+Read of `tools/mtmd/mtmd-audio.{h,cpp}` and `tools/mtmd/mtmd.cpp`:
+
+  - Public API takes one complete audio bitmap via
+    `mtmd_bitmap_init_from_audio(n_samples, data)`.  **No
+    `push_chunk` / `feed_incremental` surface.**
+  - Long audio is split *internally* by the Whisper preprocessor into
+    fixed 30 s / 3000-frame chunks (`frames_per_chunk = 3000` in
+    `mtmd_audio_preprocessor_whisper::preprocess`).  Each chunk runs
+    through the encoder **independently** — no encoder-KV persistence
+    between them.
+  - `mtmd_audio_streaming_istft` exists but is *output-side* (frame-
+    by-frame spectrogram → waveform reconstruction), not input.
+
+So MTMD supports **whole-utterance input with internal 30 s chunking**.
+It does NOT support true incremental streaming where new audio
+samples arrive across many small inference steps with encoder state
+preserved.
+
+Truly-streaming models (Moshi / Hibiki duplex, Kyutai STT,
+MiniCPM-o-2.6 TDM, Qwen2.5-Omni audio-in's 2 s blocks) therefore can't
+use MTMD as-is.  Two options:
+
+  1. Buffer + re-encode periodically (high latency; OK for QA, bad
+     for duplex).
+  2. **Bypass MTMD and use Mimi-as-adapter (cluster G in §2.1)** —
+     run `codec_encode` on incoming PCM chunks to produce Mimi codes,
+     then feed those codes through `compose_user_audio_codes_embd`.
+     We already have Mimi `codec_encode` shipped; only the codec_lm
+     state-machine side needs work.
+
+This means: **whole-utterance audio-in via MTMD is the universal path
+for ASR / audio-QA / whole-utt chat; truly-streaming chat uses the
+Mimi-as-adapter path entirely on codec.cpp's side**, with no MTMD
+involvement at all on the input.
+
+## 9. codec_lm completion plan (audio-OUT side)
+
+With MTMD covering most audio-IN encoder work, the remaining
+codec.cpp roadmap focuses on the **audio-OUT** side and the
+**semantic coordination** between input + output.  Reorganised by
+implementation effort and dependency order.
+
+### Tier C-1 — codec_lm semantic extensions (smallest blast radius)
+
+These don't add new graphs; they add knobs to the existing
+`residual_depth_ar` runtime + state machine.
+
+1. **`position_kind` per step** — already partially implemented as
+   `step_mode` in `examples/tts.py`'s TTSSession; promote to a C-side
+   `codec_lm_state_set_position_kind(state, kind)` so the same
+   semantics work for Python and any future C client.
+   - Kinds: `TEXT_ONLY` / `AUDIO_ONLY` / `BOTH` / `DUPLEX`.
+   - Unlocks: LFM2-Audio chat mode (native), GLM-4-Voice,
+     Spirit-LM, Mini-Omni-2.
+
+2. **`step_text_logits` accessor** — when `position_kind ∈ {BOTH,
+   DUPLEX}`, the codec_lm needs to expose a text-logits buffer (the
+   text head's output for that step) so the caller can sample text +
+   audio in the same step.
+   - Unlocks: Moshi text+audio co-emission, Mini-Omni-2 delay-parallel.
+
+3. **Stop-condition flexibility** — current detect_stop is profile-
+   specific; codec_lm should expose `codec.lm.stop_token` /
+   `codec.lm.stop_kind ∈ {audio_eos_in_cb_0, text_eos, max_frames}`
+   so generic profile code can stop without special-casing.
+
+**Implementation cost:** ~1 model-week if approached together.  These
+are purely state-machine additions; no new ggml graph code.
+
+### Tier C-2 — Duplex + dual-stream user audio
+
+For Moshi / Hibiki / Kyutai STT where the user-audio side is fed in
+continuously alongside model emission.
+
+4. **`set_user_audio_codes(state, codec_id, codes, frame_offset)`** —
+   per-frame push of user-audio codes that the next `step_begin` will
+   sum into the backbone input embed.
+   - Internally adds a parallel embed-sum to the existing model-cb
+     embed-sum.  Same shape op, different table.
+   - Requires the codec_lm GGUF to carry a second compose table
+     (`lm.compose.user_audio_embd.weight`) when the model has a
+     user-audio stream.
+   - Unlocks: Moshi duplex, Hibiki S2S, Kyutai STT (user-only).
+
+5. **Mimi-as-adapter integration on the C side** — `codec_encode`
+   over PCM → user_audio_codes feeds `set_user_audio_codes`.  No new
+   ggml work; just a Python helper that chains
+   `codec_decoder.encode(pcm)` → `state.set_user_audio_codes(codes)`.
+
+**Cost:** ~2 model-weeks.  Mostly converter + state-machine; the
+ggml graph for user-audio embed-sum is structurally identical to the
+existing audio-output embed-sum.
+
+### Tier C-3 — Talker transformer (Qwen-Omni)
+
+6. **`CODEC_LM_KIND_TALKER_TRANSFORMER`** new kind:
+   - Persistent multi-step KV cache (not reset per backbone step,
+     unlike `residual_depth_ar`).
+   - `step_begin` *appends* one position; cache only clears on
+     `codec_lm_state_kv_clear`.
+   - Talker block is structurally a Qwen3 transformer layer (already
+     supported by our existing `codec_op_lm_llama_depth_block`).
+   - For Qwen3-Omni-MoE Talker: blocks are MoE (`qwen3_moe_decoder`
+     layers).  Lift our existing block builder to support MoE FFN,
+     or wire a separate `talker_moe_block` op.
+   - Unlocks: Qwen2.5-Omni-7B (non-MoE Talker), Qwen3-Omni-MoE
+     (MoE Talker).
+
+**Cost:** ~3 model-weeks if MoE FFN is in scope.  Without MoE
+(Qwen2.5-Omni only) it's ~1.5 model-weeks.
+
+### Tier C-4 — Streaming KV / state lifecycle
+
+7. **`codec_lm_state_kv_clear(state)`** — explicit clear for end-of-
+   utterance / start-of-new-conversation.
+8. **`codec_lm_state_clone(state)`** — copy-on-write KV clone for
+   speculative-sampling / CFG cond+uncond branching.
+
+**Cost:** ~3 days.  Minor API extensions; the KV state is already
+heap-managed.
+
+### Tier C-5 — Non-AR audio-output codecs (NEW codec_model converters)
+
+Each of these is a new codec converter + decode graph in
+`src/models/`.  Not `codec_lm` work; they only need the
+`codec.cpp/codec_model` shape.
+
+9. **EnCodec 32 kHz** (4 cb @ 50 Hz) — needed for MusicGen / MAGNeT /
+   AudioGen audio output.  Well-documented AE + RVQ, structurally
+   close to Mimi.  **Easiest.**
+10. **CosyVoice-derived flow-matching decoder** — GLM-4-Voice audio
+    output.  Flow-matching ODE solver (similar to Chatterbox-S3G's
+    CFM Euler steps).
+11. **HuBERT-unit HiFi-GAN** — SpeechGPT / Spirit-LM / Llama-Omni audio
+    output.  Unit-conditional vocoder; reuses our HiFiGAN-shaped
+    infrastructure (Chatterbox-S3G shares it).
+12. **ChatTTS codec** — MiniCPM-o-2.6 audio output.
+13. **Seamless T2U + HiFi-GAN** — SeamlessM4T-v2 / StreamSpeech audio
+    output.  Two-stage: non-AR seq2seq (T2U) → HiFi-GAN.
+14. **Stable Audio VAE** — Stable Audio Open audio output.  Diffusion
+    VAE; pure decode (no AR).
+15. **YuE residual-VQ + upsampler** — YuE audio output.
+
+**Cost per codec:** ~1–3 days for EnCodec / HuBERT-unit HiFi-GAN /
+ChatTTS / YuE; ~1 model-week for CosyVoice flow-matching dec and
+Seamless T2U (more novel graphs).
+
+### Tier C-6 — Non-LM audio-output models (new full pipelines)
+
+These don't fit `codec_lm` shape at all; each is a standalone graph
+pipeline under `src/models/`.  Listed for completeness.
+
+16. **MusicGen** — EnCodec codec + `parallel_heads_delay`-shaped AR
+    with codebook-delay + T5 text cross-attention.  Mostly fits
+    existing infra; new is the cross-attention wiring.
+17. **MAGNeT** — masked NAR Transformer over EnCodec codes.  Needs
+    new `non_ar_masked_iter` kind.
+18. **Stable Audio Open** — DiT over VAE latents; pure diffusion.
+    Needs DiT block builder.
+19. **RVC v2** — HuBERT content + RMVPE f0 + NSF-HiFiGAN.  Reuses
+    Chatterbox-S3G's NSF + STFT in-graph helpers.
+20. **OpenVoice v2** — MeloTTS base + ToneColorConverter (VITS).
+21. **Seed-VC / Diff-HierVC / StyleTTS-VC** — DiT flow-matching /
+    diffusion VC variants.
+
+**Cost per model:** 1–2 model-weeks each; large because each VC
+family has its own decoder architecture.
+
+### Recommended order across tiers
+
+Order chosen to maximise immediate unlocks per LOC, and to let each
+piece be validated by an existing model before depending on it:
+
+1. **Tier C-1 (position_kind + text-logits + stop flexibility)** — 
+   one PR, ~1 model-week.  **Unlocks LFM2-Audio chat (native, no HF
+   fallback) immediately** — we already have all the GGUFs.
+2. **Tier C-2 (user-audio compose + Mimi-as-adapter)** — ~2 model-
+   weeks.  Unlocks Moshi duplex + Hibiki + Kyutai STT.  Hibiki is
+   the smallest model in this set (2B), good for smoke validation.
+3. **Tier C-4 (state lifecycle)** — ~3 days, can go in parallel.
+4. **Tier C-5 #9 (EnCodec)** — ~1 week.  Unlocks the MusicGen output
+   side which is then ~1 more week to wire as #16 in Tier C-6.
+5. **Tier C-3 (Talker)** — ~1.5–3 model-weeks depending on MoE scope.
+   Unlocks Qwen-Omni family.  Best done after Tier C-2 so the
+   `set_user_audio_codes` pattern is already established (Talker uses
+   a similar "feed accumulated codes back" mechanism).
+6. **Tier C-5 remainder + Tier C-6** — opportunistic, model-by-model.
+
+### Total scope estimate
+
+Tier C-1 → C-4 (codec_lm + codec_model semantic extensions, no new
+encoder graphs, no non-AR pipelines): **~6–8 model-weeks of focused
+work** for the full audio-LM (TTS / chat / duplex / Talker) coverage.
+
+Tier C-5 + C-6 (new codecs + non-AR pipelines): **~10–15 additional
+model-weeks** for everything else (music / VC / S2S translation /
+diffusion-based output).  Each tier-C-5/6 model is independent and
+can be cherry-picked based on demand.
+
+Audio-IN: covered by MTMD for whole-utterance cases (~80% of demand);
+audio-IN for truly-streaming cases reuses our existing Mimi
+`codec_encode` (no new work).
+
 Status today (the 7 wired TTS profiles in `docs/tts_cli.md`): the
 output-side audio path is well-covered for both `parallel_heads_delay`
 and `residual_depth_ar` kinds.  **There is no audio-input adapter, no
