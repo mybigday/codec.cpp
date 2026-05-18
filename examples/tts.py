@@ -1090,6 +1090,104 @@ class Lfm2AudioSession(TTSSession):
 
 
 # ---------------------------------------------------------------------
+# MOSS-TTS-Nano-100M (GPT-2-with-RoPE backbone; HF-driven AR loop)
+# ---------------------------------------------------------------------
+
+class MossTTSNanoProfile(TTSProfile):
+    bypass_standard_run = True   # tells run() to call session.run_full()
+
+    """OpenMOSS-Team/MOSS-TTS-Nano-100M — 100M GPT-2-with-RoPE backbone +
+    1-layer GPT-2 local_transformer + 16 audio codebooks.
+
+    Currently runs the AR loop through HF transformers (not codec.cpp's
+    runtime) because:
+      - llama.cpp's `gpt2` arch defaults to absolute PE; Nano's GPT-2
+        uses `position_embedding_type="rope"`.  Either a `gpt2_rope`
+        variant upstream or a per-tensor remap is needed before the
+        backbone fits in llama.cpp's existing arch families.
+      - codec_lm runtime's residual_depth_ar path only supports
+        Llama-flavoured depth blocks (RMSNorm + SwiGLU); Nano's depth
+        decoder is GPT-2-style (LayerNorm+bias + GELU + fused c_attn).
+        Adding `codec_op_lm_gpt2_depth_block` is a separate
+        ~3 h ggml-op implementation.
+
+    What we DO use from codec.cpp: the codec decode (our
+    `moss_audio_nano.gguf` MOSS-Audio-Tokenizer-Nano at 48 kHz, 16 cb).
+    That keeps the audio synthesis path on codec.cpp even while the
+    AR loop is HF-driven.  This profile is the simplest path to a
+    working Nano TTS CLI; replacing the HF AR loop with a native
+    codec_lm + llama.cpp path is tracked in `docs/tts_remaining_plan.md`.
+    """
+
+    def create_session(self, *, codec_lm, codec, args, speaker_cfg):
+        return MossTTSNanoSession(self, codec_lm, codec, args, speaker_cfg)
+
+
+class MossTTSNanoSession(TTSSession):
+    """Bypasses the standard backbone + codec_lm AR loop in favour of
+    HF MossTTSNanoForCausalLM.generate().  See run_full()."""
+
+    def initial_prompt_embeds(self, text: str) -> np.ndarray:
+        # Driver still wants a (T, hidden) tensor; return a 1-row dummy
+        # so the backbone load + n_ctx sizing pass through.  run_full()
+        # will be called before the standard AR loop ever uses this.
+        return np.zeros((1, self.codec_lm.hidden_dim if self.codec_lm
+                            else 1), dtype=np.float32)
+
+    def run_full(self, args, output_path: Path) -> int:
+        """Full TTS pipeline using HF for AR + codec.cpp for decode."""
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        print(f"[hf] loading {self.profile.hf_id} (eager attn) …", flush=True)
+        mdl = AutoModel.from_pretrained(
+            self.profile.hf_id, trust_remote_code=True,
+            torch_dtype=torch.float32, attn_implementation="eager",
+        ).eval()
+        mdl._set_decoder_attention_implementation(mdl.local_transformer, "eager")
+        mdl._set_decoder_attention_implementation(mdl.transformer,      "eager")
+        tok = AutoTokenizer.from_pretrained(
+            self.profile.hf_id, trust_remote_code=True)
+
+        print(f"[ses] building Nano prompt + running HF AR loop …", flush=True)
+        input_ids, attn_mask = mdl.build_inference_input_ids(
+            text=args.text, mode="continuation",
+            text_tokenizer=tok, device="cpu",
+        )
+
+        temperature = (args.temperature if not args.greedy else 0.0)
+        out = mdl.generate(
+            input_ids=input_ids, attention_mask=attn_mask,
+            max_new_frames=args.max_frames,
+            do_sample=(not args.greedy),
+            audio_temperature=max(temperature, 1e-3),
+            audio_top_k=args.top_k or 25,
+            audio_top_p=args.top_p or 0.8,
+            text_temperature=1.0, text_top_k=50, text_top_p=1.0,
+            use_kv_cache=True,
+        )
+        codes = out.audio_token_ids[0].cpu().numpy().astype(np.int32)
+        n_frames = int(codes.shape[0])
+        print(f"[gen] HF emitted {n_frames} frames ({codes.shape})",
+              flush=True)
+
+        if n_frames == 0:
+            print("FAIL: HF emitted 0 audio frames", file=sys.stderr)
+            return 4
+
+        # Decode via our codec.cpp moss_audio_nano codec.
+        print(f"[dec] codec_decode codes shape={codes.shape} …", flush=True)
+        pcm, sr = self.codec.decode(codes)
+        print(f"  pcm: n_samples={pcm.size if pcm.ndim == 1 else pcm.shape[0]}"
+              f" sr={sr}", flush=True)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        write_wav_pcm16(output_path, pcm, sr)
+        print(f"[wav] wrote {output_path}", flush=True)
+        return 0
+
+
+# ---------------------------------------------------------------------
 # Profile registry
 # ---------------------------------------------------------------------
 
@@ -1152,6 +1250,18 @@ PROFILES: dict[str, TTSProfile] = {
         codec_gguf    = REPO / "models/mimi/mimi.gguf",
         needs_speaker_config = False,
     ),
+    "moss-tts-nano-100m": MossTTSNanoProfile(
+        name="moss-tts-nano-100m",
+        hf_id="OpenMOSS-Team/MOSS-TTS-Nano-100M",
+        # AR loop runs through HF transformers (Nano's GPT-2-with-RoPE
+        # backbone + GPT-2-style local_transformer don't yet have native
+        # codec.cpp / llama.cpp runtime support).  These two paths are
+        # unused — set to the codec for both to satisfy the registry.
+        backbone_gguf = REPO / "models/moss_audio_nano/moss_audio_nano.gguf",
+        codec_lm_gguf = REPO / "models/moss_audio_nano/moss_audio_nano.gguf",
+        codec_gguf    = REPO / "models/moss_audio_nano/moss_audio_nano.gguf",
+        needs_speaker_config = False,
+    ),
 }
 
 
@@ -1180,26 +1290,43 @@ def write_wav_pcm16(path: Path, pcm: np.ndarray, sample_rate: int) -> None:
 # ---------------------------------------------------------------------
 
 def run(profile: TTSProfile, args, speaker_cfg: SpeakerConfig | None) -> int:
-    for label, p in (("backbone", profile.backbone_gguf),
-                     ("codec_lm", profile.codec_lm_gguf),
-                     ("codec",    profile.codec_gguf)):
+    # Profiles that bypass the standard backbone + codec_lm AR loop
+    # (e.g. MOSS-TTS-Nano, which currently runs through HF transformers)
+    # set `bypass_standard_run = True` on the class and implement
+    # `TTSSession.run_full(args, output_path)`.  Those only need the
+    # audio codec — backbone + codec_lm GGUF aren't loaded.
+    bypass = getattr(profile, "bypass_standard_run", False)
+
+    needs_files = [("codec", profile.codec_gguf)]
+    if not bypass:
+        needs_files += [("backbone", profile.backbone_gguf),
+                        ("codec_lm", profile.codec_lm_gguf)]
+    for label, p in needs_files:
         if not p.is_file():
             print(f"FAIL: missing {label} GGUF {p}", file=sys.stderr)
             return 2
 
-    print(f"[cpp] loading codec_lm + codec_model …", flush=True)
-    cpp_lm = CodecLM(profile.codec_lm_gguf)
+    print(("[cpp] loading codec_model only (HF-driven AR loop) …" if bypass
+          else "[cpp] loading codec_lm + codec_model …"), flush=True)
+    cpp_lm = None if bypass else CodecLM(profile.codec_lm_gguf)
     codec  = CodecDecoder(profile.codec_gguf, use_gpu=args.use_gpu)
-    print(f"  codec_lm:  n_cb={cpp_lm.n_cb} hidden={cpp_lm.hidden_dim}", flush=True)
+    if cpp_lm is not None:
+        print(f"  codec_lm:  n_cb={cpp_lm.n_cb} hidden={cpp_lm.hidden_dim}", flush=True)
     print(f"  codec:     sr={codec.sample_rate} n_q={codec.n_q} hop={codec.hop_size}",
           flush=True)
-    if cpp_lm.n_cb > codec.n_q:
+    if cpp_lm is not None and cpp_lm.n_cb > codec.n_q:
         print(f"WARN: codec_lm n_cb={cpp_lm.n_cb} > codec n_q={codec.n_q}; "
               f"decoder will use the first {codec.n_q} codebooks",
               file=sys.stderr)
 
     session = profile.create_session(
         codec_lm=cpp_lm, codec=codec, args=args, speaker_cfg=speaker_cfg)
+
+    if bypass:
+        # Profile owns the full pipeline (HF AR loop + codec.decode).
+        rc = session.run_full(args, Path(args.output))
+        codec.close()
+        return rc
 
     print(f"[ses] building initial prompt embeddings …", flush=True)
     prompt_embeds = session.initial_prompt_embeds(args.text)
