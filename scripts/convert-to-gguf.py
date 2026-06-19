@@ -38,6 +38,7 @@ LM_SOURCE_TO_CODEC: dict = {
     "MossTTSDelayModel":               "moss_audio",           # MOSS-TTSD v1.0 / MOSS-TTS
     "Qwen3TTSForConditionalGeneration":"qwen3_tts_tokenizer",  # Qwen3-TTS-12Hz-* (residual_depth_ar)
     "Lfm2AudioForConditionalGeneration":"mimi",                # LFM2-Audio-1.5B uses kyutai/mimi externally
+    "ChatterboxT3":                    "chatterbox_s3g",       # ResembleAI Chatterbox (T3 + S3G)
     # MossTTSNanoForCausalLM uses a depth-AR (local_transformer) adaptor;
     # pending codec_lm M3 (residual_depth_ar).
 }
@@ -57,7 +58,8 @@ LM_SOURCE_DEFAULT_CODEC_REPO: dict = {
 # Codec converters that accept an `lm_source=...` kwarg.  Currently both
 # MOSS-Audio-Tokenizer and XY-Tokenizer pair with MOSS-TTS-family LMs;
 # more codecs will join when M3+ adds residual_depth_ar models.
-LM_SOURCE_CAPABLE_CONVERTERS = {"xy_tokenizer", "moss_audio", "qwen3_tts_tokenizer", "mimi"}
+LM_SOURCE_CAPABLE_CONVERTERS = {"xy_tokenizer", "moss_audio", "qwen3_tts_tokenizer",
+                                "mimi", "chatterbox_s3g"}
 
 
 def detect_model_type_from_config(config_path: Path) -> str:

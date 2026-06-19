@@ -314,6 +314,152 @@ def prep_moss_ttsd(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
     return []
 
 
+# ---- Chatterbox T3 (Llama 520M with llama3 RoPE scaling) ----------------
+
+# Mirror of `.model-src/chatterbox/src/chatterbox/models/t3/llama_configs.py`
+# `LLAMA_520M_CONFIG_DICT`.  The vocab_size=8 placeholder is intentional:
+# T3 bypasses the backbone's own embed_tokens (the real text/speech
+# embeddings live in `text_emb` / `speech_emb` outside the tfmr), so the
+# backbone GGUF only needs to load the transformer layers + a vestigial
+# embed table.  At inference we feed embeddings via batch.embd, never
+# token IDs, so the tiny vocab is unused.
+CHATTERBOX_T3_LLAMA_CFG = {
+    "vocab_size":              8,
+    "hidden_size":             1024,
+    "intermediate_size":       4096,
+    "num_hidden_layers":       30,
+    "num_attention_heads":     16,
+    "num_key_value_heads":     16,
+    "head_dim":                64,
+    "max_position_embeddings": 131072,
+    "rms_norm_eps":            1e-05,
+    "rope_theta":              500000.0,
+    "hidden_act":              "silu",
+    "attention_bias":          False,
+    "attention_dropout":       0.0,
+    "mlp_bias":                False,
+    "initializer_range":       0.02,
+    "tie_word_embeddings":     False,
+    "torch_dtype":             "float32",
+    "use_cache":               True,
+    "rope_scaling":            dict(
+        factor=8.0,
+        high_freq_factor=4.0,
+        low_freq_factor=1.0,
+        original_max_position_embeddings=8192,
+        rope_type="llama3",
+    ),
+}
+
+
+def _chatterbox_find_t3_safetensors(src: Path) -> Path:
+    """Find the T3 LM checkpoint inside a Chatterbox-format directory.
+    Supports English (`t3_cfg.safetensors`) + multilingual variants
+    (`t3_23lang.safetensors`, `t3_mtl23ls_v2.safetensors`,
+    `t3_mtl23ls_v3.safetensors`)."""
+    for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
+               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
+        p = src / fn
+        if p.is_file():
+            return p
+    raise SystemExit(
+        f"no Chatterbox T3 checkpoint in {src}; expected one of "
+        f"t3_cfg / t3_mtl23ls_v2 / t3_mtl23ls_v3 / t3_23lang .safetensors")
+
+
+def prep_chatterbox_t3(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
+    """Unwrap Chatterbox T3's Llama-520M backbone.
+
+    Chatterbox's `t3_cfg.safetensors` (and the multilingual variants)
+    bundles BOTH the Llama tfmr and the T3 LM-adaptor side
+    (text/speech embeds + heads + learned PEs + cond_enc) under
+    `tfmr.*` and various other prefixes.  This prep extracts only the
+    `tfmr.*` tensors → standalone Llama layout; the LM-adaptor side
+    is handled separately by `scripts/converters/lm_adaptor/chatterbox.py`.
+    """
+    t3_path = _chatterbox_find_t3_safetensors(src)
+    sd = load_file(str(t3_path))
+
+    out_sd: Dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if k.startswith("tfmr.layers."):
+            out_sd["model." + k[len("tfmr."):]] = v
+        elif k == "tfmr.norm.weight":
+            out_sd["model.norm.weight"] = v
+        elif k == "tfmr.embed_tokens.weight":
+            # vocab=8 placeholder; kept for round-trip but unused at inference.
+            out_sd["model.embed_tokens.weight"] = v
+
+    if "model.embed_tokens.weight" not in out_sd:
+        raise SystemExit(f"missing tfmr.embed_tokens.weight in {t3_path}")
+
+    llama_cfg = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        **CHATTERBOX_T3_LLAMA_CFG,
+    }
+    (dst / "config.json").write_text(json.dumps(llama_cfg, indent=2))
+    _save_state_dict(out_sd, dst)
+    _write_generation_config(dst, None, None)
+    # No tokenizer to copy — Chatterbox's tokenizer.json is the speech-LM
+    # text tokenizer (704-vocab EN or 2454-vocab multilingual), not the
+    # backbone's vocab (which is just an 8-row placeholder).  We
+    # synthesise a minimal HF tokenizer dir so llama.cpp's converter
+    # doesn't reject the source.
+    _write_chatterbox_placeholder_tokenizer(dst)
+
+    # Force llama.cpp's converter into the `no_vocab` path for
+    # Chatterbox.  Our 8-token placeholder isn't a real tokenizer
+    # (and the backbone is embd-driven at inference); writing a
+    # `tokenizer.ggml.model = "none"` marker tells llama.cpp's loader
+    # to skip vocab validation.  We patch LlamaModel.set_vocab to
+    # early-return _set_vocab_none() for any model with vocab_size<=8.
+    return [(
+        'if self.origin_hf_arch == "GlmasrModel":',
+        'if (self.hparams.get("vocab_size", 0) or 0) <= 8:\n'
+        '            return self._set_vocab_none()\n'
+        '        if self.origin_hf_arch == "GlmasrModel":',
+    )]
+
+
+def _write_chatterbox_placeholder_tokenizer(dst: Path) -> None:
+    """T3's backbone has a vocab=8 placeholder embed table (real text +
+    speech embeddings live in the LM-adaptor side).  llama.cpp's
+    converter expects a HF tokenizer.json — synthesise a minimal one
+    with the same 8-token vocab.  `<unk>` must be in the vocab for
+    `tokenizers.Tokenizer` to load it; we put it at id 0 and fill the
+    rest with `<t1>`..`<t7>` placeholders."""
+    # WordLevel tokenizer with no merges — simplest type that
+    # `tokenizers.Tokenizer.from_file()` accepts.  We never tokenize
+    # through this vocab (backbone is embd-driven only); it just exists
+    # so llama.cpp's converter has *some* vocab to write.
+    vocab = {"<unk>": 0}
+    vocab.update({f"<t{i}>": i for i in range(1, 8)})
+    placeholder = {
+        "version": "1.0",
+        "model": {
+            "type":         "WordLevel",
+            "unk_token":    "<unk>",
+            "vocab":        vocab,
+        },
+        "added_tokens": [
+            {"id": tid, "content": tok, "single_word": False,
+             "lstrip": False, "rstrip": False, "normalized": False,
+             "special": True}
+            for tok, tid in vocab.items()
+        ],
+        "pre_tokenizer": None,
+        "post_processor": None,
+        "decoder": None,
+        "normalizer": None,
+    }
+    (dst / "tokenizer.json").write_text(json.dumps(placeholder, indent=2))
+    (dst / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "model_max_length": CHATTERBOX_T3_LLAMA_CFG["max_position_embeddings"],
+    }, indent=2))
+
+
 # ---- MOSS-TTS-Realtime (Qwen3 language_model) --------------------------
 
 def prep_moss_tts_realtime(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
@@ -518,6 +664,7 @@ PREPARERS: Dict[str, Callable[[Path, Path, dict], list[tuple[str, str]]]] = {
     "MossTTSRealtime":                prep_moss_tts_realtime,
     "Lfm2AudioForConditionalGeneration": prep_lfm2_audio,
     "MoshiForConditionalGeneration":  prep_moshi,
+    "ChatterboxT3":                   prep_chatterbox_t3,
 }
 
 
@@ -529,6 +676,19 @@ def detect_arch(cfg: dict) -> str:
     raise SystemExit(
         f"unsupported architectures={archs}; supported: "
         f"{sorted(PREPARERS.keys())}")
+
+
+def chatterbox_layout_detected(src: Path) -> bool:
+    """Detect a Chatterbox-format checkpoint dir.  Chatterbox doesn't
+    ship a `config.json` with `architectures[]`, so we autodetect by
+    looking for the bundled T3 checkpoint filename(s)."""
+    if not src.is_dir():
+        return False
+    for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
+               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
+        if (src / fn).is_file():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------
@@ -587,7 +747,14 @@ def main() -> int:
 
     src = resolve_source(args.model_id)
     print(f"[bb] source: {src}", flush=True)
-    cfg = load_config(src)
+
+    # Chatterbox doesn't ship a config.json (its T3 weights live in
+    # `t3_cfg.safetensors`); autodetect the layout and synthesise a
+    # config dict for the dispatch.
+    if chatterbox_layout_detected(src):
+        cfg = {"architectures": ["ChatterboxT3"]}
+    else:
+        cfg = load_config(src)
     arch = detect_arch(cfg)
     print(f"[bb] arch: {arch}", flush=True)
 

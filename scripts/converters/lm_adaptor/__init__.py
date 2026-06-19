@@ -55,6 +55,10 @@ def dump_lm_into(writer, lm_source, *, verbose: bool = False) -> None:
         from . import moss_tts_local
         moss_tts_local.dump(writer, sd, cfg, verbose=verbose)
         return
+    if arch == "ChatterboxT3":
+        from . import chatterbox
+        chatterbox.dump(writer, sd, cfg, verbose=verbose)
+        return
 
     raise NotImplementedError(
         f"unsupported LM-source architecture: {arch!r}; "
@@ -80,6 +84,15 @@ def _load_lm_source(lm_source, *, verbose: bool = False) -> Tuple[Dict[str, np.n
             allow_patterns=["*.safetensors", "*.json", "*.py"],
         ))
 
+    # Chatterbox doesn't ship a config.json (the T3 weights live in
+    # `t3_cfg.safetensors` / `t3_mtl23ls_*.safetensors`) — auto-detect
+    # that layout and synthesise both the config dict and the state
+    # dict directly from the T3 checkpoint.
+    if local.is_dir():
+        ch_sd, ch_cfg = _load_chatterbox_lm_source_if_present(local, verbose=verbose)
+        if ch_sd is not None:
+            return ch_sd, ch_cfg
+
     cfg_path = local / "config.json" if local.is_dir() else local.parent / "config.json"
     if not cfg_path.is_file():
         raise FileNotFoundError(f"missing config.json next to {local}")
@@ -90,6 +103,46 @@ def _load_lm_source(lm_source, *, verbose: bool = False) -> Tuple[Dict[str, np.n
     if verbose:
         print(f"[lm_adaptor] loaded {len(sd)} tensors from {local}")
     return sd, cfg
+
+
+def _load_chatterbox_lm_source_if_present(
+    local: Path, *, verbose: bool = False
+) -> Tuple[Dict[str, np.ndarray] | None, Dict[str, Any] | None]:
+    """If `local` is a Chatterbox-format dir (no config.json + a T3
+    checkpoint file), return its (state_dict, synth_config) tuple;
+    otherwise return (None, None)."""
+    for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
+               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
+        t3_path = local / fn
+        if t3_path.is_file():
+            try:
+                import torch
+            except ImportError as e:
+                raise ImportError(
+                    "torch is required for Chatterbox T3 LM-source loading"
+                ) from e
+            from safetensors.torch import load_file as load_st_torch
+            sd_torch = load_st_torch(str(t3_path))
+            sd: Dict[str, np.ndarray] = {}
+            for k, v in sd_torch.items():
+                if v.dtype == torch.bfloat16:
+                    v = v.to(torch.float32)
+                sd[k] = v.detach().cpu().numpy()
+            # Tell the dispatcher this is a Chatterbox T3 + propagate
+            # the actual text-vocab so the adaptor can write metadata
+            # without re-inspecting the state dict.
+            text_vocab = int(sd["text_emb.weight"].shape[0]) \
+                if "text_emb.weight" in sd else 0
+            cfg: Dict[str, Any] = {
+                "architectures": ["ChatterboxT3"],
+                "chatterbox_t3_checkpoint": fn,
+                "chatterbox_text_vocab_size": text_vocab,
+            }
+            if verbose:
+                print(f"[lm_adaptor] loaded {len(sd)} tensors from {t3_path} "
+                      f"(text_vocab={text_vocab})")
+            return sd, cfg
+    return None, None
 
 
 def _looks_like_path(s) -> bool:

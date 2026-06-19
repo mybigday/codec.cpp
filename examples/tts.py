@@ -1188,6 +1188,410 @@ class MossTTSNanoSession(TTSSession):
 
 
 # ---------------------------------------------------------------------
+# Chatterbox T3 (HF-driven AR loop + codec.cpp Chatterbox-S3G decode)
+# ---------------------------------------------------------------------
+
+class ChatterboxProfile(TTSProfile):
+    bypass_standard_run = True   # tells run() to call session.run_full()
+
+    """ResembleAI/chatterbox — Llama-520M T3 LM + Chatterbox-S3G codec.
+
+    Native Phase B: backbone (`llama_backbone.gguf`) runs through
+    llama.cpp; codec (`chatterbox.gguf` includes both the S3G codec
+    section *and* the bundled `lm.*` adaptor tensors) runs through
+    codec.cpp.  The AR loop reconstructs T3's exact CFG / repetition-
+    penalty / min-p / top-p sampling Python-side, using the bundled
+    `lm.*` tensors for text/speech embed + position embed + speech
+    head, and the vendored T3CondEnc for the speaker / perceiver /
+    emotion prefix.
+
+    Default speaker (from `conds.pt`) only; ref-audio voice cloning
+    needs a separate flow that also reconditions the S3G decoder.
+    """
+
+    def create_session(self, *, codec_lm, codec, args, speaker_cfg):
+        return ChatterboxSession(self, codec_lm, codec, args, speaker_cfg)
+
+
+def _chatterbox_punc_norm(text: str) -> str:
+    """Inline copy of `chatterbox.tts.punc_norm` to avoid importing
+    that module (it pulls in the `perth` watermarker as a hard dep)."""
+    if len(text) == 0:
+        return "You need to add some text for me to talk."
+    if text[0].islower():
+        text = text[0].upper() + text[1:]
+    text = " ".join(text.split())
+    for old, new in [("...", ", "), ("…", ", "), (":", ","),
+                     (" - ", ", "), (";", ", "), ("—", "-"), ("–", "-"),
+                     (" ,", ","), ("“", "\""), ("”", "\""),
+                     ("‘", "'"), ("’", "'")]:
+        text = text.replace(old, new)
+    text = text.rstrip(" ")
+    sentence_enders = {".", "!", "?", "-", ","}
+    if not any(text.endswith(p) for p in sentence_enders):
+        text += "."
+    return text
+
+
+def _load_chatterbox_lm_tensors(gguf_path: Path) -> dict[str, np.ndarray]:
+    """Pull the `lm.*` tensors out of the bundled chatterbox.gguf into
+    a flat numpy-float32 dict ready for the AR loop.  Each tensor is
+    laid out the way gguf-python returns it (row-major PyTorch order),
+    so embedding tables can be indexed directly: `arr[token_id, :]`."""
+    from gguf import GGUFReader
+    r = GGUFReader(str(gguf_path))
+
+    wanted = {
+        "lm.audio_embd_0.weight":                       "speech_emb",
+        "lm.c0_head.weight":                            "speech_head",
+        "lm.chatterbox.text_emb.weight":                "text_emb",
+        "lm.chatterbox.text_pos_emb.weight":            "text_pos_emb",
+        "lm.chatterbox.speech_pos_emb.weight":          "speech_pos_emb",
+        "lm.chatterbox.cond.spkr_enc.weight":           "spkr_enc_w",
+        "lm.chatterbox.cond.spkr_enc.bias":             "spkr_enc_b",
+        "lm.chatterbox.cond.emotion_adv_fc.weight":     "emotion_adv_w",
+        "lm.chatterbox.cond.perceiver.queries":         "perc_q",
+        "lm.chatterbox.cond.perceiver.norm.weight":     "perc_nw",
+        "lm.chatterbox.cond.perceiver.norm.bias":       "perc_nb",
+        "lm.chatterbox.cond.perceiver.to_q.weight":     "perc_qw",
+        "lm.chatterbox.cond.perceiver.to_q.bias":       "perc_qb",
+        "lm.chatterbox.cond.perceiver.to_k.weight":     "perc_kw",
+        "lm.chatterbox.cond.perceiver.to_k.bias":       "perc_kb",
+        "lm.chatterbox.cond.perceiver.to_v.weight":     "perc_vw",
+        "lm.chatterbox.cond.perceiver.to_v.bias":       "perc_vb",
+        "lm.chatterbox.cond.perceiver.proj_out.weight": "perc_pw",
+        "lm.chatterbox.cond.perceiver.proj_out.bias":   "perc_pb",
+    }
+    out: dict[str, np.ndarray] = {}
+    for t in r.tensors:
+        key = wanted.get(t.name)
+        if key is None:
+            continue
+        out[key] = np.array(t.data, dtype=np.float32, copy=True)
+    missing = [k for k in wanted.values() if k not in out]
+    if missing:
+        raise RuntimeError(f"chatterbox.gguf missing lm.* tensors: {missing}")
+    return out
+
+
+def _build_chatterbox_cond_emb(lm: dict, speaker_emb_np: np.ndarray,
+                                cond_speech_tokens_np: np.ndarray,
+                                emotion_adv_scalar: float) -> np.ndarray:
+    """Reconstruct T3CondEnc(t3_cond) → cond_emb of shape (34, 1024).
+
+    Layout: [spkr (1) | perceiver-resampled cond speech (32) | emotion (1)].
+    Uses the vendored Perceiver module under torch (instantiated with
+    the chatterbox.gguf weights) — the perceiver is a non-trivial
+    multi-head cross+self attention block that we don't want to
+    reimplement in numpy.
+    """
+    import torch
+    from chatterbox.models.t3.modules.perceiver import Perceiver
+
+    dim = lm["spkr_enc_w"].shape[0]  # 1024
+    spkr_w = torch.from_numpy(lm["spkr_enc_w"]).float()       # (1024, 256)
+    spkr_b = torch.from_numpy(lm["spkr_enc_b"]).float()       # (1024,)
+    speaker_emb_t = torch.from_numpy(speaker_emb_np).float().reshape(-1)
+    cond_spkr = (spkr_w @ speaker_emb_t) + spkr_b             # (1024,)
+    cond_spkr = cond_spkr.reshape(1, dim)                     # (1, 1024)
+
+    cond_speech_emb = torch.from_numpy(
+        lm["speech_emb"][cond_speech_tokens_np]).float()       # (T_spk, 1024)
+    T_spk = cond_speech_emb.shape[0]
+    cond_speech_emb = cond_speech_emb + torch.from_numpy(
+        lm["speech_pos_emb"][:T_spk]).float()                  # + pos emb
+    cond_speech_emb = cond_speech_emb.unsqueeze(0)             # (1, T_spk, dim)
+
+    perc = Perceiver(pre_attention_query_token=32,
+                     pre_attention_query_size=dim,
+                     embedding_dim=dim, num_attn_heads=4).eval()
+    # Load perceiver weights from chatterbox.gguf into the torch module.
+    sd = {
+        "pre_attention_query":    torch.from_numpy(lm["perc_q"]).float(),
+        "attn.norm.weight":       torch.from_numpy(lm["perc_nw"]).float(),
+        "attn.norm.bias":         torch.from_numpy(lm["perc_nb"]).float(),
+        "attn.to_q.weight":       torch.from_numpy(lm["perc_qw"]).float(),
+        "attn.to_q.bias":         torch.from_numpy(lm["perc_qb"]).float(),
+        "attn.to_k.weight":       torch.from_numpy(lm["perc_kw"]).float(),
+        "attn.to_k.bias":         torch.from_numpy(lm["perc_kb"]).float(),
+        "attn.to_v.weight":       torch.from_numpy(lm["perc_vw"]).float(),
+        "attn.to_v.bias":         torch.from_numpy(lm["perc_vb"]).float(),
+        "attn.proj_out.weight":   torch.from_numpy(lm["perc_pw"]).float(),
+        "attn.proj_out.bias":     torch.from_numpy(lm["perc_pb"]).float(),
+    }
+    perc.load_state_dict(sd, strict=True)
+    with torch.inference_mode():
+        cond_speech_resampled = perc(cond_speech_emb)         # (1, 32, dim)
+    cond_speech_resampled = cond_speech_resampled.squeeze(0)  # (32, dim)
+
+    emotion_w = torch.from_numpy(lm["emotion_adv_w"]).float()  # (1024, 1)
+    emotion = (emotion_w.reshape(-1) * float(emotion_adv_scalar)).reshape(1, dim)
+
+    cond_emb = torch.cat([cond_spkr, cond_speech_resampled, emotion], dim=0)
+    return cond_emb.numpy().astype(np.float32)                # (34, 1024)
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float64)
+    x = x - np.max(x[np.isfinite(x)]) if np.isfinite(x).any() else x
+    e = np.exp(x); e[~np.isfinite(e)] = 0.0
+    s = e.sum()
+    return (e / s) if s > 0 else e
+
+
+def _apply_rep_penalty(logits: np.ndarray, seen: set[int],
+                        penalty: float) -> np.ndarray:
+    """Mirror `RepetitionPenaltyLogitsProcessor`: if logit > 0 divide
+    by penalty, else multiply by penalty (so positive logits get
+    pushed down, negative ones get pushed further down)."""
+    if penalty == 1.0 or not seen:
+        return logits
+    out = logits.copy()
+    idx = np.fromiter((i for i in seen if 0 <= i < out.shape[0]),
+                      dtype=np.int64, count=len(seen))
+    if idx.size == 0:
+        return out
+    vals = out[idx]
+    out[idx] = np.where(vals > 0, vals / penalty, vals * penalty)
+    return out
+
+
+def _apply_min_p(logits: np.ndarray, min_p: float) -> np.ndarray:
+    if min_p <= 0.0:
+        return logits
+    probs = _softmax(logits)
+    max_p = probs.max() if probs.size else 0.0
+    threshold = min_p * max_p
+    out = np.where(probs >= threshold, logits, -np.inf)
+    if not np.isfinite(out).any():
+        return logits
+    return out
+
+
+def _apply_top_p(logits: np.ndarray, top_p: float) -> np.ndarray:
+    if top_p >= 1.0:
+        return logits
+    probs = _softmax(logits)
+    order = np.argsort(-probs, kind="stable")
+    cum = np.cumsum(probs[order])
+    # Mirror HF's TopPLogitsWarper: keep tokens up to (and including)
+    # the one that crosses the threshold; never drop the argmax.
+    keep_mask = cum <= top_p
+    keep_mask[0] = True   # always keep top token
+    # Extend by one so the boundary token is kept (HF "shift right by 1").
+    if not keep_mask.all():
+        first_drop = int(np.argmin(keep_mask))
+        keep_mask[first_drop] = True
+    kept = np.zeros_like(probs, dtype=bool)
+    kept[order[keep_mask]] = True
+    return np.where(kept, logits, -np.inf)
+
+
+class ChatterboxSession(TTSSession):
+    CHATTERBOX_DIR = REPO / "models/chatterbox"
+
+    def run_full(self, args, output_path: Path) -> int:
+        import sys
+        import torch
+
+        # The vendored Perceiver / cond_enc Python modules are
+        # `import torch + einops` only — no `perth` dep — so they're
+        # safe to import directly without triggering the top-level
+        # `chatterbox.__init__` (which would pull in the watermarker).
+        chatterbox_src = REPO / ".model-src/chatterbox/src"
+        if str(chatterbox_src) not in sys.path:
+            sys.path.insert(0, str(chatterbox_src))
+
+        ck = self.CHATTERBOX_DIR
+        for need in ("chatterbox.gguf", "llama_backbone.gguf",
+                     "conds.pt", "tokenizer.json"):
+            if not (ck / need).is_file():
+                print(f"FAIL: missing {need} in {ck}", file=sys.stderr)
+                return 2
+
+        # T3 hyperparameter constants (mirror `T3Config.english_only()`).
+        START_TEXT_TOKEN   = 255
+        STOP_TEXT_TOKEN    = 0
+        START_SPEECH_TOKEN = 6561
+        STOP_SPEECH_TOKEN  = 6562
+
+        # ---- 1. Load `lm.*` tensors from bundled chatterbox.gguf ----
+        print(f"[gguf] loading lm.* tensors from {ck/'chatterbox.gguf'} …",
+              flush=True)
+        lm = _load_chatterbox_lm_tensors(ck / "chatterbox.gguf")
+
+        # ---- 2. Load default-speaker conds.pt ----
+        print(f"[cond] loading conditioning from {ck/'conds.pt'} …",
+              flush=True)
+        cond_blob = torch.load(ck / "conds.pt", map_location="cpu",
+                               weights_only=False)
+        t3c = cond_blob["t3"]
+
+        def _to_np(v):
+            return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
+        speaker_emb_np = _to_np(t3c["speaker_emb"]).astype(np.float32).reshape(-1)
+        cond_speech_tokens_np = _to_np(
+            t3c["cond_prompt_speech_tokens"]).astype(np.int64).reshape(-1)
+
+        exag = 0.5
+        if (self.speaker_cfg is not None
+                and getattr(self.speaker_cfg, "emotion", None) is not None):
+            exag = float(self.speaker_cfg.emotion)
+
+        # ---- 3. Tokenize text (inline EnTokenizer logic) ----
+        print(f"[tok] tokenizing …", flush=True)
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(str(ck / "tokenizer.json"))
+        text_norm = _chatterbox_punc_norm(args.text)
+        text_for_enc = text_norm.replace(" ", "[SPACE]")
+        text_ids = tok.encode(text_for_enc).ids
+        text_ids = np.array([START_TEXT_TOKEN, *text_ids, STOP_TEXT_TOKEN],
+                            dtype=np.int64)
+        T_text = int(text_ids.shape[0])
+
+        # ---- 4. Build cond prefix [spkr | perceiver(cond speech) | emotion] ----
+        print(f"[cond] building cond_emb (perceiver) …", flush=True)
+        cond_emb = _build_chatterbox_cond_emb(
+            lm, speaker_emb_np, cond_speech_tokens_np, exag)  # (34, 1024)
+        len_cond = int(cond_emb.shape[0])
+
+        # ---- 5. Build text rows: emb + learned pos_emb at 0..T_text-1 ----
+        text_emb_cond = (lm["text_emb"][text_ids]
+                         + lm["text_pos_emb"][:T_text]).astype(np.float32)
+        # CFG uncond: text_emb is zeroed (see `prepare_input_embeds`
+        # `text_emb[1].zero_()`), but text_pos_emb still applied.
+        text_emb_uncond = lm["text_pos_emb"][:T_text].astype(np.float32)
+
+        # ---- 6. Initial speech rows: prepare_input_embeds adds speech_emb +
+        # speech_pos_emb at position 0 for the start_speech_token, then
+        # T3.inference() concatenates *another* identical bos_embed
+        # (speech_emb(start) + get_fixed_embedding(0)).  Both rows share
+        # speech_pos_emb[0] — duplicate is intentional in the reference
+        # path, so we mirror it exactly.
+        start_emb = (lm["speech_emb"][START_SPEECH_TOKEN]
+                     + lm["speech_pos_emb"][0]).astype(np.float32)
+        start_block = np.stack([start_emb, start_emb], axis=0)  # (2, 1024)
+
+        # ---- 7. Concatenate cond + text + start*2 for both CFG branches ----
+        prompt_cond   = np.concatenate(
+            [cond_emb, text_emb_cond, start_block], axis=0).astype(np.float32)
+        prompt_uncond = np.concatenate(
+            [cond_emb, text_emb_uncond, start_block], axis=0).astype(np.float32)
+
+        # ---- 8. Two LlamaBackbone contexts for the CFG pair ----
+        max_new = int(args.max_frames) if args.max_frames else 1000
+        n_ctx_needed = max(2048, prompt_cond.shape[0] + max_new + 16)
+        n_gpu_layers = int(getattr(args, "gpu_layers", 0) or 0)
+        print(f"[bb] loading llama_backbone.gguf x2 (cond/uncond, "
+              f"n_ctx={n_ctx_needed}) …", flush=True)
+        bb_cond   = LlamaBackbone(ck / "llama_backbone.gguf",
+                                   n_ctx=n_ctx_needed, n_gpu_layers=n_gpu_layers)
+        bb_uncond = LlamaBackbone(ck / "llama_backbone.gguf",
+                                   n_ctx=n_ctx_needed, n_gpu_layers=n_gpu_layers)
+        rc = 0
+        emitted: list[int] = []
+        try:
+            print(f"[bb] feeding prompts (T_prompt={prompt_cond.shape[0]}) …",
+                  flush=True)
+            h_cond   = bb_cond.feed_embeds(prompt_cond)
+            h_uncond = bb_uncond.feed_embeds(prompt_uncond)
+
+            # ---- 9. AR loop ----
+            head = lm["speech_head"]  # (8194, 1024)
+
+            cfg_weight = 0.5
+            if (self.speaker_cfg is not None
+                    and getattr(self.speaker_cfg, "cfg_weight", None) is not None):
+                cfg_weight = float(self.speaker_cfg.cfg_weight)
+            temperature = float(args.temperature) if args.temperature is not None else 0.8
+            if args.greedy:
+                temperature = 0.0
+            top_p = float(args.top_p) if args.top_p is not None else 0.95
+            min_p = 0.05
+            rep_penalty = 1.2
+            seed = int(args.seed) if args.seed is not None else 0
+            rng = np.random.default_rng(seed)
+
+            print(f"[ses] AR loop (cfg={cfg_weight}, T={temperature}, "
+                  f"top_p={top_p}, min_p={min_p}, rep_penalty={rep_penalty}, "
+                  f"max_new={max_new}) …", flush=True)
+            t0 = time.time()
+
+            generated = [START_SPEECH_TOKEN]
+            for i in range(max_new):
+                logits_cond   = head @ h_cond     # (8194,)
+                logits_uncond = head @ h_uncond
+                # CFG combine: cond + cfg * (cond - uncond).
+                logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+                # Repetition penalty (cond-branch token history only,
+                # matching the reference: `ids_for_proc = generated_ids[:1, ...]`).
+                logits = _apply_rep_penalty(logits, set(generated), rep_penalty)
+
+                if temperature <= 0.0:
+                    next_token = int(np.argmax(
+                        np.where(np.isfinite(logits), logits, -np.inf)))
+                else:
+                    if temperature != 1.0:
+                        logits = logits / temperature
+                    logits = _apply_min_p(logits, min_p=min_p)
+                    logits = _apply_top_p(logits, top_p=top_p)
+                    probs = _softmax(logits)
+                    if (not np.isfinite(probs).all()) or probs.sum() <= 0.0:
+                        next_token = int(np.argmax(
+                            np.where(np.isfinite(logits), logits, -np.inf)))
+                    else:
+                        probs = probs / probs.sum()
+                        next_token = int(rng.choice(probs.shape[0], p=probs))
+
+                generated.append(next_token)
+                if next_token == STOP_SPEECH_TOKEN:
+                    break
+                emitted.append(next_token)
+
+                # Next-step embed: speech_emb(token) + speech_pos_emb at
+                # relative-position i+1 (BOS used pos 0).
+                next_emb = (lm["speech_emb"][next_token]
+                            + lm["speech_pos_emb"][i + 1]).astype(np.float32)
+                next_emb = next_emb.reshape(1, -1)
+                h_cond   = bb_cond.feed_embeds(next_emb)
+                h_uncond = bb_uncond.feed_embeds(next_emb)
+
+            elapsed = time.time() - t0
+            n_emitted = len(emitted)
+            print(f"[gen] T3 emitted {n_emitted} speech tokens in "
+                  f"{elapsed:.2f}s ({n_emitted/max(elapsed,1e-3):.1f} tok/s)",
+                  flush=True)
+        finally:
+            bb_cond.close()
+            bb_uncond.close()
+
+        if not emitted:
+            print("FAIL: T3 emitted 0 speech tokens", file=sys.stderr)
+            return 4
+
+        # ---- 10. Decode emitted speech tokens via the S3G codec ----
+        codes_np = np.asarray(emitted, dtype=np.int32)
+        # Strip any out-of-range / special tokens before decode — the
+        # S3G codebook only covers [0, 6561).
+        codes_np = codes_np[codes_np < START_SPEECH_TOKEN]
+        if codes_np.size == 0:
+            print("FAIL: all emitted tokens were special / out-of-range",
+                  file=sys.stderr)
+            return 4
+        codes = codes_np.reshape(-1, 1)
+        print(f"[dec] codec_decode codes shape={codes.shape} …", flush=True)
+        pcm, sr = self.codec.decode(codes)
+        print(f"  pcm: n_samples={pcm.size if pcm.ndim == 1 else pcm.shape[0]}"
+              f" sr={sr}", flush=True)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        write_wav_pcm16(output_path, pcm, sr)
+        print(f"[wav] wrote {output_path}", flush=True)
+        return rc
+
+
+# ---------------------------------------------------------------------
 # Profile registry
 # ---------------------------------------------------------------------
 
@@ -1248,6 +1652,21 @@ PROFILES: dict[str, TTSProfile] = {
         backbone_gguf = REPO / "models/lfm2_audio/lfm_backbone.gguf",
         codec_lm_gguf = REPO / "models/lfm2_audio/lfm2_audio.gguf",
         codec_gguf    = REPO / "models/mimi/mimi.gguf",
+        needs_speaker_config = False,
+    ),
+    "chatterbox": ChatterboxProfile(
+        name="chatterbox",
+        hf_id="ResembleAI/chatterbox",
+        # Native Phase B: backbone (Llama 520M) loaded directly Python-
+        # side by ChatterboxSession; codec + LM adaptor bundled in
+        # chatterbox.gguf (codec section drives `self.codec`, lm.*
+        # tensors loaded ad-hoc by the session).  backbone_gguf points
+        # at the bundled file too just to satisfy the registry — the
+        # session ignores it (bypass_standard_run=True) and loads
+        # llama_backbone.gguf directly.
+        backbone_gguf = REPO / "models/chatterbox/llama_backbone.gguf",
+        codec_lm_gguf = REPO / "models/chatterbox/chatterbox.gguf",
+        codec_gguf    = REPO / "models/chatterbox/chatterbox.gguf",
         needs_speaker_config = False,
     ),
     "moss-tts-nano-100m": MossTTSNanoProfile(

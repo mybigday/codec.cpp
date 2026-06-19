@@ -461,6 +461,20 @@ class ChatterboxS3TConverter(_BaseChatterboxConverter):
 class ChatterboxS3GConverter(_BaseChatterboxConverter):
     model_name = "Chatterbox-S3G"
 
+    def __init__(
+        self,
+        quantization: str = "F16",
+        quantize_codebook: bool = False,
+        verbose: bool = False,
+        lm_source=None,
+    ):
+        super().__init__(
+            quantization=quantization,
+            quantize_codebook=quantize_codebook,
+            verbose=verbose,
+        )
+        self.lm_source = lm_source
+
     @property
     def model_type(self) -> str:
         return "chatterbox_s3g"
@@ -547,5 +561,12 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         for gguf_name, arr in emit:
             self._add_tensor(writer, gguf_name, arr)
 
+        if self.lm_source is not None:
+            from .lm_adaptor import dump_lm_into
+            dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+
         writer.write()
         self._warn_if_no_quantized()
+        if self.lm_source is not None:
+            self.log(f"Wrote Chatterbox-S3G codec + LM adaptor GGUF to {output_path} "
+                     f"(lm_source={self.lm_source})")
