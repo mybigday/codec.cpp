@@ -1243,7 +1243,7 @@ def _load_chatterbox_lm_tensors(gguf_path: Path) -> dict[str, np.ndarray]:
 
     wanted = {
         "lm.audio_embd_0.weight":                       "speech_emb",
-        "lm.c0_head.weight":                            "speech_head",
+        "lm.heads_0.weight":                            "speech_head",
         "lm.chatterbox.text_emb.weight":                "text_emb",
         "lm.chatterbox.text_pos_emb.weight":            "text_pos_emb",
         "lm.chatterbox.speech_pos_emb.weight":          "speech_pos_emb",

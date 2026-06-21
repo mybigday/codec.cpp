@@ -152,10 +152,14 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_uint32 ("codec.lm.chatterbox.cond_len", COND_LEN)
 
     # ---- speech embed + head (the n_cb=1 codec_lm pair) --------------
+    # Tensor names follow the parallel_heads_delay convention
+    # (`lm.heads_{i}.weight` + `lm.audio_embd_{i}.weight`) so the
+    # standard `codec_lm_check_unfused_audio_tables` validator picks
+    # them up at codec_lm_create time.
     _emit(writer, "lm.audio_embd_0.weight",
           _require(sd, "speech_emb.weight"),
           shape=(SPEECH_VOCAB_SIZE, HIDDEN_DIM))
-    _emit(writer, "lm.c0_head.weight",
+    _emit(writer, "lm.heads_0.weight",
           _require(sd, "speech_head.weight"),
           shape=(SPEECH_VOCAB_SIZE, HIDDEN_DIM))
 

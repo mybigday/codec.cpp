@@ -57,6 +57,72 @@ def _find_s3gen_checkpoint(checkpoint_dir: Path) -> Path:
     )
 
 
+# Chatterbox VoiceEncoder layout — 3-layer LSTM (hidden=256) over 40-bin
+# mel inputs, followed by a 256→256 projection.  Tensor names + shapes
+# come from `.model-src/chatterbox/.../voice_encoder.py`; weights are
+# distributed as `ve.safetensors` alongside `t3_cfg.safetensors`.
+VE_NUM_MELS         = 40
+VE_HIDDEN_SIZE      = 256
+VE_NUM_LAYERS       = 3
+VE_SPEAKER_EMBED    = 256
+VE_SAMPLE_RATE      = 16000
+VE_N_FFT            = 400
+VE_HOP_SIZE         = 160
+VE_WIN_SIZE         = 400
+VE_FMIN             = 0
+VE_FMAX             = 8000
+VE_PARTIAL_FRAMES   = 160
+VE_FINAL_RELU       = True
+VE_OVERLAP          = 0.5
+VE_RATE             = 1.3
+VE_MIN_COVERAGE     = 0.8
+VE_TRIM_TOP_DB      = 20.0
+
+
+def _find_voice_encoder_checkpoint(checkpoint_dir: Path) -> Path | None:
+    """Voice-encoder weights live in `ve.safetensors` next to t3_cfg /
+    s3gen / conds in every Chatterbox checkpoint we ship for.  Absent
+    only when the user pointed at a directory that doesn't include the
+    speaker-conditioning side (e.g. S3G-only test fixtures)."""
+    candidate = checkpoint_dir / "ve.safetensors"
+    return candidate if candidate.is_file() else None
+
+
+def _load_voice_encoder_state(path: Path) -> Dict[str, np.ndarray]:
+    """Load ve.safetensors as a flat numpy dict.  Shapes match PyTorch
+    `nn.LSTM` conventions: weight_ih_l{n} = (4H, input_size),
+    weight_hh_l{n} = (4H, H), bias_ih_l{n} / bias_hh_l{n} = (4H,);
+    gates are concatenated in the order [i, f, g, o]."""
+    out: Dict[str, np.ndarray] = {}
+    with safe_open(str(path), framework="numpy") as f:
+        for key in f.keys():
+            arr = f.get_tensor(key)
+            out[key] = np.asarray(arr)
+    return out
+
+
+def _build_mel_filter_bank() -> np.ndarray:
+    """Bake the librosa mel filter bank (40 × 201) into a constant tensor
+    so the runtime doesn't depend on librosa.  Matches
+    `librosa.filters.mel(sr=16000, n_fft=400, n_mels=40, fmin=0,
+    fmax=8000)` element-for-element."""
+    import librosa
+    fb = librosa.filters.mel(
+        sr=VE_SAMPLE_RATE, n_fft=VE_N_FFT, n_mels=VE_NUM_MELS,
+        fmin=VE_FMIN, fmax=VE_FMAX)
+    return np.asarray(fb, dtype=np.float32)
+
+
+def _build_hann_window() -> np.ndarray:
+    """librosa.stft default — `scipy.signal.windows.hann` periodic Hann
+    of length `win_size`.  Bake as F32 to avoid a runtime DSP dep."""
+    n = VE_WIN_SIZE
+    return np.asarray(
+        0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=np.float64) / n),
+        dtype=np.float32,
+    )
+
+
 def _materialize_weight_norm(weight_g: np.ndarray, weight_v: np.ndarray) -> np.ndarray:
     g = np.asarray(weight_g, dtype=np.float32)
     v = np.asarray(weight_v, dtype=np.float32)
@@ -501,9 +567,17 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         self.state_dict = _load_safetensors(weights_path)
         self.conds = _load_optional_conds(checkpoint_dir / "conds.pt")
         self.config = cfg
+
+        # Optional voice-encoder bundle — only when the user's checkpoint
+        # dir ships `ve.safetensors`.  Carried through to convert_and_save
+        # via `self.ve_state`; downstream we also need `lm_source` set
+        # (the cond_enc weights live under the LM adaptor section).
+        ve_path = _find_voice_encoder_checkpoint(checkpoint_dir)
+        self.ve_state = _load_voice_encoder_state(ve_path) if ve_path is not None else None
         self.log(
             f"Loaded Chatterbox-S3G checkpoint from {weights_path} "
-            f"({len(self.state_dict)} tensors, builtin_conds={self.conds is not None})"
+            f"({len(self.state_dict)} tensors, builtin_conds={self.conds is not None}, "
+            f"voice_encoder={'yes' if self.ve_state is not None else 'no'})"
         )
 
     def load_from_huggingface(self, model_id: str) -> None:
@@ -565,8 +639,101 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
             from .lm_adaptor import dump_lm_into
             dump_lm_into(writer, self.lm_source, verbose=self.verbose)
 
+        # Speaker-conditioning encoder section.  Only emitted when both
+        # the voice_encoder weights and the LM adaptor are present —
+        # the cond_enc projection (spkr_enc / perceiver / emotion_adv_fc)
+        # is bundled under `lm.chatterbox.cond.*` by the LM adaptor dump
+        # above, so the VE-side embedding has nowhere to feed without it.
+        if self.ve_state is not None and self.lm_source is not None:
+            self._write_speaker_section(writer)
+        elif self.ve_state is not None:
+            self.log(
+                "voice_encoder weights found but no --lm-source; "
+                "speaker section requires the LM adaptor's cond_enc — skipping."
+            )
+
         writer.write()
         self._warn_if_no_quantized()
         if self.lm_source is not None:
             self.log(f"Wrote Chatterbox-S3G codec + LM adaptor GGUF to {output_path} "
                      f"(lm_source={self.lm_source})")
+
+    def _write_speaker_section(self, writer: GGUFWriter) -> None:
+        """Bundle the Chatterbox VoiceEncoder + speaker metadata.
+
+        Tensor namespace:
+            speaker.voice_encoder.lstm_{l}.W_ih   (4H, in)
+            speaker.voice_encoder.lstm_{l}.W_hh   (4H, H)
+            speaker.voice_encoder.lstm_{l}.b_ih   (4H,)
+            speaker.voice_encoder.lstm_{l}.b_hh   (4H,)
+            speaker.voice_encoder.proj.weight     (E, H)
+            speaker.voice_encoder.proj.bias       (E,)
+            speaker.voice_encoder.mel_basis       (n_mels, n_fft/2 + 1)
+            speaker.voice_encoder.window          (win_size,)
+
+        Plus the codec.speaker.* metadata block consumed by the runtime
+        loader.
+        """
+        ve = self.ve_state
+        assert ve is not None
+
+        four_H = 4 * VE_HIDDEN_SIZE
+        for l in range(VE_NUM_LAYERS):
+            in_dim = VE_NUM_MELS if l == 0 else VE_HIDDEN_SIZE
+            wih = ve[f"lstm.weight_ih_l{l}"]
+            whh = ve[f"lstm.weight_hh_l{l}"]
+            bih = ve[f"lstm.bias_ih_l{l}"]
+            bhh = ve[f"lstm.bias_hh_l{l}"]
+            assert wih.shape == (four_H, in_dim), \
+                f"VE lstm.weight_ih_l{l} shape {wih.shape} != {(four_H, in_dim)}"
+            assert whh.shape == (four_H, VE_HIDDEN_SIZE), \
+                f"VE lstm.weight_hh_l{l} shape {whh.shape} != {(four_H, VE_HIDDEN_SIZE)}"
+            assert bih.shape == (four_H,)
+            assert bhh.shape == (four_H,)
+            self._add_tensor(writer, f"speaker.voice_encoder.lstm_{l}.W_ih", wih)
+            self._add_tensor(writer, f"speaker.voice_encoder.lstm_{l}.W_hh", whh)
+            self._add_tensor(writer, f"speaker.voice_encoder.lstm_{l}.b_ih", bih, st_dtype="F32")
+            self._add_tensor(writer, f"speaker.voice_encoder.lstm_{l}.b_hh", bhh, st_dtype="F32")
+
+        pw = ve["proj.weight"]
+        pb = ve["proj.bias"]
+        assert pw.shape == (VE_SPEAKER_EMBED, VE_HIDDEN_SIZE)
+        assert pb.shape == (VE_SPEAKER_EMBED,)
+        self._add_tensor(writer, "speaker.voice_encoder.proj.weight", pw)
+        self._add_tensor(writer, "speaker.voice_encoder.proj.bias", pb, st_dtype="F32")
+
+        mel_basis = _build_mel_filter_bank()
+        window    = _build_hann_window()
+        self._add_tensor(writer, "speaker.voice_encoder.mel_basis", mel_basis, st_dtype="F32")
+        self._add_tensor(writer, "speaker.voice_encoder.window",    window,    st_dtype="F32")
+
+        # Metadata block — read by codec_lm at create time.
+        writer.add_bool   ("codec.speaker.has_encoder", True)
+        writer.add_uint32 ("codec.speaker.n_rows", 34)
+        writer.add_uint32 ("codec.speaker.hidden_dim", 1024)
+        writer.add_bool   ("codec.speaker.needs_ref_pcm", True)
+        writer.add_bool   ("codec.speaker.needs_ref_speech_tokens", True)
+        writer.add_bool   ("codec.speaker.needs_emotion_scalar", True)
+        writer.add_uint32 ("codec.speaker.ref_sample_rate", VE_SAMPLE_RATE)
+        writer.add_float32("codec.speaker.emotion_default", 0.5)
+
+        # VE shape/op constants — runtime reads these to size graphs.
+        writer.add_string ("codec.speaker.encoder_arch", "chatterbox_voice_encoder")
+        writer.add_uint32 ("codec.speaker.ve.num_mels", VE_NUM_MELS)
+        writer.add_uint32 ("codec.speaker.ve.hidden_size", VE_HIDDEN_SIZE)
+        writer.add_uint32 ("codec.speaker.ve.num_layers", VE_NUM_LAYERS)
+        writer.add_uint32 ("codec.speaker.ve.speaker_embed_dim", VE_SPEAKER_EMBED)
+        writer.add_uint32 ("codec.speaker.ve.n_fft", VE_N_FFT)
+        writer.add_uint32 ("codec.speaker.ve.hop_size", VE_HOP_SIZE)
+        writer.add_uint32 ("codec.speaker.ve.win_size", VE_WIN_SIZE)
+        writer.add_uint32 ("codec.speaker.ve.partial_frames", VE_PARTIAL_FRAMES)
+        writer.add_bool   ("codec.speaker.ve.final_relu", VE_FINAL_RELU)
+        writer.add_float32("codec.speaker.ve.overlap", VE_OVERLAP)
+        writer.add_float32("codec.speaker.ve.rate", VE_RATE)
+        writer.add_float32("codec.speaker.ve.min_coverage", VE_MIN_COVERAGE)
+        writer.add_float32("codec.speaker.ve.trim_top_db", VE_TRIM_TOP_DB)
+
+        self.log(
+            f"Speaker section: voice_encoder (3-layer LSTM, hidden={VE_HIDDEN_SIZE}, "
+            f"embed={VE_SPEAKER_EMBED}) + cond_enc (from LM adaptor) -> 34 × 1024"
+        )
