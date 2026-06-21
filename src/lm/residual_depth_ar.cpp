@@ -184,9 +184,15 @@ ggml_tensor * rda_depth_layer(
 
 // Host-side helper: copy one row of an embedding table into a float
 // buffer.  Both the flex (Moshi) and lfm2 prefix builders need this to
-// fill the (depth_hidden, T) input embeddings.  F32 host-buffer tables
-// memcpy directly; F16 / quantized tables go through
-// `codec_tensor_as_vec_f32` which dequants the whole table.
+// fill the (depth_hidden, T) input embeddings.
+//
+// Single-row dequant: F32 memcpy directly, F16/BF16 do per-row
+// conversion (a few KB of work), and only true quantized types fall
+// back to `codec_tensor_as_vec_f32` (the full-table path that used to
+// be taken unconditionally — for a 32-codebook 2048-hidden CSM, that
+// was burning ~64 GB/s of memory bandwidth per backbone step
+// dequanting the same tables over and over to throw away all but one
+// row each time).
 //
 // Returns true on success.  On failure, `error_out` (if non-null) gets
 // a descriptive message including the caller-supplied `tag`.
@@ -202,19 +208,85 @@ static bool rda_copy_embd_row(
         if (error_out) *error_out = std::string("row id out of range for ") + tag;
         return false;
     }
-    const size_t row_bytes = (size_t) row_dim * sizeof(float);
-    if (tbl->type == GGML_TYPE_F32 &&
-        (tbl->buffer == nullptr || ggml_backend_buffer_is_host(tbl->buffer))) {
+    const bool host_buffer =
+        tbl->buffer == nullptr || ggml_backend_buffer_is_host(tbl->buffer);
+    const size_t row_offset_elems = (size_t) row_id * (size_t) row_dim;
+
+    if (tbl->type == GGML_TYPE_F32 && host_buffer) {
         const float * data = static_cast<const float *>(ggml_get_data(tbl));
-        std::memcpy(dst, data + (size_t) row_id * row_dim, row_bytes);
-    } else {
-        std::vector<float> all;
-        if (!codec_tensor_as_vec_f32(tbl, &all)) {
-            if (error_out) *error_out = std::string("dequant failed for ") + tag;
-            return false;
-        }
-        std::memcpy(dst, all.data() + (size_t) row_id * row_dim, row_bytes);
+        std::memcpy(dst, data + row_offset_elems, (size_t) row_dim * sizeof(float));
+        return true;
     }
+
+    if (tbl->type == GGML_TYPE_F16) {
+        const size_t row_bytes_src = (size_t) row_dim * sizeof(ggml_fp16_t);
+        const ggml_fp16_t * src;
+        std::vector<ggml_fp16_t> tmp;
+        if (host_buffer) {
+            src = static_cast<const ggml_fp16_t *>(ggml_get_data(tbl)) + row_offset_elems;
+        } else {
+            tmp.resize((size_t) row_dim);
+            ggml_backend_tensor_get(
+                const_cast<ggml_tensor *>(tbl), tmp.data(),
+                row_offset_elems * sizeof(ggml_fp16_t), row_bytes_src);
+            src = tmp.data();
+        }
+        for (int32_t i = 0; i < row_dim; ++i) {
+            dst[i] = ggml_fp16_to_fp32(src[i]);
+        }
+        return true;
+    }
+
+    if (tbl->type == GGML_TYPE_BF16) {
+        const size_t row_bytes_src = (size_t) row_dim * sizeof(ggml_bf16_t);
+        const ggml_bf16_t * src;
+        std::vector<ggml_bf16_t> tmp;
+        if (host_buffer) {
+            src = static_cast<const ggml_bf16_t *>(ggml_get_data(tbl)) + row_offset_elems;
+        } else {
+            tmp.resize((size_t) row_dim);
+            ggml_backend_tensor_get(
+                const_cast<ggml_tensor *>(tbl), tmp.data(),
+                row_offset_elems * sizeof(ggml_bf16_t), row_bytes_src);
+            src = tmp.data();
+        }
+        for (int32_t i = 0; i < row_dim; ++i) {
+            dst[i] = ggml_bf16_to_fp32(src[i]);
+        }
+        return true;
+    }
+
+    // True quantized (Q4_K, Q8_0, …): dequant a single row's worth of
+    // bytes via the type traits, no full-table pass.  This relies on
+    // `row_dim == tbl->ne[0]`, which holds for an embedding table laid
+    // out (hidden, vocab).
+    const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
+    if (traits != nullptr && traits->to_float != nullptr && tbl->ne[0] == row_dim) {
+        const size_t row_size = ggml_row_size(tbl->type, (int64_t) row_dim);
+        std::vector<uint8_t> tmp;
+        const uint8_t * src;
+        if (host_buffer) {
+            src = static_cast<const uint8_t *>(ggml_get_data(tbl)) + (size_t) row_id * row_size;
+        } else {
+            tmp.resize(row_size);
+            ggml_backend_tensor_get(
+                const_cast<ggml_tensor *>(tbl), tmp.data(),
+                (size_t) row_id * row_size, row_size);
+            src = tmp.data();
+        }
+        traits->to_float(src, dst, (int64_t) row_dim);
+        return true;
+    }
+
+    // Final fallback for unusual shapes: dequant the whole table and
+    // copy one row.  Should be unreachable in normal use.
+    std::vector<float> all;
+    if (!codec_tensor_as_vec_f32(tbl, &all)) {
+        if (error_out) *error_out = std::string("dequant failed for ") + tag;
+        return false;
+    }
+    std::memcpy(dst, all.data() + row_offset_elems,
+                (size_t) row_dim * sizeof(float));
     return true;
 }
 
@@ -236,7 +308,7 @@ bool rda_build_c0(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     ggml_tensor * t_h = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, b->impl->hidden_dim);
     ggml_set_name(t_h, "lm.c0.h_in");
 
-    ggml_tensor * head = codec_graph_cast_f32(ctx_eval, b->impl->c0_head);
+    ggml_tensor * head = codec_graph_mat_lhs(ctx_eval, b->impl->c0_head);
     ggml_tensor * logits = ggml_mul_mat(ctx_eval, head, t_h);
     ggml_set_name(logits, "lm.c0.logits");
     *out = logits;
@@ -403,18 +475,20 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
     ggml_tensor * head_w;
     if (impl->flex_heads != nullptr) {
         // Single 3D heads tensor (Moshi): slice [head_idx] as a 2D view.
-        ggml_tensor * heads_f32 = codec_graph_cast_f32(ctx_eval, impl->flex_heads);
+        // Keep stored dtype (F16 typical) — mul_mat below handles it
+        // natively as src[0] without an extra dequant pass.
+        ggml_tensor * heads_lhs = codec_graph_mat_lhs(ctx_eval, impl->flex_heads);
         head_w = ggml_view_2d(
-            ctx_eval, heads_f32,
-            heads_f32->ne[0], heads_f32->ne[1],
-            heads_f32->nb[1],
-            (size_t) head_idx * heads_f32->nb[2]);
+            ctx_eval, heads_lhs,
+            heads_lhs->ne[0], heads_lhs->ne[1],
+            heads_lhs->nb[1],
+            (size_t) head_idx * heads_lhs->nb[2]);
     } else {
         if ((size_t) head_idx >= impl->depth_heads.size() ||
             impl->depth_heads[(size_t) head_idx] == nullptr) {
             return false;
         }
-        head_w = codec_graph_cast_f32(ctx_eval, impl->depth_heads[(size_t) head_idx]);
+        head_w = codec_graph_mat_lhs(ctx_eval, impl->depth_heads[(size_t) head_idx]);
     }
 
     ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_w, x_last);

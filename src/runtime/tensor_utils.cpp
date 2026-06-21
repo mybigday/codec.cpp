@@ -113,6 +113,23 @@ ggml_tensor * codec_graph_cast_f32(ggml_context * ctx_eval, ggml_tensor * t) {
     return ggml_cast(ctx_eval, t, GGML_TYPE_F32);
 }
 
+ggml_tensor * codec_graph_mat_lhs(ggml_context * ctx_eval, ggml_tensor * t) {
+    // Pass-through for the dtypes ggml_mul_mat consumes natively as
+    // src[0] without an extra dequant pass — see header comment for
+    // the rationale.  Cast the rest.
+    if (ctx_eval == nullptr || t == nullptr) {
+        return nullptr;
+    }
+    switch (t->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            return t;
+        default:
+            return ggml_cast(ctx_eval, t, GGML_TYPE_F32);
+    }
+}
+
 ggml_tensor * codec_graph_weight_or_null(ggml_context * ctx_eval, const codec_model * model, const char * name) {
     if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr || name == nullptr) {
         return nullptr;

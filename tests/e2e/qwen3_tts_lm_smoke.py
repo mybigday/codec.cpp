@@ -36,7 +36,14 @@ GGUF  = REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf"
 HF_LM = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 LOGITS_CORR_MIN     = 0.99999
-LOGITS_MAX_ABS_DIFF = 1e-2
+# Loosened from 1e-2 to match the CSM / Moshi / LFM2-Audio tests (2e-2)
+# after the residual_depth_ar perf rework removed the
+# `codec_graph_cast_f32` calls that used to force F32 weight materialisation
+# before each `ggml_mul_mat`.  The matmul still accumulates in F32, but
+# F16 weights flow through ggml's native vec_dot kernels which reorder
+# the additions slightly — corr stays at 1.000000 across all codebooks,
+# the absolute diff just sits in the same band as the other models'.
+LOGITS_MAX_ABS_DIFF = 2e-2
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _codec_lm_ctypes import CodecLM

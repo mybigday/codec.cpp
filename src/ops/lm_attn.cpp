@@ -285,13 +285,31 @@ ggml_tensor * codec_op_lm_per_pos_linear(
         int32_t out_dim,
         int32_t T) {
     if (ctx == nullptr || w == nullptr || x_2d == nullptr) return nullptr;
-    ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
     // 2D weights have ne[2] == 1 (ggml tensors are internally 4D with
     // missing dims set to 1).  3D per-pos weights have ne[2] = N >= T.
-    if (w_f32->ne[2] <= 1) {
-        // Shared: plain matmul, gives (out_dim, T).
-        return ggml_mul_mat(ctx, w_f32, x_2d);
+    if (w->ne[2] <= 1) {
+        // Shared: plain matmul, gives (out_dim, T).  mul_mat handles
+        // F16/BF16 src[0] natively — let codec_graph_mat_lhs pass those
+        // through and cast only true quantized types.  Removing the
+        // unconditional F32 cast that used to live here saves a full
+        // weight dequant per graph execution, the dominant cost in the
+        // residual_depth_ar prefix-recompute regime where this helper
+        // runs depth_layers × 7 times per cb step.
+        //
+        // Force F32 accumulation explicitly: some backends default to
+        // F16 accumulation for F16 src[0], which adds a few millibits
+        // of drift versus the legacy cast-to-F32 path.  PREC_F32 keeps
+        // the dot product accumulator in F32 without materialising a
+        // dequanted weight tensor — best of both worlds.
+        ggml_tensor * w_lhs = codec_graph_mat_lhs(ctx, w);
+        ggml_tensor * y     = ggml_mul_mat(ctx, w_lhs, x_2d);
+        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+        return y;
     }
+    // 3D per-pos branch: still cast to F32 because the broadcast
+    // arrangement puts the weight slice as mul_mat's src[1] (which must
+    // be F32) — see comment below.
+    ggml_tensor * w_f32   = codec_graph_cast_f32(ctx, w);
     ggml_tensor * w_slice = lm_per_pos_weight_slice(ctx, w_f32, T);
     const int64_t in_dim  = x_2d->ne[0];
     ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x_2d, in_dim, 1, (int64_t) T);

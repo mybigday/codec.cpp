@@ -28,4 +28,18 @@ ggml_tensor * codec_graph_weight_or_null(ggml_context * ctx_eval, const codec_mo
 // Cast a tensor to F32 in the graph if it isn't already.
 ggml_tensor * codec_graph_cast_f32(ggml_context * ctx_eval, ggml_tensor * t);
 
+// Pass-through wrapper intended for tensors that will land as the LHS
+// (src[0], the weight side) of ggml_mul_mat.  ggml_mul_mat handles F32 /
+// F16 / BF16 src[0] with an F32 src[1] natively via fused vec_dot
+// kernels — wrapping the weight in ggml_cast(.., F32) just bakes an
+// extra dequant op into the graph that runs every execution, wasting
+// memory bandwidth proportional to the weight size.
+//
+// Truly quantized types (Q4_K, Q5_K, Q8_0, …) still get cast to F32
+// because the on-the-fly per-block re-quant of the F32 activation
+// inside their mul_mat kernel adds enough compute that an explicit
+// cast (which can be tiled / fused) is the lesser evil.  Most codec_lm
+// GGUFs ship F16 weights, so this is the hot path.
+ggml_tensor * codec_graph_mat_lhs(ggml_context * ctx_eval, ggml_tensor * t);
+
 #endif
