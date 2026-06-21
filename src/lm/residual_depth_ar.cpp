@@ -1641,4 +1641,5 @@ const codec_lm_kind_vtable codec_lm_vtable_residual_depth_ar = {
     /*.step_finish        =*/ step_finish,
     /*.audio_embd         =*/ audio_embd,
     /*.compose_audio_embd =*/ compose_audio_embd,
+    /*.speaker_encode     =*/ nullptr,
 };

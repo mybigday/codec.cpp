@@ -196,6 +196,31 @@ static bool codec_lm_populate_info(codec_lm * lm) {
     lm->info.codebook_sizes   = lm->codebook_sizes_buf.data();
     lm->info.delay_pattern    = lm->delay_pattern_buf.data();
     lm->info.host_arch        = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
+
+    // Speaker-conditioning encoder section is optional.  Absent means
+    // codec_lm_speaker_get_info returns NULL and codec_lm_speaker_encode
+    // returns CODEC_STATUS_NOT_SUPPORTED.
+    lm->has_speaker_encoder = codec_read_bool_kv(gf, "codec.speaker.has_encoder", false);
+    if (lm->has_speaker_encoder) {
+        codec_lm_speaker_info & si = lm->speaker_info;
+        si.needs_ref_pcm           = codec_read_bool_kv(gf, "codec.speaker.needs_ref_pcm", false);
+        si.needs_ref_speech_tokens = codec_read_bool_kv(gf, "codec.speaker.needs_ref_speech_tokens", false);
+        si.needs_emotion_scalar    = codec_read_bool_kv(gf, "codec.speaker.needs_emotion_scalar", false);
+        si.ref_sample_rate         = codec_read_i32_kv (gf, "codec.speaker.ref_sample_rate", 0);
+        si.emotion_default         = codec_read_f32_kv (gf, "codec.speaker.emotion_default", 0.5f);
+        si.n_rows                  = codec_read_i32_kv (gf, "codec.speaker.n_rows", 0);
+        si.hidden_dim              = codec_read_i32_kv (gf, "codec.speaker.hidden_dim", hidden);
+        if (si.n_rows <= 0 || si.hidden_dim <= 0) {
+            lm->last_error =
+                "codec.speaker.has_encoder=true but n_rows / hidden_dim missing or non-positive";
+            return false;
+        }
+        if (si.needs_ref_pcm && si.ref_sample_rate <= 0) {
+            lm->last_error =
+                "codec.speaker.needs_ref_pcm=true but ref_sample_rate missing or non-positive";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -521,4 +546,67 @@ enum codec_status codec_lm_step_finish(
     }
     st->step_in_progress = false;
     return CODEC_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// speaker encoder — delegate to vtable
+// ---------------------------------------------------------------------
+
+const struct codec_lm_speaker_info * codec_lm_speaker_get_info(
+        const struct codec_lm * lm) {
+    if (lm == nullptr || !lm->has_speaker_encoder) {
+        return nullptr;
+    }
+    return &lm->speaker_info;
+}
+
+enum codec_status codec_lm_speaker_encode(
+        struct codec_lm *          lm,
+        const struct codec_audio * ref_pcm,
+        const int32_t *            ref_speech_tokens,
+        int32_t                    n_ref_speech_tokens,
+        const float *              emotion,
+        float *                    out,
+        int32_t                    out_n_elems) {
+    if (lm == nullptr || lm->vtable == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (!lm->has_speaker_encoder || lm->vtable->speaker_encode == nullptr) {
+        lm->last_error = "codec_lm_speaker_encode: model has no speaker section";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    if (out == nullptr) {
+        lm->last_error = "codec_lm_speaker_encode: out is NULL";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const codec_lm_speaker_info & si = lm->speaker_info;
+    const int32_t need_elems = si.n_rows * si.hidden_dim;
+    if (out_n_elems < need_elems) {
+        lm->last_error = "codec_lm_speaker_encode: out buffer too small";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    if (si.needs_ref_pcm) {
+        if (ref_pcm == nullptr || ref_pcm->data == nullptr || ref_pcm->n_samples <= 0) {
+            lm->last_error = "codec_lm_speaker_encode: ref_pcm required but missing";
+            return CODEC_STATUS_INVALID_ARG;
+        }
+    }
+    if (si.needs_ref_speech_tokens) {
+        if (ref_speech_tokens == nullptr || n_ref_speech_tokens <= 0) {
+            lm->last_error = "codec_lm_speaker_encode: ref_speech_tokens required but missing";
+            return CODEC_STATUS_INVALID_ARG;
+        }
+    }
+
+    // NULL emotion → use the model's training default (see header for
+    // semantics).  Models that don't consume emotion ignore the value
+    // regardless.
+    const float emotion_val = (emotion != nullptr) ? *emotion : si.emotion_default;
+
+    return lm->vtable->speaker_encode(
+        lm, ref_pcm,
+        ref_speech_tokens, n_ref_speech_tokens,
+        emotion_val,
+        out, out_n_elems);
 }

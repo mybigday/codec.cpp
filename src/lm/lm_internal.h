@@ -28,6 +28,15 @@ struct codec_lm {
 
     codec_lm_info info = {};
 
+    // Speaker-conditioning encoder info, populated from `codec.speaker.*`
+    // GGUF metadata at create time.  `has_speaker_encoder = false` when
+    // the section is absent (most codecs); `codec_lm_speaker_get_info`
+    // returns NULL in that case.  When true, callers read shape /
+    // requirements from `speaker_info` and call `codec_lm_speaker_encode`
+    // — vtable->speaker_encode must be wired by the kind impl.
+    bool                       has_speaker_encoder = false;
+    codec_lm_speaker_info      speaker_info        = {};
+
     std::string last_error;
 };
 
@@ -91,6 +100,18 @@ struct codec_lm_kind_vtable {
     // unfused per-cb tables).
     const float *     (*audio_embd)(codec_lm * lm, int32_t cb_idx, int32_t code);
     enum codec_status (*compose_audio_embd)(codec_lm * lm, const int32_t * codes, float * out_embd);
+
+    // Speaker-conditioning encoder.  Optional per arch — leave NULL when
+    // the model has no speaker section (most kinds: parallel_heads_delay
+    // for plain TTS, residual_depth_ar for CSM, etc.).  When non-NULL,
+    // the runtime is responsible for honouring `lm->speaker_info` — it
+    // must produce `n_rows * hidden_dim` F32 values in `out`.
+    enum codec_status (*speaker_encode)(
+        codec_lm * lm,
+        const struct codec_audio * ref_pcm,
+        const int32_t * ref_speech_tokens, int32_t n_ref_speech_tokens,
+        float emotion,                  // pre-defaulted by lm.cpp
+        float * out, int32_t out_n_elems);
 };
 
 // Map between the GGUF string and the C enum.  Returns

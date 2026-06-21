@@ -276,6 +276,79 @@ enum codec_status codec_lm_step_finish(
     struct codec_lm_state * st,
     int32_t *               out_codes);  // [n_codebook]
 
+// =====================================================================
+// Speaker-conditioning encoder.
+//
+// Generic across voice-clone families (Chatterbox cond_enc, Qwen3-TTS
+// speaker_encoder, MOSS-TTSD x-vector projector, LFM2-Audio speaker
+// prefix, …).  Each codec model declares its required inputs + output
+// shape via `codec_lm_speaker_info`; the caller (typically the LM
+// arch on the llama.cpp side) decides how to consume the resulting
+// `(n_rows, hidden_dim)` matrix — prefix concat, additive overlay,
+// cross-attention KV, etc.
+//
+// Returns NULL via `codec_lm_speaker_get_info` when the loaded
+// codec_model has no speaker section (most codecs don't —
+// `codec.speaker.has_encoder` GGUF metadata key absent or false).
+// =====================================================================
+
+struct codec_lm_speaker_info {
+    // Required inputs.  Each codec declares which it consumes; the
+    // caller passes the corresponding argument to
+    // `codec_lm_speaker_encode` (NULL allowed for optional ones).
+    bool    needs_ref_pcm;             // ref audio PCM (mono).  Sample
+                                       // rate the encoder works at is
+                                       // declared via `ref_sample_rate`.
+    bool    needs_ref_speech_tokens;   // pre-encoded via codec_encode
+                                       // (e.g. Chatterbox S3T codes).
+    bool    needs_emotion_scalar;      // single float in [0, 1] (model-
+                                       // specific semantics).  When the
+                                       // caller passes NULL,
+                                       // `emotion_default` is used.
+
+    // Working sample rate the encoder expects on `ref_pcm` when
+    // `needs_ref_pcm` is set.  Caller is responsible for resampling.
+    // Zero when `needs_ref_pcm = false`.
+    int32_t ref_sample_rate;
+
+    // Default value the runtime substitutes when the caller passes NULL
+    // for `emotion`.  Pulled from `codec.speaker.emotion_default` GGUF
+    // metadata, otherwise 0.5.  Meaningful only when
+    // `needs_emotion_scalar = true`.
+    float   emotion_default;
+
+    // Output shape.  How the LM consumes this is the LM arch's decision
+    // — codec_lm does not bake "prefix" / "vector" / etc. semantics
+    // into this field.
+    int32_t n_rows;
+    int32_t hidden_dim;
+};
+
+// Returns NULL when no speaker section is present.  Lifetime = lifetime
+// of `lm`.
+const struct codec_lm_speaker_info * codec_lm_speaker_get_info(
+    const struct codec_lm * lm);
+
+// Run the speaker-conditioning encoder.
+//
+// Arguments are validated against `codec_lm_speaker_info`:
+//   * required inputs that are NULL / zero-length → INVALID_ARG
+//   * NULL `emotion` is substituted with `info->emotion_default`
+//
+// `out` must have room for at least `info->n_rows * info->hidden_dim`
+// floats and is written as F32.  `out_n_elems` is the caller's buffer
+// capacity in elements (used for a size check; runtime never writes
+// past it).  Returns NOT_SUPPORTED when the codec has no speaker
+// section (mirror of `codec_lm_speaker_get_info == NULL`).
+enum codec_status codec_lm_speaker_encode(
+    struct codec_lm *          lm,
+    const struct codec_audio * ref_pcm,             // OPTIONAL per info
+    const int32_t *            ref_speech_tokens,   // OPTIONAL per info
+    int32_t                    n_ref_speech_tokens,
+    const float *              emotion,             // NULL = use default
+    float *                    out,                 // [n_rows × hidden_dim]
+    int32_t                    out_n_elems);
+
 #ifdef __cplusplus
 }
 #endif
