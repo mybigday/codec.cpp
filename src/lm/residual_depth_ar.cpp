@@ -146,6 +146,28 @@ struct rda_state {
     // Buffers backing the step machine:
     std::vector<float> h_in_buf;                    // [hidden_dim]; written at step_begin
     std::vector<std::vector<float>> logits_buf;     // [n_codebook]; per-cb scratch
+
+    // Persistent llama.cpp-style KV cache for the depth decoder.
+    //
+    // ctx_kv holds tensor headers, buf_kv backs them in the model's
+    // backend (CPU or GPU); both live for the lifetime of the state.
+    // `k_cache[l]` / `v_cache[l]` shape: (head_dim, n_kv_heads, max_T)
+    // where max_T = n_codebook + 1 (worst-case prefix length the depth
+    // decoder ever runs).  `kv_pos` is the next position to write, reset
+    // to 0 at every step_begin so the depth decoder restarts fresh per
+    // backbone step.
+    //
+    // `kv_ok = false` when the model variant can't be served by the
+    // incremental KV path (e.g. flex_heads / per-pos in_proj —
+    // implemented in a follow-up).  The step machine then falls back
+    // to the legacy prefix-recompute path transparently.
+    ggml_context *               ctx_kv  = nullptr;
+    ggml_backend_buffer_t        buf_kv  = nullptr;
+    std::vector<ggml_tensor *>   k_cache;
+    std::vector<ggml_tensor *>   v_cache;
+    int32_t                      max_kv_T = 0;
+    int32_t                      kv_pos   = 0;
+    bool                         kv_ok    = false;
 };
 
 // ---------------------------------------------------------------------
@@ -497,6 +519,238 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
     return true;
 }
 
+// ---------------------------------------------------------------------
+// Incremental KV-cache depth-step builder
+//
+// llama.cpp-style flow: the depth decoder keeps persistent per-layer
+// K/V buffers in a backend-resident `ggml_backend_buffer` owned by
+// `rda_state` (allocated at state_init).  Each call computes Q/K/V
+// only for the T_new new positions, attends over the union of the
+// already-cached K/V and the new K/V, and writes the new K/V back into
+// the persistent cache as a side-effect.  Combining via `ggml_concat`
+// instead of in-place writes avoids relying on graph topology to
+// serialise the cpy before the attention reads — the side-effect cpy
+// happens on a separate root that the runtime evaluates as part of
+// the same compute pass (see `side_outputs` in `runtime/graph.cpp`).
+//
+// Cost: O(T_new × kv_total) attention instead of O(kv_total²) per
+// backbone step.  Eliminates the prefix-recompute regime's O(N³)
+// dominant term entirely.
+// ---------------------------------------------------------------------
+
+ggml_tensor * rda_depth_layer_kv(
+    ggml_context * ctx,
+    ggml_tensor * x_ht,
+    const rda_layer_w & w,
+    ggml_tensor * t_pos,
+    ggml_tensor * freq_factors,
+    int32_t head_dim,
+    int32_t n_heads,
+    int32_t n_kv_heads,
+    float   rope_theta,
+    float   rms_eps,
+    bool    has_qk_norm,
+    int32_t rope_mode,
+    bool    use_rope,
+    ggml_tensor * k_cache_l,
+    ggml_tensor * v_cache_l,
+    int32_t kv_pos_start,
+    int32_t kv_total) {
+
+    const int64_t T_new  = x_ht->ne[1];
+    const int32_t q_dim  = n_heads    * head_dim;
+    const int32_t kv_dim = n_kv_heads * head_dim;
+
+    // ── Attention pre-norm + projections (T_new positions) ─────────
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, w.attn_norm);
+
+    ggml_tensor * q     = codec_op_lm_per_pos_linear(ctx, w.q, h, q_dim,  (int32_t) T_new);
+    ggml_tensor * k_new = codec_op_lm_per_pos_linear(ctx, w.k, h, kv_dim, (int32_t) T_new);
+    ggml_tensor * v_new = codec_op_lm_per_pos_linear(ctx, w.v, h, kv_dim, (int32_t) T_new);
+
+    q     = ggml_reshape_3d(ctx, q,     head_dim, n_heads,    T_new);
+    k_new = ggml_reshape_3d(ctx, k_new, head_dim, n_kv_heads, T_new);
+    v_new = ggml_reshape_3d(ctx, v_new, head_dim, n_kv_heads, T_new);
+
+    if (has_qk_norm && w.q_norm && w.k_norm) {
+        q     = codec_op_rms_norm_ct(ctx, q,     rms_eps, w.q_norm);
+        k_new = codec_op_rms_norm_ct(ctx, k_new, rms_eps, w.k_norm);
+    }
+
+    if (use_rope) {
+        const int32_t n_ctx_orig = 2048;
+        const float   freq_scale = 1.0f, ext_factor = 0.0f, attn_factor = 1.0f;
+        const float   beta_fast  = 32.0f, beta_slow  = 1.0f;
+        q     = ggml_rope_ext(ctx, q,     t_pos, freq_factors,
+                              head_dim, rope_mode, n_ctx_orig, rope_theta,
+                              freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        k_new = ggml_rope_ext(ctx, k_new, t_pos, freq_factors,
+                              head_dim, rope_mode, n_ctx_orig, rope_theta,
+                              freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+
+    // ── Build the full K/V for attention via concat with cache ─────
+    ggml_tensor * k_all;
+    ggml_tensor * v_all;
+    if (kv_pos_start > 0) {
+        // Cache view (positions 0 .. kv_pos_start) → concat with new.
+        ggml_tensor * k_old = ggml_view_3d(ctx, k_cache_l,
+            head_dim, n_kv_heads, (int64_t) kv_pos_start,
+            k_cache_l->nb[1], k_cache_l->nb[2], 0);
+        ggml_tensor * v_old = ggml_view_3d(ctx, v_cache_l,
+            head_dim, n_kv_heads, (int64_t) kv_pos_start,
+            v_cache_l->nb[1], v_cache_l->nb[2], 0);
+        k_all = ggml_concat(ctx, k_old, k_new, 2);
+        v_all = ggml_concat(ctx, v_old, v_new, 2);
+    } else {
+        k_all = k_new;
+        v_all = v_new;
+    }
+
+    // ── GQA attention ───────────────────────────────────────────────
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q,     0, 2, 1, 3));
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k_all, 0, 2, 1, 3));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
+    // Causal mask offset by the already-cached prefix: q at relative
+    // position i (overall = kv_pos_start + i) can attend to k at
+    // overall positions 0..(kv_pos_start + i).  ggml_diag_mask_inf
+    // masks scores[k_idx, q_idx, h] for k_idx > q_idx + n_past, exactly
+    // matching when n_past = kv_pos_start.  For T_new=1 the mask is a
+    // no-op (k_all length = kv_pos_start+1, all positions visible).
+    scores = ggml_diag_mask_inf(ctx, scores, kv_pos_start);
+    scores = ggml_soft_max(ctx, scores);
+
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v_all, 1, 2, 0, 3));
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, (int64_t) q_dim, T_new);
+
+    const int32_t hidden = (int32_t) x_ht->ne[0];
+    ggml_tensor * o = codec_op_lm_per_pos_linear(ctx, w.o, attn, hidden, (int32_t) T_new);
+    x_ht = ggml_add(ctx, x_ht, o);
+
+    // ── Cache writes (side-effect roots) ────────────────────────────
+    // ggml_cpy(src, dst) returns a view of dst; flag both with
+    // ggml_set_output so the codec.cpp graph framework expands them as
+    // separate roots, guaranteeing they're executed in this compute.
+    ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache_l,
+        head_dim, n_kv_heads, T_new,
+        k_cache_l->nb[1], k_cache_l->nb[2],
+        (size_t) kv_pos_start * k_cache_l->nb[2]);
+    ggml_tensor * v_dst = ggml_view_3d(ctx, v_cache_l,
+        head_dim, n_kv_heads, T_new,
+        v_cache_l->nb[1], v_cache_l->nb[2],
+        (size_t) kv_pos_start * v_cache_l->nb[2]);
+    ggml_tensor * k_cpy = ggml_cpy(ctx, k_new, k_dst);
+    ggml_tensor * v_cpy = ggml_cpy(ctx, v_new, v_dst);
+    ggml_set_output(k_cpy);
+    ggml_set_output(v_cpy);
+
+    // ── FFN (SwiGLU) ────────────────────────────────────────────────
+    h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, w.ffn_norm);
+    const int32_t inter = (int32_t) w.ffn_gate->ne[1];
+    ggml_tensor * gate = codec_op_lm_per_pos_linear(ctx, w.ffn_gate, h, inter,  (int32_t) T_new);
+    ggml_tensor * up   = codec_op_lm_per_pos_linear(ctx, w.ffn_up,   h, inter,  (int32_t) T_new);
+    ggml_tensor * mlp  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor * down = codec_op_lm_per_pos_linear(ctx, w.ffn_down, mlp, hidden, (int32_t) T_new);
+    x_ht = ggml_add(ctx, x_ht, down);
+
+    return x_ht;
+}
+
+struct rda_depth_kv_build {
+    rda_impl *      impl;
+    int32_t         T_new;
+    int32_t         kv_pos_start;
+    int32_t         head_idx;
+    ggml_tensor **  k_cache;   // depth_layers entries
+    ggml_tensor **  v_cache;
+};
+
+bool rda_build_depth_step_kv(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
+    auto * b = static_cast<rda_depth_kv_build *>(ud);
+    if (!ctx_eval || !b || !b->impl || !out || !b->k_cache || !b->v_cache) return false;
+    rda_impl * impl = b->impl;
+    const int32_t T_new        = b->T_new;
+    const int32_t kv_pos_start = b->kv_pos_start;
+    const int32_t kv_total     = kv_pos_start + T_new;
+    if (T_new < 1 || kv_total > impl->n_codebook + 1) return false;
+
+    ggml_tensor * t_x = ggml_new_tensor_2d(
+        ctx_eval, GGML_TYPE_F32, impl->audio_embed_dim, T_new);
+    ggml_set_name(t_x, "lm.depth.kv.x");
+
+    ggml_tensor * t_pos = nullptr;
+    if (impl->use_rope) {
+        t_pos = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, T_new);
+        ggml_set_name(t_pos, "lm.depth.kv.pos");
+    }
+
+    // Compose: shared 2D in_proj only (KV path doesn't cover per-pos in_proj yet).
+    ggml_tensor * x;
+    if (impl->has_in_proj && impl->in_proj != nullptr) {
+        x = codec_op_lm_per_pos_linear(
+            ctx_eval, impl->in_proj, t_x, impl->depth_hidden, T_new);
+        if (impl->in_proj_bias != nullptr) {
+            ggml_tensor * bias_f32 = codec_graph_cast_f32(ctx_eval, impl->in_proj_bias);
+            x = ggml_add(ctx_eval, x, bias_f32);
+        }
+    } else {
+        x = t_x;
+    }
+
+    ggml_tensor * freqs = (impl->use_rope && impl->rope_freq_factors)
+        ? codec_graph_cast_f32(ctx_eval, impl->rope_freq_factors)
+        : nullptr;
+    const int32_t rope_mode = impl->rope_interleaved
+        ? GGML_ROPE_TYPE_NORMAL : GGML_ROPE_TYPE_NEOX;
+
+    for (int32_t l = 0; l < impl->depth_layers; ++l) {
+        const rda_layer_w & w = impl->layers[(size_t) l];
+        ggml_tensor * q_norm  = (impl->has_qk_norm && w.q_norm) ? w.q_norm : nullptr;
+        ggml_tensor * k_norm  = (impl->has_qk_norm && w.k_norm) ? w.k_norm : nullptr;
+        rda_layer_w  w2 = w;
+        w2.q_norm = q_norm;
+        w2.k_norm = k_norm;
+        x = rda_depth_layer_kv(
+            ctx_eval, x, w2, t_pos, freqs,
+            impl->depth_head_dim, impl->depth_n_heads, impl->depth_n_kv_heads,
+            impl->depth_rope_theta, impl->depth_rms_eps,
+            impl->has_qk_norm, rope_mode, impl->use_rope,
+            b->k_cache[(size_t) l], b->v_cache[(size_t) l],
+            kv_pos_start, kv_total);
+    }
+
+    if (impl->has_output_norm && impl->depth_output_norm != nullptr) {
+        x = codec_op_rms_norm_ct(ctx_eval, x, impl->depth_rms_eps, impl->depth_output_norm);
+    }
+
+    // Pick last position.
+    ggml_tensor * x_last = ggml_view_1d(
+        ctx_eval, x, impl->depth_hidden,
+        (size_t) (T_new - 1) * impl->depth_hidden * sizeof(float));
+    x_last = ggml_cont(ctx_eval, x_last);
+
+    if (impl->has_pre_head_norm) {
+        if ((size_t) b->head_idx >= impl->heads_pre_norm.size() ||
+            impl->heads_pre_norm[(size_t) b->head_idx] == nullptr) return false;
+        x_last = codec_op_rms_norm_ct(
+            ctx_eval, x_last, impl->depth_rms_eps,
+            impl->heads_pre_norm[(size_t) b->head_idx]);
+    }
+    if ((size_t) b->head_idx >= impl->depth_heads.size() ||
+        impl->depth_heads[(size_t) b->head_idx] == nullptr) return false;
+    ggml_tensor * head_w = codec_graph_mat_lhs(
+        ctx_eval, impl->depth_heads[(size_t) b->head_idx]);
+    ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_w, x_last);
+    ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    ggml_set_name(logits, "lm.depth.kv.ck_logits");
+    *out = logits;
+    return true;
+}
+
 // compose_audio_embd graph: get_rows on each cb's table, sum.  Same
 // pattern as parallel_heads_delay's compose graph.
 struct rda_compose_build {
@@ -762,6 +1016,71 @@ void free_lm(codec_lm * lm) {
     lm->impl = nullptr;
 }
 
+// Allocate persistent K/V cache tensors in the model's backend.
+// Returns true on success; on failure (or for variants the KV path
+// doesn't yet support), leaves `sst->kv_ok = false` and the step
+// machine falls back to the legacy prefix-recompute graph.
+static bool rda_alloc_kv_cache(rda_state * sst, const rda_impl * impl,
+                                codec_model * codec) {
+    // Variants the incremental KV path doesn't (yet) handle.  The
+    // legacy prefix-recompute path keeps these working unchanged.
+    if (impl->in_proj_per_pos) {
+        // Moshi / LFM2-Audio: per-position in_proj.  Wireable but
+        // non-trivial (per-pos in_proj slice on each step) — deferred.
+        return false;
+    }
+    if (impl->flex_heads != nullptr) {
+        // 3D `lm.depth.heads.weight` (Moshi) — same family as above.
+        return false;
+    }
+    if (codec == nullptr || codec->backend == nullptr) {
+        return false;
+    }
+
+    const int32_t max_T = impl->n_codebook + 1;
+
+    // Pre-size for: 2 tensors × n_layers headers + struct overhead.
+    const size_t hdr_bytes = (size_t) impl->depth_layers * 2 * ggml_tensor_overhead()
+        + ggml_tensor_overhead() * 8;
+    ggml_init_params p = {
+        /*.mem_size   =*/ hdr_bytes,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    sst->ctx_kv = ggml_init(p);
+    if (sst->ctx_kv == nullptr) return false;
+
+    sst->k_cache.assign((size_t) impl->depth_layers, nullptr);
+    sst->v_cache.assign((size_t) impl->depth_layers, nullptr);
+
+    char name_buf[64];
+    for (int32_t l = 0; l < impl->depth_layers; ++l) {
+        ggml_tensor * k = ggml_new_tensor_3d(
+            sst->ctx_kv, GGML_TYPE_F32,
+            impl->depth_head_dim, impl->depth_n_kv_heads, max_T);
+        if (!k) return false;
+        std::snprintf(name_buf, sizeof(name_buf), "rda.k_cache_%d", l);
+        ggml_set_name(k, name_buf);
+        sst->k_cache[(size_t) l] = k;
+
+        ggml_tensor * v = ggml_new_tensor_3d(
+            sst->ctx_kv, GGML_TYPE_F32,
+            impl->depth_head_dim, impl->depth_n_kv_heads, max_T);
+        if (!v) return false;
+        std::snprintf(name_buf, sizeof(name_buf), "rda.v_cache_%d", l);
+        ggml_set_name(v, name_buf);
+        sst->v_cache[(size_t) l] = v;
+    }
+
+    sst->buf_kv = ggml_backend_alloc_ctx_tensors(sst->ctx_kv, codec->backend);
+    if (sst->buf_kv == nullptr) return false;
+
+    sst->max_kv_T = max_T;
+    sst->kv_pos   = 0;
+    sst->kv_ok    = true;
+    return true;
+}
+
 bool state_init(codec_lm_state * st) {
     if (!st || !st->lm || !st->lm->impl) return false;
     rda_impl * impl = static_cast<rda_impl *>(st->lm->impl);
@@ -773,19 +1092,37 @@ bool state_init(codec_lm_state * st) {
     for (int32_t i = 0; i < impl->n_codebook; ++i) {
         sst->logits_buf[(size_t) i].resize((size_t) st->lm->info.codebook_sizes[i]);
     }
+
+    // Best-effort KV cache.  Failure here is not fatal: the step
+    // machine checks `sst->kv_ok` and falls back to the legacy
+    // prefix-recompute graph for variants we haven't wired the
+    // incremental path for yet (Moshi flex / LFM2 per-pos in_proj).
+    rda_alloc_kv_cache(sst, impl, st->lm->codec);
+
     st->impl = sst;
     return true;
 }
 
 void state_free(codec_lm_state * st) {
     if (!st || !st->impl) return;
-    delete static_cast<rda_state *>(st->impl);
+    rda_state * sst = static_cast<rda_state *>(st->impl);
+    if (sst->buf_kv != nullptr) {
+        ggml_backend_buffer_free(sst->buf_kv);
+        sst->buf_kv = nullptr;
+    }
+    if (sst->ctx_kv != nullptr) {
+        ggml_free(sst->ctx_kv);
+        sst->ctx_kv = nullptr;
+    }
+    delete sst;
     st->impl = nullptr;
 }
 
-void state_reset(codec_lm_state * /*st*/) {
-    // No KV cache to clear in the prefix-recompute regime; logits buffers
-    // are overwritten by step_begin/step_logits anyway.
+void state_reset(codec_lm_state * st) {
+    if (!st || !st->impl) return;
+    rda_state * sst = static_cast<rda_state *>(st->impl);
+    sst->kv_pos = 0;
+    // Logits buffers are overwritten by step_begin/step_logits.
 }
 
 // ---------------------------------------------------------------------
@@ -985,11 +1322,132 @@ enum codec_status run_depth_step(codec_lm_state * st, int32_t current_k) {
     return CODEC_STATUS_SUCCESS;
 }
 
+// Incremental KV-cache depth-step driver.  Computes only the new
+// positions (kv_pos .. current_k) and uses the persistent K/V cache
+// from `rda_state` for everything before.  Called only when
+// `sst->kv_ok = true` (state_init confirmed allocation succeeded AND
+// the model variant is supported — see rda_alloc_kv_cache).
+enum codec_status run_depth_step_kv(codec_lm_state * st, int32_t current_k) {
+    rda_impl  * impl = static_cast<rda_impl  *>(st->lm->impl);
+    rda_state * sst  = static_cast<rda_state *>(st->impl);
+    if (current_k < 0 || current_k >= impl->n_codebook) {
+        st->last_error = "depth step: cb index out of range";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+    if (!impl->depth_emits_c0 && current_k < 1) {
+        st->last_error = "depth step: k=0 invalid when depth_emits_c0=false";
+        return CODEC_STATUS_INVALID_STATE;
+    }
+
+    const int32_t kv_pos_start = sst->kv_pos;
+    const int32_t T_target     = current_k + 1;
+    const int32_t T_new        = T_target - kv_pos_start;
+    if (T_new < 1) {
+        st->last_error = "depth step kv: cache already past current_k";
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (T_target > sst->max_kv_T) {
+        st->last_error = "depth step kv: T exceeds cache capacity";
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // ---- Build the (audio_embed_dim, T_new) prefix host-side --------
+    const int32_t row_dim = impl->audio_embed_dim;
+    std::vector<float> prefix((size_t) row_dim * (size_t) T_new, 0.0f);
+
+    for (int32_t i = 0; i < T_new; ++i) {
+        const int32_t pos = kv_pos_start + i;
+        if (pos == 0) {
+            // Shared in_proj mode (CSM / Qwen3-TTS): pos 0 = raw h_in.
+            // (Per-pos / depth_emits_c0 / flex_heads not on KV path —
+            //  rda_alloc_kv_cache refuses those variants, so we never
+            //  enter this branch for Moshi / LFM2.)
+            std::memcpy(prefix.data() + (size_t) i * row_dim,
+                        sst->h_in_buf.data(),
+                        (size_t) impl->hidden_dim * sizeof(float));
+        } else {
+            const int32_t embd_idx = pos - 1;
+            if ((size_t) embd_idx >= impl->audio_embds.size() ||
+                impl->audio_embds[(size_t) embd_idx] == nullptr) {
+                st->last_error = "depth step kv: missing audio_embd for prefix pos";
+                return CODEC_STATUS_INTERNAL_ERROR;
+            }
+            std::string err;
+            if (!rda_copy_embd_row(
+                    impl->audio_embds[(size_t) embd_idx],
+                    st->codes_buf[(size_t) embd_idx],
+                    row_dim,
+                    prefix.data() + (size_t) i * row_dim,
+                    "audio_embd", &err)) {
+                st->last_error = "depth step kv: " + err;
+                return CODEC_STATUS_INTERNAL_ERROR;
+            }
+        }
+    }
+
+    const int32_t head_idx = impl->depth_emits_c0 ? current_k : (current_k - 1);
+
+    rda_depth_kv_build build = {
+        impl, T_new, kv_pos_start, head_idx,
+        sst->k_cache.data(), sst->v_cache.data(),
+    };
+
+    codec_graph_eval_guard guard(st->ctx);
+    std::string err;
+    codec_graph_cache_entry * entry = nullptr;
+    codec_graph_cache_key key = {};
+    key.kind     = (int32_t) CODEC_GRAPH_LM_RDA_DEPTH_STEP_KV;
+    key.n_frames = T_new;
+    key.n_q      = head_idx;
+    key.n_in     = kv_pos_start;   // overload n_in for the cache offset
+
+    if (!codec_graph_cache_get_or_build(
+            st->ctx, key, rda_build_depth_step_kv, &build, sizeof(build), &entry, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    ggml_tensor * t_x   = codec_graph_get_tensor(st->ctx, entry, "lm.depth.kv.x");
+    ggml_tensor * t_pos = impl->use_rope
+        ? codec_graph_get_tensor(st->ctx, entry, "lm.depth.kv.pos") : nullptr;
+    ggml_tensor * t_lg  = codec_graph_get_tensor(st->ctx, entry, "lm.depth.kv.ck_logits");
+    if (!t_x || !t_lg || (impl->use_rope && !t_pos)) {
+        st->last_error = "depth kv graph missing tensors";
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_graph_prepare_io(st->ctx, entry, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_runtime_write_tensor(t_x, prefix.data(),
+                                    prefix.size() * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (impl->use_rope) {
+        std::vector<int32_t> positions((size_t) T_new);
+        for (int32_t i = 0; i < T_new; ++i) positions[(size_t) i] = kv_pos_start + i;
+        if (!codec_runtime_write_tensor(t_pos, positions.data(),
+                                        positions.size() * sizeof(int32_t), &err)) {
+            st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+    const int32_t nt = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
+    if (!codec_graph_compute(st->ctx, entry, nt, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    const int32_t vk = st->lm->info.codebook_sizes[current_k];
+    if (!codec_runtime_read_tensor(t_lg, sst->logits_buf[(size_t) current_k].data(),
+                                   (size_t) vk * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    sst->kv_pos = T_target;
+    return CODEC_STATUS_SUCCESS;
+}
+
 enum codec_status step_begin(codec_lm_state * st, const float * h_in) {
     if (!st || !h_in) return CODEC_STATUS_INVALID_ARG;
     rda_impl * impl = static_cast<rda_impl *>(st->lm->impl);
     rda_state * sst = static_cast<rda_state *>(st->impl);
     std::memcpy(sst->h_in_buf.data(), h_in, (size_t) impl->hidden_dim * sizeof(float));
+    // Fresh depth pass: the KV cache holds nothing yet.
+    sst->kv_pos = 0;
     if (impl->depth_emits_c0) {
         // Models without a separate c0_head defer all logits to the
         // depth decoder.  Just stash h_in; step_logits(k=0) will run
@@ -1016,8 +1474,15 @@ const float * step_logits(codec_lm_state * st, int32_t * out_cb_idx, int32_t * o
     //  - `depth_emits_c0 = false` (CSM / Qwen3-TTS): c0 was already
     //    computed at step_begin via a separate c0_head; c1..c_{N-1}
     //    flow through the same depth graph with a different `head_idx`.
+    //
+    // Prefer the incremental KV-cache path when the state has it wired
+    // (CSM / Qwen3-TTS variants only for now — Moshi flex / LFM2 per-pos
+    // in_proj keep using the prefix-recompute path until that's wired).
     if (impl->depth_emits_c0 || k >= 1) {
-        if (run_depth_step(st, k) != CODEC_STATUS_SUCCESS) {
+        const enum codec_status rc = sst->kv_ok
+            ? run_depth_step_kv(st, k)
+            : run_depth_step(st, k);
+        if (rc != CODEC_STATUS_SUCCESS) {
             return nullptr;
         }
     }

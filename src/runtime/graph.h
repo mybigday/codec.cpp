@@ -32,9 +32,10 @@ enum codec_graph_kind {
     CODEC_GRAPH_LM_PARALLEL_HEADS_LOGITS  = 26,
     CODEC_GRAPH_LM_PARALLEL_HEADS_COMPOSE = 27,
 
-    CODEC_GRAPH_LM_RDA_C0_HEAD     = 28,
-    CODEC_GRAPH_LM_RDA_DEPTH_STEP  = 29,
-    CODEC_GRAPH_LM_RDA_COMPOSE     = 30,
+    CODEC_GRAPH_LM_RDA_C0_HEAD        = 28,
+    CODEC_GRAPH_LM_RDA_DEPTH_STEP     = 29,
+    CODEC_GRAPH_LM_RDA_COMPOSE        = 30,
+    CODEC_GRAPH_LM_RDA_DEPTH_STEP_KV  = 31,  // incremental, llama.cpp-style KV cache
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);
