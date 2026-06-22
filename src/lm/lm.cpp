@@ -230,6 +230,12 @@ static bool codec_lm_populate_info(codec_lm * lm) {
             codec_lm_read_string_kv(lm->codec, "codec.speaker.encoder_arch");
         if (arch_s == "chatterbox_voice_encoder") {
             lm->speaker_arch = codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC;
+        } else if (arch_s == "qwen3_tts_ecapa_tdnn") {
+            // Recognised at the dispatch layer; runtime impl is a stub
+            // (codec_lm_speaker_encode returns NOT_SUPPORTED).  Lets the
+            // codec be loaded + introspected (info struct, n_rows,
+            // hidden_dim) while the ECAPA-TDNN port lands.
+            lm->speaker_arch = codec_lm::CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN;
         } else {
             lm->last_error =
                 "codec.speaker.encoder_arch='" + arch_s + "' is not recognised "
@@ -245,6 +251,12 @@ static bool speaker_arch_init(codec_lm * lm) {
     switch (lm->speaker_arch) {
         case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
             return chatterbox_speaker_init(lm);
+        case codec_lm::CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN:
+            // Stub: init is a no-op; the speaker section's metadata is
+            // visible via codec_lm_speaker_get_info but
+            // codec_lm_speaker_encode returns NOT_SUPPORTED until the
+            // ECAPA-TDNN runtime lands.
+            return true;
         case codec_lm::CODEC_SPEAKER_ARCH_NONE:
             return true;
     }
@@ -256,6 +268,7 @@ static void speaker_arch_free(codec_lm * lm) {
         case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
             chatterbox_speaker_free(lm);
             break;
+        case codec_lm::CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN:
         case codec_lm::CODEC_SPEAKER_ARCH_NONE:
             break;
     }
@@ -659,6 +672,12 @@ enum codec_status codec_lm_speaker_encode(
                 ref_speech_tokens, n_ref_speech_tokens,
                 emotion_val,
                 out, out_n_elems);
+        case codec_lm::CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN:
+            lm->last_error =
+                "codec_lm_speaker_encode: qwen3_tts_ecapa_tdnn runtime not yet "
+                "implemented (architecture scaffolded; ECAPA-TDNN port pending — "
+                "see docs/audio_speaker_encoders.md for the checklist).";
+            return CODEC_STATUS_NOT_SUPPORTED;
         case codec_lm::CODEC_SPEAKER_ARCH_NONE:
             break;
     }
@@ -719,6 +738,11 @@ enum codec_status codec_lm_speaker_encode_from_embedding(
                 ref_speech_tokens, n_ref_speech_tokens,
                 emotion_val,
                 out, out_n_elems);
+        case codec_lm::CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN:
+            lm->last_error =
+                "codec_lm_speaker_encode_from_embedding: qwen3_tts_ecapa_tdnn "
+                "runtime not yet implemented — see docs/audio_speaker_encoders.md";
+            return CODEC_STATUS_NOT_SUPPORTED;
         case codec_lm::CODEC_SPEAKER_ARCH_NONE:
             break;
     }

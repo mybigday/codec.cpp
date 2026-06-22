@@ -41,7 +41,8 @@ struct codec_lm {
     enum codec_speaker_arch {
         CODEC_SPEAKER_ARCH_NONE                  = 0,
         CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC  = 1,
-        // Add more here: CODEC_SPEAKER_ARCH_QWEN3_TTS_W2V, …
+        CODEC_SPEAKER_ARCH_QWEN3_TTS_ECAPA_TDNN  = 2, // runtime stub — see docs/audio_speaker_encoders.md
+        // Add more here: CODEC_SPEAKER_ARCH_MOSS_TTSD_XVECTOR, …
     };
     codec_speaker_arch speaker_arch = CODEC_SPEAKER_ARCH_NONE;
     void *             speaker_impl = nullptr;
