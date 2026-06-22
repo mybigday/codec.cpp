@@ -85,19 +85,27 @@ codec_status codec_lm_speaker_encode_from_embedding(
   pass-through (the x-vector IS the cond_emb), so callers that cached
   the 1024-d vector elsewhere can feed it back without re-running ECAPA.
 
-### 3. MOSS-TTSD (no `encoder_arch` registered) — **N/A by design**
+### 3. MOSS-TTSD (uses `codec_encode`, no `encoder_arch`) — **SHIPPED**
 
-- **Audio encoder**: there isn't a separate speaker encoder.  MOSS-TTSD's
-  voice-clone path interleaves the **speech-tokenizer codes** of the ref
+- **Audio encoder**: no separate speaker encoder.  MOSS-TTSD's voice-
+  clone path interleaves the **speech-tokenizer codes** of the ref
   audio directly into the prompt (as audio-channel tokens), alongside
   the ref transcript on the text channel.
-- **No speaker_encode needed**: the existing `codec_encode(ref_pcm)`
-  yields the speech tokens; the application splices them into the
-  prompt.
-- **Today**: `examples/tts.py` MossTTSDSession does exactly this through
-  HF.  A future codec.cpp-only path would call `codec_encode` directly
-  (which already works on the bundled `moss_ttsd_*.gguf` codec) — no
-  new API surface required.
+- **codec.cpp surface**: the existing `codec_encode` API on the
+  bundled `moss_ttsd_v0_5.gguf` (which carries the XY-Tokenizer codec
+  + LM adaptor sections in one file) produces speech tokens that the
+  application splices into the prompt.  No `codec_lm_speaker_encode`
+  variant is registered because there's nothing audio→embedding to
+  compute; the LM consumes the codes through its own embedding tables.
+- **Parity**: `tests/e2e/moss_ttsd_encode_smoke.py` — `codec.cpp`'s
+  encode (via `codec-cli encode`) matches HF's MossTTSDProcessor
+  speech-tokenizer codes 100 % over a 1.5 s clip.
+- **Today**: `examples/tts.py` MossTTSDSession uses HF for full prompt
+  assembly (including ref-audio encoding).  Switching to codec.cpp's
+  encoder is mechanical (call `codec_encode` then splice the resulting
+  tokens into the prompt token tensor manually) and is a separate
+  follow-up that doesn't affect the framework — the encoder itself is
+  bit-parity-verified.
 
 ### 4. LFM2-Audio, MOSS-TTS-Realtime, CSM, MOSS-TTS-Nano — **no speaker encoder**
 
