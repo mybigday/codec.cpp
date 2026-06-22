@@ -266,6 +266,11 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_tensor("lm.depth.output_norm.weight",
                       out_norm.astype(np.float32), st_dtype="F32")
 
+    # --- speaker_encoder (ECAPA-TDNN) ----------------------------------
+    # Bundled only if the HF checkpoint exposed it (some Qwen3-TTS
+    # variants are zero-shot — no x-vector speaker encoder).
+    _dump_qwen3_tts_speaker_encoder(writer, sd, cfg, verbose=verbose)
+
     if verbose:
         print(f"[lm_adaptor:qwen3_tts] residual_depth_ar: "
               f"n_codebook={n_codebook} "
@@ -273,3 +278,154 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
               f"{depth_hidden}h, {depth_nh}q/{depth_nkvh}kv heads, "
               f"head_dim={depth_hd}, ffn={depth_inter}, "
               f"rope_theta={depth_rope}, has_in_proj={has_in_proj})")
+
+
+def _dump_qwen3_tts_speaker_encoder(writer, sd, cfg, *, verbose=False):
+    """Bundle Qwen3-TTS's ECAPA-TDNN speaker encoder + mel front-end
+    constants into the same GGUF.
+
+    Tensor namespace (matches what `src/lm/speaker_qwen3_tts.cpp`
+    consumes — block_idx mirrors `Qwen3TTSSpeakerEncoder.blocks`):
+
+      speaker.qwen3_tts.blocks.0.conv.{weight,bias}        ; TDNN (k=5)
+      speaker.qwen3_tts.blocks.{1..N-2}.tdnn1.conv.{w,b}   ; SE-Res2Net
+      speaker.qwen3_tts.blocks.{1..N-2}.res2net.{0..S-2}.conv.{w,b}
+      speaker.qwen3_tts.blocks.{1..N-2}.tdnn2.conv.{w,b}
+      speaker.qwen3_tts.blocks.{1..N-2}.se.{conv1,conv2}.{w,b}
+      speaker.qwen3_tts.mfa.conv.{weight,bias}             ; MFA TDNN
+      speaker.qwen3_tts.asp.tdnn.conv.{w,b}                ; ASP
+      speaker.qwen3_tts.asp.conv.{w,b}
+      speaker.qwen3_tts.fc.{weight,bias}                   ; final Conv1d
+      speaker.qwen3_tts.mel_basis                          ; (n_mels, n_freq)
+      speaker.qwen3_tts.window                             ; (win,)
+    """
+    # The speaker_encoder lives on the talker side of the model.  Detect
+    # by probing for the initial TDNN weight; if missing, the checkpoint
+    # is zero-shot and we skip.
+    probe_key = "speaker_encoder.blocks.0.conv.weight"
+    if probe_key not in sd:
+        if verbose:
+            print(f"[lm_adaptor:qwen3_tts] no speaker_encoder in checkpoint "
+                  f"(zero-shot variant); skipping speaker section.")
+        return
+
+    # speaker_encoder_config lives at top-level of Qwen3-TTS's config.
+    # Most fields are dataclass defaults from Qwen3TTSSpeakerEncoderConfig
+    # — the published config only overrides enc_dim / sample_rate.
+    se_cfg = cfg.get("speaker_encoder_config") or {}
+    mel_dim       = int(se_cfg.get("mel_dim", 128))
+    enc_dim       = int(se_cfg.get("enc_dim", 1024))
+    enc_channels  = list(se_cfg.get("enc_channels", [512, 512, 512, 512, 1536]))
+    enc_kernels   = list(se_cfg.get("enc_kernel_sizes", [5, 3, 3, 3, 1]))
+    enc_dilations = list(se_cfg.get("enc_dilations", [1, 2, 3, 4, 1]))
+    enc_attn_ch   = int(se_cfg.get("enc_attention_channels", 128))
+    enc_res2net   = int(se_cfg.get("enc_res2net_scale", 8))
+    enc_se_ch     = int(se_cfg.get("enc_se_channels", 128))
+    sample_rate   = int(se_cfg.get("sample_rate", 24000))
+
+    # Mel front-end defaults (per upstream `mel_spectrogram` in
+    # modeling_qwen3_tts.py — n_fft=1024, hop=256, win=1024, fmin=0,
+    # fmax=None → 12000, center=False, Slaney mel).
+    n_fft   = 1024
+    hop     = 256
+    win     = 1024
+    fmin    = 0
+    fmax    = sample_rate // 2     # librosa default when fmax=None
+    center  = False
+
+    n_blocks = len(enc_channels)   # 5 by default — block 0 + (N-2) SE-Res2Net + 1 MFA
+
+    def _emit(name, arr, st_dtype="F16"):
+        a = arr.astype(np.float32, copy=False)
+        writer.add_tensor(name, a,
+                          st_dtype="F32" if name.endswith((".bias", "norm.weight")) else st_dtype)
+
+    # block 0: TDNN (in=mel_dim, out=enc_channels[0], k=enc_kernels[0])
+    _emit("speaker.qwen3_tts.blocks.0.conv.weight",
+          sd["speaker_encoder.blocks.0.conv.weight"])
+    _emit("speaker.qwen3_tts.blocks.0.conv.bias",
+          sd["speaker_encoder.blocks.0.conv.bias"])
+
+    # blocks 1..N-2: SE-Res2Net
+    for bi in range(1, n_blocks - 1):
+        p = f"speaker_encoder.blocks.{bi}"
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.tdnn1.conv.weight", sd[f"{p}.tdnn1.conv.weight"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.tdnn1.conv.bias",   sd[f"{p}.tdnn1.conv.bias"])
+        for ri in range(enc_res2net - 1):
+            _emit(f"speaker.qwen3_tts.blocks.{bi}.res2net.{ri}.conv.weight",
+                  sd[f"{p}.res2net_block.blocks.{ri}.conv.weight"])
+            _emit(f"speaker.qwen3_tts.blocks.{bi}.res2net.{ri}.conv.bias",
+                  sd[f"{p}.res2net_block.blocks.{ri}.conv.bias"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.tdnn2.conv.weight", sd[f"{p}.tdnn2.conv.weight"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.tdnn2.conv.bias",   sd[f"{p}.tdnn2.conv.bias"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.se.conv1.weight",   sd[f"{p}.se_block.conv1.weight"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.se.conv1.bias",     sd[f"{p}.se_block.conv1.bias"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.se.conv2.weight",   sd[f"{p}.se_block.conv2.weight"])
+        _emit(f"speaker.qwen3_tts.blocks.{bi}.se.conv2.bias",     sd[f"{p}.se_block.conv2.bias"])
+
+    # MFA TDNN (operates on concat of SE-Res2Net outputs):
+    _emit("speaker.qwen3_tts.mfa.conv.weight", sd["speaker_encoder.mfa.conv.weight"])
+    _emit("speaker.qwen3_tts.mfa.conv.bias",   sd["speaker_encoder.mfa.conv.bias"])
+
+    # ASP
+    _emit("speaker.qwen3_tts.asp.tdnn.conv.weight", sd["speaker_encoder.asp.tdnn.conv.weight"])
+    _emit("speaker.qwen3_tts.asp.tdnn.conv.bias",   sd["speaker_encoder.asp.tdnn.conv.bias"])
+    _emit("speaker.qwen3_tts.asp.conv.weight",      sd["speaker_encoder.asp.conv.weight"])
+    _emit("speaker.qwen3_tts.asp.conv.bias",        sd["speaker_encoder.asp.conv.bias"])
+
+    # Final fc Conv1d
+    _emit("speaker.qwen3_tts.fc.weight", sd["speaker_encoder.fc.weight"])
+    _emit("speaker.qwen3_tts.fc.bias",   sd["speaker_encoder.fc.bias"])
+
+    # Mel basis (slaney) + window (periodic Hann).  Baked at convert time
+    # so the runtime has no librosa/scipy dep.
+    import librosa
+    mel_basis = librosa.filters.mel(
+        sr=sample_rate, n_fft=n_fft, n_mels=mel_dim,
+        fmin=fmin, fmax=fmax, htk=False, norm="slaney",
+    ).astype(np.float32)
+    window = np.asarray(
+        0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(win, dtype=np.float64) / win),
+        dtype=np.float32,
+    )
+    writer.add_tensor("speaker.qwen3_tts.mel_basis", mel_basis, st_dtype="F32")
+    writer.add_tensor("speaker.qwen3_tts.window",    window,    st_dtype="F32")
+
+    # ---- Metadata block ----------------------------------------------
+    # Qwen3-TTS uses `speaker_emb` as a single row in the talker prompt,
+    # so n_rows = 1, hidden_dim = enc_dim (1024).  Talker hidden is
+    # also 1024 for the 0.6B base, so the output is directly consumable.
+    talker_hidden = int(cfg["talker_config"]["hidden_size"])
+
+    writer.add_bool   ("codec.speaker.has_encoder", True)
+    writer.add_uint32 ("codec.speaker.n_rows", 1)
+    writer.add_uint32 ("codec.speaker.hidden_dim", talker_hidden)
+    writer.add_bool   ("codec.speaker.needs_ref_pcm", True)
+    writer.add_bool   ("codec.speaker.needs_ref_speech_tokens", False)
+    writer.add_bool   ("codec.speaker.needs_emotion_scalar", False)
+    writer.add_uint32 ("codec.speaker.ref_sample_rate", sample_rate)
+    writer.add_uint32 ("codec.speaker.speaker_emb_dim", enc_dim)
+    writer.add_float32("codec.speaker.emotion_default", 0.5)
+    writer.add_string ("codec.speaker.encoder_arch", "qwen3_tts_ecapa_tdnn")
+
+    # ECAPA-TDNN op constants the runtime reads to size graphs.
+    writer.add_uint32 ("codec.speaker.ecapa.mel_dim", mel_dim)
+    writer.add_array  ("codec.speaker.ecapa.enc_channels", enc_channels)
+    writer.add_array  ("codec.speaker.ecapa.enc_kernel_sizes", enc_kernels)
+    writer.add_array  ("codec.speaker.ecapa.enc_dilations", enc_dilations)
+    writer.add_uint32 ("codec.speaker.ecapa.enc_attention_channels", enc_attn_ch)
+    writer.add_uint32 ("codec.speaker.ecapa.enc_res2net_scale", enc_res2net)
+    writer.add_uint32 ("codec.speaker.ecapa.enc_se_channels", enc_se_ch)
+    writer.add_uint32 ("codec.speaker.ecapa.enc_dim", enc_dim)
+    writer.add_uint32 ("codec.speaker.ecapa.n_fft", n_fft)
+    writer.add_uint32 ("codec.speaker.ecapa.hop_size", hop)
+    writer.add_uint32 ("codec.speaker.ecapa.win_size", win)
+    writer.add_uint32 ("codec.speaker.ecapa.fmin", fmin)
+    writer.add_uint32 ("codec.speaker.ecapa.fmax", fmax)
+    writer.add_bool   ("codec.speaker.ecapa.center", center)
+
+    if verbose:
+        print(f"[lm_adaptor:qwen3_tts] speaker_encoder ECAPA-TDNN: "
+              f"mel_dim={mel_dim} enc_dim={enc_dim} "
+              f"channels={enc_channels} (1+{n_blocks-2}+1) "
+              f"@ sr={sample_rate} → (1, {talker_hidden})")

@@ -69,6 +69,7 @@ set(CODEC_SOURCES
     src/lm/parallel_heads_delay.cpp
     src/lm/residual_depth_ar.cpp
     src/lm/speaker_chatterbox.cpp
+    src/lm/speaker_qwen3_tts.cpp
 )
 
 # Build the codec library as both static (linked into the example binaries

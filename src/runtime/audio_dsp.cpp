@@ -319,6 +319,112 @@ void codec_runtime_ola_identity_kernel(int32_t n_fft, std::vector<float> * out) 
 }
 
 // ---------------------------------------------------------------------
+// Qwen3-TTS speaker-encoder mel pipeline.  See header for the recipe.
+// Diffs vs Chatterbox VE mel: reflect pad is `(n_fft - hop)/2` (not
+// `n_fft/2`), magnitude (not power), and a final log-clip @ 1e-5.
+// ---------------------------------------------------------------------
+
+bool codec_runtime_qwen3_tts_speaker_mel(
+    const std::vector<float> & pcm,
+    const std::vector<float> & mel_basis,
+    int32_t                    n_freq,
+    int32_t                    n_mels,
+    const std::vector<float> & window,
+    int32_t                    n_fft,
+    int32_t                    hop,
+    std::vector<float> *       out_features,
+    int32_t *                  out_n_frames,
+    std::string *              err) {
+
+    if (out_features == nullptr || out_n_frames == nullptr) {
+        if (err) *err = "null output";
+        return false;
+    }
+    if (n_fft <= 0 || hop <= 0 || n_mels <= 0 ||
+        n_freq != n_fft / 2 + 1 ||
+        (int32_t) mel_basis.size() != n_freq * n_mels ||
+        (int32_t) window.size() != n_fft) {
+        if (err) *err = "invalid Qwen3-TTS speaker mel arguments";
+        return false;
+    }
+    if (pcm.empty()) {
+        if (err) *err = "empty PCM";
+        return false;
+    }
+
+    const int32_t pad  = (n_fft - hop) / 2;
+    const int32_t n_in = (int32_t) pcm.size();
+    if (pad < 0 || pad >= n_in) {
+        if (err) *err = "PCM too short for the n_fft / hop pair";
+        return false;
+    }
+    std::vector<float> padded((size_t) (n_in + 2 * pad), 0.0f);
+    for (int32_t i = 0; i < pad; ++i)  padded[(size_t) i]                 = pcm[(size_t) (pad - i)];
+    for (int32_t i = 0; i < n_in; ++i) padded[(size_t) (pad + i)]         = pcm[(size_t) i];
+    for (int32_t i = 0; i < pad; ++i)  padded[(size_t) (pad + n_in + i)]  = pcm[(size_t) (n_in - 2 - i)];
+
+    // Frame count for center=False with reflect pad of `(n_fft-hop)/2`:
+    //   padded_len = n_in + (n_fft - hop)
+    //   n_frames = floor((padded_len - n_fft) / hop) + 1 = floor(n_in / hop)
+    // (matches HF / BigVGAN convention).
+    const int32_t n_frames = n_in / hop;
+    if (n_frames <= 0) {
+        if (err) *err = "no STFT frames";
+        return false;
+    }
+
+    std::vector<double> dft_cos((size_t) n_freq * (size_t) n_fft, 0.0);
+    std::vector<double> dft_sin((size_t) n_freq * (size_t) n_fft, 0.0);
+    const double two_pi = 2.0 * 3.14159265358979323846;
+    for (int32_t k = 0; k < n_freq; ++k) {
+        for (int32_t m = 0; m < n_fft; ++m) {
+            const double ang = -two_pi * (double) k * (double) m / (double) n_fft;
+            dft_cos[(size_t) k * (size_t) n_fft + (size_t) m] = std::cos(ang);
+            dft_sin[(size_t) k * (size_t) n_fft + (size_t) m] = std::sin(ang);
+        }
+    }
+
+    // Magnitude spectrogram (n_freq, n_frames).
+    std::vector<double> mag((size_t) n_freq * (size_t) n_frames, 0.0);
+    std::vector<double> buf((size_t) n_fft, 0.0);
+    for (int32_t ti = 0; ti < n_frames; ++ti) {
+        const int32_t off = ti * hop;
+        for (int32_t m = 0; m < n_fft; ++m) {
+            buf[(size_t) m] = (double) padded[(size_t) (off + m)] * (double) window[(size_t) m];
+        }
+        for (int32_t k = 0; k < n_freq; ++k) {
+            double re = 0.0, im = 0.0;
+            const double * cos_row = &dft_cos[(size_t) k * (size_t) n_fft];
+            const double * sin_row = &dft_sin[(size_t) k * (size_t) n_fft];
+            for (int32_t m = 0; m < n_fft; ++m) {
+                re += buf[(size_t) m] * cos_row[(size_t) m];
+                im += buf[(size_t) m] * sin_row[(size_t) m];
+            }
+            mag[(size_t) k * (size_t) n_frames + (size_t) ti] = std::sqrt(re * re + im * im);
+        }
+    }
+
+    // mel = mel_basis @ |X|.  Output (n_mels, n_frames) row-major.
+    out_features->assign((size_t) n_mels * (size_t) n_frames, 0.0f);
+    for (int32_t mi = 0; mi < n_mels; ++mi) {
+        const float * mb_row = &mel_basis[(size_t) mi * (size_t) n_freq];
+        for (int32_t ti = 0; ti < n_frames; ++ti) {
+            double acc = 0.0;
+            for (int32_t k = 0; k < n_freq; ++k) {
+                acc += (double) mb_row[(size_t) k] *
+                       mag[(size_t) k * (size_t) n_frames + (size_t) ti];
+            }
+            const double clipped = std::max(1e-5, acc);
+            (*out_features)[(size_t) mi * (size_t) n_frames + (size_t) ti] =
+                (float) std::log(clipped);
+        }
+    }
+    *out_n_frames = n_frames;
+    (void) err;
+    return true;
+}
+
+// ---------------------------------------------------------------------
 // Chatterbox VoiceEncoder mel pipeline.  See header for the recipe.
 // ---------------------------------------------------------------------
 

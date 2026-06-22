@@ -153,6 +153,31 @@ bool codec_runtime_chatterbox_ve_mel_partials(
     int32_t *                  out_n_partials,
     std::string *              err);
 
+// Qwen3-TTS speaker-encoder mel front-end (matches the upstream
+// `mel_spectrogram` helper in modeling_qwen3_tts.py exactly).
+//
+//   * reflect-pad PCM by (n_fft - hop)/2 each side  (HF/BigVGAN style;
+//     differs from librosa center=True which pads n_fft/2)
+//   * frame at `hop`, Hann window, n_fft FFT → magnitude
+//   * mel_basis @ |X|  (Slaney-norm librosa mel triangles, fmin=0 fmax=sr/2)
+//   * log clamp: log(max(x, 1e-5)) — dynamic-range compression
+//
+// `mel_basis` is row-major `(n_mels, n_freq)` exactly as librosa returns
+// it.  Output `out_features` is row-major `(n_mels, n_frames)` (channel-
+// major — ECAPA-TDNN convs are 1D along time so channel-major is what
+// the runtime feeds the first TDNN block).
+bool codec_runtime_qwen3_tts_speaker_mel(
+    const std::vector<float> & pcm,
+    const std::vector<float> & mel_basis,
+    int32_t                    n_freq,
+    int32_t                    n_mels,
+    const std::vector<float> & window,
+    int32_t                    n_fft,
+    int32_t                    hop,
+    std::vector<float> *       out_features,
+    int32_t *                  out_n_frames,
+    std::string *              err);
+
 // Whisper-style mel-fbank feature extractor (HF `WhisperFeatureExtractor`).
 //   1. Reflection-pad PCM by n_fft/2 each side ('center=True').
 //   2. Frame with stride `hop`, window with periodic Hann (length n_fft).

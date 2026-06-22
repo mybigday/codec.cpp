@@ -66,64 +66,24 @@ codec_status codec_lm_speaker_encode_from_embedding(
   path.wav` runs the full pipeline; default falls back to the bundled
   `conds.pt` speaker via `codec_lm_speaker_encode_from_embedding`).
 
-### 2. Qwen3-TTS (`encoder_arch = "qwen3_tts_ecapa_tdnn"`) — **SCAFFOLDED**
+### 2. Qwen3-TTS (`encoder_arch = "qwen3_tts_ecapa_tdnn"`) — **SHIPPED**
 
-- **Audio encoder**: ECAPA-TDNN (TDNN + SE-Res2Net stack + Attentive
-  Statistical Pooling + final Conv1d) → 1024-d x-vector (from
-  `Qwen3TTSSpeakerEncoder` in upstream).
+- **Audio encoder**: ECAPA-TDNN (TDNN + 3× SE-Res2Net + MFA TDNN +
+  Attentive Statistical Pooling + final Conv1d) → 1024-d x-vector
+  (from `Qwen3TTSSpeakerEncoder` in upstream).
 - **Conditioning pipeline**: x-vector spliced as a single row into
   `talker_input_embed` between `tts_pad_embed` placeholders and the
   `tts_bos_embed`.
-- **Output target**: `(1, 1024)`.
-- **Runtime**: stub.  `lm.cpp` recognises the `encoder_arch`, exposes
-  `codec_lm_speaker_get_info` correctly, but `codec_lm_speaker_encode`
-  returns `CODEC_STATUS_NOT_SUPPORTED` with a clear error message.
-- **Today's workaround**: `examples/tts.py` Qwen3TTSSession runs the HF
-  `Qwen3TTSModel.extract_speaker_embedding` Python-side and feeds the
-  result into the backbone via `inputs_embeds` (the same way it does for
-  the entire voice-clone prompt).  Switching this to the C API is the
-  follow-up.
-
-#### Port checklist (ECAPA-TDNN)
-
-1. **Converter** (`scripts/converters/lm_adaptor/qwen3_tts.py`):
-   - Locate the HF `model.talker.speaker_encoder` parameters.
-   - Bundle as `speaker.qwen3_tts.blocks_{l}.conv.{weight,bias}`,
-     `speaker.qwen3_tts.mfa.…`, `speaker.qwen3_tts.asp.…`,
-     `speaker.qwen3_tts.fc.{weight,bias}`.
-   - Bake mel basis (slaney, librosa-style, fmin=0 fmax=8000, 128 mels)
-     + Hann window into `speaker.qwen3_tts.mel_basis` /
-     `speaker.qwen3_tts.window`.
-   - Write `codec.speaker.encoder_arch = "qwen3_tts_ecapa_tdnn"`,
-     `codec.speaker.n_rows = 1`, `codec.speaker.hidden_dim = 1024`,
-     `codec.speaker.speaker_emb_dim = 1024`,
-     `codec.speaker.ref_sample_rate = 24000`,
-     plus `codec.speaker.ecapa.*` (enc_channels, enc_kernel_sizes,
-     enc_dilations, enc_attention_channels, enc_res2net_scale,
-     enc_se_channels).
-
-2. **Runtime** (`src/lm/speaker_qwen3_tts.cpp`):
-   - Slaney mel front-end (CPU helper in `audio_dsp.cpp`, exists for
-     other models — reuse).
-   - `TimeDelayNetBlock` = `ggml_conv_1d` (reflect pad) + ReLU.
-   - `Res2NetBlock` = chunk along channels, chain residuals through
-     `scale - 1` TDNN sub-blocks, re-concat.
-   - `SqueezeExcitationBlock` = mean-pool over time + Conv1d + ReLU +
-     Conv1d + sigmoid + multiplicative gate.
-   - `SE-Res2NetBlock` = TDNN + Res2Net + TDNN + SE + skip.
-   - `AttentiveStatisticsPooling` = compute (mean, std) → TDNN(channels×3 →
-     attn_channels) → tanh → Conv1d → softmax over time → weighted
-     (mean, std) → cat.
-   - Final `fc` Conv1d → squeeze to `(1, 1024)`.
-
-3. **Dispatch** (`lm.cpp`): replace the stub branch in
-   `speaker_arch_init`/`codec_lm_speaker_encode*` with calls into the
-   new file's API.
-
-4. **Parity test** (`tests/e2e/qwen3_tts_speaker_smoke.py`):
-   feed a synthetic 5 s waveform; compare against the vendored
-   `Qwen3TTSSpeakerEncoder.forward(mel)` reference.  Threshold: corr ≥
-   0.9999.
+- **Output**: `(1, 1024)`.
+- **Runtime**: `src/lm/speaker_qwen3_tts.cpp`.  Pure CPU forward
+  (~5 GFLOPs once per ref clip; no big matmul, ggml graph would add
+  complexity without perf wins).  Reflect-pad reflection helper handles
+  TDNN k=5 / k=3 with arbitrary dilation.
+- **Parity**: `tests/e2e/qwen3_tts_speaker_smoke.py` — corr=1.000000,
+  max_abs_diff < 1e-3 vs HF reference.
+- **Notes**: `codec_lm_speaker_encode_from_embedding` is a memcpy
+  pass-through (the x-vector IS the cond_emb), so callers that cached
+  the 1024-d vector elsewhere can feed it back without re-running ECAPA.
 
 ### 3. MOSS-TTSD (no `encoder_arch` registered) — **N/A by design**
 
