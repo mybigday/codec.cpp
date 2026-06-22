@@ -31,11 +31,20 @@ struct codec_lm {
     // Speaker-conditioning encoder info, populated from `codec.speaker.*`
     // GGUF metadata at create time.  `has_speaker_encoder = false` when
     // the section is absent (most codecs); `codec_lm_speaker_get_info`
-    // returns NULL in that case.  When true, callers read shape /
-    // requirements from `speaker_info` and call `codec_lm_speaker_encode`
-    // — vtable->speaker_encode must be wired by the kind impl.
+    // returns NULL in that case.  When true, the loader reads
+    // `codec.speaker.encoder_arch` to set `speaker_arch` (enum below)
+    // and the public `codec_lm_speaker_encode` dispatches on it.
+    // `speaker_impl` is per-arch opaque state (e.g. dequanted LSTM
+    // weights, cached graph context).
     bool                       has_speaker_encoder = false;
     codec_lm_speaker_info      speaker_info        = {};
+    enum codec_speaker_arch {
+        CODEC_SPEAKER_ARCH_NONE                  = 0,
+        CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC  = 1,
+        // Add more here: CODEC_SPEAKER_ARCH_QWEN3_TTS_W2V, …
+    };
+    codec_speaker_arch speaker_arch = CODEC_SPEAKER_ARCH_NONE;
+    void *             speaker_impl = nullptr;
 
     std::string last_error;
 };

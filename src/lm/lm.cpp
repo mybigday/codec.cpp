@@ -1,4 +1,5 @@
 #include "lm_internal.h"
+#include "speaker_chatterbox.h"
 
 #include "../runtime/graph.h"
 #include "../runtime/graph_exec.h"
@@ -220,8 +221,41 @@ static bool codec_lm_populate_info(codec_lm * lm) {
                 "codec.speaker.needs_ref_pcm=true but ref_sample_rate missing or non-positive";
             return false;
         }
+
+        // Dispatch on `codec.speaker.encoder_arch` to choose the impl.
+        const std::string arch_s =
+            codec_lm_read_string_kv(lm->codec, "codec.speaker.encoder_arch");
+        if (arch_s == "chatterbox_voice_encoder") {
+            lm->speaker_arch = codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC;
+        } else {
+            lm->last_error =
+                "codec.speaker.encoder_arch='" + arch_s + "' is not recognised "
+                "by this codec.cpp build";
+            return false;
+        }
     }
     return true;
+}
+
+// Per-arch init / free dispatchers.
+static bool speaker_arch_init(codec_lm * lm) {
+    switch (lm->speaker_arch) {
+        case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
+            return chatterbox_speaker_init(lm);
+        case codec_lm::CODEC_SPEAKER_ARCH_NONE:
+            return true;
+    }
+    return false;
+}
+
+static void speaker_arch_free(codec_lm * lm) {
+    switch (lm->speaker_arch) {
+        case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
+            chatterbox_speaker_free(lm);
+            break;
+        case codec_lm::CODEC_SPEAKER_ARCH_NONE:
+            break;
+    }
 }
 
 // Thread-local fallback for the most recent codec_lm_create failure.
@@ -259,6 +293,15 @@ struct codec_lm * codec_lm_create(struct codec_model * codec) {
         return nullptr;
     }
 
+    if (lm->has_speaker_encoder && !speaker_arch_init(lm)) {
+        s_codec_lm_create_error = lm->last_error.empty()
+            ? "codec_lm_create: speaker init returned false (no detail)"
+            : lm->last_error;
+        if (lm->vtable->free != nullptr) lm->vtable->free(lm);
+        delete lm;
+        return nullptr;
+    }
+
     return lm;
 }
 
@@ -270,6 +313,7 @@ void codec_lm_free(struct codec_lm * lm) {
     if (lm == nullptr) {
         return;
     }
+    speaker_arch_free(lm);
     if (lm->vtable != nullptr && lm->vtable->free != nullptr) {
         lm->vtable->free(lm);
     }
@@ -568,10 +612,11 @@ enum codec_status codec_lm_speaker_encode(
         const float *              emotion,
         float *                    out,
         int32_t                    out_n_elems) {
-    if (lm == nullptr || lm->vtable == nullptr) {
+    if (lm == nullptr) {
         return CODEC_STATUS_INVALID_ARG;
     }
-    if (!lm->has_speaker_encoder || lm->vtable->speaker_encode == nullptr) {
+    if (!lm->has_speaker_encoder ||
+        lm->speaker_arch == codec_lm::CODEC_SPEAKER_ARCH_NONE) {
         lm->last_error = "codec_lm_speaker_encode: model has no speaker section";
         return CODEC_STATUS_NOT_SUPPORTED;
     }
@@ -604,9 +649,16 @@ enum codec_status codec_lm_speaker_encode(
     // regardless.
     const float emotion_val = (emotion != nullptr) ? *emotion : si.emotion_default;
 
-    return lm->vtable->speaker_encode(
-        lm, ref_pcm,
-        ref_speech_tokens, n_ref_speech_tokens,
-        emotion_val,
-        out, out_n_elems);
+    switch (lm->speaker_arch) {
+        case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
+            return chatterbox_speaker_encode(
+                lm, ref_pcm,
+                ref_speech_tokens, n_ref_speech_tokens,
+                emotion_val,
+                out, out_n_elems);
+        case codec_lm::CODEC_SPEAKER_ARCH_NONE:
+            break;
+    }
+    lm->last_error = "codec_lm_speaker_encode: no impl for speaker_arch";
+    return CODEC_STATUS_NOT_SUPPORTED;
 }

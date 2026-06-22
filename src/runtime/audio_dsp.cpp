@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 bool codec_runtime_istft_from_head(
     const std::vector<float> & head,
@@ -315,6 +316,171 @@ void codec_runtime_ola_identity_kernel(int32_t n_fft, std::vector<float> * out) 
     for (int32_t i = 0; i < n_fft; ++i) {
         (*out)[(size_t) i + (size_t) i * (size_t) n_fft] = 1.0f;
     }
+}
+
+// ---------------------------------------------------------------------
+// Chatterbox VoiceEncoder mel pipeline.  See header for the recipe.
+// ---------------------------------------------------------------------
+
+bool codec_runtime_chatterbox_ve_mel_partials(
+    const std::vector<float> & pcm,
+    int32_t                    /*sample_rate*/,
+    const std::vector<float> & mel_basis,
+    int32_t                    n_freq,
+    int32_t                    n_mels,
+    const std::vector<float> & window,
+    int32_t                    n_fft,
+    int32_t                    hop,
+    int32_t                    partial_frames,
+    float                      overlap,
+    float                      rate,
+    float                      min_coverage,
+    std::vector<float> *       out_partials,
+    int32_t *                  out_n_partials,
+    std::string *              err) {
+
+    if (out_partials == nullptr || out_n_partials == nullptr) {
+        if (err != nullptr) *err = "null output";
+        return false;
+    }
+    if (n_fft <= 0 || hop <= 0 || n_mels <= 0 || partial_frames <= 0 ||
+        n_freq != n_fft / 2 + 1 ||
+        (int32_t) mel_basis.size() != n_freq * n_mels ||
+        (int32_t) window.size() != n_fft) {
+        if (err != nullptr) *err = "invalid VE mel arguments";
+        return false;
+    }
+    if (pcm.empty()) {
+        if (err != nullptr) *err = "empty PCM";
+        return false;
+    }
+
+    // 1. Reflect-pad PCM by n_fft/2 each side (librosa center=True default).
+    //    Reflection excludes the boundary sample: [a,b,c,d][reflect 2] =
+    //    [c,b,a,b,c,d,c,b].
+    const int32_t pad = n_fft / 2;
+    const int32_t n_in = (int32_t) pcm.size();
+    if (pad >= n_in) {
+        if (err != nullptr) *err = "PCM too short for reflect padding";
+        return false;
+    }
+    std::vector<float> padded((size_t) (n_in + 2 * pad), 0.0f);
+    for (int32_t i = 0; i < pad; ++i)            padded[(size_t) i]                  = pcm[(size_t) (pad - i)];
+    for (int32_t i = 0; i < n_in; ++i)           padded[(size_t) (pad + i)]          = pcm[(size_t) i];
+    for (int32_t i = 0; i < pad; ++i)            padded[(size_t) (pad + n_in + i)]   = pcm[(size_t) (n_in - 2 - i)];
+
+    // 2. n_frames = 1 + n_in / hop (librosa center=True convention).  The
+    //    final frame ends at sample n_in + n_fft within the padded buffer
+    //    (the frame at index i covers [i*hop, i*hop + n_fft)).
+    const int32_t n_frames = 1 + n_in / hop;
+    if (n_frames <= 0) {
+        if (err != nullptr) *err = "no STFT frames";
+        return false;
+    }
+
+    // Precompute DFT basis at double precision.
+    std::vector<double> dft_cos((size_t) n_freq * (size_t) n_fft, 0.0);
+    std::vector<double> dft_sin((size_t) n_freq * (size_t) n_fft, 0.0);
+    const double two_pi = 2.0 * 3.14159265358979323846;
+    for (int32_t k = 0; k < n_freq; ++k) {
+        for (int32_t m = 0; m < n_fft; ++m) {
+            const double ang = -two_pi * (double) k * (double) m / (double) n_fft;
+            dft_cos[(size_t) k * (size_t) n_fft + (size_t) m] = std::cos(ang);
+            dft_sin[(size_t) k * (size_t) n_fft + (size_t) m] = std::sin(ang);
+        }
+    }
+
+    // 3. STFT → power spectrogram.  Lay out as (n_freq, n_frames) so the
+    //    subsequent mel projection is a contiguous strided gather.
+    std::vector<double> power((size_t) n_freq * (size_t) n_frames, 0.0);
+    std::vector<double> buf  ((size_t) n_fft, 0.0);
+    for (int32_t ti = 0; ti < n_frames; ++ti) {
+        const int32_t off = ti * hop;
+        for (int32_t m = 0; m < n_fft; ++m) {
+            buf[(size_t) m] = (double) padded[(size_t) (off + m)] * (double) window[(size_t) m];
+        }
+        for (int32_t k = 0; k < n_freq; ++k) {
+            double re = 0.0, im = 0.0;
+            const double * cos_row = &dft_cos[(size_t) k * (size_t) n_fft];
+            const double * sin_row = &dft_sin[(size_t) k * (size_t) n_fft];
+            for (int32_t m = 0; m < n_fft; ++m) {
+                re += buf[(size_t) m] * cos_row[(size_t) m];
+                im += buf[(size_t) m] * sin_row[(size_t) m];
+            }
+            power[(size_t) k * (size_t) n_frames + (size_t) ti] = re * re + im * im;
+        }
+    }
+
+    // 4. Mel projection.  mel_basis is row-major `(n_mels, n_freq)` — the
+    //    same layout librosa.filters.mel returns; each row is a mel
+    //    triangle weighted across frequency bins.  Result is laid out
+    //    (n_frames, n_mels) ready for the strided partial gather.
+    std::vector<float> mel_TM((size_t) n_frames * (size_t) n_mels, 0.0f);
+    for (int32_t ti = 0; ti < n_frames; ++ti) {
+        for (int32_t mi = 0; mi < n_mels; ++mi) {
+            double acc = 0.0;
+            const float * mb_row = &mel_basis[(size_t) mi * (size_t) n_freq];
+            for (int32_t k = 0; k < n_freq; ++k) {
+                acc += power[(size_t) k * (size_t) n_frames + (size_t) ti] *
+                       (double) mb_row[(size_t) k];
+            }
+            mel_TM[(size_t) ti * (size_t) n_mels + (size_t) mi] = (float) acc;
+        }
+    }
+
+    // 5. Compute frame_step + n_partials matching `get_num_wins`.
+    int32_t frame_step;
+    if (rate <= 0.0f) {
+        frame_step = (int32_t) std::lround((double) partial_frames * (1.0 - (double) overlap));
+    } else {
+        // sample_rate / rate / partial_frames → frame_step in MEL frames.
+        // The vendored formula uses hp.sample_rate (== 16000 for Chatterbox);
+        // the relation `(sample_rate / rate) / partial_frames` is intentional
+        // (it makes frame_step independent of the input audio length).
+        frame_step = (int32_t) std::lround((double) 16000.0 / (double) rate / (double) partial_frames);
+    }
+    if (frame_step <= 0 || frame_step > partial_frames) {
+        if (err != nullptr) *err = "invalid frame_step (rate / overlap out of range)";
+        return false;
+    }
+
+    int32_t n_wins;
+    int32_t remainder;
+    {
+        const int32_t numer = std::max(n_frames - partial_frames + frame_step, 0);
+        n_wins    = numer / frame_step;
+        remainder = numer % frame_step;
+    }
+    if (n_wins == 0 ||
+        ((double) (remainder + (partial_frames - frame_step)) / (double) partial_frames
+            >= (double) min_coverage)) {
+        n_wins += 1;
+    }
+    const int32_t target_n = partial_frames + frame_step * (n_wins - 1);
+
+    // 6. Trim or zero-pad the mel to `target_n` frames so it strides into
+    //    a whole number of `partial_frames`-length windows.
+    if (target_n > n_frames) {
+        mel_TM.resize((size_t) target_n * (size_t) n_mels, 0.0f);
+    } else if (target_n < n_frames) {
+        mel_TM.resize((size_t) target_n * (size_t) n_mels);
+    }
+
+    // 7. Strided gather into (n_wins, partial_frames, n_mels).
+    out_partials->assign((size_t) n_wins * (size_t) partial_frames * (size_t) n_mels, 0.0f);
+    for (int32_t p = 0; p < n_wins; ++p) {
+        const int32_t start = p * frame_step;
+        for (int32_t t = 0; t < partial_frames; ++t) {
+            std::memcpy(
+                out_partials->data() + ((size_t) p * (size_t) partial_frames +
+                                        (size_t) t) * (size_t) n_mels,
+                mel_TM.data() + (size_t) (start + t) * (size_t) n_mels,
+                (size_t) n_mels * sizeof(float));
+        }
+    }
+    *out_n_partials = n_wins;
+    (void) err;
+    return true;
 }
 
 void codec_runtime_slaney_mel_filterbank(
