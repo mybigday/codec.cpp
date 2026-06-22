@@ -20,4 +20,15 @@ enum codec_status chatterbox_speaker_encode(
     float emotion,
     float * out, int32_t out_n_elems);
 
+// Skip the mel + LSTM front-end; feed a pre-computed `speaker_emb`
+// (256-d, matching VoiceEncoder's projection output) straight into the
+// cond_enc graph.  Used by the public
+// `codec_lm_speaker_encode_from_embedding` entry.
+enum codec_status chatterbox_speaker_encode_from_emb(
+    codec_lm * lm,
+    const float * speaker_emb,
+    const int32_t * ref_speech_tokens, int32_t n_ref_speech_tokens,
+    float emotion,
+    float * out, int32_t out_n_elems);
+
 #endif

@@ -211,6 +211,9 @@ static bool codec_lm_populate_info(codec_lm * lm) {
         si.emotion_default         = codec_read_f32_kv (gf, "codec.speaker.emotion_default", 0.5f);
         si.n_rows                  = codec_read_i32_kv (gf, "codec.speaker.n_rows", 0);
         si.hidden_dim              = codec_read_i32_kv (gf, "codec.speaker.hidden_dim", hidden);
+        // VE / wav2vec / x-vector / … all expose a single intermediate
+        // dim; Chatterbox: 256.  Reused by `_from_embedding`.
+        si.speaker_emb_dim         = codec_read_i32_kv (gf, "codec.speaker.speaker_emb_dim", 0);
         if (si.n_rows <= 0 || si.hidden_dim <= 0) {
             lm->last_error =
                 "codec.speaker.has_encoder=true but n_rows / hidden_dim missing or non-positive";
@@ -660,5 +663,66 @@ enum codec_status codec_lm_speaker_encode(
             break;
     }
     lm->last_error = "codec_lm_speaker_encode: no impl for speaker_arch";
+    return CODEC_STATUS_NOT_SUPPORTED;
+}
+
+enum codec_status codec_lm_speaker_encode_from_embedding(
+        struct codec_lm *          lm,
+        const float *              speaker_emb,
+        int32_t                    speaker_emb_dim,
+        const int32_t *            ref_speech_tokens,
+        int32_t                    n_ref_speech_tokens,
+        const float *              emotion,
+        float *                    out,
+        int32_t                    out_n_elems) {
+    if (lm == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (!lm->has_speaker_encoder ||
+        lm->speaker_arch == codec_lm::CODEC_SPEAKER_ARCH_NONE) {
+        lm->last_error = "codec_lm_speaker_encode_from_embedding: no speaker section";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    if (lm->speaker_info.speaker_emb_dim <= 0) {
+        lm->last_error =
+            "codec_lm_speaker_encode_from_embedding: codec doesn't expose an "
+            "intermediate speaker embedding (info->speaker_emb_dim == 0)";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    if (out == nullptr || speaker_emb == nullptr) {
+        lm->last_error = "codec_lm_speaker_encode_from_embedding: NULL argument";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (speaker_emb_dim != lm->speaker_info.speaker_emb_dim) {
+        lm->last_error =
+            "codec_lm_speaker_encode_from_embedding: speaker_emb_dim mismatch";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const codec_lm_speaker_info & si = lm->speaker_info;
+    if (out_n_elems < si.n_rows * si.hidden_dim) {
+        lm->last_error =
+            "codec_lm_speaker_encode_from_embedding: out buffer too small";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (si.needs_ref_speech_tokens &&
+        (ref_speech_tokens == nullptr || n_ref_speech_tokens <= 0)) {
+        lm->last_error =
+            "codec_lm_speaker_encode_from_embedding: ref_speech_tokens required";
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const float emotion_val = (emotion != nullptr) ? *emotion : si.emotion_default;
+
+    switch (lm->speaker_arch) {
+        case codec_lm::CODEC_SPEAKER_ARCH_CHATTERBOX_VOICE_ENC:
+            return chatterbox_speaker_encode_from_emb(
+                lm, speaker_emb,
+                ref_speech_tokens, n_ref_speech_tokens,
+                emotion_val,
+                out, out_n_elems);
+        case codec_lm::CODEC_SPEAKER_ARCH_NONE:
+            break;
+    }
+    lm->last_error =
+        "codec_lm_speaker_encode_from_embedding: no impl for speaker_arch";
     return CODEC_STATUS_NOT_SUPPORTED;
 }

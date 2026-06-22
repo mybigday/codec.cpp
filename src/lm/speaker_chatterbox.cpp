@@ -642,10 +642,27 @@ enum codec_status chatterbox_speaker_encode(
     l2_normalize_rows(spk_emb_raw.data(), 1, impl->embed_size);
 
     // ---- 5. cond_enc + perceiver graph ----------------------------
+    return chatterbox_speaker_encode_from_emb(
+        lm, spk_emb_raw.data(),
+        ref_speech_tokens, n_ref_speech_tokens, emotion,
+        out, out_n_elems);
+}
+
+enum codec_status chatterbox_speaker_encode_from_emb(
+        codec_lm * lm,
+        const float * speaker_emb,
+        const int32_t * ref_speech_tokens, int32_t n_ref_speech_tokens,
+        float emotion,
+        float * out, int32_t out_n_elems) {
+    if (lm == nullptr || lm->speaker_impl == nullptr || speaker_emb == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    cbx_impl * impl = static_cast<cbx_impl *>(lm->speaker_impl);
     if (n_ref_speech_tokens <= 0) {
         lm->last_error = "chatterbox speaker_encode: ref_speech_tokens required";
         return CODEC_STATUS_INVALID_ARG;
     }
+    std::string err;
     if (impl->cond_ctx == nullptr) {
         codec_context * cctx = new (std::nothrow) codec_context();
         if (cctx == nullptr) return CODEC_STATUS_INTERNAL_ERROR;
@@ -685,7 +702,7 @@ enum codec_status chatterbox_speaker_encode(
         lm->last_error = "chatterbox speaker_encode: " + err;
         return CODEC_STATUS_INTERNAL_ERROR;
     }
-    if (!codec_runtime_write_tensor(t_spk, spk_emb_raw.data(),
+    if (!codec_runtime_write_tensor(t_spk, speaker_emb,
                                     (size_t) impl->speaker_embed_dim * sizeof(float), &err) ||
         !codec_runtime_write_tensor(t_tokens, ref_speech_tokens,
                                     (size_t) n_ref_speech_tokens * sizeof(int32_t), &err) ||

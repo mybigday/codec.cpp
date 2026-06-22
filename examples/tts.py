@@ -1234,33 +1234,22 @@ def _chatterbox_punc_norm(text: str) -> str:
 
 
 def _load_chatterbox_lm_tensors(gguf_path: Path) -> dict[str, np.ndarray]:
-    """Pull the `lm.*` tensors out of the bundled chatterbox.gguf into
-    a flat numpy-float32 dict ready for the AR loop.  Each tensor is
-    laid out the way gguf-python returns it (row-major PyTorch order),
-    so embedding tables can be indexed directly: `arr[token_id, :]`."""
+    """Pull the prompt-builder `lm.*` tensors out of chatterbox.gguf.
+
+    Only the tables the Python-side prompt assembler reads directly are
+    loaded — text_emb / text_pos_emb / speech_emb / speech_pos_emb plus
+    the speech head for AR-side sampling.  The cond_enc / perceiver
+    weights stay on the C side; the codec.cpp speaker encoder consumes
+    them via the `codec_lm_speaker_encode*` C API."""
     from gguf import GGUFReader
     r = GGUFReader(str(gguf_path))
 
     wanted = {
-        "lm.audio_embd_0.weight":                       "speech_emb",
-        "lm.heads_0.weight":                            "speech_head",
-        "lm.chatterbox.text_emb.weight":                "text_emb",
-        "lm.chatterbox.text_pos_emb.weight":            "text_pos_emb",
-        "lm.chatterbox.speech_pos_emb.weight":          "speech_pos_emb",
-        "lm.chatterbox.cond.spkr_enc.weight":           "spkr_enc_w",
-        "lm.chatterbox.cond.spkr_enc.bias":             "spkr_enc_b",
-        "lm.chatterbox.cond.emotion_adv_fc.weight":     "emotion_adv_w",
-        "lm.chatterbox.cond.perceiver.queries":         "perc_q",
-        "lm.chatterbox.cond.perceiver.norm.weight":     "perc_nw",
-        "lm.chatterbox.cond.perceiver.norm.bias":       "perc_nb",
-        "lm.chatterbox.cond.perceiver.to_q.weight":     "perc_qw",
-        "lm.chatterbox.cond.perceiver.to_q.bias":       "perc_qb",
-        "lm.chatterbox.cond.perceiver.to_k.weight":     "perc_kw",
-        "lm.chatterbox.cond.perceiver.to_k.bias":       "perc_kb",
-        "lm.chatterbox.cond.perceiver.to_v.weight":     "perc_vw",
-        "lm.chatterbox.cond.perceiver.to_v.bias":       "perc_vb",
-        "lm.chatterbox.cond.perceiver.proj_out.weight": "perc_pw",
-        "lm.chatterbox.cond.perceiver.proj_out.bias":   "perc_pb",
+        "lm.audio_embd_0.weight":              "speech_emb",
+        "lm.heads_0.weight":                   "speech_head",
+        "lm.chatterbox.text_emb.weight":       "text_emb",
+        "lm.chatterbox.text_pos_emb.weight":   "text_pos_emb",
+        "lm.chatterbox.speech_pos_emb.weight": "speech_pos_emb",
     }
     out: dict[str, np.ndarray] = {}
     for t in r.tensors:
@@ -1274,61 +1263,117 @@ def _load_chatterbox_lm_tensors(gguf_path: Path) -> dict[str, np.ndarray]:
     return out
 
 
-def _build_chatterbox_cond_emb(lm: dict, speaker_emb_np: np.ndarray,
-                                cond_speech_tokens_np: np.ndarray,
-                                emotion_adv_scalar: float) -> np.ndarray:
-    """Reconstruct T3CondEnc(t3_cond) → cond_emb of shape (34, 1024).
+def _build_chatterbox_cond_emb_via_c_api(
+        lm_handle, speaker_emb_np: np.ndarray | None,
+        ref_pcm_np: np.ndarray | None, ref_sr: int,
+        cond_speech_tokens_np: np.ndarray,
+        emotion_adv_scalar: float) -> np.ndarray:
+    """Compute Chatterbox's (34, 1024) cond_emb via the codec.cpp
+    `codec_lm_speaker_encode*` C API.
 
-    Layout: [spkr (1) | perceiver-resampled cond speech (32) | emotion (1)].
-    Uses the vendored Perceiver module under torch (instantiated with
-    the chatterbox.gguf weights) — the perceiver is a non-trivial
-    multi-head cross+self attention block that we don't want to
-    reimplement in numpy.
+    Two flows, picked by the inputs the caller has on hand:
+
+      * `ref_pcm_np` set (and `speaker_emb_np` None / unused) →
+        `codec_lm_speaker_encode(ref_pcm, ref_speech_tokens, emotion)`.
+        The C runtime resamples / runs VE / runs the cond_enc graph.
+
+      * `speaker_emb_np` set →
+        `codec_lm_speaker_encode_from_embedding(spk_emb, ref_speech_tokens,
+        emotion)`.  Skips VE.  Used for the conds.pt default-speaker path,
+        where the post-VE 256-d vector is already cached on disk.
     """
-    import torch
-    from chatterbox.models.t3.modules.perceiver import Perceiver
+    import ctypes as ct
+    sys.path.insert(0, str(REPO / "tests/e2e"))
+    from _codec_lm_ctypes import lib, codec_audio, CODEC_PCM_TYPE_F32
 
-    dim = lm["spkr_enc_w"].shape[0]  # 1024
-    spkr_w = torch.from_numpy(lm["spkr_enc_w"]).float()       # (1024, 256)
-    spkr_b = torch.from_numpy(lm["spkr_enc_b"]).float()       # (1024,)
-    speaker_emb_t = torch.from_numpy(speaker_emb_np).float().reshape(-1)
-    cond_spkr = (spkr_w @ speaker_emb_t) + spkr_b             # (1024,)
-    cond_spkr = cond_spkr.reshape(1, dim)                     # (1, 1024)
+    # ---- ABI bindings (idempotent — _codec_lm_ctypes pre-registers the rest) -
+    class SpeakerInfo(ct.Structure):
+        _fields_ = [
+            ("needs_ref_pcm",           ct.c_bool),
+            ("needs_ref_speech_tokens", ct.c_bool),
+            ("needs_emotion_scalar",    ct.c_bool),
+            ("ref_sample_rate",         ct.c_int32),
+            ("emotion_default",         ct.c_float),
+            ("n_rows",                  ct.c_int32),
+            ("hidden_dim",              ct.c_int32),
+            ("speaker_emb_dim",         ct.c_int32),
+        ]
+    lib.codec_lm_speaker_get_info.argtypes = [ct.c_void_p]
+    lib.codec_lm_speaker_get_info.restype  = ct.POINTER(SpeakerInfo)
+    lib.codec_lm_speaker_encode.argtypes = [
+        ct.c_void_p,
+        ct.POINTER(codec_audio),
+        ct.POINTER(ct.c_int32), ct.c_int32,
+        ct.POINTER(ct.c_float),
+        ct.POINTER(ct.c_float), ct.c_int32,
+    ]
+    lib.codec_lm_speaker_encode.restype = ct.c_int
+    lib.codec_lm_speaker_encode_from_embedding.argtypes = [
+        ct.c_void_p,
+        ct.POINTER(ct.c_float), ct.c_int32,
+        ct.POINTER(ct.c_int32), ct.c_int32,
+        ct.POINTER(ct.c_float),
+        ct.POINTER(ct.c_float), ct.c_int32,
+    ]
+    lib.codec_lm_speaker_encode_from_embedding.restype = ct.c_int
+    lib.codec_lm_get_last_error.argtypes = [ct.c_void_p]
+    lib.codec_lm_get_last_error.restype = ct.c_char_p
 
-    cond_speech_emb = torch.from_numpy(
-        lm["speech_emb"][cond_speech_tokens_np]).float()       # (T_spk, 1024)
-    T_spk = cond_speech_emb.shape[0]
-    cond_speech_emb = cond_speech_emb + torch.from_numpy(
-        lm["speech_pos_emb"][:T_spk]).float()                  # + pos emb
-    cond_speech_emb = cond_speech_emb.unsqueeze(0)             # (1, T_spk, dim)
+    info_ptr = lib.codec_lm_speaker_get_info(lm_handle)
+    if not info_ptr:
+        raise RuntimeError(
+            "chatterbox.gguf has no speaker section — re-run "
+            "scripts/convert-to-gguf.py with the voice_encoder bundle."
+        )
+    info = info_ptr.contents
+    out = (ct.c_float * (info.n_rows * info.hidden_dim))()
+    emo = ct.c_float(float(emotion_adv_scalar))
 
-    perc = Perceiver(pre_attention_query_token=32,
-                     pre_attention_query_size=dim,
-                     embedding_dim=dim, num_attn_heads=4).eval()
-    # Load perceiver weights from chatterbox.gguf into the torch module.
-    sd = {
-        "pre_attention_query":    torch.from_numpy(lm["perc_q"]).float(),
-        "attn.norm.weight":       torch.from_numpy(lm["perc_nw"]).float(),
-        "attn.norm.bias":         torch.from_numpy(lm["perc_nb"]).float(),
-        "attn.to_q.weight":       torch.from_numpy(lm["perc_qw"]).float(),
-        "attn.to_q.bias":         torch.from_numpy(lm["perc_qb"]).float(),
-        "attn.to_k.weight":       torch.from_numpy(lm["perc_kw"]).float(),
-        "attn.to_k.bias":         torch.from_numpy(lm["perc_kb"]).float(),
-        "attn.to_v.weight":       torch.from_numpy(lm["perc_vw"]).float(),
-        "attn.to_v.bias":         torch.from_numpy(lm["perc_vb"]).float(),
-        "attn.proj_out.weight":   torch.from_numpy(lm["perc_pw"]).float(),
-        "attn.proj_out.bias":     torch.from_numpy(lm["perc_pb"]).float(),
-    }
-    perc.load_state_dict(sd, strict=True)
-    with torch.inference_mode():
-        cond_speech_resampled = perc(cond_speech_emb)         # (1, 32, dim)
-    cond_speech_resampled = cond_speech_resampled.squeeze(0)  # (32, dim)
+    tokens = np.ascontiguousarray(cond_speech_tokens_np, dtype=np.int32)
+    tok_ptr = tokens.ctypes.data_as(ct.POINTER(ct.c_int32))
 
-    emotion_w = torch.from_numpy(lm["emotion_adv_w"]).float()  # (1024, 1)
-    emotion = (emotion_w.reshape(-1) * float(emotion_adv_scalar)).reshape(1, dim)
+    if ref_pcm_np is not None:
+        if ref_sr != info.ref_sample_rate:
+            import librosa
+            ref_pcm_np = librosa.resample(
+                ref_pcm_np.astype(np.float32, copy=False),
+                orig_sr=ref_sr, target_sr=info.ref_sample_rate,
+                res_type="kaiser_fast",
+            )
+        pcm = np.ascontiguousarray(ref_pcm_np, dtype=np.float32)
+        audio = codec_audio()
+        audio.data        = pcm.ctypes.data_as(ct.c_void_p)
+        audio.n_samples   = pcm.size
+        audio.sample_rate = info.ref_sample_rate
+        audio.n_channels  = 1
+        audio.pcm_type    = CODEC_PCM_TYPE_F32
+        rc = lib.codec_lm_speaker_encode(
+            lm_handle, ct.byref(audio), tok_ptr, tokens.size,
+            ct.byref(emo), out, info.n_rows * info.hidden_dim,
+        )
+    else:
+        if speaker_emb_np is None:
+            raise ValueError(
+                "Need either ref_pcm or a pre-computed speaker_emb."
+            )
+        spk = np.ascontiguousarray(speaker_emb_np, dtype=np.float32).reshape(-1)
+        if spk.size != info.speaker_emb_dim:
+            raise ValueError(
+                f"speaker_emb_dim mismatch: caller {spk.size}, model {info.speaker_emb_dim}"
+            )
+        spk_ptr = spk.ctypes.data_as(ct.POINTER(ct.c_float))
+        rc = lib.codec_lm_speaker_encode_from_embedding(
+            lm_handle, spk_ptr, spk.size,
+            tok_ptr, tokens.size,
+            ct.byref(emo), out, info.n_rows * info.hidden_dim,
+        )
 
-    cond_emb = torch.cat([cond_spkr, cond_speech_resampled, emotion], dim=0)
-    return cond_emb.numpy().astype(np.float32)                # (34, 1024)
+    if rc != 0:
+        err = lib.codec_lm_get_last_error(lm_handle) or b""
+        raise RuntimeError(f"codec_lm_speaker_encode rc={rc}: {err.decode()!r}")
+
+    return np.frombuffer(out, dtype=np.float32).reshape(
+        info.n_rows, info.hidden_dim).copy()
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -1416,22 +1461,76 @@ class ChatterboxSession(TTSSession):
         STOP_SPEECH_TOKEN  = 6562
 
         # ---- 1. Load `lm.*` tensors from bundled chatterbox.gguf ----
+        # The numpy-side tensor dict serves the prompt-builder
+        # (text_emb / text_pos_emb / speech_emb / speech_pos_emb at the
+        # start_speech_token).  The codec.cpp-side CodecLM serves
+        # `codec_lm_speaker_encode*` for the cond_emb prefix.
         print(f"[gguf] loading lm.* tensors from {ck/'chatterbox.gguf'} …",
               flush=True)
         lm = _load_chatterbox_lm_tensors(ck / "chatterbox.gguf")
+        from _codec_lm_ctypes import CodecLM
+        cpp_lm = CodecLM(ck / "chatterbox.gguf")
 
-        # ---- 2. Load default-speaker conds.pt ----
-        print(f"[cond] loading conditioning from {ck/'conds.pt'} …",
-              flush=True)
-        cond_blob = torch.load(ck / "conds.pt", map_location="cpu",
-                               weights_only=False)
-        t3c = cond_blob["t3"]
+        # ---- 2. Load conditioning ----
+        #
+        # Two flows, picked by `args.ref_audio`:
+        #
+        #   * --ref-audio set: user supplies a ref WAV.  We resample to
+        #     16 kHz, then need ref speech tokens for the same audio —
+        #     vendored S3Tokenizer reads `s3tokenizer.S3Tokenizer` and
+        #     produces them.  Both fed through the C API
+        #     `codec_lm_speaker_encode`, which runs VE + cond_enc.
+        #
+        #   * no --ref-audio: fall back to `conds.pt` (the default
+        #     speaker the model shipped with).  That pickle carries the
+        #     already-post-VE 256-d speaker_emb + the S3T tokens of the
+        #     reference clip the upstream baked.  Fed through the C API
+        #     `codec_lm_speaker_encode_from_embedding` (skips VE).
+        ref_audio_arg = getattr(args, "ref_audio", None)
+        if ref_audio_arg is not None:
+            import librosa as _lr
+            ref_path = Path(ref_audio_arg)
+            print(f"[cond] loading ref audio {ref_path} (voice clone) …",
+                  flush=True)
+            ref_pcm_np, ref_sr_native = _lr.load(str(ref_path), sr=None, mono=True)
+            ref_pcm_np = ref_pcm_np.astype(np.float32, copy=False)
+            ref_sr = int(ref_sr_native)
+            speaker_emb_np = None
+            # S3 speech tokens for the same ref audio — vendored S3Tokenizer.
+            from chatterbox.models.s3tokenizer import S3Tokenizer, S3_SR
+            tok_path = ck / "s3tokenizer.pt"
+            if not tok_path.is_file():
+                # The default Chatterbox ships S3T tokens inside conds.pt
+                # but no standalone tokenizer file.  Fall back to
+                # downloading via vendored module; raise clearly if that
+                # path is also unavailable.
+                raise FileNotFoundError(
+                    f"{tok_path} missing.  Voice clone needs an S3T "
+                    f"tokenizer .pt next to chatterbox.gguf.  See "
+                    f"docs/chatterbox_t3_plan.md."
+                )
+            s3t = S3Tokenizer("speech_tokenizer_v2_25hz")
+            s3t.load_state_dict(torch.load(str(tok_path), map_location="cpu"))
+            s3t.eval()
+            ref_at_s3 = _lr.resample(ref_pcm_np, orig_sr=ref_sr, target_sr=S3_SR,
+                                      res_type="kaiser_fast")
+            tokens, _len = s3t.forward([torch.from_numpy(ref_at_s3)],
+                                       max_len=int(S3_SR * 30))
+            cond_speech_tokens_np = tokens.squeeze(0).cpu().numpy().astype(np.int64)
+        else:
+            print(f"[cond] loading conditioning from {ck/'conds.pt'} …",
+                  flush=True)
+            cond_blob = torch.load(ck / "conds.pt", map_location="cpu",
+                                   weights_only=False)
+            t3c = cond_blob["t3"]
 
-        def _to_np(v):
-            return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
-        speaker_emb_np = _to_np(t3c["speaker_emb"]).astype(np.float32).reshape(-1)
-        cond_speech_tokens_np = _to_np(
-            t3c["cond_prompt_speech_tokens"]).astype(np.int64).reshape(-1)
+            def _to_np(v):
+                return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
+            speaker_emb_np = _to_np(t3c["speaker_emb"]).astype(np.float32).reshape(-1)
+            cond_speech_tokens_np = _to_np(
+                t3c["cond_prompt_speech_tokens"]).astype(np.int64).reshape(-1)
+            ref_pcm_np = None
+            ref_sr = 0
 
         exag = 0.5
         if (self.speaker_cfg is not None
@@ -1449,10 +1548,17 @@ class ChatterboxSession(TTSSession):
                             dtype=np.int64)
         T_text = int(text_ids.shape[0])
 
-        # ---- 4. Build cond prefix [spkr | perceiver(cond speech) | emotion] ----
-        print(f"[cond] building cond_emb (perceiver) …", flush=True)
-        cond_emb = _build_chatterbox_cond_emb(
-            lm, speaker_emb_np, cond_speech_tokens_np, exag)  # (34, 1024)
+        # ---- 4. Build cond prefix via the codec.cpp speaker encoder ----
+        # No more inline Python Perceiver — the C runtime owns this.
+        print(f"[cond] codec_lm_speaker_encode → cond_emb …", flush=True)
+        try:
+            cond_emb = _build_chatterbox_cond_emb_via_c_api(
+                cpp_lm.lm,           # codec.cpp codec_lm pointer
+                speaker_emb_np, ref_pcm_np, ref_sr,
+                cond_speech_tokens_np, exag,
+            )                                          # (34, 1024)
+        finally:
+            cpp_lm.close()
         len_cond = int(cond_emb.shape[0])
 
         # ---- 5. Build text rows: emb + learned pos_emb at 0..T_text-1 ----
@@ -1838,6 +1944,10 @@ def main() -> int:
                     help="speaker id (CSM accepts 0/1; ignored if not supported)")
     ap.add_argument("--speaker-config", type=Path, default=None,
                     help="JSON config with ref_audio + ref_text (voice-clone models)")
+    ap.add_argument("--ref-audio", type=Path, default=None,
+                    help="(Chatterbox only) ref WAV for voice clone — runs the "
+                         "codec.cpp VE + cond_enc through codec_lm_speaker_encode. "
+                         "When unset, falls back to the model's baked default speaker.")
     ap.add_argument("--max-frames", type=int, default=200)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-p", type=float, default=None)

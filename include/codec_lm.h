@@ -322,6 +322,15 @@ struct codec_lm_speaker_info {
     // into this field.
     int32_t n_rows;
     int32_t hidden_dim;
+
+    // Width of the intermediate speaker-embedding vector this codec's
+    // audio encoder produces.  Useful when the caller has a cached
+    // embedding from a prior call (or from a pickled file like
+    // Chatterbox's conds.pt) and wants to feed it back in via
+    // `codec_lm_speaker_encode_from_embedding`.  Zero when the codec
+    // doesn't expose a usable intermediate (i.e. when only the full
+    // ref_pcm-driven path is supported).
+    int32_t speaker_emb_dim;
 };
 
 // Returns NULL when no speaker section is present.  Lifetime = lifetime
@@ -347,6 +356,26 @@ enum codec_status codec_lm_speaker_encode(
     int32_t                    n_ref_speech_tokens,
     const float *              emotion,             // NULL = use default
     float *                    out,                 // [n_rows × hidden_dim]
+    int32_t                    out_n_elems);
+
+// Like `codec_lm_speaker_encode` but takes a pre-computed
+// `speaker_emb` directly (skipping the audio encoder front-end).
+// Useful when the caller has cached the embedding from a prior call
+// (Chatterbox's `conds.pt` pickles the post-VE 256-d vector this way)
+// or has computed it via an out-of-band path.
+//
+// `speaker_emb_dim` must match `info->speaker_emb_dim` exactly;
+// callers should query that field before calling.  Returns
+// CODEC_STATUS_NOT_SUPPORTED on codecs whose encoder doesn't expose a
+// usable intermediate (info->speaker_emb_dim == 0).
+enum codec_status codec_lm_speaker_encode_from_embedding(
+    struct codec_lm *          lm,
+    const float *              speaker_emb,
+    int32_t                    speaker_emb_dim,
+    const int32_t *            ref_speech_tokens,   // OPTIONAL per info
+    int32_t                    n_ref_speech_tokens,
+    const float *              emotion,             // NULL = use default
+    float *                    out,
     int32_t                    out_n_elems);
 
 #ifdef __cplusplus

@@ -715,6 +715,7 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         writer.add_bool   ("codec.speaker.needs_ref_speech_tokens", True)
         writer.add_bool   ("codec.speaker.needs_emotion_scalar", True)
         writer.add_uint32 ("codec.speaker.ref_sample_rate", VE_SAMPLE_RATE)
+        writer.add_uint32 ("codec.speaker.speaker_emb_dim", VE_SPEAKER_EMBED)
         writer.add_float32("codec.speaker.emotion_default", 0.5)
 
         # VE shape/op constants — runtime reads these to size graphs.
