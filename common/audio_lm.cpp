@@ -23,6 +23,13 @@ struct audio_lm_context {
     int32_t  hidden        = 0;
     bool     has_spk_enc   = false;
 
+    // Type A audio-token range.  `audio_tok_offset < 0` → disabled
+    // (every token surfaces as PASSTHROUGH).  Set from GGUF metadata
+    // at init; hosts override via `audio_lm_set_audio_token_range`.
+    int32_t  audio_tok_offset = -1;
+    int32_t  audio_tok_count  = 0;
+    int32_t  audio_tok_eos    = -1;
+
     // Per-sequence buffers (cleared on reset).
     //
     // `codes` is laid out (T, n_cb) interleaved: codes[t*n_cb + q] = code
@@ -77,6 +84,19 @@ static uint32_t read_modality_or_infer(audio_lm_context * ctx) {
             else if (std::strcmp(key, "codec.lm.modality.input_audio" ) == 0) { if (on) mask |= INPUT_AUDIO;  saw_explicit = true; }
             else if (std::strcmp(key, "codec.lm.modality.output_text" ) == 0) { if (on) mask |= OUTPUT_TEXT;  saw_explicit = true; }
             else if (std::strcmp(key, "codec.lm.modality.output_audio") == 0) { if (on) mask |= OUTPUT_AUDIO; saw_explicit = true; }
+        }
+    }
+
+    // Type A audio-token range — independent of modality but pulled
+    // from the same metadata scan to avoid a second pass.
+    if (meta != nullptr) {
+        for (size_t i = 0; i < meta->n_items; ++i) {
+            const char * key = meta->items[i].key;
+            const char * val = meta->items[i].value;
+            if (key == nullptr || val == nullptr) continue;
+            if      (std::strcmp(key, "codec.audio_token.offset") == 0) ctx->audio_tok_offset = std::atoi(val);
+            else if (std::strcmp(key, "codec.audio_token.count")  == 0) ctx->audio_tok_count  = std::atoi(val);
+            else if (std::strcmp(key, "codec.audio_token.eos_id") == 0) ctx->audio_tok_eos    = std::atoi(val);
         }
     }
 
@@ -334,15 +354,68 @@ bool audio_lm_build_prompt(audio_lm_context * ctx,
     return true;
 }
 
+// ─── Type A audio-token range config ────────────────────────────────
+
+void audio_lm_set_audio_token_range(audio_lm_context * ctx,
+                                     int32_t offset, int32_t count, int32_t eos_id) {
+    if (ctx == nullptr) return;
+    ctx->audio_tok_offset = offset;
+    ctx->audio_tok_count  = count;
+    ctx->audio_tok_eos    = eos_id;
+}
+
+void audio_lm_get_audio_token_range(const audio_lm_context * ctx,
+                                     int32_t * out_offset, int32_t * out_count,
+                                     int32_t * out_eos_id) {
+    if (out_offset) *out_offset = ctx ? ctx->audio_tok_offset : -1;
+    if (out_count ) *out_count  = ctx ? ctx->audio_tok_count  : 0;
+    if (out_eos_id) *out_eos_id = ctx ? ctx->audio_tok_eos    : -1;
+}
+
+// ─── Per-step observe ───────────────────────────────────────────────
+//
+// Type A path implemented (single-codebook contiguous audio range +
+// optional EOS sentinel).  Type B/C/D paths land in steps 4–5 and
+// will inspect the `last_hidden` argument; for now Type A ignores it.
+
 observe_action audio_lm_observe_token(
         audio_lm_context * ctx,
-        codec_common_token /*tok*/,
+        codec_common_token tok,
         const float *      /*last_hidden*/,
         int32_t            /*hidden_dim*/) {
-    if (ctx) ctx->last_error =
-        "audio_lm_observe_token: not yet implemented for this model "
-        "(reference impls land in roadmap steps 3–5)";
-    return OBSERVE_STOP;
+    if (ctx == nullptr) return OBSERVE_STOP;
+
+    // EOS sentinel — explicit end-of-audio token.  Checked BEFORE the
+    // audio range in case the converter put eos_id inside [offset,
+    // offset+count) (unusual but legal).
+    if (ctx->audio_tok_eos >= 0 && tok == ctx->audio_tok_eos) {
+        return OBSERVE_STOP;
+    }
+
+    // Type A audio-range detection.  Disabled when offset < 0.
+    if (ctx->audio_tok_offset >= 0 && ctx->audio_tok_count > 0 &&
+        tok >= ctx->audio_tok_offset &&
+        tok <  ctx->audio_tok_offset + ctx->audio_tok_count) {
+        const int32_t code = tok - ctx->audio_tok_offset;
+        // Append (single-cb frame).  Future multi-cb Type A variants
+        // (e.g. Orpheus-style delay over N codebooks) will need a more
+        // structured stride here; n_q==1 is the only shape we surface
+        // today.
+        const int32_t this_n_q = ctx->n_cb > 0 ? ctx->n_cb : 1;
+        if (this_n_q != 1) {
+            // Multi-cb Type A isn't part of step 3.  Fall through to
+            // PASSTHROUGH rather than silently corrupt the accumulator.
+            return OBSERVE_PASSTHROUGH;
+        }
+        if (ctx->n_cb == 0) ctx->n_cb = 1;
+        ctx->codes.push_back(code);
+        ctx->codes_n_frames += 1;
+        return OBSERVE_CONSUMED;
+    }
+
+    // Anything else — BOS, text token, special marker.  Caller renders
+    // it / handles it on the text path.
+    return OBSERVE_PASSTHROUGH;
 }
 
 const float * audio_lm_get_next_embed(const audio_lm_context * ctx,

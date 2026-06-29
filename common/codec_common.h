@@ -167,6 +167,40 @@ bool audio_lm_build_prompt(audio_lm_context * ctx,
                             audio_lm_prompt       * out);
 
 // ─────────────────────────────────────────────────────────────────────
+// Type A audio-token-range config
+//
+// Type A models (OuteTTS, Orpheus, …) encode their audio as ordinary
+// LM tokens sitting in a contiguous slice of the host vocabulary.
+// observe_token detects "this tok is an audio code" via:
+//
+//   `tok ∈ [offset, offset + count)`  → audio code, value = tok - offset
+//   `tok == eos_id` (when ≥ 0)         → end of audio (OBSERVE_STOP)
+//   otherwise                          → text (OBSERVE_PASSTHROUGH)
+//
+// The values are read at init from GGUF metadata:
+//
+//   codec.audio_token.offset  (uint32)   — first audio-token ID
+//   codec.audio_token.count   (uint32)   — number of audio tokens
+//   codec.audio_token.eos_id  (int32)    — end-of-audio sentinel (-1 = none)
+//
+// Hosts that need to override (test rigs, models without the keys
+// baked) can call `audio_lm_set_audio_token_range` after init.
+// `offset < 0` disables Type A dispatch entirely (every token returns
+// OBSERVE_PASSTHROUGH).
+// ─────────────────────────────────────────────────────────────────────
+void audio_lm_set_audio_token_range(
+        audio_lm_context * ctx,
+        int32_t            offset,
+        int32_t            count,
+        int32_t            eos_id);
+
+void audio_lm_get_audio_token_range(
+        const audio_lm_context * ctx,
+        int32_t * out_offset,
+        int32_t * out_count,
+        int32_t * out_eos_id);
+
+// ─────────────────────────────────────────────────────────────────────
 // Per-step observe (called by host after each backbone token sample)
 //
 // `last_hidden` is the backbone's hidden state at the just-sampled

@@ -39,7 +39,17 @@ void print_usage(const char * prog) {
         "  info       --model PATH\n"
         "  decode     --model PATH --codes PATH.npy --output PATH.wav [--n-threads N]\n"
         "  synthesize --model PATH --text STRING --output PATH.wav\n"
-        "             [--ref-audio PATH.wav] [--emotion FLOAT] [--n-threads N]\n",
+        "             [--ref-audio PATH.wav] [--emotion FLOAT] [--n-threads N]\n"
+        "  trace      --model PATH --tokens \"id1,id2,...\"\n"
+        "             [--audio-offset N --audio-count K [--audio-eos M]]\n"
+        "             dispatch the given token stream through observe_token;\n"
+        "             prints one verdict per token.  When --audio-offset is\n"
+        "             omitted the model's GGUF metadata determines the range.\n"
+        "  simulate-typeA --model PATH --codes PATH.npy --output PATH.wav\n"
+        "             treat each code as `code + 10000` and dispatch through\n"
+        "             observe_token (Type A path) → decode_audio.  Validates\n"
+        "             the observe→decode data flow end-to-end without needing\n"
+        "             a real Type A LM checkpoint.\n",
         prog);
 }
 
@@ -82,6 +92,13 @@ struct args {
     std::optional<float> emotion;
     int32_t n_threads = 0;
     bool    use_gpu   = false;
+
+    // trace / simulate-typeA
+    std::string tokens_csv;
+    int32_t     audio_offset = -1;
+    int32_t     audio_count  = 0;
+    int32_t     audio_eos    = -1;
+    bool        audio_offset_set = false;
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -104,6 +121,10 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--emotion"){ const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->emotion = f; i++; }
         else if (a == "--n-threads"){ const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
         else if (a == "--gpu") { out->use_gpu = true; }
+        else if (a == "--tokens"){ const char * v = need(); if (!v) return false; out->tokens_csv = v; i++; }
+        else if (a == "--audio-offset"){ const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_offset)) return false; out->audio_offset_set = true; i++; }
+        else if (a == "--audio-count") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_count))  return false; i++; }
+        else if (a == "--audio-eos")   { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_eos))    return false; i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -269,15 +290,159 @@ int cmd_synthesize(const args & a) {
     return 0;
 }
 
+// ─── Subcommand: trace ───────────────────────────────────────────
+// Dispatch a comma-separated token stream through observe_token and
+// print one verdict line per token.  Used to hand-validate the Type A
+// classification logic with model-side metadata or manual overrides.
+int cmd_trace(const args & a) {
+    if (a.tokens_csv.empty()) {
+        std::fprintf(stderr, "trace requires --tokens \"id1,id2,...\"\n");
+        return 1;
+    }
+    codec_common::audio_lm_params p;
+    p.codec_path = a.model;
+    p.use_gpu    = a.use_gpu;
+    p.n_threads  = a.n_threads;
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    if (a.audio_offset_set) {
+        codec_common::audio_lm_set_audio_token_range(
+            ctx, a.audio_offset, a.audio_count, a.audio_eos);
+    }
+    int32_t off=0, cnt=0, eos=0;
+    codec_common::audio_lm_get_audio_token_range(ctx, &off, &cnt, &eos);
+    std::printf("audio_token: offset=%d count=%d eos_id=%d\n", off, cnt, eos);
+
+    // Parse the CSV stream.
+    std::vector<int32_t> toks;
+    {
+        const std::string & s = a.tokens_csv;
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos) j = s.size();
+            if (j > i) {
+                try { toks.push_back(std::stoi(s.substr(i, j - i))); }
+                catch (...) { std::fprintf(stderr, "skipped malformed token: %s\n", s.substr(i, j-i).c_str()); }
+            }
+            i = j + 1;
+        }
+    }
+
+    auto name_of = [](codec_common::observe_action a) {
+        switch (a) {
+            case codec_common::OBSERVE_PASSTHROUGH:    return "PASSTHROUGH";
+            case codec_common::OBSERVE_CONSUMED:       return "CONSUMED";
+            case codec_common::OBSERVE_CONSUMED_EMBED: return "CONSUMED_EMBED";
+            case codec_common::OBSERVE_STOP:           return "STOP";
+        }
+        return "?";
+    };
+
+    for (int32_t tok : toks) {
+        auto act = codec_common::audio_lm_observe_token(ctx, tok, nullptr, 0);
+        std::printf("  tok=%-6d → %s\n", tok, name_of(act));
+        if (act == codec_common::OBSERVE_STOP) break;
+    }
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
+// ─── Subcommand: simulate-typeA ──────────────────────────────────
+// Take a real codes .npy (must be n_q=1; treat each value as
+// `code + 10000` so it looks like a Type A LM-vocab token), dispatch
+// each through observe_token, then call decode_audio.  Validates the
+// observe → accumulator → decode_audio data flow end-to-end without
+// needing a real Type A LM checkpoint.
+int cmd_simulate_typeA(const args & a) {
+    if (a.codes.empty() || a.output.empty()) {
+        std::fprintf(stderr, "simulate-typeA requires --codes and --output\n");
+        return 1;
+    }
+    codec_common::audio_lm_params p;
+    p.codec_path = a.model;
+    p.use_gpu    = a.use_gpu;
+    p.n_threads  = a.n_threads;
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    std::vector<int32_t> npy_codes;
+    int32_t n_frames = 0, n_q = 0;
+    std::string npy_err;
+    if (!codec_example_load_npy_i32_2d_tq(a.codes.c_str(), &npy_codes, &n_q, &n_frames, &npy_err)) {
+        std::fprintf(stderr, "failed to load %s: %s\n", a.codes.c_str(), npy_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 3;
+    }
+    if (n_q != 1) {
+        std::fprintf(stderr, "simulate-typeA expects n_q=1 codes, got n_q=%d\n", n_q);
+        codec_common::audio_lm_free(ctx);
+        return 4;
+    }
+
+    const int32_t OFFSET = 10000;
+    const int32_t COUNT  = 65536;   // larger than any reasonable codebook
+    const int32_t EOS    = 99999;
+    codec_common::audio_lm_set_audio_token_range(ctx, OFFSET, COUNT, EOS);
+
+    int32_t n_consumed = 0;
+    for (int32_t i = 0; i < n_frames; ++i) {
+        const int32_t fake_tok = OFFSET + npy_codes[(size_t) i];
+        auto act = codec_common::audio_lm_observe_token(ctx, fake_tok, nullptr, 0);
+        if (act != codec_common::OBSERVE_CONSUMED) {
+            std::fprintf(stderr,
+                "simulate-typeA: expected CONSUMED, got action=%d at frame %d (tok=%d)\n",
+                (int) act, i, fake_tok);
+            codec_common::audio_lm_free(ctx);
+            return 5;
+        }
+        n_consumed++;
+    }
+    auto eos_act = codec_common::audio_lm_observe_token(ctx, EOS, nullptr, 0);
+    if (eos_act != codec_common::OBSERVE_STOP) {
+        std::fprintf(stderr, "simulate-typeA: expected STOP on EOS, got %d\n", (int) eos_act);
+        codec_common::audio_lm_free(ctx);
+        return 6;
+    }
+    std::printf("simulate-typeA: %d tokens CONSUMED + STOP on EOS\n", n_consumed);
+
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "decode_audio failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 7;
+    }
+
+    std::string wav_err;
+    if (!codec_example_write_wav_pcm16(
+            a.output.c_str(), pcm.pcm.data(),
+            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+            pcm.sample_rate, &wav_err, pcm.n_channels)) {
+        std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 8;
+    }
+    std::printf("wrote %s: %zu samples @ %d Hz\n",
+                a.output.c_str(), pcm.pcm.size() / (size_t) pcm.n_channels, pcm.sample_rate);
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
 
-    if (a.sub == "info")       return cmd_info(a);
-    if (a.sub == "decode")     return cmd_decode(a);
-    if (a.sub == "synthesize") return cmd_synthesize(a);
+    if (a.sub == "info")           return cmd_info(a);
+    if (a.sub == "decode")         return cmd_decode(a);
+    if (a.sub == "synthesize")     return cmd_synthesize(a);
+    if (a.sub == "trace")          return cmd_trace(a);
+    if (a.sub == "simulate-typeA") return cmd_simulate_typeA(a);
 
     std::fprintf(stderr, "unknown subcommand: %s\n", a.sub.c_str());
     print_usage(argv[0]);
