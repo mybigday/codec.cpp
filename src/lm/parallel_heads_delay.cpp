@@ -47,6 +47,16 @@ struct phd_impl {
     std::vector<ggml_tensor *> heads;       // [n_codebook]
     std::vector<ggml_tensor *> audio_embds; // [n_codebook]
 
+    // Optional learned per-step positional embedding.  Chatterbox T3
+    // stores `lm.chatterbox.speech_pos_emb.weight` of shape
+    // (hidden, max_speech_tokens) — added on top of the audio embed
+    // for the next backbone input (Type B / embed-override).  Loaded
+    // opportunistically at init; absent for plain TTS variants.
+    ggml_tensor *      pos_emb     = nullptr;
+    int32_t            pos_emb_dim = 0;   // hidden_dim of pos table
+    int32_t            pos_emb_max = 0;   // max position
+    std::vector<float> pos_emb_f32;       // lazy-dequanted full table; cached on first use
+
     // Lazily-allocated codec_context for compose_audio_embd graphs;
     // owned, freed by free_lm.  Independent of any codec_lm_state's
     // ctx so concurrent step_begin / compose calls don't fight over
@@ -210,6 +220,25 @@ bool init(codec_lm * lm) {
             return false;
         }
     }
+
+    // Optional Chatterbox-style learned position embedding.  Used by
+    // codec_lm_compose_next_embd for the next backbone-input embed
+    // (`speech_emb[code] + speech_pos_emb[step]`).  Absent for plain TTS
+    // variants — compose_next_embd then degrades to compose_audio_embd.
+    impl->pos_emb = ggml_get_tensor(lm->codec->weights, "lm.chatterbox.speech_pos_emb.weight");
+    if (impl->pos_emb != nullptr) {
+        // ne[0] = hidden, ne[1] = max_pos (PyTorch nn.Embedding saved
+        // row-major (V, H) lands in ggml as ne[0]=H, ne[1]=V).
+        impl->pos_emb_dim = (int32_t) impl->pos_emb->ne[0];
+        impl->pos_emb_max = (int32_t) impl->pos_emb->ne[1];
+        if (impl->pos_emb_dim != impl->audio_embed_dim) {
+            // Mismatched dim — bail out of the optional pos path.
+            impl->pos_emb     = nullptr;
+            impl->pos_emb_dim = 0;
+            impl->pos_emb_max = 0;
+        }
+    }
+
     lm->impl = impl;
     return true;
 }
@@ -502,6 +531,53 @@ enum codec_status compose_audio_embd(codec_lm * lm, const int32_t * codes, float
     return CODEC_STATUS_SUCCESS;
 }
 
+enum codec_status compose_next_embd(codec_lm * lm, const int32_t * codes,
+                                     int32_t step, float * out_embd) {
+    if (lm == nullptr || lm->impl == nullptr || codes == nullptr || out_embd == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    // Base audio embed first — same compose graph used for the normal
+    // depth-decoder / no-pos paths.
+    const enum codec_status rc = compose_audio_embd(lm, codes, out_embd);
+    if (rc != CODEC_STATUS_SUCCESS) {
+        return rc;
+    }
+
+    phd_impl * impl = static_cast<phd_impl *>(lm->impl);
+    if (impl->pos_emb == nullptr || step < 0 || step >= impl->pos_emb_max) {
+        // No learned pos table (plain TTS), or step out of range — just
+        // return the audio embed.  Out-of-range with a table loaded is a
+        // soft fail: caller's sequence overshot max_speech_tokens.  We
+        // log via last_error so the host can surface it without crashing.
+        if (impl->pos_emb != nullptr && step >= impl->pos_emb_max) {
+            lm->last_error = "compose_next_embd: step >= max_speech_tokens — pos emb skipped";
+        }
+        return CODEC_STATUS_SUCCESS;
+    }
+
+    // Lazy-dequant the entire pos table once.  ~4100 × 1024 floats =
+    // 16 MB; one-time hit per lm.
+    if (impl->pos_emb_f32.empty()) {
+        if (!codec_tensor_as_vec_f32(impl->pos_emb, &impl->pos_emb_f32)) {
+            lm->last_error = "compose_next_embd: failed to dequant speech_pos_emb";
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        const size_t expect = (size_t) impl->pos_emb_dim * (size_t) impl->pos_emb_max;
+        if (impl->pos_emb_f32.size() != expect) {
+            lm->last_error = "compose_next_embd: pos table size mismatch";
+            impl->pos_emb_f32.clear();
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    const float * row = impl->pos_emb_f32.data() + (size_t) step * (size_t) impl->pos_emb_dim;
+    for (int32_t i = 0; i < impl->pos_emb_dim; ++i) {
+        out_embd[i] += row[i];
+    }
+    return CODEC_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 const codec_lm_kind_vtable codec_lm_vtable_parallel_heads_delay = {
@@ -519,5 +595,6 @@ const codec_lm_kind_vtable codec_lm_vtable_parallel_heads_delay = {
     /*.step_finish        =*/ step_finish,
     /*.audio_embd         =*/ audio_embd,
     /*.compose_audio_embd =*/ compose_audio_embd,
+    /*.compose_next_embd  =*/ compose_next_embd,
     /*.speaker_encode     =*/ nullptr,
 };

@@ -1641,5 +1641,8 @@ const codec_lm_kind_vtable codec_lm_vtable_residual_depth_ar = {
     /*.step_finish        =*/ step_finish,
     /*.audio_embd         =*/ audio_embd,
     /*.compose_audio_embd =*/ compose_audio_embd,
+    /*.compose_next_embd  =*/ nullptr,   // CSM has no learned per-step pos emb;
+                                         // public function falls back to
+                                         // compose_audio_embd and ignores step.
     /*.speaker_encode     =*/ nullptr,
 };

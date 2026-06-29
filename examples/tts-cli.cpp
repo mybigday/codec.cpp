@@ -22,6 +22,7 @@
 #include "utils/wav_io.h"
 #include "utils/npy_io.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,7 +50,14 @@ void print_usage(const char * prog) {
         "             treat each code as `code + 10000` and dispatch through\n"
         "             observe_token (Type A path) → decode_audio.  Validates\n"
         "             the observe→decode data flow end-to-end without needing\n"
-        "             a real Type A LM checkpoint.\n",
+        "             a real Type A LM checkpoint.\n"
+        "  simulate-typeB --model PATH --codes PATH.npy --output PATH.wav\n"
+        "             [--start-step N]\n"
+        "             same as simulate-typeA but with the Type B embed-override\n"
+        "             flag set.  Each consume should return CONSUMED_EMBED and\n"
+        "             populate get_next_embed with `audio_embd[code] +\n"
+        "             pos_embd[step]`.  Used with chatterbox.gguf to verify the\n"
+        "             compose_next_embd path.\n",
         prog);
 }
 
@@ -93,12 +101,14 @@ struct args {
     int32_t n_threads = 0;
     bool    use_gpu   = false;
 
-    // trace / simulate-typeA
+    // trace / simulate-typeA / simulate-typeB
     std::string tokens_csv;
     int32_t     audio_offset = -1;
     int32_t     audio_count  = 0;
     int32_t     audio_eos    = -1;
     bool        audio_offset_set = false;
+    int32_t     start_step   = 1;   // Type B AR-step start
+    bool        probe_first  = false;
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -125,6 +135,8 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--audio-offset"){ const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_offset)) return false; out->audio_offset_set = true; i++; }
         else if (a == "--audio-count") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_count))  return false; i++; }
         else if (a == "--audio-eos")   { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_eos))    return false; i++; }
+        else if (a == "--start-step")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->start_step))   return false; i++; }
+        else if (a == "--probe-first") { out->probe_first = true; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -432,6 +444,136 @@ int cmd_simulate_typeA(const args & a) {
     return 0;
 }
 
+// ─── Subcommand: simulate-typeB ──────────────────────────────────
+// Like simulate-typeA but with the embed-override flag set: every
+// consumed token should return CONSUMED_EMBED with `get_next_embed`
+// populated by `audio_embd[code] + pos_embd[step]`.  Exercises the
+// codec_lm_compose_next_embd code path end-to-end.  The same
+// accumulator still backs decode_audio so we also get a WAV out at
+// the end (matches a direct codec_decode of the input codes).
+int cmd_simulate_typeB(const args & a) {
+    if (a.codes.empty() || a.output.empty()) {
+        std::fprintf(stderr, "simulate-typeB requires --codes and --output\n");
+        return 1;
+    }
+    codec_common::audio_lm_params p;
+    p.codec_path = a.model;
+    p.use_gpu    = a.use_gpu;
+    p.n_threads  = a.n_threads;
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    if (codec_common::audio_lm_n_codebook(ctx) != 1) {
+        std::fprintf(stderr,
+            "simulate-typeB expects a single-codebook model (n_q=1), got %d\n",
+            codec_common::audio_lm_n_codebook(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 2;
+    }
+    const int32_t hidden = codec_common::audio_lm_hidden_dim(ctx);
+    if (hidden <= 0) {
+        std::fprintf(stderr, "simulate-typeB: model reports hidden_dim=0\n");
+        codec_common::audio_lm_free(ctx);
+        return 2;
+    }
+
+    std::vector<int32_t> npy_codes;
+    int32_t n_frames = 0, n_q = 0;
+    std::string npy_err;
+    if (!codec_example_load_npy_i32_2d_tq(a.codes.c_str(), &npy_codes, &n_q, &n_frames, &npy_err)) {
+        std::fprintf(stderr, "failed to load %s: %s\n", a.codes.c_str(), npy_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 3;
+    }
+    if (n_q != 1) {
+        std::fprintf(stderr, "simulate-typeB expects n_q=1 codes, got n_q=%d\n", n_q);
+        codec_common::audio_lm_free(ctx);
+        return 4;
+    }
+
+    // Use a synthetic audio range that wraps the model's actual codebook.
+    // For chatterbox.gguf this would naturally be offset=0, count=6561,
+    // eos_id=6562 — but we keep the same `code + 10000` convention as
+    // simulate-typeA so the test runs without any model-specific knowledge.
+    const int32_t OFFSET = 10000;
+    const int32_t COUNT  = 65536;
+    const int32_t EOS    = 99999;
+    codec_common::audio_lm_set_audio_token_range(ctx, OFFSET, COUNT, EOS);
+    codec_common::audio_lm_set_uses_embed_override(ctx, true, a.start_step);
+
+    int32_t n_consumed_embed = 0;
+    float last_embed_l2 = 0.0f;
+    for (int32_t i = 0; i < n_frames; ++i) {
+        const int32_t fake_tok = OFFSET + npy_codes[(size_t) i];
+        auto act = codec_common::audio_lm_observe_token(ctx, fake_tok, nullptr, 0);
+        if (act != codec_common::OBSERVE_CONSUMED_EMBED) {
+            std::fprintf(stderr,
+                "simulate-typeB: expected CONSUMED_EMBED, got action=%d at frame %d (tok=%d): %s\n",
+                (int) act, i, fake_tok,
+                codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 5;
+        }
+        int32_t dim = 0;
+        const float * eb = codec_common::audio_lm_get_next_embed(ctx, &dim);
+        if (eb == nullptr || dim != hidden) {
+            std::fprintf(stderr,
+                "simulate-typeB: get_next_embed empty/wrong dim (dim=%d, hidden=%d) at frame %d\n",
+                dim, hidden, i);
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+        if (i == n_frames - 1) {
+            double sq = 0.0;
+            for (int32_t k = 0; k < dim; ++k) sq += (double) eb[k] * (double) eb[k];
+            last_embed_l2 = (float) std::sqrt(sq);
+        }
+        if (i == 0 && a.probe_first) {
+            // Dump enough state for an external script to verify the
+            // composition.  Code value + step value pin which table rows
+            // were summed; the first 8 floats + L2 are the comparison
+            // points.
+            std::printf("probe-first: code=%d step=%d ||v||=", npy_codes[0], a.start_step);
+            double sq = 0.0;
+            for (int32_t k = 0; k < dim; ++k) sq += (double) eb[k] * (double) eb[k];
+            std::printf("%.6f  v[:8]=", std::sqrt(sq));
+            for (int32_t k = 0; k < 8 && k < dim; ++k) std::printf(" %.6f", eb[k]);
+            std::printf("\n");
+        }
+        n_consumed_embed++;
+    }
+    auto eos_act = codec_common::audio_lm_observe_token(ctx, EOS, nullptr, 0);
+    if (eos_act != codec_common::OBSERVE_STOP) {
+        std::fprintf(stderr, "simulate-typeB: expected STOP on EOS, got %d\n", (int) eos_act);
+        codec_common::audio_lm_free(ctx);
+        return 7;
+    }
+    std::printf("simulate-typeB: %d tokens CONSUMED_EMBED + STOP on EOS (hidden=%d, last embed ||v||=%.4f, end step=%d)\n",
+                n_consumed_embed, hidden, last_embed_l2, a.start_step + n_consumed_embed);
+
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "decode_audio failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 8;
+    }
+    std::string wav_err;
+    if (!codec_example_write_wav_pcm16(
+            a.output.c_str(), pcm.pcm.data(),
+            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+            pcm.sample_rate, &wav_err, pcm.n_channels)) {
+        std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 9;
+    }
+    std::printf("wrote %s: %zu samples @ %d Hz\n",
+                a.output.c_str(), pcm.pcm.size() / (size_t) pcm.n_channels, pcm.sample_rate);
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -443,6 +585,7 @@ int main(int argc, char ** argv) {
     if (a.sub == "synthesize")     return cmd_synthesize(a);
     if (a.sub == "trace")          return cmd_trace(a);
     if (a.sub == "simulate-typeA") return cmd_simulate_typeA(a);
+    if (a.sub == "simulate-typeB") return cmd_simulate_typeB(a);
 
     std::fprintf(stderr, "unknown subcommand: %s\n", a.sub.c_str());
     print_usage(argv[0]);

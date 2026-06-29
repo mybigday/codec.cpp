@@ -111,6 +111,12 @@ struct codec_lm_kind_vtable {
     const float *     (*audio_embd)(codec_lm * lm, int32_t cb_idx, int32_t code);
     enum codec_status (*compose_audio_embd)(codec_lm * lm, const int32_t * codes, float * out_embd);
 
+    // Like compose_audio_embd but adds a learned per-step positional
+    // embedding when the kind has one (Chatterbox T3's `speech_pos_emb`).
+    // Leave NULL for kinds without per-step pos emb — the public function
+    // then falls back to compose_audio_embd, ignoring `step`.
+    enum codec_status (*compose_next_embd)(codec_lm * lm, const int32_t * codes, int32_t step, float * out_embd);
+
     // Speaker-conditioning encoder.  Optional per arch — leave NULL when
     // the model has no speaker section (most kinds: parallel_heads_delay
     // for plain TTS, residual_depth_ar for CSM, etc.).  When non-NULL,

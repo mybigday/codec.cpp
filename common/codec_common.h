@@ -201,6 +201,29 @@ void audio_lm_get_audio_token_range(
         int32_t * out_eos_id);
 
 // ─────────────────────────────────────────────────────────────────────
+// Type B embed-override flag
+//
+// When `true`, observe_token treats audio-range tokens as Type B
+// (Chatterbox-style): in addition to accumulating the code, it composes
+// the next backbone-input embedding (`speech_emb[code] + speech_pos_emb
+// [step]`) into the context's internal buffer and returns
+// OBSERVE_CONSUMED_EMBED so the host knows to switch to its
+// `inputs_embeds` decode path for the next step.  When `false` (the
+// default), the same audio-range tokens dispatch as Type A and the host
+// keeps using the standard token-id decode path.
+//
+// The step counter is internal: it starts at `start_step` on reset and
+// increments by 1 each time a Type B audio token is consumed.  Pass the
+// initial position (Chatterbox starts at 1 because pos 0 is the
+// start_speech_token's slot in the prefill).
+// ─────────────────────────────────────────────────────────────────────
+void audio_lm_set_uses_embed_override(audio_lm_context * ctx,
+                                       bool    enabled,
+                                       int32_t start_step);
+
+bool audio_lm_get_uses_embed_override(const audio_lm_context * ctx);
+
+// ─────────────────────────────────────────────────────────────────────
 // Per-step observe (called by host after each backbone token sample)
 //
 // `last_hidden` is the backbone's hidden state at the just-sampled

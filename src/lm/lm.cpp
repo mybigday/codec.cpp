@@ -464,6 +464,29 @@ enum codec_status codec_lm_compose_audio_embd(
     return lm->vtable->compose_audio_embd(lm, codes, out_embd);
 }
 
+enum codec_status codec_lm_compose_next_embd(
+    struct codec_lm * lm,
+    const int32_t * codes,
+    int32_t step,
+    float * out_embd) {
+    if (lm == nullptr || codes == nullptr || out_embd == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (lm->vtable == nullptr) {
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    // Prefer the kind-specific impl (pos-aware).  Fall back to plain
+    // compose_audio_embd when the kind doesn't have a per-step pos emb
+    // — step is then ignored, matching the documented contract.
+    if (lm->vtable->compose_next_embd != nullptr) {
+        return lm->vtable->compose_next_embd(lm, codes, step, out_embd);
+    }
+    if (lm->vtable->compose_audio_embd != nullptr) {
+        return lm->vtable->compose_audio_embd(lm, codes, out_embd);
+    }
+    return CODEC_STATUS_NOT_SUPPORTED;
+}
+
 // ---------------------------------------------------------------------
 // step machine — delegate to vtable, with a thin layer of state-machine
 // invariant checking so kind impls don't have to repeat it.

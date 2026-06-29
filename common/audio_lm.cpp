@@ -30,6 +30,15 @@ struct audio_lm_context {
     int32_t  audio_tok_count  = 0;
     int32_t  audio_tok_eos    = -1;
 
+    // Type B embed-override toggle.  When true, observe_token composes
+    // the next backbone-input embed via `codec_lm_compose_next_embd`
+    // and returns OBSERVE_CONSUMED_EMBED.  `ar_step` is the position
+    // counter passed to compose_next_embd (incremented on each consume);
+    // `ar_step_start` is the value `reset()` restores it to.
+    bool    uses_embed_override = false;
+    int32_t ar_step             = 1;
+    int32_t ar_step_start       = 1;
+
     // Per-sequence buffers (cleared on reset).
     //
     // `codes` is laid out (T, n_cb) interleaved: codes[t*n_cb + q] = code
@@ -185,6 +194,7 @@ void audio_lm_reset(audio_lm_context * ctx) {
     ctx->codes_n_frames = 0;
     ctx->next_embed_buf.clear();
     ctx->next_embed_dim = 0;
+    ctx->ar_step = ctx->ar_step_start;
     if (ctx->state) codec_lm_state_reset(ctx->state);
     ctx->last_error.clear();
 }
@@ -372,6 +382,20 @@ void audio_lm_get_audio_token_range(const audio_lm_context * ctx,
     if (out_eos_id) *out_eos_id = ctx ? ctx->audio_tok_eos    : -1;
 }
 
+// ─── Type B embed-override config ───────────────────────────────────
+
+void audio_lm_set_uses_embed_override(audio_lm_context * ctx,
+                                       bool enabled, int32_t start_step) {
+    if (ctx == nullptr) return;
+    ctx->uses_embed_override = enabled;
+    ctx->ar_step_start       = start_step;
+    ctx->ar_step             = start_step;
+}
+
+bool audio_lm_get_uses_embed_override(const audio_lm_context * ctx) {
+    return ctx ? ctx->uses_embed_override : false;
+}
+
 // ─── Per-step observe ───────────────────────────────────────────────
 //
 // Type A path implemented (single-codebook contiguous audio range +
@@ -392,7 +416,7 @@ observe_action audio_lm_observe_token(
         return OBSERVE_STOP;
     }
 
-    // Type A audio-range detection.  Disabled when offset < 0.
+    // Type A/B audio-range detection.  Disabled when offset < 0.
     if (ctx->audio_tok_offset >= 0 && ctx->audio_tok_count > 0 &&
         tok >= ctx->audio_tok_offset &&
         tok <  ctx->audio_tok_offset + ctx->audio_tok_count) {
@@ -403,13 +427,37 @@ observe_action audio_lm_observe_token(
         // today.
         const int32_t this_n_q = ctx->n_cb > 0 ? ctx->n_cb : 1;
         if (this_n_q != 1) {
-            // Multi-cb Type A isn't part of step 3.  Fall through to
+            // Multi-cb Type A/B isn't part of step 3/4.  Fall through to
             // PASSTHROUGH rather than silently corrupt the accumulator.
             return OBSERVE_PASSTHROUGH;
         }
         if (ctx->n_cb == 0) ctx->n_cb = 1;
         ctx->codes.push_back(code);
         ctx->codes_n_frames += 1;
+
+        // Type B: compose the next backbone-input embed via codec_lm.
+        // Requires a codec_lm (single-cb here, so codes is just [code])
+        // and surfaces OBSERVE_CONSUMED_EMBED so the host knows to feed
+        // `get_next_embed`'s buffer into its inputs_embeds decode path.
+        if (ctx->uses_embed_override && ctx->lm != nullptr && ctx->hidden > 0) {
+            ctx->next_embed_buf.assign((size_t) ctx->hidden, 0.0f);
+            const int32_t codes_single[1] = { code };
+            const enum codec_status rc = codec_lm_compose_next_embd(
+                ctx->lm, codes_single, ctx->ar_step,
+                ctx->next_embed_buf.data());
+            if (rc != CODEC_STATUS_SUCCESS) {
+                const char * raw = codec_lm_get_last_error(ctx->lm);
+                ctx->last_error = std::string("observe_token: compose_next_embd failed (")
+                                  + (raw && *raw ? raw : "?") + ")";
+                ctx->next_embed_buf.clear();
+                ctx->next_embed_dim = 0;
+                return OBSERVE_STOP;
+            }
+            ctx->next_embed_dim = ctx->hidden;
+            ctx->ar_step       += 1;
+            return OBSERVE_CONSUMED_EMBED;
+        }
+
         return OBSERVE_CONSUMED;
     }
 

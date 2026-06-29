@@ -202,6 +202,24 @@ enum codec_status codec_lm_compose_audio_embd(
     const int32_t *    codes,        // [n_codebook]
     float *            out_embd);    // [hidden_dim]
 
+// Compose the next-step backbone input embedding.  For models that have
+// a learned per-step positional embedding (Chatterbox T3's
+// `speech_pos_emb` is the canonical example), `step` indexes into that
+// table and is added on top of `compose_audio_embd`.  For models without
+// such a table (CSM, generic parallel-heads-delay TTS), `step` is
+// ignored and this is identical to `compose_audio_embd`.
+//
+// This is the embedding the host feeds back into the LM as
+// `inputs_embeds` for the next decode call (Type B / embed-override
+// inference pattern).
+//
+// Caller must size `out_embd` to at least `info->hidden_dim` floats.
+enum codec_status codec_lm_compose_next_embd(
+    struct codec_lm *  lm,
+    const int32_t *    codes,        // [n_codebook]
+    int32_t            step,         // AR step index for learned pos emb
+    float *            out_embd);    // [hidden_dim]
+
 // ─────────────────────────────────────────────────────────────────────
 // Per-AR-step state machine: hidden -> codebook logits -> codes.
 //
