@@ -136,16 +136,9 @@ int cmd_info(const args & a) {
 }
 
 // ─── Subcommand: decode ──────────────────────────────────────────
-// Offline decode of pre-sampled codes.  Used for parity-style tests
-// and round-trip debugging — the AR loop that produced the codes can
-// live anywhere (a sibling tool, `examples/tts.py`, llama.rn).
-//
-// Internally we still need to push the caller's codes into the
-// audio_lm_context's accumulator before calling audio_lm_decode_audio;
-// the audio_lm_push_codes entry that does this lands in roadmap step 2
-// alongside build_prompt.  For now: open codec_model directly and call
-// codec_decode (codec_common's lifecycle still owns the high-level
-// model load).
+// Offline decode of pre-sampled codes through the codec_common pipeline:
+// load → push_codes → decode_audio.  The same code path observe_token
+// (step 3+) will run through, just with the AR loop swapped for a file.
 int cmd_decode(const args & a) {
     if (a.codes.empty() || a.output.empty()) {
         std::fprintf(stderr, "decode requires --codes and --output\n");
@@ -158,68 +151,54 @@ int cmd_decode(const args & a) {
     std::string err;
     auto * ctx = codec_common::audio_lm_init(p, &err);
     if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
-    const int32_t n_cb_model = codec_common::audio_lm_n_codebook(ctx);
-    codec_common::audio_lm_free(ctx);
 
     std::vector<int32_t> npy_codes;
     int32_t n_frames = 0, n_q = 0;
     std::string npy_err;
     if (!codec_example_load_npy_i32_2d_tq(a.codes.c_str(), &npy_codes, &n_q, &n_frames, &npy_err)) {
         std::fprintf(stderr, "failed to load %s: %s\n", a.codes.c_str(), npy_err.c_str());
+        codec_common::audio_lm_free(ctx);
         return 3;
     }
-    if (n_cb_model > 0 && n_q != n_cb_model) {
-        std::fprintf(stderr, "codes n_q=%d but model n_codebook=%d\n", n_q, n_cb_model);
+
+    if (!codec_common::audio_lm_push_codes(ctx, npy_codes.data(), n_frames, n_q)) {
+        std::fprintf(stderr, "audio_lm_push_codes failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
         return 4;
     }
 
-    auto mp = codec_model_default_params();
-    mp.use_gpu   = a.use_gpu;
-    if (a.n_threads > 0) mp.n_threads = a.n_threads;
-    auto * model = codec_model_load_from_file(a.model.c_str(), mp);
-    if (!model) {
-        std::fprintf(stderr, "codec_model_load_from_file failed\n");
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "audio_lm_decode_audio failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
         return 5;
-    }
-    auto * cctx = codec_init_from_model(model, codec_context_default_params());
-
-    codec_token_buffer tokens = {};
-    tokens.data          = npy_codes.data();
-    tokens.n_tokens      = (int32_t) npy_codes.size();
-    tokens.n_frames      = n_frames;
-    tokens.n_q           = n_q;
-    tokens.codebook_size = codec_model_codebook_size(model);
-    tokens.sample_rate   = codec_model_sample_rate(model);
-    tokens.hop_size      = codec_model_hop_size(model);
-
-    codec_pcm_buffer pcm = {};
-    auto dp = codec_decode_default_params();
-    if (a.n_threads > 0) dp.n_threads = a.n_threads;
-    const enum codec_status rc = codec_decode(cctx, &tokens, &pcm, dp);
-    if (rc != CODEC_STATUS_SUCCESS) {
-        std::fprintf(stderr, "codec_decode failed: %s\n",
-                     codec_get_last_error(cctx));
-        codec_free(cctx); codec_model_free(model);
-        return 6;
     }
 
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(a.output.c_str(), pcm.data,
-                                        pcm.n_samples, pcm.sample_rate, &wav_err,
-                                        pcm.n_channels)) {
+    if (!codec_example_write_wav_pcm16(
+            a.output.c_str(), pcm.pcm.data(),
+            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+            pcm.sample_rate, &wav_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
-        codec_pcm_buffer_free(&pcm);
-        codec_free(cctx); codec_model_free(model);
-        return 7;
+        codec_common::audio_lm_free(ctx);
+        return 6;
     }
     std::printf("wrote %s: %d samples @ %d Hz (%d ch)\n",
-                a.output.c_str(), pcm.n_samples, pcm.sample_rate, pcm.n_channels);
-    codec_pcm_buffer_free(&pcm);
-    codec_free(cctx); codec_model_free(model);
+                a.output.c_str(),
+                (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+                pcm.sample_rate, pcm.n_channels);
+    codec_common::audio_lm_free(ctx);
     return 0;
 }
 
 // ─── Subcommand: synthesize ──────────────────────────────────────
+// Step 2 deliverable: build_prompt runs the speaker-encode pipeline
+// when --ref-audio is given (or implicitly via speaker_emb in a
+// future invocation).  AR loop + decode_audio require host llama.cpp
+// integration (step 3+); we print prompt structure as proof the
+// speaker-encode side reaches `embeds_prefix` correctly.
 int cmd_synthesize(const args & a) {
     codec_common::audio_lm_params p;
     p.codec_path = a.model;
@@ -233,29 +212,61 @@ int cmd_synthesize(const args & a) {
     in.text = a.text;
     if (a.emotion) in.emotion = &a.emotion.value();
 
-    // ref-audio loading isn't wired here yet — it'll arrive alongside
-    // step 2 (build_prompt for Type A → Type B/C/D).  For now the
-    // synthesis path itself is the bottleneck; build_prompt is the
-    // skeleton return.
+    // Optional ref audio: WAV load + auto-resample to the encoder's
+    // declared sample rate is the host's job in a real integration;
+    // tts-cli reads the WAV as-is and refuses if the SR doesn't match
+    // (forces the user to bring resampled audio for now — a simple
+    // resampler can land alongside Type C/D once it's broadly useful).
+    std::vector<float> ref_pcm;
+    int32_t ref_sr = 0;
+    if (!a.ref_audio.empty()) {
+        codec_example_wav_data w;
+        std::string werr;
+        if (!codec_example_load_wav_pcm16(a.ref_audio.c_str(), &w, &werr)) {
+            std::fprintf(stderr, "failed to load %s: %s\n", a.ref_audio.c_str(), werr.c_str());
+            codec_common::audio_lm_free(ctx);
+            return 3;
+        }
+        // Downmix to mono + convert PCM16 → F32.
+        const int32_t nch = w.n_channels > 0 ? w.n_channels : 1;
+        const int32_t nframes = (int32_t) (w.pcm_i16.size() / (size_t) nch);
+        ref_pcm.assign((size_t) nframes, 0.0f);
+        for (int32_t i = 0; i < nframes; ++i) {
+            float acc = 0.0f;
+            for (int32_t c = 0; c < nch; ++c) {
+                acc += w.pcm_i16[(size_t) i * (size_t) nch + (size_t) c] / 32768.0f;
+            }
+            ref_pcm[(size_t) i] = acc / (float) nch;
+        }
+        ref_sr  = w.sample_rate;
+        in.ref_pcm         = ref_pcm.data();
+        in.ref_n_samples   = (int32_t) ref_pcm.size();
+        in.ref_sample_rate = ref_sr;
+    }
+
     codec_common::audio_lm_prompt prompt;
     if (!codec_common::audio_lm_build_prompt(ctx, in, &prompt)) {
         std::fprintf(stderr, "build_prompt failed: %s\n",
                      codec_common::audio_lm_last_error(ctx));
-        std::fprintf(stderr,
-            "  → step 2–5 of docs/codec_common_api.md is what lights this up\n");
         codec_common::audio_lm_free(ctx);
-        return 7;
+        return 4;
     }
 
-    // The next pieces (host-side llama.cpp loop + observe_token +
-    // decode_audio) land in roadmap step 3+.  Bail with a clear pointer.
+    std::printf("build_prompt OK\n");
+    std::printf("  tokens.size        = %zu\n", prompt.tokens.size());
+    std::printf("  embeds_prefix_rows = %d\n",  prompt.embeds_prefix_rows);
+    std::printf("  embeds_prefix_hidd = %d\n",  prompt.embeds_prefix_hidden);
+    std::printf("  embeds_prefix.size = %zu (= rows×hidden)\n", prompt.embeds_prefix.size());
+
+    // Host-side llama.cpp AR loop + observe_token + decode_audio land
+    // in roadmap step 3+.  Bail cleanly here so the user knows where
+    // tts-cli sits relative to the doc.
     std::fprintf(stderr,
-        "synthesize: AR loop not yet wired (roadmap step 3+).\n"
-        "  prompt.tokens.size = %zu\n"
-        "  embeds_prefix_rows = %d\n",
-        prompt.tokens.size(), prompt.embeds_prefix_rows);
+        "\nsynthesize: AR loop not yet wired (roadmap step 3+).  "
+        "Output file %s NOT written.\n",
+        a.output.empty() ? "<unspecified>" : a.output.c_str());
     codec_common::audio_lm_free(ctx);
-    return 8;
+    return 0;
 }
 
 }  // namespace

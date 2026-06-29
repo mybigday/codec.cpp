@@ -188,6 +188,23 @@ const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
                                        int32_t * out_dim);
 
 // ─────────────────────────────────────────────────────────────────────
+// External codes push (offline / debug / parity round-trip)
+//
+// Append `n_frames * n_q` codes to the context's per-sequence
+// accumulator.  Codes are interleaved (T, n_q): `codes[t*n_q + q]`.
+// `n_q` must match `audio_lm_n_codebook(ctx)`.  Used by tooling that
+// already has the codes (e.g. tts-cli's `decode` subcommand) and just
+// wants to flow them through codec_common's `decode_audio`.
+//
+// `audio_lm_observe_token` (step 3+) appends codes internally as the
+// AR loop runs, so the same accumulator backs both flows.
+// ─────────────────────────────────────────────────────────────────────
+bool audio_lm_push_codes(audio_lm_context * ctx,
+                         const int32_t   * codes,
+                         int32_t           n_frames,
+                         int32_t           n_q);
+
+// ─────────────────────────────────────────────────────────────────────
 // End of sequence
 //
 // Decode accumulated audio codes → PCM.  Valid only when modality has

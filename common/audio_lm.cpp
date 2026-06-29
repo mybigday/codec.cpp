@@ -194,21 +194,144 @@ const char * audio_lm_last_error(const audio_lm_context * ctx) {
 }
 
 // =====================================================================
-// Prompt build + per-step observe + next-embed lookup
+// Prompt build
 //
-// Skeletons.  Reference impls per inference Type land in roadmap steps
-// 2–5.  Returning a clear NOT_SUPPORTED-style error keeps the lifecycle
-// + decode_audio paths usable today for codec-only smoke tests and
-// makes it obvious when a host hits an un-wired path.
+// For step 2 the implemented branch is the speaker-encode path: when
+// the model has a speaker_encoder section AND the caller supplied either
+// `ref_pcm` or `speaker_emb` (+ `ref_speech_tokens` if needed), run
+// `codec_lm_speaker_encode` and populate `embeds_prefix` with the
+// resulting (n_rows × hidden_dim) matrix.
+//
+// `tokens` is left empty — text tokenization runs in the host (which
+// owns the llama_model + tokenizer), and codec_common doesn't depend on
+// llama.cpp.  Once Type A reference models join, build_prompt may also
+// emit a few seed tokens (e.g. audio_start markers) directly.
+//
+// Sampler hints + start/stop tokens are zero for now; they'll get
+// populated from `codec.lm.sampling.*` GGUF keys in a follow-up — for
+// step 2 the host fills them in itself.
+//
+// Returns true even when no speaker encoding happens (Type A / zero-
+// shot models) — empty `tokens` + empty `embeds_prefix` is a valid
+// "host does everything text-side" prompt.
 // =====================================================================
 
 bool audio_lm_build_prompt(audio_lm_context * ctx,
-                            const audio_lm_input  & /*in*/,
-                            audio_lm_prompt       * /*out*/) {
-    if (ctx) ctx->last_error =
-        "audio_lm_build_prompt: not yet implemented for this model "
-        "(reference impls land in roadmap steps 2–5)";
-    return false;
+                            const audio_lm_input  & in,
+                            audio_lm_prompt       * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    out->tokens.clear();
+    out->embeds_prefix.clear();
+    out->embeds_prefix_rows   = 0;
+    out->embeds_prefix_hidden = 0;
+    out->embeds_uncond.clear();
+    out->default_temperature        = 0.0f;
+    out->default_top_p              = 0.0f;
+    out->default_min_p              = 0.0f;
+    out->default_repetition_penalty = 0.0f;
+    out->default_cfg_weight         = 0.0f;
+    out->start_token                = -1;
+    out->stop_token                 = -1;
+
+    if (!ctx->has_spk_enc) {
+        // Type A / zero-shot — no speaker prefix to compute.  Caller
+        // still gets a successful (empty) prompt; the host AR loop runs
+        // entirely on its own tokenized text input.
+        return true;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Speaker-encode branch.  Two flavours depending on what the caller
+    // has on hand: (a) raw `ref_pcm` → run the full speaker encoder
+    // (VE + cond_enc for Chatterbox, ECAPA-TDNN for Qwen3-TTS);
+    // (b) cached `speaker_emb` → skip the front-end via `_from_embedding`.
+    // ────────────────────────────────────────────────────────────────
+    const codec_lm_speaker_info * si = codec_lm_speaker_get_info(ctx->lm);
+    if (si == nullptr || si->n_rows <= 0 || si->hidden_dim <= 0) {
+        ctx->last_error = "audio_lm_build_prompt: speaker_info missing or invalid";
+        return false;
+    }
+    const int32_t need_elems = si->n_rows * si->hidden_dim;
+    out->embeds_prefix.resize((size_t) need_elems);
+
+    const bool has_pcm = (in.ref_pcm != nullptr && in.ref_n_samples > 0);
+    const bool has_emb = (in.speaker_emb != nullptr && in.speaker_emb_dim > 0);
+
+    if (!has_pcm && !has_emb) {
+        // Caller declared neither — but the model has a speaker encoder.
+        // Allow the no-speaker path (build_prompt returns success with
+        // empty prefix) only when the model doesn't strictly require ref
+        // audio; otherwise complain.
+        if (si->needs_ref_pcm || si->needs_ref_speech_tokens) {
+            ctx->last_error =
+                "audio_lm_build_prompt: model requires ref_pcm / ref_speech_tokens "
+                "but neither ref_pcm nor speaker_emb was provided";
+            out->embeds_prefix.clear();
+            return false;
+        }
+        out->embeds_prefix.clear();
+        return true;
+    }
+
+    codec_audio audio = {};
+    if (has_pcm) {
+        audio.data        = in.ref_pcm;
+        audio.n_samples   = in.ref_n_samples;
+        audio.sample_rate = in.ref_sample_rate > 0
+                            ? in.ref_sample_rate
+                            : si->ref_sample_rate;
+        audio.n_channels  = 1;
+        audio.pcm_type    = CODEC_PCM_TYPE_F32;
+    }
+
+    // ref_speech_tokens are model-specific (Chatterbox needs them; the
+    // Qwen3-TTS ECAPA path doesn't).  For now they come from `in.extra`
+    // when the model needs them: key `"ref_speech_tokens_csv"` =
+    // comma-separated int32 ids.  This stays a private convention until
+    // the input schema doc lands; tts-cli doesn't drive it yet.
+    std::vector<int32_t> ref_codes;
+    const int32_t * ref_codes_ptr = nullptr;
+    int32_t         ref_codes_n   = 0;
+    if (si->needs_ref_speech_tokens) {
+        auto it = in.extra.find("ref_speech_tokens_csv");
+        if (it != in.extra.end()) {
+            const std::string & s = it->second;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                if (j == std::string::npos) j = s.size();
+                if (j > i) {
+                    try { ref_codes.push_back(std::stoi(s.substr(i, j - i))); }
+                    catch (...) { /* skip malformed */ }
+                }
+                i = j + 1;
+            }
+        }
+        if (!ref_codes.empty()) {
+            ref_codes_ptr = ref_codes.data();
+            ref_codes_n   = (int32_t) ref_codes.size();
+        }
+    }
+
+    const enum codec_status rc = has_pcm
+        ? codec_lm_speaker_encode(
+            ctx->lm, &audio, ref_codes_ptr, ref_codes_n, in.emotion,
+            out->embeds_prefix.data(), need_elems)
+        : codec_lm_speaker_encode_from_embedding(
+            ctx->lm, in.speaker_emb, in.speaker_emb_dim,
+            ref_codes_ptr, ref_codes_n, in.emotion,
+            out->embeds_prefix.data(), need_elems);
+
+    if (rc != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_get_last_error(ctx->lm);
+        ctx->last_error = std::string("audio_lm_build_prompt: speaker_encode failed (")
+                          + (raw && *raw ? raw : "?") + ")";
+        out->embeds_prefix.clear();
+        return false;
+    }
+    out->embeds_prefix_rows   = si->n_rows;
+    out->embeds_prefix_hidden = si->hidden_dim;
+    return true;
 }
 
 observe_action audio_lm_observe_token(
@@ -226,6 +349,41 @@ const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
                                        int32_t * out_dim) {
     if (out_dim) *out_dim = ctx ? ctx->next_embed_dim : 0;
     return (ctx && !ctx->next_embed_buf.empty()) ? ctx->next_embed_buf.data() : nullptr;
+}
+
+// =====================================================================
+// External codes push (offline / debug)
+//
+// Appends to the same `ctx->codes` accumulator `observe_token` will
+// populate during AR.  Format mirrors codec_token_buffer: (T, n_q)
+// interleaved row-major.
+// =====================================================================
+
+bool audio_lm_push_codes(audio_lm_context * ctx,
+                          const int32_t   * codes,
+                          int32_t           n_frames,
+                          int32_t           n_q) {
+    if (ctx == nullptr || codes == nullptr) return false;
+    if (n_frames <= 0 || n_q <= 0) {
+        ctx->last_error = "audio_lm_push_codes: non-positive n_frames / n_q";
+        return false;
+    }
+    // codec_lm absent → we can still accumulate; decode_audio works on
+    // codec_model only, n_q comes from the caller.  Just don't enforce
+    // a model-side n_codebook check in that case.
+    if (ctx->n_cb > 0 && n_q != ctx->n_cb) {
+        ctx->last_error = "audio_lm_push_codes: n_q doesn't match model n_codebook";
+        return false;
+    }
+    if (ctx->codes_n_frames == 0) {
+        ctx->n_cb = n_q;   // remember it so decode_audio can lay out the buffer
+    }
+    const size_t prev = ctx->codes.size();
+    ctx->codes.resize(prev + (size_t) n_frames * (size_t) n_q);
+    std::memcpy(ctx->codes.data() + prev, codes,
+                (size_t) n_frames * (size_t) n_q * sizeof(int32_t));
+    ctx->codes_n_frames += n_frames;
+    return true;
 }
 
 // =====================================================================
