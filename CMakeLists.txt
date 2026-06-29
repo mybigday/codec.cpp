@@ -103,6 +103,20 @@ target_include_directories(codec_shared
 target_link_libraries(codec        PRIVATE ggml)
 target_link_libraries(codec_shared PRIVATE ggml)
 
+# codec_common — generic audio-LM API mirroring llama.cpp's `common/`.
+# See docs/codec_common_api.md.  Built as a static lib so example
+# binaries can link it without pulling it into libcodec.so.
+add_library(codec_common STATIC
+    common/audio_lm.cpp
+)
+target_include_directories(codec_common
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/common
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(codec_common PUBLIC codec)
+
 add_executable(inspect-codec
     examples/inspect-codec.cpp
 )
@@ -132,3 +146,8 @@ add_executable(codec-batch-decode
 
 target_include_directories(codec-batch-decode PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml ggml-cpu)
+
+add_executable(tts-cli
+    examples/tts-cli.cpp
+)
+target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)

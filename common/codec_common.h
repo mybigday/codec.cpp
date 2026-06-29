@@ -1,0 +1,201 @@
+#ifndef CODEC_COMMON_H
+#define CODEC_COMMON_H
+
+// Generic audio-LM API for codec.cpp.  See docs/codec_common_api.md
+// for the full design.  Mirrors llama.cpp's `common/` layer pattern:
+// the host (llama.rn, examples/tts.py, …) keeps full ownership of the
+// `llama_decode` loop, the sampler, and KV management; this layer
+// provides build-time + per-step + end-of-sequence hooks that the host
+// calls at three points in its existing AR control flow.
+
+#include "codec.h"
+#include "codec_lm.h"
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+// We don't depend on llama.cpp here — `llama_token` aliases its public
+// type for ABI compatibility but the value is just an int32 to us.  The
+// host's translation unit can include both <llama.h> and this header.
+using codec_common_token = int32_t;
+
+namespace codec_common {
+
+// ─────────────────────────────────────────────────────────────────────
+// Modality
+// ─────────────────────────────────────────────────────────────────────
+// Bitmask read from GGUF metadata under `codec.lm.modality.*`.  Hosts
+// use it to decide whether to enable the audio path, expose a ref-audio
+// input field, set up `decode_audio` at end-of-sequence, etc.  Each
+// model declares its own modality at convert time — no host-side
+// hardcoded model lists.
+enum modality_flag : uint32_t {
+    INPUT_TEXT   = 1u << 0,   // model consumes a text prompt
+    INPUT_AUDIO  = 1u << 1,   // model consumes ref / prompt audio
+    OUTPUT_TEXT  = 1u << 2,   // model emits text (audio chat reply)
+    OUTPUT_AUDIO = 1u << 3,   // model emits speech (TTS / audio chat)
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Params + I/O types
+// ─────────────────────────────────────────────────────────────────────
+
+struct audio_lm_params {
+    std::string codec_path;             // codec / codec_lm GGUF path
+    bool        use_gpu      = false;
+    int32_t     n_threads    = 0;       // 0 → codec.cpp default
+};
+
+// Generic input descriptor.  Fill the fields the caller has; the model
+// uses what its modality + speaker_info declare.  Unknown / unused
+// fields are ignored — no errors for over-supply.
+struct audio_lm_input {
+    // Reference audio (voice clone, audio chat input, ICL prompt, …).
+    const float * ref_pcm         = nullptr;
+    int32_t       ref_n_samples   = 0;
+    int32_t       ref_sample_rate = 0;
+
+    // Pre-computed speaker embedding (skip the audio encoder front-end).
+    // Useful when the embedding is cached (e.g. Chatterbox conds.pt).
+    const float * speaker_emb     = nullptr;
+    int32_t       speaker_emb_dim = 0;
+
+    // Emotion / expressivity scalar in [0, 1].  NULL → model default.
+    const float * emotion         = nullptr;
+
+    // ICL voice-clone prompt: reference transcript paired with ref_pcm.
+    std::string   ref_text;
+
+    // Synthesis target text.
+    std::string   text;
+
+    // Model-specific knobs (language_id, speaker_id, x_vector_only_mode,
+    // …).  Keys + semantics live in docs/codec_common_input_keys.md
+    // (to be authored alongside the first 2–3 model integrations).
+    std::map<std::string, std::string> extra;
+};
+
+// Built prompt: tokens (host feeds via `llama_decode`) + optional
+// prefix embeddings (`inputs_embeds` path) for models that prepend a
+// conditioning prefix.  Plus the sampler defaults the model was
+// trained with — the host may override.
+struct audio_lm_prompt {
+    // Token ids the host concatenates onto its `embd` for `llama_decode`.
+    std::vector<codec_common_token> tokens;
+
+    // Optional: prefix embeddings prepended via the `inputs_embeds`
+    // path.  Empty for Type A token-only models (OuteTTS / Orpheus).
+    // Shape: `embeds_prefix_rows × embeds_prefix_hidden`, row-major.
+    std::vector<float> embeds_prefix;
+    int32_t            embeds_prefix_rows   = 0;
+    int32_t            embeds_prefix_hidden = 0;
+
+    // CFG-using models (Chatterbox T3): unconditional branch.  Same
+    // shape as `embeds_prefix` when present; empty when CFG isn't used.
+    std::vector<float> embeds_uncond;
+
+    // Sampler hints — model's training-time defaults.  Host may
+    // override; presented for one-call convenience.
+    float                 default_temperature        = 0.0f;
+    float                 default_top_p              = 0.0f;
+    float                 default_min_p              = 0.0f;
+    float                 default_repetition_penalty = 0.0f;
+    float                 default_cfg_weight         = 0.0f;   // 0 = no CFG
+    codec_common_token    start_token                = -1;    // -1 = no seed
+    codec_common_token    stop_token                 = -1;    // -1 = use vocab EOS
+};
+
+struct audio_lm_audio_output {
+    std::vector<float> pcm;            // interleaved when n_channels > 1
+    int32_t            sample_rate = 0;
+    int32_t            n_channels  = 1;
+};
+
+// Per-step verdict returned by `observe_token`.  Tells the host how to
+// set up the NEXT `llama_decode` call.  See docs/codec_common_api.md
+// for the full semantics table.
+enum observe_action {
+    OBSERVE_PASSTHROUGH,      // text token; render + standard token-batch path
+    OBSERVE_CONSUMED,         // audio token (Type A); no render; token-batch path
+    OBSERVE_CONSUMED_EMBED,   // audio token (Type B/C/D); no render; embd-batch
+                              //                          path via get_next_embed
+    OBSERVE_STOP,             // model emitted stop / codec_lm done
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Opaque context
+// ─────────────────────────────────────────────────────────────────────
+struct audio_lm_context;
+
+// ─────────────────────────────────────────────────────────────────────
+// Lifecycle
+// ─────────────────────────────────────────────────────────────────────
+//
+// `audio_lm_init` loads the codec + codec_lm from the same GGUF (or
+// returns success for codec-only files, in which case the AR hooks
+// remain available but report NOT_SUPPORTED at observe / build).  On
+// failure returns nullptr and writes the reason into `*err` if non-null.
+
+audio_lm_context * audio_lm_init (const audio_lm_params & p, std::string * err = nullptr);
+void               audio_lm_free (audio_lm_context * ctx);
+
+// Drop per-sequence state (accumulated codes, internal step machine,
+// pending next_embed buffer).  Capabilities / loaded weights stay.
+// Call between consecutive generations on the same context.
+void               audio_lm_reset(audio_lm_context * ctx);
+
+// ─────────────────────────────────────────────────────────────────────
+// Capability queries (computed once at init, cheap)
+// ─────────────────────────────────────────────────────────────────────
+uint32_t     audio_lm_modality       (const audio_lm_context * ctx);
+bool         audio_lm_has_speaker_enc(const audio_lm_context * ctx);
+int32_t      audio_lm_n_codebook     (const audio_lm_context * ctx);
+int32_t      audio_lm_hidden_dim     (const audio_lm_context * ctx);
+const char * audio_lm_last_error     (const audio_lm_context * ctx);
+
+// ─────────────────────────────────────────────────────────────────────
+// Prompt build (one shot, before the AR loop)
+//
+// Reference impls per inference Type land in steps 2–5 of the roadmap.
+// Returns false + populates last_error when the model doesn't support
+// build_prompt yet.
+// ─────────────────────────────────────────────────────────────────────
+bool audio_lm_build_prompt(audio_lm_context * ctx,
+                            const audio_lm_input  & in,
+                            audio_lm_prompt       * out);
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-step observe (called by host after each backbone token sample)
+//
+// `last_hidden` is the backbone's hidden state at the just-sampled
+// position (typically `llama_get_embeddings_ith(ctx, -1)`).  Required
+// for Type C/D (depth decoder / parallel heads sample from it);
+// ignored for Type A/B — pass nullptr.
+// ─────────────────────────────────────────────────────────────────────
+observe_action audio_lm_observe_token(
+        audio_lm_context * ctx,
+        codec_common_token tok,
+        const float *      last_hidden,
+        int32_t            hidden_dim);
+
+// Only valid immediately after OBSERVE_CONSUMED_EMBED.  Points into
+// `ctx`'s internal buffer; valid until the next observe_token / reset /
+// free call.  Hosts that need to retain the vector across calls memcpy
+// it out.
+const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
+                                       int32_t * out_dim);
+
+// ─────────────────────────────────────────────────────────────────────
+// End of sequence
+//
+// Decode accumulated audio codes → PCM.  Valid only when modality has
+// OUTPUT_AUDIO and the AR loop has produced at least one audio frame.
+// Returns false + populates last_error otherwise.
+// ─────────────────────────────────────────────────────────────────────
+bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out);
+
+}  // namespace codec_common
+
+#endif  // CODEC_COMMON_H
