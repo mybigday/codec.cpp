@@ -52,12 +52,20 @@ void print_usage(const char * prog) {
         "             the observe→decode data flow end-to-end without needing\n"
         "             a real Type A LM checkpoint.\n"
         "  simulate-typeB --model PATH --codes PATH.npy --output PATH.wav\n"
-        "             [--start-step N]\n"
+        "             [--start-step N] [--probe-first]\n"
         "             same as simulate-typeA but with the Type B embed-override\n"
         "             flag set.  Each consume should return CONSUMED_EMBED and\n"
         "             populate get_next_embed with `audio_embd[code] +\n"
         "             pos_embd[step]`.  Used with chatterbox.gguf to verify the\n"
-        "             compose_next_embd path.\n",
+        "             compose_next_embd path.\n"
+        "  simulate-multicb --model PATH --codes PATH.npy --output PATH.wav\n"
+        "             [--use-embed-override [--start-step N]]\n"
+        "             Multi-codebook frame observe (Type C / Type D).  Loads a\n"
+        "             (T, n_q) .npy and dispatches one frame per observe_codes\n"
+        "             call.  With --use-embed-override, each consume composes\n"
+        "             the next backbone-input embed (validates Type C path on\n"
+        "             residual_depth_ar models).  decode_audio at the end\n"
+        "             checks the accumulator matches a direct codec_decode.\n",
         prog);
 }
 
@@ -109,6 +117,7 @@ struct args {
     bool        audio_offset_set = false;
     int32_t     start_step   = 1;   // Type B AR-step start
     bool        probe_first  = false;
+    bool        use_embed_override = false;
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -137,6 +146,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--audio-eos")   { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->audio_eos))    return false; i++; }
         else if (a == "--start-step")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->start_step))   return false; i++; }
         else if (a == "--probe-first") { out->probe_first = true; }
+        else if (a == "--use-embed-override") { out->use_embed_override = true; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -574,18 +584,122 @@ int cmd_simulate_typeB(const args & a) {
     return 0;
 }
 
+// ─── Subcommand: simulate-multicb ────────────────────────────────
+// Multi-codebook frame observe (Type C / Type D).  Read a (T, n_q)
+// .npy of codes, hand each frame as one observe_codes call, then
+// decode_audio to a WAV.  When --use-embed-override is set, also runs
+// compose_next_embd on every frame (Type C path — verifies
+// residual_depth_ar's compose works through the new public API).
+//
+// Bit-exact decode_audio output vs `codec-cli decode` on the same
+// codes proves the accumulator's (T, n_q) interleaved layout is
+// correct for arbitrary n_q.
+int cmd_simulate_multicb(const args & a) {
+    if (a.codes.empty()) {
+        std::fprintf(stderr, "simulate-multicb requires --codes\n");
+        return 1;
+    }
+    codec_common::audio_lm_params p;
+    p.codec_path = a.model;
+    p.use_gpu    = a.use_gpu;
+    p.n_threads  = a.n_threads;
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    std::vector<int32_t> npy_codes;
+    int32_t n_frames = 0, n_q = 0;
+    std::string npy_err;
+    if (!codec_example_load_npy_i32_2d_tq(a.codes.c_str(), &npy_codes, &n_q, &n_frames, &npy_err)) {
+        std::fprintf(stderr, "failed to load %s: %s\n", a.codes.c_str(), npy_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 3;
+    }
+    std::printf("loaded codes: n_frames=%d n_q=%d\n", n_frames, n_q);
+
+    const codec_common::observe_action want =
+        a.use_embed_override ? codec_common::OBSERVE_CONSUMED_EMBED
+                              : codec_common::OBSERVE_CONSUMED;
+    if (a.use_embed_override) {
+        codec_common::audio_lm_set_uses_embed_override(ctx, true, a.start_step);
+    }
+
+    int32_t n_consumed = 0;
+    for (int32_t i = 0; i < n_frames; ++i) {
+        const int32_t * frame = npy_codes.data() + (size_t) i * (size_t) n_q;
+        auto act = codec_common::audio_lm_observe_codes(
+            ctx, frame, n_q, /*last_hidden=*/nullptr, /*hidden_dim=*/0);
+        if (act != want) {
+            std::fprintf(stderr,
+                "simulate-multicb: expected %s, got action=%d at frame %d: %s\n",
+                a.use_embed_override ? "CONSUMED_EMBED" : "CONSUMED",
+                (int) act, i, codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 5;
+        }
+        if (a.use_embed_override) {
+            int32_t dim = 0;
+            const float * eb = codec_common::audio_lm_get_next_embed(ctx, &dim);
+            if (eb == nullptr || dim != codec_common::audio_lm_hidden_dim(ctx)) {
+                std::fprintf(stderr,
+                    "simulate-multicb: get_next_embed null/wrong dim at frame %d\n", i);
+                codec_common::audio_lm_free(ctx);
+                return 6;
+            }
+        }
+        n_consumed++;
+    }
+    std::printf("simulate-multicb: %d frames %s (n_q=%d)\n",
+                n_consumed,
+                a.use_embed_override ? "CONSUMED_EMBED" : "CONSUMED",
+                n_q);
+
+    if (a.output.empty()) {
+        // codec_lm-only models (CSM, MOSS-TTSD LM-only) have no
+        // decoder in this GGUF — skip the decode_audio step so we can
+        // still exercise observe_codes + compose_next_embd against
+        // them.  Useful for verifying the embed-override path on
+        // residual_depth_ar (CSM) without needing a paired Mimi codec.
+        std::printf("simulate-multicb: --output omitted — skipping decode_audio\n");
+        codec_common::audio_lm_free(ctx);
+        return 0;
+    }
+
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "decode_audio failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 8;
+    }
+    std::string wav_err;
+    if (!codec_example_write_wav_pcm16(
+            a.output.c_str(), pcm.pcm.data(),
+            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+            pcm.sample_rate, &wav_err, pcm.n_channels)) {
+        std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 9;
+    }
+    std::printf("wrote %s: %zu samples @ %d Hz\n",
+                a.output.c_str(), pcm.pcm.size() / (size_t) pcm.n_channels, pcm.sample_rate);
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
 
-    if (a.sub == "info")           return cmd_info(a);
-    if (a.sub == "decode")         return cmd_decode(a);
-    if (a.sub == "synthesize")     return cmd_synthesize(a);
-    if (a.sub == "trace")          return cmd_trace(a);
-    if (a.sub == "simulate-typeA") return cmd_simulate_typeA(a);
-    if (a.sub == "simulate-typeB") return cmd_simulate_typeB(a);
+    if (a.sub == "info")             return cmd_info(a);
+    if (a.sub == "decode")           return cmd_decode(a);
+    if (a.sub == "synthesize")       return cmd_synthesize(a);
+    if (a.sub == "trace")            return cmd_trace(a);
+    if (a.sub == "simulate-typeA")   return cmd_simulate_typeA(a);
+    if (a.sub == "simulate-typeB")   return cmd_simulate_typeB(a);
+    if (a.sub == "simulate-multicb") return cmd_simulate_multicb(a);
 
     std::fprintf(stderr, "unknown subcommand: %s\n", a.sub.c_str());
     print_usage(argv[0]);

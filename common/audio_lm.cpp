@@ -472,6 +472,67 @@ const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
     return (ctx && !ctx->next_embed_buf.empty()) ? ctx->next_embed_buf.data() : nullptr;
 }
 
+// ─── Multi-cb observe (Type C / Type D) ─────────────────────────────
+//
+// Host has already done the per-frame sampling — for Type C via the
+// codec_lm step machine, for Type D via parallel head outputs — and
+// passes the assembled (n_cb) code vector in.  We just accumulate it
+// and (optionally) compose the next backbone-input embedding.
+
+observe_action audio_lm_observe_codes(
+        audio_lm_context * ctx,
+        const int32_t    * codes,
+        int32_t            n_codes,
+        const float      * /*last_hidden*/,
+        int32_t            /*hidden_dim*/) {
+    if (ctx == nullptr || codes == nullptr || n_codes <= 0) {
+        if (ctx) ctx->last_error = "observe_codes: null ctx / codes or non-positive n_codes";
+        return OBSERVE_STOP;
+    }
+
+    // Lock in n_cb on first frame.  Codec_lm-backed models declare it
+    // ahead of time; codec-only flows may discover it from the first
+    // frame's width.
+    if (ctx->n_cb == 0) {
+        ctx->n_cb = n_codes;
+    } else if (n_codes != ctx->n_cb) {
+        ctx->last_error = std::string("observe_codes: n_codes=") + std::to_string(n_codes) +
+                          " mismatches model n_codebook=" + std::to_string(ctx->n_cb);
+        return OBSERVE_STOP;
+    }
+
+    const size_t prev = ctx->codes.size();
+    ctx->codes.resize(prev + (size_t) n_codes);
+    std::memcpy(ctx->codes.data() + prev, codes, (size_t) n_codes * sizeof(int32_t));
+    ctx->codes_n_frames += 1;
+
+    // Type B/C/D: compose next backbone-input embed when override is on
+    // AND we have a codec_lm to compose with.  For residual_depth_ar
+    // (no learned pos table) compose_next_embd falls back to
+    // compose_audio_embd — exactly the right shape for CSM.  For
+    // parallel_heads_delay with a pos table (Chatterbox) the host
+    // shouldn't be hitting this path with n_codes > 1, but we honour
+    // it consistently.
+    if (ctx->uses_embed_override && ctx->lm != nullptr && ctx->hidden > 0) {
+        ctx->next_embed_buf.assign((size_t) ctx->hidden, 0.0f);
+        const enum codec_status rc = codec_lm_compose_next_embd(
+            ctx->lm, codes, ctx->ar_step, ctx->next_embed_buf.data());
+        if (rc != CODEC_STATUS_SUCCESS) {
+            const char * raw = codec_lm_get_last_error(ctx->lm);
+            ctx->last_error = std::string("observe_codes: compose_next_embd failed (")
+                              + (raw && *raw ? raw : "?") + ")";
+            ctx->next_embed_buf.clear();
+            ctx->next_embed_dim = 0;
+            return OBSERVE_STOP;
+        }
+        ctx->next_embed_dim = ctx->hidden;
+        ctx->ar_step       += 1;
+        return OBSERVE_CONSUMED_EMBED;
+    }
+
+    return OBSERVE_CONSUMED;
+}
+
 // =====================================================================
 // External codes push (offline / debug)
 //

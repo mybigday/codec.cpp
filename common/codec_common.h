@@ -245,6 +245,44 @@ const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
                                        int32_t * out_dim);
 
 // ─────────────────────────────────────────────────────────────────────
+// Multi-codebook frame observe (Type C / Type D)
+//
+// For models that emit `n_codebook` codes per backbone step:
+//
+//   * Type C — residual depth-AR (CSM, Qwen3-TTS):  the host samples c0
+//     from the backbone head, drives the codec_lm step machine
+//     (step_begin → step_logits/push_code × (n_cb-1) → step_finish) to
+//     produce c1..c{n-1}, then calls this with all N codes.
+//   * Type D — parallel heads with delay (MOSS-TTSD):  the host samples
+//     all N codes from N parallel heads, then calls this directly with
+//     the full frame.
+//
+// codec_common just accumulates the frame into the per-sequence buffer
+// and (when `uses_embed_override` is set) composes the next backbone-
+// input embedding via `codec_lm_compose_next_embd` so the host can feed
+// it back as `inputs_embeds`.
+//
+//   codes        — one frame of length n_codes
+//   n_codes      — must equal `audio_lm_n_codebook(ctx)` for codec_lm-
+//                  backed models, or 1 for codec-only Type A round-trips
+//                  (in which case prefer observe_token instead).
+//   last_hidden  — backbone hidden at the just-sampled position; required
+//                  when uses_embed_override is set AND the kind's
+//                  compose_next_embd needs it; ignored otherwise.  Pass
+//                  nullptr when the host has no hidden to share.
+//
+// Returns OBSERVE_CONSUMED_EMBED when uses_embed_override is set and
+// the embed compose succeeds; OBSERVE_CONSUMED otherwise; OBSERVE_STOP
+// on a hard error (last_error gets the reason).
+// ─────────────────────────────────────────────────────────────────────
+observe_action audio_lm_observe_codes(
+        audio_lm_context * ctx,
+        const int32_t    * codes,
+        int32_t            n_codes,
+        const float      * last_hidden,
+        int32_t            hidden_dim);
+
+// ─────────────────────────────────────────────────────────────────────
 // External codes push (offline / debug / parity round-trip)
 //
 // Append `n_frames * n_q` codes to the context's per-sequence
