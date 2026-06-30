@@ -4,7 +4,31 @@ Barbet = Open-Formosa R2 text-semantic LM (BlueMagpie-TTS backbone): a Mamba2 +
 attention **hybrid**, motif `global, sliding, sliding, mamba2` over 28 layers.
 Runs in llama.cpp (arch `barbet`); the acoustic adaptor + AudioVAE run in codec.cpp.
 
-Clone base: `third-party/llama.cpp` @ f708a5b.
+## Pinned upstream base
+
+llama.cpp lives at `common/third-party/llama.cpp` as a **git submodule** pinned to
+the commit below. The Barbet changes are *not* committed into the submodule — they
+stay as `barbet-llamacpp.patch`, applied on top of the pinned checkout. Track the
+pin here so mainline drift is detectable: if upstream reworks the Mamba2 / hybrid
+plumbing the patch may stop applying, at which point re-pin to a newer commit.
+
+- Repo: `https://github.com/ggml-org/llama.cpp`
+- Base commit: `f708a5b2caaee0226c0af220e366785699ba41e2` (2026-06-30, "vulkan: roll bk loop in matmul for asahi linux (#24663)")
+
+Set up the working tree after a fresh clone of codec.cpp:
+
+```bash
+git submodule update --init common/third-party/llama.cpp
+cd common/third-party/llama.cpp
+git apply ../../../patches/barbet-llamacpp.patch
+```
+
+Check how far the pin has drifted from upstream master:
+
+```bash
+git -C common/third-party/llama.cpp fetch origin
+git -C common/third-party/llama.cpp log --oneline f708a5b2caaee0226c0af220e366785699ba41e2..origin/master | wc -l
+```
 
 ## Status
 

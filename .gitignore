@@ -59,5 +59,5 @@ checkpoints/
 
 /.model-src
 
-# Cloned upstream repos (Barbet changes tracked via patches/)
-third-party/
+# common/third-party/llama.cpp is a pinned submodule (see .gitmodules);
+# Barbet working-tree edits live in patches/barbet-llamacpp.patch.
