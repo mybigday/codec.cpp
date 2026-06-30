@@ -128,6 +128,14 @@ struct codec_lm_kind_vtable {
         const int32_t * ref_speech_tokens, int32_t n_ref_speech_tokens,
         float emotion,                  // pre-defaulted by lm.cpp
         float * out, int32_t out_n_elems);
+
+    // Continuous-latent step machine (CONTINUOUS_LATENT_CFM).  NULL for
+    // codebook kinds.  Placed last so existing kinds' positional vtable
+    // initializers leave these zero (nullptr).
+    enum codec_status (*step_generate)(codec_lm_state * st, const float * h_in,
+        float cfg_value, int32_t n_timesteps, const float * noise,
+        float * out_patch, int32_t * out_stop);
+    enum codec_status (*step_feedback_embd)(codec_lm_state * st, float * out_embd);
 };
 
 // Map between the GGUF string and the C enum.  Returns
@@ -138,6 +146,7 @@ const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind);
 // Per-kind vtables, exposed to lm.cpp's dispatch table.
 extern const codec_lm_kind_vtable codec_lm_vtable_parallel_heads_delay;
 extern const codec_lm_kind_vtable codec_lm_vtable_residual_depth_ar;
+extern const codec_lm_kind_vtable codec_lm_vtable_continuous_latent_cfm;
 
 // Read a string KV from the codec_model's GGUF.  Returns empty string
 // if the key is absent.

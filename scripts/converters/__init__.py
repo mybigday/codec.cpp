@@ -17,6 +17,7 @@ from .moss_audio import MossAudioConverter
 from .xy_tokenizer import XYTokenizerConverter
 from .csm import CsmConverter
 from .moshi import MoshiConverter
+from .bluemagpie import BlueMagpieConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -37,6 +38,7 @@ _CONVERTER_REGISTRY = {
     'xy_tokenizer': XYTokenizerConverter,
     'csm': CsmConverter,
     'moshi': MoshiConverter,
+    'bluemagpie': BlueMagpieConverter,
 }
 
 

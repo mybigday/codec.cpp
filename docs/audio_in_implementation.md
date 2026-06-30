@@ -158,10 +158,9 @@ implementation effort and dependency order.
 These don't add new graphs; they add knobs to the existing
 `residual_depth_ar` runtime + state machine.
 
-1. **`position_kind` per step** — already partially implemented as
-   `step_mode` in `examples/tts.py`'s TTSSession; promote to a C-side
-   `codec_lm_state_set_position_kind(state, kind)` so the same
-   semantics work for Python and any future C client.
+1. **`position_kind` per step** — promote to a C-side
+   `codec_lm_state_set_position_kind(state, kind)` accessible via
+   codec_common so the same semantics work for every host.
    - Kinds: `TEXT_ONLY` / `AUDIO_ONLY` / `BOTH` / `DUPLEX`.
    - Unlocks: LFM2-Audio chat mode (native), GLM-4-Voice,
      Spirit-LM, Mini-Omni-2.
@@ -609,9 +608,9 @@ cross-attention KV), not a `codec_lm` extension.
    STFT/iSTFT recipes already documented in `CLAUDE.md`.
 2. Wire **Voxtral-Mini-3B-2507** as the smoke test — simplest Whisper
    + 4× MLP downsample exemplar, stock-llama.cpp Ministral-3B backbone.
-3. New `examples/asr.py` driver (analogue of `examples/tts.py`): audio
-   in → encoder → splice into prompt → llama.cpp text-emission AR loop
-   → decode tokens.
+3. New `examples/asr-cli` driver (analogue of `examples/tts-cli`):
+   audio in → encoder → splice into prompt → llama.cpp text-emission
+   AR loop → decode tokens.
 
 Once (1)+(2) ship, Qwen2-Audio-7B / Voxtral-Small-24B / Aero-1-Audio
 ride on the same adapter — only projector weights / backbone GGUFs

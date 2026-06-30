@@ -38,6 +38,11 @@ enum codec_graph_kind {
     CODEC_GRAPH_LM_RDA_DEPTH_STEP_KV  = 31,  // incremental, llama.cpp-style KV cache
 
     CODEC_GRAPH_LM_SPEAKER_CHATTERBOX = 32,  // cond_enc + perceiver
+
+    CODEC_GRAPH_BLUEMAGPIE_AUDIOVAE_DECODE = 50,  // VoxCPM/BlueMagpie continuous-latent VAE decode
+    CODEC_GRAPH_BLUEMAGPIE_AUDIOVAE_ENCODE = 55,  // AudioVAE encoder (audio → latent mu)
+    CODEC_GRAPH_BLUEMAGPIE_CFM             = 53,  // LocDiT + unrolled CFM Euler (codec_bluemagpie_cfm_eval, e2e test)
+    CODEC_GRAPH_BLUEMAGPIE_CFM_STEP        = 56,  // continuous_latent_cfm adaptor — unified per-step graph
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

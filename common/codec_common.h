@@ -3,10 +3,11 @@
 
 // Generic audio-LM API for codec.cpp.  See docs/codec_common_api.md
 // for the full design.  Mirrors llama.cpp's `common/` layer pattern:
-// the host (llama.rn, examples/tts.py, …) keeps full ownership of the
-// `llama_decode` loop, the sampler, and KV management; this layer
-// provides build-time + per-step + end-of-sequence hooks that the host
-// calls at three points in its existing AR control flow.
+// the host (llama.rn's rn-tts, examples/tts-cli, …) keeps full
+// ownership of the `llama_decode` loop, the sampler, and KV
+// management; this layer provides build-time + per-step + end-of-
+// sequence hooks that the host calls at three points in its existing
+// AR control flow.
 
 #include "codec.h"
 #include "codec_lm.h"
@@ -243,6 +244,32 @@ observe_action audio_lm_observe_token(
 // it out.
 const float * audio_lm_get_next_embed(const audio_lm_context * ctx,
                                        int32_t * out_dim);
+
+// ─────────────────────────────────────────────────────────────────────
+// Continuous-latent per-step observe (BlueMagpie / VoxCPM)
+//
+// For continuous-latent models (codec_lm kind continuous_latent_cfm) the
+// backbone emits a hidden state per step (no token, no codebook).  The host
+// calls this with that hidden; codec_common runs the whole adaptor step
+// (tslm_adapter + FSQ + RALM + LocDiT CFM diffusion) internally, accumulates
+// the produced latent patch, and returns:
+//   OBSERVE_CONSUMED_EMBED — feed `audio_lm_get_next_embed()` (the LocEnc
+//                            feedback) as the next backbone input embedding.
+//   OBSERVE_STOP           — the stop head fired; break and call decode_audio.
+//
+//   hidden     : [hidden_dim] backbone hidden (e.g. llama_get_embeddings_ith).
+//   noise      : [patch_size*latent_dim] CFM init noise, or NULL to sample
+//                (pass a buffer for deterministic / reproducible output).
+observe_action audio_lm_observe_hidden(audio_lm_context * ctx,
+                                       const float * hidden, int32_t hidden_dim,
+                                       const float * noise);
+
+// True when the loaded model is a continuous-latent kind (use observe_hidden
+// instead of observe_token / observe_codes).
+bool audio_lm_is_continuous(const audio_lm_context * ctx);
+
+// Set CFG strength + diffusion steps for the continuous path (defaults 2.0 / 10).
+void audio_lm_set_continuous_params(audio_lm_context * ctx, float cfg_value, int32_t n_timesteps);
 
 // ─────────────────────────────────────────────────────────────────────
 // Multi-codebook frame observe (Type C / Type D)

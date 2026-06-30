@@ -65,7 +65,10 @@ set(CODEC_SOURCES
     src/models/snac.cpp
     src/models/moss_audio.cpp
     src/models/xy_tokenizer.cpp
+    src/models/bluemagpie_audiovae.cpp
+    src/models/bluemagpie_blocks.cpp
     src/lm/lm.cpp
+    src/lm/bluemagpie_cfm.cpp
     src/lm/parallel_heads_delay.cpp
     src/lm/residual_depth_ar.cpp
     src/lm/speaker_chatterbox.cpp

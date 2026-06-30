@@ -15,7 +15,7 @@ This document tracks which models have which level of support.
 |---|---|
 | **codec.cpp** | audio encoder weights + forward (PCM → conditioning embedding) |
 | **llama.cpp** | LM backbone, tokenizer, prompt assembly, AR sampling |
-| **Application (llama.rn / examples/tts.py / …)** | wiring: load audio → call `codec_lm_speaker_encode` → hand resulting `(n_rows, hidden_dim)` embedding to llama.cpp as part of `inputs_embeds` |
+| **Application (llama.rn's rn-tts / examples/tts-cli / …)** | wiring: load audio → call `codec_lm_speaker_encode` (or `codec_common::audio_lm_build_prompt`) → hand resulting `(n_rows, hidden_dim)` embedding to llama.cpp as part of `inputs_embeds` |
 
 The output of `codec_lm_speaker_encode` is a plain F32 matrix of
 shape `(info.n_rows, info.hidden_dim)`, ready to be concatenated /
@@ -62,9 +62,11 @@ codec_status codec_lm_speaker_encode_from_embedding(
   perceiver, cached by `n_ref_speech_tokens`).
 - **Parity**: `tests/e2e/chatterbox_speaker_smoke.py` — 34 rows corr =
   1.000000 vs `VoiceEncoder.embeds_from_wavs` + `T3CondEnc.forward`.
-- **Application example**: `examples/tts.py` ChatterboxSession (`--ref-audio
-  path.wav` runs the full pipeline; default falls back to the bundled
-  `conds.pt` speaker via `codec_lm_speaker_encode_from_embedding`).
+- **Application example**: `examples/tts-cli synthesize --model
+  chatterbox.gguf --ref-audio path.wav` runs the full pipeline via
+  `codec_common::audio_lm_build_prompt`; callers without ref audio can
+  feed a cached 256-d embedding (e.g. from `conds.pt`) through
+  `codec_lm_speaker_encode_from_embedding`.
 
 ### 2. Qwen3-TTS (`encoder_arch = "qwen3_tts_ecapa_tdnn"`) — **SHIPPED**
 
@@ -100,12 +102,11 @@ codec_status codec_lm_speaker_encode_from_embedding(
 - **Parity**: `tests/e2e/moss_ttsd_encode_smoke.py` — `codec.cpp`'s
   encode (via `codec-cli encode`) matches HF's MossTTSDProcessor
   speech-tokenizer codes 100 % over a 1.5 s clip.
-- **Today**: `examples/tts.py` MossTTSDSession uses HF for full prompt
-  assembly (including ref-audio encoding).  Switching to codec.cpp's
-  encoder is mechanical (call `codec_encode` then splice the resulting
-  tokens into the prompt token tensor manually) and is a separate
-  follow-up that doesn't affect the framework — the encoder itself is
-  bit-parity-verified.
+- **Status**: the encoder side is bit-parity-verified; prompt
+  assembly + ref-audio code splicing still live in the host app
+  (`rn-tts` / future `tts-cli` MOSS profile).  Switching the host to
+  call `codec_encode` directly (instead of the HF reference) is
+  mechanical and doesn't affect the codec_common framework.
 
 ### 4. LFM2-Audio, MOSS-TTS-Realtime, CSM, MOSS-TTS-Nano — **no speaker encoder**
 

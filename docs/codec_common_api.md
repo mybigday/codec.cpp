@@ -1,6 +1,8 @@
 # codec_common — generic audio-LM API
 
-Status: design, pre-implementation.
+Status: landed.  Reference implementation in `common/audio_lm.cpp`,
+exercised by `examples/tts-cli` (`build/tts-cli {info,decode,synthesize,
+trace,simulate-typeA,simulate-typeB,simulate-multicb}`).
 
 A small `codec_common::` namespace in codec.cpp that wraps the
 per-model audio-LM machinery (speaker_encode, prompt prefix assembly,
@@ -8,9 +10,9 @@ depth-AR / parallel-heads bookkeeping, codes accumulation, audio
 decode) behind one interface, in the same spirit as llama.cpp's
 `common/` layer.
 
-The application (llama.rn, examples/tts.py, …) keeps full ownership of
-the `llama_decode` loop, the sampler, KV management, and the host-side
-batch — `codec_common` only provides:
+The application (llama.rn's rn-tts, examples/tts-cli, …) keeps full
+ownership of the `llama_decode` loop, the sampler, KV management, and
+the host-side batch — `codec_common` only provides:
   * **build-time**: ref-audio encoding + prompt-prefix construction
   * **per-step**: a `observe_token` hook that returns what the host
     should feed at the next step (text passthrough, audio-consumed
@@ -27,7 +29,7 @@ codec_common provides per-step hooks, not a loop replacement.
 |---|---|
 | **llama.cpp / host AR loop** | tokenize, `llama_decode`, sampler, KV cache, batch construction |
 | **codec_common (new)** | ref-audio encoding (speaker_encode), prompt prefix (cond_emb), per-step codes bookkeeping (depth-AR for residual_depth_ar, delay for parallel_heads_delay), `compose_audio_embd`, codes → PCM decode, modality detection |
-| **App glue (rn-tts.cpp / examples/tts.py)** | decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result (e.g. switch the next `llama_batch` between token and embd path) |
+| **App glue (rn-tts.cpp / examples/tts-cli.cpp)** | decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result (e.g. switch the next `llama_batch` between token and embd path) |
 
 ## Inference patterns
 

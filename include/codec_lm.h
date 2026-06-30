@@ -70,10 +70,25 @@ extern "C" {
 //                                       Qwen3-Omni-MoE Talker, Moshi,
 //                                       LFM2-Audio.
 
+// CODEC_LM_KIND_CONTINUOUS_LATENT_CFM — VoxCPM / BlueMagpie family.  The
+//                                       backbone (Barbet) hands in a hidden
+//                                       state; this adaptor runs the whole
+//                                       continuous-latent generation step
+//                                       (tslm_adapter + FSQ + RALM + LocDiT
+//                                       CFM diffusion) and emits ONE latent
+//                                       patch (not codebook codes) plus a stop
+//                                       flag, then turns that patch back into
+//                                       the embedding the backbone consumes
+//                                       next (LocEnc).  No logits, no sampling:
+//                                       uses the step_generate /
+//                                       step_feedback_embd entry points instead
+//                                       of the codebook step machine.
+//                                       Models: BlueMagpie-TTS, VoxCPM2.
 enum codec_lm_kind {
-    CODEC_LM_KIND_UNKNOWN              = 0,
-    CODEC_LM_KIND_PARALLEL_HEADS_DELAY = 1,
-    CODEC_LM_KIND_RESIDUAL_DEPTH_AR    = 2,
+    CODEC_LM_KIND_UNKNOWN               = 0,
+    CODEC_LM_KIND_PARALLEL_HEADS_DELAY  = 1,
+    CODEC_LM_KIND_RESIDUAL_DEPTH_AR     = 2,
+    CODEC_LM_KIND_CONTINUOUS_LATENT_CFM = 3,
 };
 
 // Returns the canonical GGUF-string name of the kind ("parallel_heads_delay"
@@ -126,6 +141,15 @@ struct codec_lm_info {
     // converter (e.g., "llama", "qwen3", "lfm2").  codec_lm does not
     // enforce a match — caller is expected to load the right backbone.
     const char *    host_arch;
+
+    // Continuous-latent kinds (CONTINUOUS_LATENT_CFM) only.  For these the
+    // audio representation is a continuous latent patch, not codebook codes:
+    // n_codebook / codebook_sizes are 0/NULL.  `patch_size` latent frames of
+    // `latent_dim` each are produced per AR step (via codec_lm_step_generate),
+    // accumulated, and decoded by codec_decode_quantized_representation.
+    bool            is_continuous;
+    int32_t         patch_size;
+    int32_t         latent_dim;
 };
 
 // Return CODEC_STATUS_NOT_SUPPORTED via NULL when the codec_model has
@@ -293,6 +317,37 @@ enum codec_status codec_lm_step_push_code(
 enum codec_status codec_lm_step_finish(
     struct codec_lm_state * st,
     int32_t *               out_codes);  // [n_codebook]
+
+// ─────────────────────────────────────────────────────────────────────
+// Continuous-latent step machine (CONTINUOUS_LATENT_CFM kind only).
+//
+// Replaces the codebook step machine.  One call runs the whole generation
+// step internally — tslm_adapter + FSQ + RALM step + LocDiT CFM diffusion —
+// and writes one latent patch plus a stop flag.  No logits, no sampling.
+//
+//   h_in        : [hidden_dim] backbone (Barbet) hidden for this position.
+//   cfg_value   : classifier-free-guidance strength (e.g. 2.0).
+//   n_timesteps : CFM Euler steps (e.g. 10).
+//   noise       : [patch_size*latent_dim] CFM init noise, or NULL to sample
+//                 internally (pass a buffer for deterministic / parity runs).
+//   out_patch   : [patch_size*latent_dim] generated latent frames (accumulate
+//                 these across steps, then codec_decode_quantized_representation).
+//   out_stop    : set to 1 when the stop head fires, else 0.
+enum codec_status codec_lm_step_generate(
+    struct codec_lm_state * st,
+    const float *           h_in,
+    float                   cfg_value,
+    int32_t                 n_timesteps,
+    const float *           noise,
+    float *                 out_patch,
+    int32_t *               out_stop);
+
+// Feedback embedding for the NEXT backbone step: LocEnc(last patch) projected
+// into the backbone hidden space (`enc_to_tslm_proj`).  Valid only after a
+// codec_lm_step_generate call.  out_embd : [hidden_dim].
+enum codec_status codec_lm_step_feedback_embd(
+    struct codec_lm_state * st,
+    float *                 out_embd);
 
 // =====================================================================
 // Speaker-conditioning encoder.

@@ -27,6 +27,7 @@ enum codec_arch {
     CODEC_ARCH_SNAC = 12,
     CODEC_ARCH_MOSS_AUDIO = 13,
     CODEC_ARCH_XY_TOKENIZER = 14,
+    CODEC_ARCH_BLUEMAGPIE_AUDIOVAE = 15,
 };
 
 enum codec_status {

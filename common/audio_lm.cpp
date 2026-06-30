@@ -51,6 +51,18 @@ struct audio_lm_context {
     std::vector<float> next_embed_buf;
     int32_t            next_embed_dim = 0;
 
+    // Continuous-latent models (BlueMagpie/VoxCPM, codec_lm kind
+    // continuous_latent_cfm).  Each backbone step produces one latent patch
+    // (patch_size × latent_dim) via codec_lm_step_generate, accumulated here;
+    // decode_audio runs codec_decode_quantized_representation over them.
+    bool    is_continuous   = false;
+    int32_t patch_size      = 0;
+    int32_t latent_dim      = 0;
+    float   cont_cfg        = 2.0f;
+    int32_t cont_timesteps  = 10;
+    std::vector<float> latents;        // channel-major [latent_dim, n_frames]
+    int32_t            latent_n_frames = 0;
+
     mutable std::string last_error;
 };
 
@@ -171,6 +183,9 @@ audio_lm_context * audio_lm_init(const audio_lm_params & p, std::string * err) {
         if (info != nullptr) {
             ctx->n_cb   = info->n_codebook;
             ctx->hidden = info->hidden_dim;
+            ctx->is_continuous = info->is_continuous;
+            ctx->patch_size    = info->patch_size;
+            ctx->latent_dim    = info->latent_dim;
         }
         ctx->has_spk_enc = (codec_lm_speaker_get_info(ctx->lm) != nullptr);
     }
@@ -195,6 +210,8 @@ void audio_lm_reset(audio_lm_context * ctx) {
     ctx->next_embed_buf.clear();
     ctx->next_embed_dim = 0;
     ctx->ar_step = ctx->ar_step_start;
+    ctx->latents.clear();
+    ctx->latent_n_frames = 0;
     if (ctx->state) codec_lm_state_reset(ctx->state);
     ctx->last_error.clear();
 }
@@ -572,8 +589,98 @@ bool audio_lm_push_codes(audio_lm_context * ctx,
 // End of sequence — codes → PCM
 // =====================================================================
 
+// =====================================================================
+// Continuous-latent path (BlueMagpie / VoxCPM, kind continuous_latent_cfm)
+// =====================================================================
+
+bool audio_lm_is_continuous(const audio_lm_context * ctx) {
+    return ctx != nullptr && ctx->is_continuous;
+}
+
+void audio_lm_set_continuous_params(audio_lm_context * ctx, float cfg_value, int32_t n_timesteps) {
+    if (ctx == nullptr) return;
+    if (cfg_value   > 0.0f) ctx->cont_cfg       = cfg_value;
+    if (n_timesteps > 0)    ctx->cont_timesteps = n_timesteps;
+}
+
+observe_action audio_lm_observe_hidden(audio_lm_context * ctx,
+                                       const float * hidden, int32_t hidden_dim,
+                                       const float * noise) {
+    if (ctx == nullptr || ctx->lm == nullptr || ctx->state == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_observe_hidden: no codec_lm adaptor";
+        return OBSERVE_STOP;
+    }
+    if (!ctx->is_continuous) {
+        ctx->last_error = "audio_lm_observe_hidden: model is not a continuous-latent kind";
+        return OBSERVE_STOP;
+    }
+    if (hidden == nullptr || hidden_dim != ctx->hidden) {
+        ctx->last_error = "audio_lm_observe_hidden: hidden is null or wrong dim";
+        return OBSERVE_STOP;
+    }
+
+    const int32_t pd = ctx->patch_size * ctx->latent_dim;
+    std::vector<float> patch((size_t) pd, 0.0f);
+    int32_t stop = 0;
+    enum codec_status rc = codec_lm_step_generate(
+        ctx->state, hidden, ctx->cont_cfg, ctx->cont_timesteps, noise, patch.data(), &stop);
+    if (rc != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("audio_lm_observe_hidden: step_generate failed (")
+                           + (raw ? raw : "?") + ")";
+        return OBSERVE_STOP;
+    }
+    // Accumulate the patch frame-major ([patch_size, latent_dim]); transposed
+    // to channel-major at decode time.
+    ctx->latents.insert(ctx->latents.end(), patch.begin(), patch.end());
+    ctx->latent_n_frames += ctx->patch_size;
+
+    if (stop) {
+        return OBSERVE_STOP;
+    }
+
+    // Feedback embedding for the next backbone step.
+    ctx->next_embed_buf.assign((size_t) ctx->hidden, 0.0f);
+    if (codec_lm_step_feedback_embd(ctx->state, ctx->next_embed_buf.data()) != CODEC_STATUS_SUCCESS) {
+        ctx->last_error = "audio_lm_observe_hidden: step_feedback_embd failed";
+        return OBSERVE_STOP;
+    }
+    ctx->next_embed_dim = ctx->hidden;
+    return OBSERVE_CONSUMED_EMBED;
+}
+
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out) {
     if (ctx == nullptr || out == nullptr) return false;
+
+    // Continuous-latent models: decode the accumulated latent patches.
+    if (ctx->is_continuous) {
+        if (ctx->latent_n_frames <= 0) {
+            ctx->last_error = "audio_lm_decode_audio: no latents accumulated";
+            return false;
+        }
+        const int32_t D = ctx->latent_dim, T = ctx->latent_n_frames;
+        // Transpose frame-major [T, D] → channel-major [D, T] for decode.
+        std::vector<float> chan((size_t) D * T);
+        for (int32_t t = 0; t < T; ++t)
+            for (int32_t d = 0; d < D; ++d)
+                chan[(size_t) d * T + t] = ctx->latents[(size_t) t * D + d];
+        codec_pcm_buffer pcm = {};
+        auto dp = codec_decode_default_params();
+        const enum codec_status rc = codec_decode_quantized_representation(
+            ctx->codec_ctx, chan.data(), D, T, &pcm, dp);
+        if (rc != CODEC_STATUS_SUCCESS) {
+            const char * raw = codec_get_last_error(ctx->codec_ctx);
+            ctx->last_error = std::string("audio_lm_decode_audio: decode_latents failed (")
+                               + (raw ? raw : "?") + ")";
+            return false;
+        }
+        out->pcm.assign(pcm.data, pcm.data + (size_t) pcm.n_samples * (size_t) pcm.n_channels);
+        out->sample_rate = pcm.sample_rate;
+        out->n_channels  = pcm.n_channels;
+        codec_pcm_buffer_free(&pcm);
+        return true;
+    }
+
     if (ctx->codes_n_frames <= 0 || ctx->n_cb <= 0) {
         ctx->last_error = "audio_lm_decode_audio: no codes accumulated";
         return false;

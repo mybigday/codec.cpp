@@ -58,3 +58,6 @@ checkpoints/
 /benchmarks/_input_cache/
 
 /.model-src
+
+# Cloned upstream repos (Barbet changes tracked via patches/)
+third-party/

@@ -29,9 +29,10 @@
 
 static const char * codec_lm_kind_name_internal(enum codec_lm_kind kind) {
     switch (kind) {
-        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY: return "parallel_heads_delay";
-        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return "residual_depth_ar";
-        case CODEC_LM_KIND_UNKNOWN:              break;
+        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY:  return "parallel_heads_delay";
+        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:     return "residual_depth_ar";
+        case CODEC_LM_KIND_CONTINUOUS_LATENT_CFM: return "continuous_latent_cfm";
+        case CODEC_LM_KIND_UNKNOWN:               break;
     }
     return "unknown";
 }
@@ -50,14 +51,18 @@ enum codec_lm_kind codec_lm_kind_from_string(const char * s) {
     if (std::strcmp(s, "residual_depth_ar") == 0) {
         return CODEC_LM_KIND_RESIDUAL_DEPTH_AR;
     }
+    if (std::strcmp(s, "continuous_latent_cfm") == 0) {
+        return CODEC_LM_KIND_CONTINUOUS_LATENT_CFM;
+    }
     return CODEC_LM_KIND_UNKNOWN;
 }
 
 const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind) {
     switch (kind) {
-        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY: return &codec_lm_vtable_parallel_heads_delay;
-        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:    return &codec_lm_vtable_residual_depth_ar;
-        case CODEC_LM_KIND_UNKNOWN:              break;
+        case CODEC_LM_KIND_PARALLEL_HEADS_DELAY:  return &codec_lm_vtable_parallel_heads_delay;
+        case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:     return &codec_lm_vtable_residual_depth_ar;
+        case CODEC_LM_KIND_CONTINUOUS_LATENT_CFM: return &codec_lm_vtable_continuous_latent_cfm;
+        case CODEC_LM_KIND_UNKNOWN:               break;
     }
     return nullptr;
 }
@@ -162,6 +167,29 @@ static bool codec_lm_populate_info(codec_lm * lm) {
     }
 
     const int32_t hidden       = codec_read_i32_kv(gf, "codec.lm.hidden_dim", 0);
+
+    // Continuous-latent kinds (CONTINUOUS_LATENT_CFM) don't have codebooks;
+    // they emit a continuous latent patch per step.  Populate the continuous
+    // info fields and skip the codebook-centric metadata below.
+    if (lm->kind == CODEC_LM_KIND_CONTINUOUS_LATENT_CFM) {
+        const int32_t patch_size = codec_read_i32_kv(gf, "codec.lm.patch_size", 0);
+        const int32_t latent_dim = codec_read_i32_kv(gf, "codec.lm.latent_dim", 0);
+        if (hidden <= 0 || patch_size <= 0 || latent_dim <= 0) {
+            lm->last_error = "codec.lm continuous: hidden_dim / patch_size / latent_dim must be > 0";
+            return false;
+        }
+        lm->host_arch_buf = codec_lm_read_string_kv(lm->codec, "codec.lm.host_arch");
+        lm->info.kind          = lm->kind;
+        lm->info.hidden_dim    = hidden;
+        lm->info.is_continuous = true;
+        lm->info.patch_size    = patch_size;
+        lm->info.latent_dim    = latent_dim;
+        lm->info.n_codebook    = 0;
+        lm->info.codebook_sizes = nullptr;
+        lm->info.delay_pattern  = nullptr;
+        lm->info.host_arch      = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
+        // speaker section + vtable init are handled by the shared tail below.
+    } else {
     const int32_t audio_embd_d = codec_read_i32_kv(gf, "codec.lm.audio_embed_dim", hidden);
     // Optional separate compose embed dim (LFM2-Audio).  When absent /
     // zero, compose output matches the depth-side audio_embed_dim
@@ -198,6 +226,7 @@ static bool codec_lm_populate_info(codec_lm * lm) {
     lm->info.codebook_sizes   = lm->codebook_sizes_buf.data();
     lm->info.delay_pattern    = lm->delay_pattern_buf.data();
     lm->info.host_arch        = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
+    }
 
     // Speaker-conditioning encoder section is optional.  Absent means
     // codec_lm_speaker_get_info returns NULL and codec_lm_speaker_encode
@@ -628,6 +657,34 @@ enum codec_status codec_lm_step_finish(
     }
     st->step_in_progress = false;
     return CODEC_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// continuous-latent step machine — delegate to vtable
+// ---------------------------------------------------------------------
+
+enum codec_status codec_lm_step_generate(
+    struct codec_lm_state * st, const float * h_in, float cfg_value,
+    int32_t n_timesteps, const float * noise, float * out_patch, int32_t * out_stop) {
+    if (st == nullptr || st->lm == nullptr || h_in == nullptr || out_patch == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (st->lm->vtable == nullptr || st->lm->vtable->step_generate == nullptr) {
+        st->last_error = "codec_lm_step_generate not supported for this kind";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    return st->lm->vtable->step_generate(st, h_in, cfg_value, n_timesteps, noise, out_patch, out_stop);
+}
+
+enum codec_status codec_lm_step_feedback_embd(struct codec_lm_state * st, float * out_embd) {
+    if (st == nullptr || st->lm == nullptr || out_embd == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (st->lm->vtable == nullptr || st->lm->vtable->step_feedback_embd == nullptr) {
+        st->last_error = "codec_lm_step_feedback_embd not supported for this kind";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+    return st->lm->vtable->step_feedback_embd(st, out_embd);
 }
 
 // ---------------------------------------------------------------------
