@@ -58,6 +58,3 @@ checkpoints/
 /benchmarks/_input_cache/
 
 /.model-src
-
-# common/third-party/llama.cpp is a pinned submodule (see .gitmodules);
-# Barbet working-tree edits live in patches/barbet-llamacpp.patch.
