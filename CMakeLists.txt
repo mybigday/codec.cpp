@@ -150,7 +150,14 @@ add_executable(codec-batch-decode
 target_include_directories(codec-batch-decode PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml ggml-cpu)
 
-add_executable(tts-cli
-    examples/tts-cli.cpp
-)
-target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
+option(CODEC_BUILD_TTS_CLI "Build the tts-cli example (drives the Barbet llama.cpp backbone)" ON)
+if(CODEC_BUILD_TTS_CLI)
+    # The TTS path uses the Barbet semantic LM in the pinned llama.cpp submodule;
+    # apply its arch patch (idempotent, skips when the submodule isn't checked out).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupBarbetLlama.cmake)
+
+    add_executable(tts-cli
+        examples/tts-cli.cpp
+    )
+    target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
+endif()

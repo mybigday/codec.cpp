@@ -15,13 +15,19 @@ plumbing the patch may stop applying, at which point re-pin to a newer commit.
 - Repo: `https://github.com/ggml-org/llama.cpp`
 - Base commit: `f708a5b2caaee0226c0af220e366785699ba41e2` (2026-06-30, "vulkan: roll bk loop in matmul for asahi linux (#24663)")
 
-Set up the working tree after a fresh clone of codec.cpp:
+The patch is applied **by CMake**, not by hand: configuring codec.cpp with the
+`tts-cli` example enabled (`CODEC_BUILD_TTS_CLI=ON`, the default) runs
+`cmake/SetupBarbetLlama.cmake`, which applies `barbet-llamacpp.patch` to the
+submodule idempotently and fails the configure if upstream has drifted so the
+patch no longer applies. You only need to check out the submodule once:
 
 ```bash
 git submodule update --init common/third-party/llama.cpp
-cd common/third-party/llama.cpp
-git apply ../../../patches/barbet-llamacpp.patch
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # applies the patch
 ```
+
+Pass `-DCODEC_BARBET_PATCH=OFF` to skip the patch step, or
+`-DCODEC_BUILD_TTS_CLI=OFF` to drop the TTS path (and its Barbet setup) entirely.
 
 Check how far the pin has drifted from upstream master:
 
