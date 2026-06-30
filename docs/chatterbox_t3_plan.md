@@ -196,37 +196,30 @@ B. **HF-fallback at session start** — load `ve.safetensors` Python-side,
 
 Recommend **B for v1, A as follow-up**.
 
-### 4.4 Profile in `examples/tts.py`
+### 4.4 Host profile (SUPERSEDED — landed via codec_common)
 
-`ChatterboxProfile` + `ChatterboxSession`:
+Originally planned as a Python `ChatterboxSession` in `examples/tts.py`.
+The actual landing folded the same flow into the codec_common
+audio-LM API:
 
-```python
-class ChatterboxSession(TTSSession):
-    def initial_prompt_embeds(self, text):
-        # 1. HF-load VE on ref_audio (if speaker config provided), produce
-        #    speaker_embed (256-d).  Else use baked-in conds.pt fallback.
-        # 2. Run cond_enc Python-side OR via codec_lm to get cond_emb
-        #    (len_cond, 1024).
-        # 3. Tokenize text via Chatterbox tokenizer (704-vocab English,
-        #    2454-vocab multilingual); wrap with start/stop_text tokens.
-        # 4. Build text_embd = text_emb(text_ids) + text_pos_emb(positions)
-        #    using tables from the codec_lm GGUF.
-        # 5. Build bos_embd = speech_emb([start_speech]) + speech_pos_emb([0]).
-        # 6. Return prompt = concat([cond_emb, text_embd, bos_embd]).
-    
-    def compose_next_embed(self, codes, step):
-        # speech_emb(codes[0]) + speech_pos_emb([step + 1])
-        # codec_lm.compose_audio_embd returns the speech_emb side;
-        # add speech_pos_emb on top Python-side.
-    
-    def detect_stop(self, codes, step):
-        return codes[0] == STOP_SPEECH_TOKEN  # 6562
-    
-    def synthesize(self, codes_all, codec):
-        # codec is Chatterbox-S3G; needs ref_x_vector from VE as
-        # speaker conditioning.  Existing codec_decode_params has n_q
-        # field; we may need to extend with a speaker-vector pointer.
-```
+- **Speaker encode**: `codec_lm_speaker_encode` runs the VE + cond_enc
+  pipeline natively (no HF call).
+- **Build prompt**: `codec_common::audio_lm_build_prompt` populates
+  `embeds_prefix` (the cond_emb rows) from either ref audio or a
+  cached speaker embedding (`conds.pt`).  The host concatenates this
+  with the text-embed prefix it owns.
+- **Compose next embed**: `codec_lm_compose_next_embd` adds
+  `speech_pos_emb[step]` on top of `compose_audio_embd` — no
+  host-side post-add.  Verified bit-exact at F32 vs the Python
+  reference (`docs/codec_common_api.md` step 4).
+- **Stop detect**: host checks `tok == 6562`
+  (`codec.lm.chatterbox.stop_speech_token`) and treats as
+  OBSERVE_STOP.
+- **Decode**: `audio_lm_decode_audio` runs Chatterbox-S3G through
+  `codec_decode`; speaker conditioning travels through the
+  codec_lm + codec_decode pipeline, no extra parameter needed.
+
+Speaker config JSON (still the same shape on the host side):
 
 Speaker config (same JSON shape as existing voice-clone profiles):
 
@@ -270,11 +263,10 @@ Recommended phased landing:
 
 **Phase A (HF-fallback profile, no C-side changes, ~1 model-day):**
 
-1. Wire `ChatterboxProfile` in `tts.py` with `bypass_standard_run=True`
-   running the entire T3 inference through HF
-   (`.model-src/chatterbox` is already vendored); use our codec.cpp
-   Chatterbox-S3G GGUF for the final waveform decode.  Same pattern
-   as the MOSS-TTS-Nano-100M profile (`run_full`).
+1. (Historical phase A — superseded.)  The original plan ran T3 in
+   HF Python while decoding via codec.cpp's S3G GGUF, as an interim.
+   The final landing brought T3 fully into codec_common (see §4.4
+   above) so this phase isn't needed any more.
 2. Smoke-test with English (`t3_cfg.safetensors`) and multilingual
    (`t3_mtl23ls_v3.safetensors`) variants.
 

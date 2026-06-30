@@ -232,7 +232,8 @@ def _dump_realtime(writer, sd: Dict[str, np.ndarray],
 
     # --- prompt-side metadata for the driver ----------------------------
     # Caller-facing fields — codec_lm itself doesn't consume them but
-    # writing them keeps the GGUF self-describing for the tts.py profile.
+    # writing them keeps the GGUF self-describing for the host driver
+    # (tts-cli / rn-tts).
     for k in ("text_pad", "reference_audio_pad", "audio_pad_token"):
         if k in cfg:
             writer.add_uint32(f"codec.lm.{k}", int(cfg[k]))

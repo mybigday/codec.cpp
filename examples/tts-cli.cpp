@@ -65,7 +65,16 @@ void print_usage(const char * prog) {
         "             call.  With --use-embed-override, each consume composes\n"
         "             the next backbone-input embed (validates Type C path on\n"
         "             residual_depth_ar models).  decode_audio at the end\n"
-        "             checks the accumulator matches a direct codec_decode.\n",
+        "             checks the accumulator matches a direct codec_decode.\n"
+        "  simulate-continuous --model PATH --hidden-npy PATH.npy --output PATH.wav\n"
+        "             [--noise-npy PATH.npy] [--cfg FLOAT] [--timesteps N]\n"
+        "             Continuous-latent observe (BlueMagpie / continuous_latent_cfm).\n"
+        "             Loads a (T, hidden_dim) F32 .npy of backbone hidden states,\n"
+        "             dispatches one step per audio_lm_observe_hidden call.  Each\n"
+        "             step runs tslm_adapter + FSQ + RALM + LocDiT CFM internally;\n"
+        "             OBSERVE_STOP from the stop head breaks the loop.  Output WAV\n"
+        "             via audio_lm_decode_audio (AudioVAE).  Pass --noise-npy of\n"
+        "             shape (T, patch_size*latent_dim) for deterministic output.\n",
         prog);
 }
 
@@ -118,6 +127,12 @@ struct args {
     int32_t     start_step   = 1;   // Type B AR-step start
     bool        probe_first  = false;
     bool        use_embed_override = false;
+
+    // simulate-continuous (BlueMagpie / continuous-latent_cfm)
+    std::string hidden_npy;   // (T, hidden_dim) F32
+    std::string noise_npy;    // (T, patch_size*latent_dim) F32, optional
+    float       cont_cfg     = 2.0f;
+    int32_t     cont_timesteps = 10;
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -147,6 +162,10 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--start-step")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->start_step))   return false; i++; }
         else if (a == "--probe-first") { out->probe_first = true; }
         else if (a == "--use-embed-override") { out->use_embed_override = true; }
+        else if (a == "--hidden-npy") { const char * v = need(); if (!v) return false; out->hidden_npy = v; i++; }
+        else if (a == "--noise-npy")  { const char * v = need(); if (!v) return false; out->noise_npy  = v; i++; }
+        else if (a == "--cfg")        { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cont_cfg)) return false; i++; }
+        else if (a == "--timesteps")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->cont_timesteps)) return false; i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -687,19 +706,149 @@ int cmd_simulate_multicb(const args & a) {
     return 0;
 }
 
+// ─── Subcommand: simulate-continuous ───────────────────────────────
+// Continuous-latent observe (BlueMagpie / VoxCPM2 family).  The host
+// owns the backbone (Barbet llama.cpp variant) and drives one
+// observe_hidden call per AR step with the latest hidden state.
+// codec_common runs tslm_adapter + FSQ + RALM + LocDiT CFM internally
+// per step, accumulates the produced latent patch into the codec_lm
+// state, and reports OBSERVE_STOP when the stop head fires.
+// decode_audio at the end runs AudioVAE on the accumulated patches.
+int cmd_simulate_continuous(const args & a) {
+    if (a.hidden_npy.empty() || a.output.empty()) {
+        std::fprintf(stderr, "simulate-continuous requires --hidden-npy and --output\n");
+        return 1;
+    }
+    codec_common::audio_lm_params p;
+    p.codec_path = a.model;
+    p.use_gpu    = a.use_gpu;
+    p.n_threads  = a.n_threads;
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    if (!codec_common::audio_lm_is_continuous(ctx)) {
+        std::fprintf(stderr, "simulate-continuous: model is not a continuous-latent kind\n");
+        codec_common::audio_lm_free(ctx);
+        return 2;
+    }
+    const int32_t hidden = codec_common::audio_lm_hidden_dim(ctx);
+    if (hidden <= 0) {
+        std::fprintf(stderr, "simulate-continuous: hidden_dim=0\n");
+        codec_common::audio_lm_free(ctx);
+        return 2;
+    }
+    codec_common::audio_lm_set_continuous_params(ctx, a.cont_cfg, a.cont_timesteps);
+
+    std::vector<float> hidden_vec;
+    int32_t n_steps = 0, h_cols = 0;
+    std::string npy_err;
+    if (!codec_example_load_npy_f32_2d(a.hidden_npy.c_str(), &hidden_vec, &n_steps, &h_cols, &npy_err)) {
+        std::fprintf(stderr, "failed to load %s: %s\n", a.hidden_npy.c_str(), npy_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 3;
+    }
+    if (h_cols != hidden) {
+        std::fprintf(stderr,
+            "simulate-continuous: hidden NPY column dim %d != model hidden_dim %d\n",
+            h_cols, hidden);
+        codec_common::audio_lm_free(ctx);
+        return 4;
+    }
+
+    std::vector<float> noise_vec;
+    int32_t noise_steps = 0, noise_cols = 0;
+    const float * noise_ptr = nullptr;
+    if (!a.noise_npy.empty()) {
+        if (!codec_example_load_npy_f32_2d(a.noise_npy.c_str(), &noise_vec,
+                                            &noise_steps, &noise_cols, &npy_err)) {
+            std::fprintf(stderr, "failed to load %s: %s\n", a.noise_npy.c_str(), npy_err.c_str());
+            codec_common::audio_lm_free(ctx);
+            return 3;
+        }
+        if (noise_steps != n_steps) {
+            std::fprintf(stderr,
+                "simulate-continuous: noise has %d steps but hidden has %d\n",
+                noise_steps, n_steps);
+            codec_common::audio_lm_free(ctx);
+            return 4;
+        }
+        noise_ptr = noise_vec.data();
+    }
+
+    std::printf("simulate-continuous: hidden=(%d, %d) cfg=%.3f timesteps=%d noise=%s\n",
+                n_steps, hidden, a.cont_cfg, a.cont_timesteps,
+                noise_ptr ? "fixed" : "sampled");
+
+    int32_t n_consumed = 0;
+    bool stopped = false;
+    for (int32_t i = 0; i < n_steps; ++i) {
+        const float * h = hidden_vec.data() + (size_t) i * (size_t) hidden;
+        const float * z = noise_ptr ? noise_ptr + (size_t) i * (size_t) noise_cols : nullptr;
+        auto act = codec_common::audio_lm_observe_hidden(ctx, h, hidden, z);
+        if (act == codec_common::OBSERVE_STOP) {
+            const char * raw_err = codec_common::audio_lm_last_error(ctx);
+            if (raw_err && *raw_err) {
+                std::fprintf(stderr,
+                    "simulate-continuous: OBSERVE_STOP at step %d (error path): %s\n",
+                    i, raw_err);
+                codec_common::audio_lm_free(ctx);
+                return 5;
+            }
+            std::printf("simulate-continuous: stop head fired at step %d\n", i);
+            stopped = true;
+            break;
+        }
+        if (act != codec_common::OBSERVE_CONSUMED_EMBED) {
+            std::fprintf(stderr,
+                "simulate-continuous: expected CONSUMED_EMBED, got %d at step %d: %s\n",
+                (int) act, i, codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+        n_consumed++;
+    }
+    if (!stopped) {
+        std::printf("simulate-continuous: %d steps CONSUMED_EMBED (exhausted hidden npy)\n",
+                    n_consumed);
+    }
+
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "decode_audio failed: %s\n",
+                     codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 7;
+    }
+    std::string wav_err;
+    if (!codec_example_write_wav_pcm16(
+            a.output.c_str(), pcm.pcm.data(),
+            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
+            pcm.sample_rate, &wav_err, pcm.n_channels)) {
+        std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+        codec_common::audio_lm_free(ctx);
+        return 8;
+    }
+    std::printf("wrote %s: %zu samples @ %d Hz\n",
+                a.output.c_str(), pcm.pcm.size() / (size_t) pcm.n_channels, pcm.sample_rate);
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
 
-    if (a.sub == "info")             return cmd_info(a);
-    if (a.sub == "decode")           return cmd_decode(a);
-    if (a.sub == "synthesize")       return cmd_synthesize(a);
-    if (a.sub == "trace")            return cmd_trace(a);
-    if (a.sub == "simulate-typeA")   return cmd_simulate_typeA(a);
-    if (a.sub == "simulate-typeB")   return cmd_simulate_typeB(a);
-    if (a.sub == "simulate-multicb") return cmd_simulate_multicb(a);
+    if (a.sub == "info")                return cmd_info(a);
+    if (a.sub == "decode")              return cmd_decode(a);
+    if (a.sub == "synthesize")          return cmd_synthesize(a);
+    if (a.sub == "trace")               return cmd_trace(a);
+    if (a.sub == "simulate-typeA")      return cmd_simulate_typeA(a);
+    if (a.sub == "simulate-typeB")      return cmd_simulate_typeB(a);
+    if (a.sub == "simulate-multicb")    return cmd_simulate_multicb(a);
+    if (a.sub == "simulate-continuous") return cmd_simulate_continuous(a);
 
     std::fprintf(stderr, "unknown subcommand: %s\n", a.sub.c_str());
     print_usage(argv[0]);

@@ -2,7 +2,7 @@
 
 Status: landed.  Reference implementation in `common/audio_lm.cpp`,
 exercised by `examples/tts-cli` (`build/tts-cli {info,decode,synthesize,
-trace,simulate-typeA,simulate-typeB,simulate-multicb}`).
+trace,simulate-typeA,simulate-typeB,simulate-multicb,simulate-continuous}`).
 
 A small `codec_common::` namespace in codec.cpp that wraps the
 per-model audio-LM machinery (speaker_encode, prompt prefix assembly,

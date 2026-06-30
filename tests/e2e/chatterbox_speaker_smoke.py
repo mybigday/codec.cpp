@@ -11,8 +11,9 @@ HF output bit-for-bit within F16-projection noise (corr ≥ 0.9999).
 Notes:
   * We supply the ref_speech_tokens directly (a small fixed array) so
     the test is deterministic — running S3T on the synthetic PCM would
-    introduce additional drift.  In practice the caller (Phase B
-    `examples/tts.py`) gets these from `conds.pt` or from `codec_encode`.
+    introduce additional drift.  In practice the host (codec_common's
+    `audio_lm_build_prompt`) gets these from `conds.pt` or from
+    `codec_encode`.
   * Mel front-end skips librosa.effects.trim(top_db=20) on both sides
     by passing already-trimmed PCM (synthetic signal, no silence
     boundary).

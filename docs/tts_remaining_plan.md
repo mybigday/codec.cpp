@@ -20,14 +20,14 @@ The Realtime + LFM2-Audio commits also produced shared infrastructure:
     is stubbed `NotImplementedError` until the GPT-2 depth-block lands).
 
 Status as of this writing: 4 profiles wired (`csm`, `qwen3-tts`,
-`moss-ttsd-v0.5`, `moss-ttsd-v0.7`) per `docs/tts_cli.md`.  This doc
-maps the 3 remaining under-3B targets onto the existing structure
-without inventing a new top-level kind: each fits as either
+`moss-ttsd-v0.5`, `moss-ttsd-v0.7`).  This doc maps the 3 remaining
+under-3B targets onto the existing structure without inventing a new
+top-level kind: each fits as either
 (a) a new `lm_adaptor` layout under one of the existing
 `codec_lm_kind`s (`residual_depth_ar` / `parallel_heads_delay`), or
-(b) a small driver-side extension in `examples/tts.py` that uses
-hooks the existing TTSSession contract already exposes (or one new
-hook).
+(b) a small driver-side extension in the host (examples/tts-cli +
+llama.rn's rn-tts) that hangs off codec_common's existing
+build_prompt / observe_codes hooks.
 
 ## 1. Decompose what each model needs
 
@@ -202,53 +202,40 @@ The new helper lives in `src/ops/lm_attn.{cpp,h}`:
 LFM2-Audio + MOSS-TTS-Realtime both use Llama/Qwen3-style depth blocks,
 so they reuse the existing path.
 
-### D. `examples/tts.py` — driver-side hooks
+### D. Host driver hooks (codec_common + tts-cli / rn-tts)
 
 Three things to add, in increasing order of size:
 
 1. **`info.cb0_is_text` awareness** (small)
-   - Today profiles encode "cb 0 is text" implicitly (MOSS-TTSD's
-     `pack_codes` doesn't strip cb 0 because the HF processor handles
-     it).  When MOSS-TTS-Realtime / MOSS-TTS-Nano land, we want a
-     generic default in `TTSSession.pack_codes`: if `info.cb0_is_text`
-     and the profile didn't override, strip cb 0 before passing to
-     `codec.decode`.  Also default the stop heuristic to
-     `codes[0] in {backbone_eos, audio_end_special}`.
+   - codec_common's `observe_codes` should default to stripping cb 0
+     before handing the frame to `audio_lm_decode_audio` when
+     `info.cb0_is_text` is set in the GGUF.  Same goes for the stop
+     heuristic: default to `codes[0] in {backbone_eos,
+     audio_end_special}` unless the host overrides.
 
-2. **MOSS-TTS-Realtime / -Nano profile** (medium)
-   - Mirrors MossTTSDSession's structure (HF processor for prompt
-     assembly + decode delegation).  Add `MossTTSRealtimeProfile` /
-     `MossTTSNanoProfile` classes pointing at the right HF id + GGUFs.
-   - Default cb-0 mask via `allowed_token_range(0)` returning
-     `(speech_token_start, speech_token_end+1)` so the free-running
-     AR loop stays in speech-space (same trick as MOSS-TTSD).
+2. **MOSS-TTS-Realtime / -Nano host glue** (medium)
+   - Mirrors the MOSS-TTSD wiring in `rn-tts.cpp` / `tts-cli
+     synthesize`: the codec_lm side already produces the right N
+     codebook codes per step; the host just needs the right prompt
+     assembly (BOS / segment tokens) plus a cb-0 mask in the sampler
+     so the free-running AR loop stays in speech-space.  No
+     codec_common API change required.
 
 3. **LFM2-Audio mode-switching** (largest)
-   - Extend `LlamaBackbone` with a `last_text_logits()` helper.  llama.cpp
-     in `embeddings=True; pooling_type=0` mode already returns the
-     last-token hidden state via `llama_get_embeddings_ith`; the
-     missing piece is the text logits.  Two options:
-     - **Compute externally**: `text_logits = hidden @ embed_tokens.T`
-       (LFM2 ties text head to embedding).  Read `embed_tokens.weight`
-       once from the backbone GGUF, keep it on the Python side, do
-       the matmul on every text-mode step.  Adds ~150 MB resident
-       (65k × 2048 fp16).  No llama.cpp changes needed.
-     - **Use llama.cpp's logits path**: switch context creation to
-       `embeddings=False`, use `llama_get_logits_ith` for text mode,
-       and run a parallel `embeddings=True` context for hidden access.
-       Heavier; not needed for v1.
-   - Extend the `TTSSession` contract with:
-     - `step_mode(step, codes_so_far) -> {TEXT, AUDIO_FRAME}` —
-       defaults to AUDIO_FRAME so existing profiles are unaffected.
-     - The driver dispatches:
-       - TEXT mode: sample 1 token from `backbone.last_text_logits()`,
-         embed via `lfm.embed_tokens(token)` (HF-side), feed back to
-         backbone.  No codec_lm call for this step.
-       - AUDIO_FRAME mode: existing path — codec_lm step + compose.
-     - Mode transitions: in LFM2's case, `step_mode` reads the last
-       text token to detect `<|audio_start|>` (= 128) → AUDIO_FRAME,
-       and the last cb-0 audio code to detect `2048` (audio EOS) →
-       TEXT, mirroring `liquid_audio.generate_sequential`.
+   - The host (llama.cpp via rn-completion / tts-cli) already owns
+     both logits and hidden state on every decode, so the runtime
+     plumbing is free.  The framework piece is a `position_kind` /
+     `step_mode` accessor on codec_lm so the host can ask "does this
+     position emit TEXT or an AUDIO_FRAME?" — see
+     `docs/audio_in_implementation.md` for the planned C-side API.
+     The host then dispatches:
+       - TEXT mode: sample 1 token from the backbone's text logits,
+         feed back via the token batch path.  No codec_lm call.
+       - AUDIO_FRAME mode: existing path — codec_lm step +
+         compose_next_embd.
+     Mode transitions for LFM2 specifically: detect `<|audio_start|>`
+     (128) on the text side → AUDIO_FRAME, detect `2048` on cb-0 →
+     TEXT, mirroring `liquid_audio.generate_sequential`.
    - Output assembly:
      - LFM2's pack_codes drops the text-only AR steps from the audio
        stream (only AUDIO_FRAME positions carry decodable codes); decode

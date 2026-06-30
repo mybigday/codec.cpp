@@ -118,7 +118,7 @@ lib.codec_lm_compose_audio_embd.argtypes = [
 lib.codec_lm_compose_audio_embd.restype  = ctypes.c_int
 
 
-# --- codec_model decode side (used by examples/tts.py to turn the
+# --- codec_model decode side (used by per-stage e2e smokes to turn a
 #     codec_lm-emitted code stream into PCM via codec_decode) ----------
 
 class codec_decode_params(ctypes.Structure):
@@ -361,9 +361,9 @@ class CodecDecoder:
 
     The audio codecs in this repo (Mimi, Qwen-codec, XY-Tokenizer, ...)
     expose `codec_encode` / `codec_decode` — this class hides the
-    ctypes plumbing for examples/tts.py.  Name kept as "Decoder" for
-    historical reasons; `.encode()` is also supported when the codec
-    has an encoder.
+    ctypes plumbing used by per-stage e2e smokes.  Name kept as
+    "Decoder" for historical reasons; `.encode()` is also supported
+    when the codec has an encoder.
     """
 
     def __init__(self, gguf_path, *, use_gpu: bool = False, n_threads: int | None = None):
