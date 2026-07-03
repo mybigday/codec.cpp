@@ -14,13 +14,15 @@ This validates the chained codec.cpp generation→decode pipeline; the LM-side
 the per-step (mu, cond).
 """
 from __future__ import annotations
-import ctypes, sys
+import ctypes, os, sys
 from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
 LIB  = REPO / "build" / "libcodec.so"
-GGUF = REPO / "models" / "bluemagpie" / "bluemagpie.gguf"
+# CODEC_BM_GGUF overrides the GGUF path (e.g. to smoke a quantized variant);
+# defaults to the F16 model shipped under models/bluemagpie/.
+GGUF = Path(os.environ.get("CODEC_BM_GGUF") or (REPO / "models" / "bluemagpie" / "bluemagpie.gguf"))
 FIX  = REPO / "tests" / "e2e" / "fixtures" / "bluemagpie" / "e2e_gen.npz"
 PATCH_CORR_MIN = 0.99
 AUDIO_CORR_MIN = 0.99

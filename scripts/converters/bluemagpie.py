@@ -290,8 +290,25 @@ class BlueMagpieConverter(BaseConverter):
                 raise KeyError(f"missing LM tensor: {name}")
             return np.asarray(arr)
 
+        # LM weight-streaming acceleration: 2D matmul weights under lm.* are
+        # quantized to Q8_0 (halves the FP16 bytes streamed per CFM step).  The
+        # gguf Q8_0 helper quantizes along ne[0] (the innermost dim = the matmul
+        # contraction dim), so rows must be a multiple of the 32-elem block.
+        # Anything else (norms, biases, 1D vectors, non-.w tensors, or rows not
+        # /32) falls back to F16 — matching the rest of the LM section's default.
+        # This is independent of the global --quantization flag so the AudioVAE
+        # section keeps its existing F16 behaviour untouched.
+        _Q8_BLK = 32
+
+        def _add_lm_weight(name: str, arr: np.ndarray) -> None:
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and (int(arr.shape[-1]) % _Q8_BLK) == 0:
+                self._add_tensor(writer, name, arr, "Q8_0")
+            else:
+                self._add_tensor(writer, name, arr, "F16")
+
         def add_lin(prefix: str, out: str, bias: bool = False) -> None:
-            self._add_tensor(writer, out + ".w", lm_t(prefix + ".weight"))  # (out,in) → ggml (in,out)
+            _add_lm_weight(out + ".w", lm_t(prefix + ".weight"))  # (out,in) → ggml (in,out)
             if bias:
                 self._add_tensor(writer, out + ".b", lm_t(prefix + ".bias").astype(np.float32), "F32")
 
@@ -343,7 +360,7 @@ class BlueMagpieConverter(BaseConverter):
         add_lin("fusion_concat_proj", "lm.proj.fusion_concat", bias=True)
         add_lin("enc_to_tslm_proj", "lm.proj.enc_to_tslm", bias=True)
         add_lin("stop_proj", "lm.stop.proj", bias=True)
-        self._add_tensor(writer, "lm.stop.head.w", lm_t("stop_head.weight"))
+        _add_lm_weight("lm.stop.head.w", lm_t("stop_head.weight"))
         add_norm("speaker_projector.norm", "lm.speaker.norm")
         add_lin("speaker_projector.proj", "lm.speaker.proj", bias=True)
         add_norm("tslm_adapter.norm", "lm.tslm_adapter.norm")
