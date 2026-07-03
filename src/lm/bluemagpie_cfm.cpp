@@ -181,20 +181,28 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_tensor * cos_t = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.cos"), I.head_dim, T, W("lm.rope.cos")->nb[1], 0));
     ggml_tensor * sin_t = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.sin"), I.head_dim, T, W("lm.rope.sin")->nb[1], 0));
 
+    const bool cfg_one = (p->cfg_value == 1.0f);
     ggml_tensor * x = z;
     for (int32_t s = 0; s < p->n_real; ++s) {
         ggml_tensor * x_h = lin(ctx, W("lm.locdit.in_proj.w"), x, W("lm.locdit.in_proj.b"));
         ggml_tensor * tsin_s = ggml_cont(ctx, ggml_view_2d(ctx, tsin, I.h_dit, 1, tsin->nb[1], (size_t) s * tsin->nb[1]));
         ggml_tensor * t_h = ggml_add(ctx, time_mlp("lm.locdit.time_mlp", tsin_s), dt_emb);
-        ggml_tensor * pos = bm_locdit_core(ctx, model, x_h, cond_h, mu,      t_h, cos_t, sin_t,
-                                           I.n_locdit, I.n_heads, I.n_kv, I.head_dim, I.eps, P, I.h_dit, I.n_mu);
-        ggml_tensor * neg = bm_locdit_core(ctx, model, x_h, cond_h, mu_zero, t_h, cos_t, sin_t,
-                                           I.n_locdit, I.n_heads, I.n_kv, I.head_dim, I.eps, P, I.h_dit, I.n_mu);
-        ggml_tensor * dot = ggml_sum(ctx, ggml_mul(ctx, pos, neg));
-        ggml_tensor * nn  = ggml_sum(ctx, ggml_mul(ctx, neg, neg));
-        ggml_tensor * st  = ggml_div(ctx, dot, ggml_scale_bias(ctx, nn, 1.0f, 1e-8f));
-        ggml_tensor * neg_st = ggml_mul(ctx, neg, st);
-        ggml_tensor * dphi = ggml_add(ctx, neg_st, ggml_scale(ctx, ggml_sub(ctx, pos, neg_st), p->cfg_value));
+        ggml_tensor * dphi;
+        if (cfg_one) {
+            // cfg == 1: dphi = pos, skip the uncond branch entirely.
+            dphi = bm_locdit_core(ctx, model, x_h, cond_h, mu, t_h, cos_t, sin_t,
+                                  I.n_locdit, I.n_heads, I.n_kv, I.head_dim, I.eps, P, I.h_dit, I.n_mu);
+        } else {
+            ggml_tensor *pos = nullptr, *neg = nullptr;
+            bm_locdit_core_batched(ctx, model, x_h, cond_h, mu, mu_zero, t_h, cos_t, sin_t,
+                                   I.n_locdit, I.n_heads, I.n_kv, I.head_dim, I.eps, P, I.h_dit, I.n_mu,
+                                   &pos, &neg);
+            ggml_tensor * dot = ggml_sum(ctx, ggml_mul(ctx, pos, neg));
+            ggml_tensor * nn  = ggml_sum(ctx, ggml_mul(ctx, neg, neg));
+            ggml_tensor * st  = ggml_div(ctx, dot, ggml_scale_bias(ctx, nn, 1.0f, 1e-8f));
+            ggml_tensor * neg_st = ggml_mul(ctx, neg, st);
+            dphi = ggml_add(ctx, neg_st, ggml_scale(ctx, ggml_sub(ctx, pos, neg_st), p->cfg_value));
+        }
         x = ggml_sub(ctx, x, ggml_scale(ctx, dphi, p->dt[s]));
     }
     ggml_set_name(x, "bm.cfm.patch");
@@ -360,6 +368,7 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     key.kind = CODEC_GRAPH_BLUEMAGPIE_CFM_STEP;
     key.n_frames = s->kv_pos;     // graph depends on the cached prefix length (KV view + mask offset)
     key.n_q = n_timesteps;
+    key.hop = (cfg_value == 1.0f) ? 1 : 0;  // cfg==1 builds a different (single-branch) graph shape
     if (!codec_graph_cache_get_or_build(st->ctx, key, build_step, &b, sizeof(b), &entry, &err)) {
         st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
     }

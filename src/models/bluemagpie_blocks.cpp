@@ -31,12 +31,13 @@ ggml_tensor * bm_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, gg
     return y;
 }
 
-// rotate_half over ne[0] for x ne=(d, A, T): cat(-x[d/2:], x[:d/2]).
+// rotate_half over ne[0] for x ne=(d, ...): cat(-x[d/2:], x[:d/2]).
+// Works for 3D (d, A, T) and 4D (d, A, T, B).
 ggml_tensor * bm_rotate_half(ggml_context * ctx, ggml_tensor * x) {
     const int64_t d = x->ne[0];
     const int64_t h = d / 2;
-    ggml_tensor * x1 = ggml_cont(ctx, ggml_view_3d(ctx, x, h, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0));
-    ggml_tensor * x2 = ggml_cont(ctx, ggml_view_3d(ctx, x, h, x->ne[1], x->ne[2], x->nb[1], x->nb[2], h * x->nb[0]));
+    ggml_tensor * x1 = ggml_cont(ctx, ggml_view_4d(ctx, x, h, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], 0));
+    ggml_tensor * x2 = ggml_cont(ctx, ggml_view_4d(ctx, x, h, x->ne[1], x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], h * x->nb[0]));
     return ggml_concat(ctx, ggml_neg(ctx, x2), x1, 0);
 }
 
@@ -60,47 +61,77 @@ ggml_tensor * bm_time_mlp(ggml_context * ctx, const codec_model * model, const c
 
 }  // namespace
 
-// Shared MiniCPM decoder block (use_mup=false → plain residual).  x_ht ne=(hidden, T).
-// cos_dt/sin_dt ne=(head_dim, T) or NULL (no_rope).  GQA via mul_mat batch broadcast.
-ggml_tensor * codec_bm_minicpm_block_ht(
-    ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix, const codec_model * model,
+// Shared MiniCPM decoder block (use_mup=false → plain residual).
+// x_htb ne=(hidden, T, B).  B branches processed jointly: every linear folds
+// (hidden, T, B) → (hidden, T*B) so its mul_mat is B× wider (weights streamed
+// once); attention keeps branches separate by carrying B in ne[3] so a branch
+// never attends across the batch.  cos_dt/sin_dt ne=(head_dim, T) or NULL.
+// GQA via mul_mat batch broadcast (n_kv→n_heads over ne[2], B over ne[3]).
+ggml_tensor * codec_bm_minicpm_block_htb(
+    ggml_context * ctx, ggml_tensor * x_htb, const std::string & prefix, const codec_model * model,
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
     ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal) {
 
     auto W = [&](const char * s) -> ggml_tensor * { return codec_graph_weight(ctx, model, prefix + s); };
-    const int64_t T = x_ht->ne[1];
+    const int64_t hidden = x_htb->ne[0];
+    const int64_t T = x_htb->ne[1];
+    const int64_t B = x_htb->ne[2];
     const int32_t q_dim = n_heads * head_dim;
 
-    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln1.w"));
+    // fold batch into the token dim for every matmul; ne[0] (hidden) unchanged.
+    auto fold = [&](ggml_tensor * t) {  // (hidden_any, T, B) → (hidden_any, T*B)
+        return ggml_reshape_2d(ctx, t, t->ne[0], T * B);
+    };
+
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx, fold(x_htb), eps, W(".ln1.w"));   // (hidden, T*B)
     ggml_tensor * q = ggml_mul_mat(ctx, W(".attn_q.w"), h);
     ggml_tensor * k = ggml_mul_mat(ctx, W(".attn_k.w"), h);
     ggml_tensor * v = ggml_mul_mat(ctx, W(".attn_v.w"), h);
-    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, T);
-    k = ggml_reshape_3d(ctx, k, head_dim, n_kv, T);
-    v = ggml_reshape_3d(ctx, v, head_dim, n_kv, T);
+    q = ggml_reshape_4d(ctx, q, head_dim, n_heads, T, B);
+    k = ggml_reshape_4d(ctx, k, head_dim, n_kv, T, B);
+    v = ggml_reshape_4d(ctx, v, head_dim, n_kv, T, B);
     if (cos_dt != nullptr) {
-        q = bm_rope(ctx, q, cos_dt, sin_dt);
-        k = bm_rope(ctx, k, cos_dt, sin_dt);
+        // cos/sin (d,T) → (d,1,T,1) broadcasts over heads (ne[1]) and batch (ne[3])
+        ggml_tensor * cos_b = ggml_reshape_4d(ctx, cos_dt, head_dim, 1, T, 1);
+        ggml_tensor * sin_b = ggml_reshape_4d(ctx, sin_dt, head_dim, 1, T, 1);
+        auto rope4 = [&](ggml_tensor * x) {
+            ggml_tensor * xr = bm_rotate_half(ctx, x);
+            return ggml_add(ctx, ggml_mul(ctx, x, cos_b), ggml_mul(ctx, xr, sin_b));
+        };
+        q = rope4(q);
+        k = rope4(k);
     }
-    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // (d, T, n_heads)
-    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // (d, T, n_kv)
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);                     // (T_k, T_q, n_heads)
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // (d, T, n_heads, B)
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // (d, T, n_kv, B)
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);                     // (T_k, T_q, n_heads, B)
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
     if (causal) scores = ggml_diag_mask_inf(ctx, scores, 0);
     scores = ggml_soft_max(ctx, scores);
-    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // (T, d, n_kv)
-    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);                    // (d, T_q, n_heads)
-    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));            // (d, n_heads, T)
-    attn = ggml_reshape_2d(ctx, attn, q_dim, T);
-    ggml_tensor * o = ggml_mul_mat(ctx, W(".attn_o.w"), attn);
-    x_ht = ggml_add(ctx, x_ht, o);
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // (T, d, n_kv, B)
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);                    // (d, T_q, n_heads, B)
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));            // (d, n_heads, T, B)
+    attn = ggml_reshape_2d(ctx, attn, q_dim, T * B);
+    ggml_tensor * o = ggml_mul_mat(ctx, W(".attn_o.w"), attn);              // (hidden, T*B)
+    ggml_tensor * x_flat = ggml_add(ctx, fold(x_htb), o);
 
-    h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln2.w"));
+    h = codec_op_rms_norm_ct(ctx, x_flat, eps, W(".ln2.w"));
     ggml_tensor * gate = ggml_mul_mat(ctx, W(".gate.w"), h);
     ggml_tensor * up = ggml_mul_mat(ctx, W(".up.w"), h);
     ggml_tensor * mlp = ggml_mul(ctx, ggml_silu(ctx, gate), up);
     ggml_tensor * down = ggml_mul_mat(ctx, W(".down.w"), mlp);
-    return ggml_add(ctx, x_ht, down);
+    ggml_tensor * out = ggml_add(ctx, x_flat, down);                       // (hidden, T*B)
+    return ggml_reshape_3d(ctx, out, hidden, T, B);
+}
+
+// B=1 wrapper: x_ht ne=(hidden, T).
+ggml_tensor * codec_bm_minicpm_block_ht(
+    ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix, const codec_model * model,
+    int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal) {
+    ggml_tensor * x_htb = ggml_reshape_3d(ctx, x_ht, x_ht->ne[0], x_ht->ne[1], 1);
+    ggml_tensor * y = codec_bm_minicpm_block_htb(ctx, x_htb, prefix, model,
+        n_heads, n_kv, head_dim, eps, cos_dt, sin_dt, causal);
+    return ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
 }
 
 // LocDiT estimator core: pre-projected x_h/cond_h (h_dit,P), mu_h (h_dit,n_mu),
@@ -125,6 +156,55 @@ ggml_tensor * bm_locdit_core(
     ggml_tensor * xt = ggml_cont(ctx, ggml_view_2d(ctx, seq, h_dit, P, seq->nb[1], start * seq->nb[1]));
     return bm_linear(ctx, codec_graph_weight(ctx, model, "lm.locdit.out_proj.w"), xt,
                      codec_graph_weight(ctx, model, "lm.locdit.out_proj.b"));
+}
+
+// Batched LocDiT estimator: runs the two CFG branches (pos = mu, neg = mu_zero)
+// jointly through the MiniCPM stack so every weight matmul is 2× wide and the
+// locdit weights are streamed once per Euler step instead of twice.  x_h/cond_h
+// (h_dit,P), t_h (h_dit,1) are shared; mu_h / mu_zero_h (h_dit,n_mu) differ.
+// Returns two velocity patches (latent_dim, P) via out params pos_out/neg_out.
+void bm_locdit_core_batched(
+    ggml_context * ctx, const codec_model * model,
+    ggml_tensor * x_h, ggml_tensor * cond_h, ggml_tensor * mu_h, ggml_tensor * mu_zero_h,
+    ggml_tensor * t_h, ggml_tensor * cos_t, ggml_tensor * sin_t,
+    int32_t n_layers, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
+    int32_t P, int32_t h_dit, int32_t n_mu,
+    ggml_tensor ** pos_out, ggml_tensor ** neg_out) {
+
+    const int64_t T = (int64_t) n_mu + 1 + P + P;   // [mu ; t ; cond ; x]
+    auto build_seq = [&](ggml_tensor * mu) {
+        ggml_tensor * s = ggml_concat(ctx, mu, t_h, 1);
+        s = ggml_concat(ctx, s, cond_h, 1);
+        return ggml_concat(ctx, s, x_h, 1);         // (h_dit, T)
+    };
+    ggml_tensor * seq_pos = build_seq(mu_h);
+    ggml_tensor * seq_neg = build_seq(mu_zero_h);
+    // stack the two branches along ne[2]: (h_dit, T, 2)
+    ggml_tensor * seq = ggml_concat(ctx,
+        ggml_reshape_3d(ctx, seq_pos, h_dit, T, 1),
+        ggml_reshape_3d(ctx, seq_neg, h_dit, T, 1), 2);
+
+    for (int32_t i = 0; i < n_layers; ++i) {
+        seq = codec_bm_minicpm_block_htb(ctx, seq, "lm.locdit.layers." + std::to_string(i), model,
+                                         n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false);
+    }
+    // rms_norm folds batch into token dim (per-token op, batch-safe)
+    ggml_tensor * seq_flat = ggml_reshape_2d(ctx, seq, h_dit, T * 2);
+    seq_flat = codec_op_rms_norm_ct(ctx, seq_flat, eps, codec_graph_weight(ctx, model, "lm.locdit.norm.w"));
+    seq = ggml_reshape_3d(ctx, seq_flat, h_dit, T, 2);
+
+    const int64_t start = (int64_t) n_mu + 1 + P;   // x-tail start
+    // x-tail per branch: (h_dit, P, 2)
+    ggml_tensor * xt = ggml_cont(ctx, ggml_view_3d(ctx, seq, h_dit, P, 2,
+                                                   seq->nb[1], seq->nb[2], start * seq->nb[1]));
+    // out_proj stays batched (fold 2 into token dim), then split.
+    ggml_tensor * xt_flat = ggml_reshape_2d(ctx, xt, h_dit, P * 2);
+    ggml_tensor * vel = bm_linear(ctx, codec_graph_weight(ctx, model, "lm.locdit.out_proj.w"), xt_flat,
+                                  codec_graph_weight(ctx, model, "lm.locdit.out_proj.b"));  // (latent, P*2)
+    const int64_t D = vel->ne[0];
+    ggml_tensor * vel3 = ggml_reshape_3d(ctx, vel, D, P, 2);
+    *pos_out = ggml_cont(ctx, ggml_view_2d(ctx, vel3, D, P, vel3->nb[1], 0));
+    *neg_out = ggml_cont(ctx, ggml_view_2d(ctx, vel3, D, P, vel3->nb[1], vel3->nb[2]));
 }
 
 // ---------------------------------------------------------------------
@@ -160,20 +240,28 @@ bool bm_build_cfm(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_tensor * cos_t = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.cos"), p->head_dim, T, W("lm.rope.cos")->nb[1], 0));
     ggml_tensor * sin_t = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.sin"), p->head_dim, T, W("lm.rope.sin")->nb[1], 0));
 
+    const bool cfg_one = (p->cfg_value == 1.0f);
     ggml_tensor * x = z;
     for (int32_t s = 0; s < p->n_real; ++s) {
         ggml_tensor * x_h   = bm_linear(ctx, W("lm.locdit.in_proj.w"), x, W("lm.locdit.in_proj.b"));
         ggml_tensor * tsin_s = ggml_cont(ctx, ggml_view_2d(ctx, tsin, p->h_dit, 1, tsin->nb[1], (size_t) s * tsin->nb[1]));
         ggml_tensor * t_h   = ggml_add(ctx, bm_time_mlp(ctx, p->model, "lm.locdit.time_mlp", tsin_s), dt_emb);
-        ggml_tensor * pos = bm_locdit_core(ctx, p->model, x_h, cond_h, mu,      t_h, cos_t, sin_t,
-                                           p->n_layers, p->n_heads, p->n_kv, p->head_dim, p->eps, p->P, p->h_dit, p->n_mu);
-        ggml_tensor * neg = bm_locdit_core(ctx, p->model, x_h, cond_h, mu_zero, t_h, cos_t, sin_t,
-                                           p->n_layers, p->n_heads, p->n_kv, p->head_dim, p->eps, p->P, p->h_dit, p->n_mu);
-        ggml_tensor * dot = ggml_sum(ctx, ggml_mul(ctx, pos, neg));
-        ggml_tensor * nn  = ggml_sum(ctx, ggml_mul(ctx, neg, neg));
-        ggml_tensor * st  = ggml_div(ctx, dot, ggml_scale_bias(ctx, nn, 1.0f, 1e-8f));
-        ggml_tensor * neg_st = ggml_mul(ctx, neg, st);
-        ggml_tensor * dphi   = ggml_add(ctx, neg_st, ggml_scale(ctx, ggml_sub(ctx, pos, neg_st), p->cfg_value));
+        ggml_tensor * dphi;
+        if (cfg_one) {
+            // cfg == 1: dphi = pos, skip the uncond branch entirely.
+            dphi = bm_locdit_core(ctx, p->model, x_h, cond_h, mu, t_h, cos_t, sin_t,
+                                  p->n_layers, p->n_heads, p->n_kv, p->head_dim, p->eps, p->P, p->h_dit, p->n_mu);
+        } else {
+            ggml_tensor *pos = nullptr, *neg = nullptr;
+            bm_locdit_core_batched(ctx, p->model, x_h, cond_h, mu, mu_zero, t_h, cos_t, sin_t,
+                                   p->n_layers, p->n_heads, p->n_kv, p->head_dim, p->eps, p->P, p->h_dit, p->n_mu,
+                                   &pos, &neg);
+            ggml_tensor * dot = ggml_sum(ctx, ggml_mul(ctx, pos, neg));
+            ggml_tensor * nn  = ggml_sum(ctx, ggml_mul(ctx, neg, neg));
+            ggml_tensor * st  = ggml_div(ctx, dot, ggml_scale_bias(ctx, nn, 1.0f, 1e-8f));
+            ggml_tensor * neg_st = ggml_mul(ctx, neg, st);
+            dphi = ggml_add(ctx, neg_st, ggml_scale(ctx, ggml_sub(ctx, pos, neg_st), p->cfg_value));
+        }
         x = ggml_sub(ctx, x, ggml_scale(ctx, dphi, p->dt[s]));
     }
     ggml_set_name(x, "bm.cfm.out");
@@ -248,6 +336,7 @@ extern "C" int codec_bluemagpie_cfm_eval(
     key.kind = CODEC_GRAPH_BLUEMAGPIE_CFM;
     key.n_frames = P;
     key.n_q = n_timesteps;
+    key.hop = (cfg_value == 1.0f) ? 1 : 0;  // cfg==1 builds a different (single-branch) graph shape
     if (!codec_graph_cache_get_or_build(ctx, key, bm_build_cfm, &b, sizeof(b), &entry, &err)) return 3;
     auto G = [&](const char * nm) { return codec_graph_get_tensor(ctx, entry, nm); };
     ggml_tensor *tz=G("bm.cfm.z"), *tc=G("bm.cfm.cond"), *tm=G("bm.cfm.mu"),

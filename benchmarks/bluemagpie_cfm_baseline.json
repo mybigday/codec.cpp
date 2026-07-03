@@ -1,0 +1,24 @@
+{
+  "_comment": "BlueMagpie LocDiT CFM performance baseline, recorded 2026-07-04 before optimization work. Machine: AMD Radeon Graphics iGPU (RADV GFX1151, UMA), CPU threads as listed. Model: models/bluemagpie/bluemagpie.gguf (lm.* weights F16, 1697 MB total, lm.locdit.* 424 MB). Params: timesteps=10 (n_real=9 after zero-init skip), cfg=2.0, patch_size=4, latent_dim=64 => 160 ms of 48 kHz audio per AR step.",
+  "capability": {
+    "e2e_smoke": "tests/e2e/bluemagpie_e2e_smoke.py PASS",
+    "per_step_patch_corr_min": 0.999997,
+    "per_step_patch_corr_mean": 0.999999,
+    "audio_corr": 0.999978
+  },
+  "cfm_only_codec_bluemagpie_cfm_eval": {
+    "_comment": "e2e fixture (mu,cond,z), 6 steps x repeats, warm. Per-call = one AR step's full CFM: 9 Euler x 2 CFG = 18 LocDiT estimator passes (12 layers, seq T=11).",
+    "cpu_8t":  { "ms_per_step_mean": 556.9, "ms_per_step_min": 451.7, "graph_compute_avg_ms": 510.2, "graph_build_avg_ms": 43.8, "graph_prepare_io_avg_ms": 0.8 },
+    "cpu_16t": { "ms_per_step_mean": 535.1, "ms_per_step_min": 517.2, "graph_compute_avg_ms": 489.5, "graph_build_avg_ms": 43.7 },
+    "vulkan":  { "ms_per_step_mean": 471.7, "ms_per_step_min": 463.6, "graph_compute_avg_ms": 440.0, "graph_build_avg_ms": 40.7, "graph_prepare_io_avg_ms": 2.2 }
+  },
+  "full_step_generate": {
+    "_comment": "codec_lm_step_generate via ctypes (tslm_adapter+FSQ+RALM kv step+LocDiT CFM+stop+LocEnc), 24 steps, random hidden, stop ignored. Graph is rebuilt EVERY step (cache key includes kv_pos; get_or_build also always re-runs build_fn).",
+    "cpu_8t": { "ms_first": 651.2, "ms_mean_warm": 625.4, "ms_min": 608.9, "graph_compute_avg_ms": 575.0, "graph_build_avg_ms": 47.6, "graph_prepare_io_avg_ms": 1.6 }
+  },
+  "realtime_factor": {
+    "audio_ms_per_step": 160,
+    "cpu_8t_full_path_rtf": 3.9,
+    "_comment": "RTF > 1 means slower than realtime; CFM alone is ~3.5x."
+  }
+}

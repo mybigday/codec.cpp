@@ -18,6 +18,13 @@ ggml_tensor * codec_bm_minicpm_block_ht(
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
     ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal);
 
+// Batched variant: x_htb ne=(hidden, T, B).  B branches share the linear
+// weights (folded into the token dim) but attend independently (B in ne[3]).
+ggml_tensor * codec_bm_minicpm_block_htb(
+    ggml_context * ctx, ggml_tensor * x_htb, const std::string & prefix, const codec_model * model,
+    int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal);
+
 // LocDiT estimator core: pre-projected x_h/cond_h (h_dit,P), mu_h (h_dit,n_mu),
 // t_h (h_dit,1) → predicted velocity patch (latent_dim, P).
 ggml_tensor * bm_locdit_core(
@@ -26,5 +33,15 @@ ggml_tensor * bm_locdit_core(
     ggml_tensor * cos_t, ggml_tensor * sin_t,
     int32_t n_layers, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
     int32_t P, int32_t h_dit, int32_t n_mu);
+
+// Batched CFG LocDiT: pos (mu_h) and neg (mu_zero_h) run jointly; returns both
+// velocity patches (latent_dim, P) via pos_out / neg_out.
+void bm_locdit_core_batched(
+    ggml_context * ctx, const codec_model * model,
+    ggml_tensor * x_h, ggml_tensor * cond_h, ggml_tensor * mu_h, ggml_tensor * mu_zero_h,
+    ggml_tensor * t_h, ggml_tensor * cos_t, ggml_tensor * sin_t,
+    int32_t n_layers, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
+    int32_t P, int32_t h_dit, int32_t n_mu,
+    ggml_tensor ** pos_out, ggml_tensor ** neg_out);
 
 #endif // CODEC_MODELS_BLUEMAGPIE_BLOCKS_H
