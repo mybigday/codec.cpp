@@ -43,6 +43,7 @@ enum codec_graph_kind {
     CODEC_GRAPH_BLUEMAGPIE_AUDIOVAE_ENCODE = 55,  // AudioVAE encoder (audio → latent mu)
     CODEC_GRAPH_BLUEMAGPIE_CFM             = 53,  // LocDiT + unrolled CFM Euler (codec_bluemagpie_cfm_eval, e2e test)
     CODEC_GRAPH_BLUEMAGPIE_CFM_STEP        = 56,  // continuous_latent_cfm adaptor — unified per-step graph
+    CODEC_GRAPH_BLUEMAGPIE_CFM_PREFILL     = 57,  // continuous_latent_cfm adaptor — RALM full-prefix prefill
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

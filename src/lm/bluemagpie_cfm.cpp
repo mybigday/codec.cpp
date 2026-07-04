@@ -40,14 +40,37 @@ struct cfm_impl {
     int32_t n_locenc, n_locdit, n_ralm;
     int32_t n_heads, n_kv, head_dim;
     int32_t fsq_scale;
+    int32_t min_len;   // stop guard: stop honoured only for patch index > min_len
     float   eps;
 };
 
 struct cfm_state {
     int32_t            kv_pos = 0;       // RALM positions cached so far (= T)
+    int32_t            patch_index = 0;  // 0-based AR patch counter (for min_len guard)
+    int32_t            min_len = -1;      // per-state override (-1 = use impl default)
     std::vector<float> prev_patch;      // [latent_dim*patch_size] cond
     std::vector<float> prev_feedback_lm;// [h_vox]
     std::vector<float> feedback_tslm;   // [h_barbet]  (for step_feedback_embd)
+
+    // Prefill priming: after codec_lm_text_prefill, `primed` is set and the
+    // last prefix position's (lm_hidden, residual_hidden) are cached here.  The
+    // NEXT step_generate consumes these directly (no adapter/FSQ/RALM) — the
+    // reference's iteration-0 uses the <|audio_start|> text position, whose
+    // lm_hidden is tslm_adapter(h) WITHOUT FSQ, and runs no RALM step.
+    bool               primed = false;
+    std::vector<float> prefill_lm_hidden;       // [h_vox]
+    std::vector<float> prefill_residual_hidden; // [h_vox]
+
+    // Teacher-forcing (parity tests only): when `has_teacher_patch` is set, the
+    // NEXT step_generate uses `teacher_patch` (a reference latent patch) as the
+    // LocEnc feedback source AND as this step's cond, instead of the codec's own
+    // generated patch — so codec replays the reference trajectory exactly and
+    // every emitted patch can be compared against the reference at high corr
+    // (free-running feedback would otherwise diverge chaotically after a few
+    // steps).  The patch the graph *emits* is still codec's own.  Cleared after
+    // consumption; the flag is set via codec_lm_set_teacher_patch.
+    bool               has_teacher_patch = false;
+    std::vector<float> teacher_patch;           // [latent_dim*patch_size]
 
     // Persistent per-layer RALM K/V cache (incremental decode, llama.cpp /
     // residual_depth_ar style).  Each step computes Q/K/V for the 1 new token,
@@ -60,6 +83,8 @@ struct cfm_state {
     std::vector<ggml_tensor *> v_cache;   // [n_ralm]
     int32_t                    max_T = 0;
 };
+
+bool alloc_kv(cfm_state * s, const cfm_impl * I, codec_model * codec);   // fwd (defined below)
 
 ggml_tensor * lin(ggml_context * c, ggml_tensor * w, ggml_tensor * x, ggml_tensor * b) {
     ggml_tensor * y = ggml_mul_mat(c, w, x);
@@ -156,6 +181,242 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
     return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".down.w"), mlp));
 }
 
+// tslm_adapter(h) → (h_vox, T): RMSNorm + proj + one residual SwiGLU block.
+// Shared by the per-step graph and the prefill graph.  x_in is (h_barbet, T).
+ggml_tensor * bm_tslm_adapter(ggml_context * ctx, const codec_model * model, ggml_tensor * x_in, float eps) {
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, s); };
+    ggml_tensor * a = codec_op_rms_norm_ct(ctx, x_in, eps, W("lm.tslm_adapter.norm.w"));
+    a = lin(ctx, WM("lm.tslm_adapter.proj.w"), a, W("lm.tslm_adapter.proj.b"));   // (h_vox,T)
+    ggml_tensor * bn = codec_op_rms_norm_ct(ctx, a, eps, W("lm.tslm_adapter.blk0.ln.w"));
+    ggml_tensor * g  = ggml_mul_mat(ctx, WM("lm.tslm_adapter.blk0.gate.w"), bn);
+    ggml_tensor * u  = ggml_mul_mat(ctx, WM("lm.tslm_adapter.blk0.up.w"), bn);
+    ggml_tensor * dn = ggml_mul_mat(ctx, WM("lm.tslm_adapter.blk0.down.w"), ggml_swiglu_split(ctx, g, u));
+    return ggml_add(ctx, a, dn);
+}
+
+// FSQ over an adapter output a (h_vox, T): out_proj(round(tanh(in_proj(a))*s)/s).
+ggml_tensor * bm_fsq(ggml_context * ctx, const codec_model * model, ggml_tensor * a, int32_t fsq_scale) {
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, s); };
+    ggml_tensor * q = ggml_tanh(ctx, lin(ctx, WM("lm.fsq.in_proj.w"), a, W("lm.fsq.in_proj.b")));
+    q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) fsq_scale)), 1.0f / (float) fsq_scale);
+    return lin(ctx, WM("lm.fsq.out_proj.w"), q, W("lm.fsq.out_proj.b"));   // (h_vox,T)
+}
+
+// ---------------------------------------------------------------------
+// RALM full-prefix prefill graph.
+//
+// The reference runs the RALM causally over the WHOLE prompt before the AR
+// loop, seeding a static KV cache.  For every prefix position (all treated as
+// TEXT positions here — zero-shot / "null" speaker):
+//   lm_hidden_p = tslm_adapter(h_p)                       (NO FSQ on text)
+//   ralm_in_p   = fusion_concat_proj(concat(lm_hidden_p, 0))   (feat_embed_lm=0)
+// then RALM(causal, no rope) over the T inputs.  We take the LAST position's
+// output (post RALM final norm) as prefill_residual_hidden, and the LAST
+// position's lm_hidden as prefill_lm_hidden, and scatter K/V for ALL T positions
+// into the persistent cache slots [0..T).
+//
+// This graph runs ONCE per utterance; it is bucketed on T so the cache reuses
+// across utterances of the same padded length.
+struct cfm_prefill_build {
+    cfm_impl  imp;
+    int32_t   n_pos;        // real prefix length T
+    ggml_tensor * k_cache[32];
+    ggml_tensor * v_cache[32];
+    const codec_model * model;
+};
+
+// One RALM prefill layer over T tokens: causal self-attention (no rope), and
+// scatter this layer's per-token K/V into the persistent cache rows [0..T).
+// x_ht (h_vox, T) → (h_vox, T).  kset/vset are surfaced as outputs so graph.cpp
+// roots the scatter writes.
+ggml_tensor * bm_ralm_prefill_layer(ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix,
+    const codec_model * model, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
+    ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, ggml_tensor * row_idx, int32_t T,
+    ggml_tensor ** kset_out, ggml_tensor ** vset_out) {
+
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, prefix + s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, prefix + s); };
+    const int32_t q_dim  = n_heads * head_dim;
+    const int32_t kv_dim = n_kv * head_dim;
+
+    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln1.w"));   // (h_vox, T)
+    ggml_tensor * q, * kk, * vv;
+    ggml_tensor * w_qkv = codec_graph_weight_mat(ctx, model, prefix + ".attn_qkv.w");
+    if (w_qkv != nullptr) {
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w_qkv, h);   // (q_dim+2*kv_dim, T)
+        ggml_tensor * qv = ggml_view_2d(ctx, qkv, q_dim,  T, qkv->nb[1], 0);
+        ggml_tensor * kv = ggml_view_2d(ctx, qkv, kv_dim, T, qkv->nb[1], (size_t) q_dim * qkv->nb[0]);
+        ggml_tensor * vvw= ggml_view_2d(ctx, qkv, kv_dim, T, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]);
+        q  = ggml_reshape_3d(ctx, ggml_cont(ctx, qv),  head_dim, n_heads, T);
+        kk = ggml_reshape_3d(ctx, ggml_cont(ctx, kv),  head_dim, n_kv,    T);
+        vv = ggml_reshape_3d(ctx, ggml_cont(ctx, vvw), head_dim, n_kv,    T);
+    } else {
+        q  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_q.w"), h), head_dim, n_heads, T);
+        kk = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_k.w"), h), head_dim, n_kv,    T);
+        vv = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_v.w"), h), head_dim, n_kv,    T);
+    }
+
+    // Scatter K/V for all T tokens into the persistent cache rows [0..T).  The
+    // cache (head_dim, n_kv, max_T) is contiguous; a 2D view (head_dim*n_kv,
+    // max_T) treats each token as one row; ggml_set_rows writes rows row_idx.
+    {
+        const int64_t kw = (int64_t) head_dim * n_kv;
+        ggml_tensor * k2 = ggml_view_2d(ctx, k_cache_l, kw, k_cache_l->ne[2], k_cache_l->nb[2], 0);
+        ggml_tensor * v2 = ggml_view_2d(ctx, v_cache_l, kw, v_cache_l->ne[2], v_cache_l->nb[2], 0);
+        ggml_tensor * kk_rows = ggml_reshape_2d(ctx, kk, kw, T);
+        ggml_tensor * vv_rows = ggml_reshape_2d(ctx, vv, kw, T);
+        *kset_out = ggml_set_rows(ctx, k2, kk_rows, row_idx);
+        *vset_out = ggml_set_rows(ctx, v2, vv_rows, row_idx);
+    }
+
+    // Causal self-attention over the T tokens (no rope).
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q,  0, 2, 1, 3));   // (d, T, n_heads)
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, kk, 0, 2, 1, 3));   // (d, T, n_kv)
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);                       // (T_k, T_q, n_heads)
+    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
+    scores = ggml_diag_mask_inf(ctx, scores, 0);
+    scores = ggml_soft_max(ctx, scores);
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, vv, 1, 2, 0, 3));   // (T, d, n_kv)
+    ggml_tensor * attn = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, v_p, scores), 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, q_dim, T);
+    x_ht = ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".attn_o.w"), attn));
+
+    h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln2.w"));
+    ggml_tensor * mlp;
+    ggml_tensor * w_gu = codec_graph_weight_mat(ctx, model, prefix + ".gate_up.w");
+    if (w_gu != nullptr) {
+        mlp = ggml_swiglu(ctx, ggml_mul_mat(ctx, w_gu, h));
+    } else {
+        ggml_tensor * g = ggml_mul_mat(ctx, WM(".gate.w"), h);
+        ggml_tensor * u = ggml_mul_mat(ctx, WM(".up.w"), h);
+        mlp = ggml_swiglu_split(ctx, g, u);
+    }
+    return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".down.w"), mlp));
+}
+
+bool build_prefill(ggml_context * ctx, void * ud, ggml_tensor ** out) {
+    cfm_prefill_build * p = static_cast<cfm_prefill_build *>(ud);
+    const cfm_impl & I = p->imp;
+    const codec_model * model = p->model;
+    const int32_t T = p->n_pos;
+
+    // Barbet prefix hiddens (h_barbet, T), position-major.
+    ggml_tensor * h_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_barbet, T);
+    ggml_set_name(h_in, "bm.pf.h_in");
+    ggml_set_input(h_in);
+
+    // Row indices [0..T) for the K/V scatter (host-written I32 arange).
+    ggml_tensor * row_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+    ggml_set_name(row_idx, "bm.pf.row_idx");
+    ggml_set_input(row_idx);
+
+    // lm_hidden = tslm_adapter(h_in) (NO FSQ — every prefix position is text).
+    ggml_tensor * a = bm_tslm_adapter(ctx, model, h_in, I.eps);   // (h_vox, T)
+
+    // ralm_in = fusion_concat_proj(concat(a, 0))  (feat_embed_lm half = 0 for text).
+    ggml_tensor * zeros = ggml_scale(ctx, a, 0.0f);                        // (h_vox, T) zeros
+    ggml_tensor * fus   = ggml_concat(ctx, a, zeros, 0);                   // (2*h_vox, T)
+    ggml_tensor * rh    = lin(ctx, codec_graph_weight_mat(ctx, model, "lm.proj.fusion_concat.w"),
+                             fus, codec_graph_weight(ctx, model, "lm.proj.fusion_concat.b"));  // (h_vox, T)
+
+    for (int32_t i = 0; i < I.n_ralm; ++i) {
+        ggml_tensor * kset_i = nullptr, * vset_i = nullptr;
+        rh = bm_ralm_prefill_layer(ctx, rh, "lm.ralm.layers." + std::to_string(i), model,
+                                   I.n_heads, I.n_kv, I.head_dim, I.eps,
+                                   p->k_cache[i], p->v_cache[i], row_idx, T, &kset_i, &vset_i);
+        ggml_set_name(kset_i, ("bm.pf.kset." + std::to_string(i)).c_str());
+        ggml_set_output(kset_i);
+        ggml_set_name(vset_i, ("bm.pf.vset." + std::to_string(i)).c_str());
+        ggml_set_output(vset_i);
+    }
+    ggml_tensor * rn = codec_op_rms_norm_ct(ctx, rh, I.eps, codec_graph_weight(ctx, model, "lm.ralm.norm.w"));
+
+    // Last-position outputs.
+    ggml_tensor * res_last = ggml_cont(ctx, ggml_view_1d(ctx, rn, I.h_vox, (size_t) (T - 1) * rn->nb[1]));
+    ggml_set_name(res_last, "bm.pf.res_last");
+    ggml_set_output(res_last);
+    ggml_tensor * lm_last = ggml_cont(ctx, ggml_view_1d(ctx, a, I.h_vox, (size_t) (T - 1) * a->nb[1]));
+    ggml_set_name(lm_last, "bm.pf.lm_last");
+    ggml_set_output(lm_last);
+
+    *out = res_last;
+    return true;
+}
+
+enum codec_status text_prefill(codec_lm_state * st, const float * hiddens, int32_t n_pos, int32_t hidden_dim) {
+    cfm_impl * I = static_cast<cfm_impl *>(st->lm->impl);
+    cfm_state * s = static_cast<cfm_state *>(st->impl);
+    (void) hidden_dim;   // validated by the public wrapper == I->h_barbet
+
+    if (!alloc_kv(s, I, st->lm->codec)) { st->last_error = "RALM KV cache alloc failed"; return CODEC_STATUS_INTERNAL_ERROR; }
+    if (n_pos > s->max_T) { st->last_error = "prefix longer than RALM KV cache (max_T)"; return CODEC_STATUS_INVALID_ARG; }
+
+    // Start from a clean cache/state: prefill defines the whole prefix.
+    s->kv_pos = 0;
+    s->patch_index = 0;
+
+    cfm_prefill_build b = {};
+    b.imp = *I; b.n_pos = n_pos; b.model = st->lm->codec;
+    for (int32_t l = 0; l < I->n_ralm; ++l) { b.k_cache[l] = s->k_cache[(size_t) l]; b.v_cache[l] = s->v_cache[(size_t) l]; }
+
+    codec_graph_eval_guard guard(st->ctx, /*persist=*/false);
+    std::string err;
+    codec_graph_cache_entry * entry = nullptr;
+    codec_graph_cache_key key = {};
+    key.kind = CODEC_GRAPH_BLUEMAGPIE_CFM_PREFILL;
+    key.n_frames = n_pos;   // graph shape depends on the (unbucketed) prefix length
+    if (!codec_graph_cache_get_or_build(st->ctx, key, build_prefill, &b, sizeof(b), &entry, &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    auto G = [&](const char * nm) { return codec_graph_get_tensor(st->ctx, entry, nm); };
+    if (!codec_graph_prepare_io(st->ctx, entry, &err)) { st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR; }
+
+    if (!codec_runtime_write_tensor(G("bm.pf.h_in"), hiddens, (size_t) I->h_barbet * n_pos * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    std::vector<int32_t> row_idx((size_t) n_pos);
+    for (int32_t i = 0; i < n_pos; ++i) row_idx[(size_t) i] = i;
+    if (!codec_runtime_write_tensor(G("bm.pf.row_idx"), row_idx.data(), (size_t) n_pos * sizeof(int32_t), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    const int32_t nth = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
+    if (!codec_graph_compute(st->ctx, entry, nth, &err)) { st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR; }
+
+    if (!codec_runtime_read_tensor(G("bm.pf.res_last"), s->prefill_residual_hidden.data(),
+                                   (size_t) I->h_vox * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_runtime_read_tensor(G("bm.pf.lm_last"), s->prefill_lm_hidden.data(),
+                                   (size_t) I->h_vox * sizeof(float), &err)) {
+        st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    // K/V for all T positions were scattered into the cache in-graph.
+    s->kv_pos = n_pos;
+    s->primed = true;
+    return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status set_min_len(codec_lm_state * st, int32_t min_len) {
+    cfm_state * s = static_cast<cfm_state *>(st->impl);
+    s->min_len = min_len;   // <0 restores impl default
+    return CODEC_STATUS_SUCCESS;
+}
+
+enum codec_status set_teacher_patch(codec_lm_state * st, const float * patch, int32_t n) {
+    cfm_impl * I = static_cast<cfm_impl *>(st->lm->impl);
+    cfm_state * s = static_cast<cfm_state *>(st->impl);
+    const int32_t dp = I->latent_dim * I->patch_size;
+    if (patch == nullptr) { s->has_teacher_patch = false; return CODEC_STATUS_SUCCESS; }
+    if (n != dp) { st->last_error = "teacher patch length mismatch"; return CODEC_STATUS_INVALID_ARG; }
+    s->teacher_patch.assign(patch, patch + dp);
+    s->has_teacher_patch = true;
+    return CODEC_STATUS_SUCCESS;
+}
+
 // Build the whole per-step graph.
 //
 // IMPORTANT: the graph shape depends ONLY on (bucket, n_real, cfg_value) — NOT
@@ -169,6 +430,10 @@ struct cfm_build {
     int32_t   bucket;       // RALM cache view length (round_up(kv_pos+1, 64))
     int32_t   n_real;       // CFM real (non-zero-init) steps
     float     cfg_value;
+    int32_t   primed;       // 1 = primed first step: lm_hidden/residual_hidden are
+                            // INPUTS (from prefill); skip adapter/FSQ/RALM entirely.
+    int32_t   teacher;      // 1 = LocEnc runs on the `bm.cfm.teacher` input patch
+                            // (teacher-forced trajectory) instead of the emitted x.
     float     dt[64];
     ggml_tensor * k_cache[32];
     ggml_tensor * v_cache[32];
@@ -187,60 +452,75 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
         return lin(ctx, WM(wn), x, bn ? W(bn) : nullptr);
     };
 
-    ggml_tensor * h_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_barbet, 1);  ggml_set_name(h_in, "bm.cfm.h_in");
-    ggml_tensor * pfb_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_vox, 1);      ggml_set_name(pfb_lm, "bm.cfm.pfb_lm");
     ggml_tensor * cond   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, P);            ggml_set_name(cond, "bm.cfm.cond");
     ggml_tensor * z      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, P);            ggml_set_name(z, "bm.cfm.z");
     ggml_tensor * tsin   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_dit, p->n_real); ggml_set_name(tsin, "bm.cfm.tsin");
     ggml_tensor * dtsin  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_dit, 1);       ggml_set_name(dtsin, "bm.cfm.dtsin");
 
-    // ---- tslm_adapter(h_in) → h_vox ----
-    ggml_tensor * a = codec_op_rms_norm_ct(ctx, h_in, I.eps, W("lm.tslm_adapter.norm.w"));
-    a = linW("lm.tslm_adapter.proj.w", a, "lm.tslm_adapter.proj.b");   // (h_vox,1)
-    {   // residual SwiGLU block
-        ggml_tensor * bn = codec_op_rms_norm_ct(ctx, a, I.eps, W("lm.tslm_adapter.blk0.ln.w"));
-        ggml_tensor * g = linW("lm.tslm_adapter.blk0.gate.w", bn, nullptr);
-        ggml_tensor * u = linW("lm.tslm_adapter.blk0.up.w", bn, nullptr);
-        a = ggml_add(ctx, a, linW("lm.tslm_adapter.blk0.down.w", ggml_swiglu_split(ctx, g, u), nullptr));
+    ggml_tensor * lm_hidden;
+    ggml_tensor * residual_hidden;
+
+    if (p->primed) {
+        // Primed first step: lm_hidden / residual_hidden come straight from the
+        // prefill (last prefix position — a text position, so lm_hidden is the
+        // non-FSQ tslm_adapter output).  No adapter / FSQ / RALM step here; the
+        // RALM step for the NEXT iteration runs in the next (non-primed) call.
+        lm_hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_vox, 1);
+        ggml_set_name(lm_hidden, "bm.cfm.lm_hidden_in");   ggml_set_input(lm_hidden);
+        residual_hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_vox, 1);
+        ggml_set_name(residual_hidden, "bm.cfm.res_hidden_in"); ggml_set_input(residual_hidden);
+    } else {
+        ggml_tensor * h_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_barbet, 1);  ggml_set_name(h_in, "bm.cfm.h_in");
+        ggml_tensor * pfb_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_vox, 1);      ggml_set_name(pfb_lm, "bm.cfm.pfb_lm");
+
+        // ---- tslm_adapter(h_in) → h_vox ----
+        ggml_tensor * a = codec_op_rms_norm_ct(ctx, h_in, I.eps, W("lm.tslm_adapter.norm.w"));
+        a = linW("lm.tslm_adapter.proj.w", a, "lm.tslm_adapter.proj.b");   // (h_vox,1)
+        {   // residual SwiGLU block
+            ggml_tensor * bn = codec_op_rms_norm_ct(ctx, a, I.eps, W("lm.tslm_adapter.blk0.ln.w"));
+            ggml_tensor * g = linW("lm.tslm_adapter.blk0.gate.w", bn, nullptr);
+            ggml_tensor * u = linW("lm.tslm_adapter.blk0.up.w", bn, nullptr);
+            a = ggml_add(ctx, a, linW("lm.tslm_adapter.blk0.down.w", ggml_swiglu_split(ctx, g, u), nullptr));
+        }
+        // ---- FSQ: round(tanh(in_proj(a))*s)/s then out_proj ----
+        ggml_tensor * q = ggml_tanh(ctx, linW("lm.fsq.in_proj.w", a, "lm.fsq.in_proj.b"));
+        q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) I.fsq_scale)), 1.0f / (float) I.fsq_scale);
+        lm_hidden = linW("lm.fsq.out_proj.w", q, "lm.fsq.out_proj.b");   // (h_vox,1)
+
+        // ---- RALM input = fusion_concat_proj([lm_hidden ; prev_feedback_lm]) ----
+        ggml_tensor * fus = ggml_concat(ctx, lm_hidden, pfb_lm, 0);                                // (2*h_vox,1)
+        ggml_tensor * ralm_new = linW("lm.proj.fusion_concat.w", fus, "lm.proj.fusion_concat.b"); // (h_vox,1)
+
+        // ---- RALM: one incremental step over the persistent KV cache ----
+        // Shared additive attention mask for all RALM layers.  scores has ne0 =
+        // bucket+1 (bucket cache slots + the 1 concatenated new token), so the
+        // mask is (bucket+1, 1).  Host fills it each step.
+        ggml_tensor * ralm_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, p->bucket + 1, 1);
+        ggml_set_name(ralm_mask, "bm.cfm.ralm_mask");
+        ggml_set_input(ralm_mask);
+
+        // Row index (= kv_pos) for the in-graph ggml_set_rows K/V scatter.  1-element
+        // I32 input, host-written per step; the graph stays static per bucket.
+        ggml_tensor * ralm_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ralm_row, "bm.cfm.ralm_row");
+        ggml_set_input(ralm_row);
+
+        ggml_tensor * rh = ralm_new;   // 1 new token
+        for (int32_t i = 0; i < I.n_ralm; ++i) {
+            ggml_tensor * kset_i = nullptr, * vset_i = nullptr;
+            rh = bm_ralm_kv_step(ctx, rh, "lm.ralm.layers." + std::to_string(i), model,
+                                 I.n_heads, I.n_kv, I.head_dim, I.eps,
+                                 p->k_cache[i], p->v_cache[i], p->bucket, ralm_mask, ralm_row, &kset_i, &vset_i);
+            // The in-graph set_rows writes are pure side-outputs; flag them so
+            // graph.cpp roots them for execution (they scatter into the persistent
+            // cache and are never read back within this graph).
+            ggml_set_name(kset_i, ("bm.cfm.ralm_kset." + std::to_string(i)).c_str());
+            ggml_set_output(kset_i);
+            ggml_set_name(vset_i, ("bm.cfm.ralm_vset." + std::to_string(i)).c_str());
+            ggml_set_output(vset_i);
+        }
+        residual_hidden = codec_op_rms_norm_ct(ctx, rh, I.eps, W("lm.ralm.norm.w"));  // (h_vox,1)
     }
-    // ---- FSQ: round(tanh(in_proj(a))*s)/s then out_proj ----
-    ggml_tensor * q = ggml_tanh(ctx, linW("lm.fsq.in_proj.w", a, "lm.fsq.in_proj.b"));
-    q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) I.fsq_scale)), 1.0f / (float) I.fsq_scale);
-    ggml_tensor * lm_hidden = linW("lm.fsq.out_proj.w", q, "lm.fsq.out_proj.b");   // (h_vox,1)
-
-    // ---- RALM input = fusion_concat_proj([lm_hidden ; prev_feedback_lm]) ----
-    ggml_tensor * fus = ggml_concat(ctx, lm_hidden, pfb_lm, 0);                                // (2*h_vox,1)
-    ggml_tensor * ralm_new = linW("lm.proj.fusion_concat.w", fus, "lm.proj.fusion_concat.b"); // (h_vox,1)
-
-    // ---- RALM: one incremental step over the persistent KV cache ----
-    // Shared additive attention mask for all RALM layers.  scores has ne0 =
-    // bucket+1 (bucket cache slots + the 1 concatenated new token), so the
-    // mask is (bucket+1, 1).  Host fills it each step.
-    ggml_tensor * ralm_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, p->bucket + 1, 1);
-    ggml_set_name(ralm_mask, "bm.cfm.ralm_mask");
-    ggml_set_input(ralm_mask);
-
-    // Row index (= kv_pos) for the in-graph ggml_set_rows K/V scatter.  1-element
-    // I32 input, host-written per step; the graph stays static per bucket.
-    ggml_tensor * ralm_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_name(ralm_row, "bm.cfm.ralm_row");
-    ggml_set_input(ralm_row);
-
-    ggml_tensor * rh = ralm_new;   // 1 new token
-    for (int32_t i = 0; i < I.n_ralm; ++i) {
-        ggml_tensor * kset_i = nullptr, * vset_i = nullptr;
-        rh = bm_ralm_kv_step(ctx, rh, "lm.ralm.layers." + std::to_string(i), model,
-                             I.n_heads, I.n_kv, I.head_dim, I.eps,
-                             p->k_cache[i], p->v_cache[i], p->bucket, ralm_mask, ralm_row, &kset_i, &vset_i);
-        // The in-graph set_rows writes are pure side-outputs; flag them so
-        // graph.cpp roots them for execution (they scatter into the persistent
-        // cache and are never read back within this graph).
-        ggml_set_name(kset_i, ("bm.cfm.ralm_kset." + std::to_string(i)).c_str());
-        ggml_set_output(kset_i);
-        ggml_set_name(vset_i, ("bm.cfm.ralm_vset." + std::to_string(i)).c_str());
-        ggml_set_output(vset_i);
-    }
-    ggml_tensor * residual_hidden = codec_op_rms_norm_ct(ctx, rh, I.eps, W("lm.ralm.norm.w"));  // (h_vox,1)
 
     // ---- mu = [lm_to_dit(lm_hidden) ; res_to_dit(residual_hidden)] → (h_dit, n_mu) ----
     ggml_tensor * mu1 = linW("lm.proj.lm_to_dit.w", lm_hidden, "lm.proj.lm_to_dit.b");
@@ -293,7 +573,16 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_set_output(stop_logit);
 
     // ---- LocEnc(patch) → feedback ----
-    ggml_tensor * le = linW("lm.locenc.in_proj.w", x, "lm.locenc.in_proj.b");   // (h_enc, P)
+    // Teacher-forcing: LocEnc runs on the reference patch input so the feedback
+    // (and hence the next step's RALM/backbone drive) tracks the reference
+    // trajectory exactly.  The emitted patch `x` is unchanged.
+    ggml_tensor * le_src = x;
+    if (p->teacher) {
+        ggml_tensor * tp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, P);
+        ggml_set_name(tp, "bm.cfm.teacher"); ggml_set_input(tp);
+        le_src = tp;
+    }
+    ggml_tensor * le = linW("lm.locenc.in_proj.w", le_src, "lm.locenc.in_proj.b");   // (h_enc, P)
     ggml_tensor * sptok = ggml_reshape_2d(ctx, codec_graph_cast_f32(ctx, W("lm.locenc.special_token")), I.h_enc, 1);
     le = ggml_concat(ctx, sptok, le, 1);                                                   // (h_enc, P+1)
     const int64_t Te = le->ne[1];
@@ -338,6 +627,7 @@ bool init(codec_lm * lm) {
     I->n_kv      = codec_read_i32_kv(gf, "codec.lm.n_kv", 2);
     I->head_dim  = codec_read_i32_kv(gf, "codec.lm.head_dim", 128);
     I->fsq_scale = codec_read_i32_kv(gf, "codec.lm.fsq_scale", 9);
+    I->min_len   = codec_read_i32_kv(gf, "codec.lm.min_len", 2);
     I->eps       = codec_read_f32_kv(gf, "codec.lm.rms_eps", 1e-5f);
     lm->impl = I;
     return true;
@@ -354,6 +644,8 @@ bool state_init(codec_lm_state * st) {
     s->prev_patch.assign((size_t) I->latent_dim * I->patch_size, 0.0f);
     s->prev_feedback_lm.assign((size_t) I->h_vox, 0.0f);
     s->feedback_tslm.assign((size_t) I->h_barbet, 0.0f);
+    s->prefill_lm_hidden.assign((size_t) I->h_vox, 0.0f);
+    s->prefill_residual_hidden.assign((size_t) I->h_vox, 0.0f);
     st->impl = s;
     return true;
 }
@@ -369,9 +661,15 @@ void state_free(codec_lm_state * st) {
 void state_reset(codec_lm_state * st) {
     cfm_state * s = static_cast<cfm_state *>(st->impl);
     s->kv_pos = 0;   // discard cached RALM K/V (positions before 0 are never read)
+    s->patch_index = 0;
+    s->primed = false;
+    s->has_teacher_patch = false;
     std::fill(s->prev_patch.begin(), s->prev_patch.end(), 0.0f);
     std::fill(s->prev_feedback_lm.begin(), s->prev_feedback_lm.end(), 0.0f);
     std::fill(s->feedback_tslm.begin(), s->feedback_tslm.end(), 0.0f);
+    std::fill(s->prefill_lm_hidden.begin(), s->prefill_lm_hidden.end(), 0.0f);
+    std::fill(s->prefill_residual_hidden.begin(), s->prefill_residual_hidden.end(), 0.0f);
+    // min_len override is preserved across reset (host set it deliberately).
 }
 
 // Lazily allocate the persistent RALM K/V cache in the codec backend.
@@ -427,6 +725,13 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     if (!alloc_kv(s, I, st->lm->codec)) { st->last_error = "RALM KV cache alloc failed"; return CODEC_STATUS_INTERNAL_ERROR; }
     if (s->kv_pos >= s->max_T) { st->last_error = "RALM KV cache full (max_T)"; return CODEC_STATUS_INVALID_STATE; }
 
+    // Primed first step (after codec_lm_text_prefill): lm_hidden / residual_hidden
+    // come from the prefill's last position; no adapter / FSQ / RALM step here.
+    // h_in is accepted but UNUSED on this call (the reference's iteration-0 reuses
+    // the <|audio_start|> prefill position; the RALM step for the next iteration
+    // runs in the next, non-primed call).  kv_pos does NOT advance here.
+    const bool primed = s->primed;
+
     const int32_t zero_init = std::max(1, (int32_t) ((double) (n + 1) * 0.04));
     // Bucket the RALM cache view length so the graph shape is kv_pos-independent
     // within a 64-step window: consecutive steps reuse the same cache entry.
@@ -434,6 +739,8 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     const int32_t bucket = ((s->kv_pos + 1 + kBucketQuantum - 1) / kBucketQuantum) * kBucketQuantum;
     cfm_build b = {};
     b.imp = *I; b.bucket = bucket; b.cfg_value = cfg_value; b.model = st->lm->codec;
+    b.primed = primed ? 1 : 0;
+    b.teacher = s->has_teacher_patch ? 1 : 0;
     for (int32_t l = 0; l < I->n_ralm; ++l) { b.k_cache[l] = s->k_cache[(size_t) l]; b.v_cache[l] = s->v_cache[(size_t) l]; }
     std::vector<double> t_real;
     double t = tspan[0], dt = tspan[0] - tspan[1];
@@ -457,7 +764,9 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     key.kind = CODEC_GRAPH_BLUEMAGPIE_CFM_STEP;
     key.n_frames = bucket;        // graph shape depends only on the 64-bucketed KV view length
     key.n_q = n_timesteps;
-    key.hop = (cfg_value == 1.0f) ? 1 : 0;  // cfg==1 builds a different (single-branch) graph shape
+    // hop bit0 = cfg==1 single-branch shape; bit1 = primed (lm/res hidden are
+    // inputs, no adapter/FSQ/RALM subgraph); bit2 = teacher-forced LocEnc input.
+    key.hop = ((cfg_value == 1.0f) ? 1 : 0) | (primed ? 2 : 0) | (b.teacher ? 4 : 0);
     if (!codec_graph_cache_get_or_build(st->ctx, key, build_step, &b, sizeof(b), &entry, &err)) {
         st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -467,21 +776,31 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     auto wr = [&](const char * nm, const float * d, size_t n_el) -> bool {
         ggml_tensor * tt = G(nm); return tt && codec_runtime_write_tensor(tt, d, n_el * sizeof(float), &err);
     };
-    // RALM additive attention mask, shape (bucket+1, 1).  Layout of the
-    // concatenated keys: slots [0..bucket) are the cache view, slot [bucket] is
-    // the freshly computed new token.  Valid slots: old cache [0..kv_pos) and
-    // the self slot [bucket]; unfilled cache slots [kv_pos..bucket) are -inf.
-    std::vector<float> ralm_mask((size_t) bucket + 1, 0.0f);
-    for (int32_t j = s->kv_pos; j < bucket; ++j) ralm_mask[(size_t) j] = -INFINITY;
-    bool ok = wr("bm.cfm.h_in", h_in, I->h_barbet) && wr("bm.cfm.pfb_lm", s->prev_feedback_lm.data(), I->h_vox)
-        && wr("bm.cfm.cond", s->prev_patch.data(), dp) && wr("bm.cfm.z", noise, dp)
-        && wr("bm.cfm.tsin", tsin_all.data(), tsin_all.size()) && wr("bm.cfm.dtsin", dtsin.data(), dtsin.size())
-        && wr("bm.cfm.ralm_mask", ralm_mask.data(), ralm_mask.size());
-    if (!ok) { st->last_error = err.empty() ? "write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
-    // Row index for the in-graph set_rows K/V scatter (= current kv_pos).
-    { ggml_tensor * tr = G("bm.cfm.ralm_row");
-      if (!tr || !codec_runtime_write_tensor(tr, &s->kv_pos, sizeof(int32_t), &err)) {
-          st->last_error = err.empty() ? "row write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; } }
+    bool ok = wr("bm.cfm.cond", s->prev_patch.data(), dp) && wr("bm.cfm.z", noise, dp)
+        && wr("bm.cfm.tsin", tsin_all.data(), tsin_all.size()) && wr("bm.cfm.dtsin", dtsin.data(), dtsin.size());
+    if (b.teacher) {
+        ok = ok && wr("bm.cfm.teacher", s->teacher_patch.data(), dp);
+    }
+    if (primed) {
+        // Primed step inputs: cached lm_hidden / residual_hidden from prefill.
+        ok = ok && wr("bm.cfm.lm_hidden_in", s->prefill_lm_hidden.data(), I->h_vox)
+                && wr("bm.cfm.res_hidden_in", s->prefill_residual_hidden.data(), I->h_vox);
+        if (!ok) { st->last_error = err.empty() ? "write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
+    } else {
+        // RALM additive attention mask, shape (bucket+1, 1).  Layout of the
+        // concatenated keys: slots [0..bucket) are the cache view, slot [bucket] is
+        // the freshly computed new token.  Valid slots: old cache [0..kv_pos) and
+        // the self slot [bucket]; unfilled cache slots [kv_pos..bucket) are -inf.
+        std::vector<float> ralm_mask((size_t) bucket + 1, 0.0f);
+        for (int32_t j = s->kv_pos; j < bucket; ++j) ralm_mask[(size_t) j] = -INFINITY;
+        ok = ok && wr("bm.cfm.h_in", h_in, I->h_barbet) && wr("bm.cfm.pfb_lm", s->prev_feedback_lm.data(), I->h_vox)
+                && wr("bm.cfm.ralm_mask", ralm_mask.data(), ralm_mask.size());
+        if (!ok) { st->last_error = err.empty() ? "write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
+        // Row index for the in-graph set_rows K/V scatter (= current kv_pos).
+        ggml_tensor * tr = G("bm.cfm.ralm_row");
+        if (!tr || !codec_runtime_write_tensor(tr, &s->kv_pos, sizeof(int32_t), &err)) {
+            st->last_error = err.empty() ? "row write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
+    }
 
     const int32_t nth = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
     if (!codec_graph_compute(st->ctx, entry, nth, &err)) { st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR; }
@@ -491,16 +810,31 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
         st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR; }
     float stop2[2] = {0, 0};
     codec_runtime_read_tensor(G("bm.cfm.stop"), stop2, sizeof(stop2), &err);
-    if (out_stop) *out_stop = (stop2[1] > stop2[0]) ? 1 : 0;
+    int32_t stop = (stop2[1] > stop2[0]) ? 1 : 0;
+    // min_len guard: the reference does `if i > min_len and stop == 1: break`, so
+    // the stop flag is IGNORED for patches 0..min_len (0-based patch index).
+    const int32_t min_len = (s->min_len >= 0) ? s->min_len : I->min_len;
+    if (s->patch_index <= min_len) stop = 0;
+    if (out_stop) *out_stop = stop;
     codec_runtime_read_tensor(G("bm.cfm.fb_tslm"), s->feedback_tslm.data(), (size_t) I->h_barbet * sizeof(float), &err);
     codec_runtime_read_tensor(G("bm.cfm.fb_lm"), s->prev_feedback_lm.data(), (size_t) I->h_vox * sizeof(float), &err);
 
     // The new token's K/V were scattered into the persistent cache in-graph via
     // ggml_set_rows (row = kv_pos), so no host readback + tensor_set is needed.
 
-    // advance state: the RALM K/V for this position is now in the cache.
-    s->kv_pos += 1;
-    std::memcpy(s->prev_patch.data(), out_patch, dp * sizeof(float));
+    // advance state.  On a primed step no RALM step ran, so kv_pos does NOT
+    // advance (the RALM step for iteration 1 runs in the next, non-primed call).
+    if (!primed) s->kv_pos += 1;
+    s->primed = false;   // consumed the prime
+    s->patch_index += 1;
+    // Next step's cond = this step's patch.  Under teacher-forcing that is the
+    // reference patch (so the trajectory stays aligned); else the codec's own.
+    if (s->has_teacher_patch) {
+        std::memcpy(s->prev_patch.data(), s->teacher_patch.data(), dp * sizeof(float));
+        s->has_teacher_patch = false;   // consumed; caller re-arms per step
+    } else {
+        std::memcpy(s->prev_patch.data(), out_patch, dp * sizeof(float));
+    }
     return CODEC_STATUS_SUCCESS;
 }
 
@@ -532,4 +866,7 @@ const codec_lm_kind_vtable codec_lm_vtable_continuous_latent_cfm = {
     /*.speaker_encode     =*/ nullptr,
     /*.step_generate      =*/ step_generate,
     /*.step_feedback_embd =*/ step_feedback_embd,
+    /*.text_prefill       =*/ text_prefill,
+    /*.set_min_len        =*/ set_min_len,
+    /*.set_teacher_patch  =*/ set_teacher_patch,
 };

@@ -67,7 +67,7 @@ void print_usage(const char * prog) {
         "             residual_depth_ar models).  decode_audio at the end\n"
         "             checks the accumulator matches a direct codec_decode.\n"
         "  simulate-continuous --model PATH --hidden-npy PATH.npy --output PATH.wav\n"
-        "             [--noise-npy PATH.npy] [--cfg FLOAT] [--timesteps N]\n"
+        "             [--noise-npy PATH.npy] [--cfg FLOAT] [--timesteps N] [--min-len N]\n"
         "             Continuous-latent observe (BlueMagpie / continuous_latent_cfm).\n"
         "             Loads a (T, hidden_dim) F32 .npy of backbone hidden states,\n"
         "             dispatches one step per audio_lm_observe_hidden call.  Each\n"
@@ -133,6 +133,7 @@ struct args {
     std::string noise_npy;    // (T, patch_size*latent_dim) F32, optional
     float       cont_cfg     = 2.0f;
     int32_t     cont_timesteps = 10;
+    int32_t     cont_min_len = -1;   // -1 = model default (GGUF codec.lm.min_len / 2)
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -166,6 +167,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--noise-npy")  { const char * v = need(); if (!v) return false; out->noise_npy  = v; i++; }
         else if (a == "--cfg")        { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cont_cfg)) return false; i++; }
         else if (a == "--timesteps")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->cont_timesteps)) return false; i++; }
+        else if (a == "--min-len")    { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->cont_min_len)) return false; i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -738,7 +740,7 @@ int cmd_simulate_continuous(const args & a) {
         codec_common::audio_lm_free(ctx);
         return 2;
     }
-    codec_common::audio_lm_set_continuous_params(ctx, a.cont_cfg, a.cont_timesteps);
+    codec_common::audio_lm_set_continuous_params(ctx, a.cont_cfg, a.cont_timesteps, a.cont_min_len);
 
     std::vector<float> hidden_vec;
     int32_t n_steps = 0, h_cols = 0;
