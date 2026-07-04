@@ -246,8 +246,11 @@ ggml_tensor * codec_op_channel_scale(ggml_context * ctx, ggml_tensor * x, ggml_t
         return nullptr;
     }
     scale = codec_graph_cast_f32(ctx, scale);
+    // ggml_mul broadcasts src1 over ne>=1 dims natively (ne[1]=1 repeats over
+    // x's ne[1]); no explicit ggml_repeat needed.  scale is (ne[0],) → view as
+    // (ne[0], 1) so the leading dims match x for the broadcast.
     ggml_tensor * s2 = ggml_reshape_2d(ctx, scale, x->ne[0], 1);
-    return ggml_mul(ctx, x, ggml_repeat(ctx, s2, x));
+    return ggml_mul(ctx, x, s2);
 }
 
 ggml_tensor * codec_op_tokens_to_features(ggml_context * ctx, ggml_tensor * tokens, int32_t out_channels) {

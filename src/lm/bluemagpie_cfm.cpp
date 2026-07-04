@@ -81,7 +81,7 @@ ggml_tensor * lin(ggml_context * c, ggml_tensor * w, ggml_tensor * x, ggml_tenso
 ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix,
     const codec_model * model, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
     ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, int32_t bucket, ggml_tensor * mask,
-    ggml_tensor ** kk_out, ggml_tensor ** vv_out) {
+    ggml_tensor * row_idx, ggml_tensor ** kset_out, ggml_tensor ** vset_out) {
 
     auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, prefix + s); };
     auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, prefix + s); };
@@ -101,8 +101,25 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
         kk = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_k.w"), h), head_dim, n_kv, 1);
         vv = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_v.w"), h), head_dim, n_kv, 1);
     }
-    *kk_out = kk;
-    *vv_out = vv;
+    // In-graph scatter of the new token's K/V into the persistent cache at row
+    // `row_idx` (= kv_pos), replacing the Phase-3 host readback + tensor_set.
+    // The cache (head_dim, n_kv, max_T) is contiguous, so a 2D view
+    // (head_dim*n_kv, max_T) treats each token as one row; ggml_set_rows writes
+    // the single flattened K/V row at kv_pos.  INVARIANT: this write targets row
+    // kv_pos, but attention above reads only cache[0..bucket) with the additive
+    // mask valid on [0..kv_pos) and the *new* token supplied by the in-graph
+    // concat (k_all/v_all) — so row kv_pos is NEVER read within this same graph.
+    // The write is therefore a pure side-output; ordering vs. the read is
+    // irrelevant.  Marked as an output by the caller so graph.cpp roots it.
+    {
+        const int64_t kw = (int64_t) head_dim * n_kv;
+        ggml_tensor * k2 = ggml_view_2d(ctx, k_cache_l, kw, k_cache_l->ne[2], k_cache_l->nb[2], 0);
+        ggml_tensor * v2 = ggml_view_2d(ctx, v_cache_l, kw, v_cache_l->ne[2], v_cache_l->nb[2], 0);
+        ggml_tensor * kk_row = ggml_reshape_2d(ctx, kk, kw, 1);
+        ggml_tensor * vv_row = ggml_reshape_2d(ctx, vv, kw, 1);
+        *kset_out = ggml_set_rows(ctx, k2, kk_row, row_idx);
+        *vset_out = ggml_set_rows(ctx, v2, vv_row, row_idx);
+    }
 
     // Bucketed key/value: first `bucket` slots from the persistent cache (the
     // new token's slot kv_pos is inside the bucket and gets host-filled after
@@ -125,19 +142,18 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
     x_ht = ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".attn_o.w"), attn));
 
     h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln2.w"));
-    ggml_tensor * g, * u;
+    ggml_tensor * mlp;
     ggml_tensor * w_gu = codec_graph_weight_mat(ctx, model, prefix + ".gate_up.w");
     if (w_gu != nullptr) {
+        // Fused gate|up: gate is the first half of ne[0] → swiglu (non-swapped).
         ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, h);   // (2*ffn, 1)
-        const int64_t ffn = gu->ne[0] / 2;
-        g = ggml_view_1d(ctx, gu, ffn, 0);
-        u = ggml_view_1d(ctx, gu, ffn, (size_t) ffn * gu->nb[0]);
+        mlp = ggml_swiglu(ctx, gu);
     } else {
-        g = ggml_mul_mat(ctx, WM(".gate.w"), h);
-        u = ggml_mul_mat(ctx, WM(".up.w"), h);
+        ggml_tensor * g = ggml_mul_mat(ctx, WM(".gate.w"), h);
+        ggml_tensor * u = ggml_mul_mat(ctx, WM(".up.w"), h);
+        mlp = ggml_swiglu_split(ctx, g, u);
     }
-    g = ggml_silu(ctx, g);
-    return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".down.w"), ggml_mul(ctx, g, u)));
+    return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".down.w"), mlp));
 }
 
 // Build the whole per-step graph.
@@ -183,9 +199,9 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     a = linW("lm.tslm_adapter.proj.w", a, "lm.tslm_adapter.proj.b");   // (h_vox,1)
     {   // residual SwiGLU block
         ggml_tensor * bn = codec_op_rms_norm_ct(ctx, a, I.eps, W("lm.tslm_adapter.blk0.ln.w"));
-        ggml_tensor * g = ggml_silu(ctx, linW("lm.tslm_adapter.blk0.gate.w", bn, nullptr));
+        ggml_tensor * g = linW("lm.tslm_adapter.blk0.gate.w", bn, nullptr);
         ggml_tensor * u = linW("lm.tslm_adapter.blk0.up.w", bn, nullptr);
-        a = ggml_add(ctx, a, linW("lm.tslm_adapter.blk0.down.w", ggml_mul(ctx, g, u), nullptr));
+        a = ggml_add(ctx, a, linW("lm.tslm_adapter.blk0.down.w", ggml_swiglu_split(ctx, g, u), nullptr));
     }
     // ---- FSQ: round(tanh(in_proj(a))*s)/s then out_proj ----
     ggml_tensor * q = ggml_tanh(ctx, linW("lm.fsq.in_proj.w", a, "lm.fsq.in_proj.b"));
@@ -204,18 +220,25 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_set_name(ralm_mask, "bm.cfm.ralm_mask");
     ggml_set_input(ralm_mask);
 
+    // Row index (= kv_pos) for the in-graph ggml_set_rows K/V scatter.  1-element
+    // I32 input, host-written per step; the graph stays static per bucket.
+    ggml_tensor * ralm_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(ralm_row, "bm.cfm.ralm_row");
+    ggml_set_input(ralm_row);
+
     ggml_tensor * rh = ralm_new;   // 1 new token
     for (int32_t i = 0; i < I.n_ralm; ++i) {
-        ggml_tensor * kk_i = nullptr, * vv_i = nullptr;
+        ggml_tensor * kset_i = nullptr, * vset_i = nullptr;
         rh = bm_ralm_kv_step(ctx, rh, "lm.ralm.layers." + std::to_string(i), model,
                              I.n_heads, I.n_kv, I.head_dim, I.eps,
-                             p->k_cache[i], p->v_cache[i], p->bucket, ralm_mask, &kk_i, &vv_i);
-        // Surface the new token's K/V as named outputs for host-side scatter
-        // into the persistent cache after compute.
-        ggml_set_name(kk_i, ("bm.cfm.ralm_k." + std::to_string(i)).c_str());
-        ggml_set_output(kk_i);
-        ggml_set_name(vv_i, ("bm.cfm.ralm_v." + std::to_string(i)).c_str());
-        ggml_set_output(vv_i);
+                             p->k_cache[i], p->v_cache[i], p->bucket, ralm_mask, ralm_row, &kset_i, &vset_i);
+        // The in-graph set_rows writes are pure side-outputs; flag them so
+        // graph.cpp roots them for execution (they scatter into the persistent
+        // cache and are never read back within this graph).
+        ggml_set_name(kset_i, ("bm.cfm.ralm_kset." + std::to_string(i)).c_str());
+        ggml_set_output(kset_i);
+        ggml_set_name(vset_i, ("bm.cfm.ralm_vset." + std::to_string(i)).c_str());
+        ggml_set_output(vset_i);
     }
     ggml_tensor * residual_hidden = codec_op_rms_norm_ct(ctx, rh, I.eps, W("lm.ralm.norm.w"));  // (h_vox,1)
 
@@ -276,9 +299,10 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     const int64_t Te = le->ne[1];
     ggml_tensor * ecos = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.cos"), I.head_dim, Te, W("lm.rope.cos")->nb[1], 0));
     ggml_tensor * esin = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.sin"), I.head_dim, Te, W("lm.rope.sin")->nb[1], 0));
+    ggml_tensor * le_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) Te, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < I.n_locenc; ++i) {
         le = codec_bm_minicpm_block_ht(ctx, le, "lm.locenc.layers." + std::to_string(i), model,
-                                       I.n_heads, I.n_kv, I.head_dim, I.eps, ecos, esin, /*causal=*/false);
+                                       I.n_heads, I.n_kv, I.head_dim, I.eps, ecos, esin, /*causal=*/false, le_pos);
     }
     le = codec_op_rms_norm_ct(ctx, le, I.eps, W("lm.locenc.norm.w"));
     ggml_tensor * cls = ggml_cont(ctx, ggml_view_1d(ctx, le, I.h_enc, 0));                 // (h_enc,)
@@ -454,6 +478,10 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
         && wr("bm.cfm.tsin", tsin_all.data(), tsin_all.size()) && wr("bm.cfm.dtsin", dtsin.data(), dtsin.size())
         && wr("bm.cfm.ralm_mask", ralm_mask.data(), ralm_mask.size());
     if (!ok) { st->last_error = err.empty() ? "write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
+    // Row index for the in-graph set_rows K/V scatter (= current kv_pos).
+    { ggml_tensor * tr = G("bm.cfm.ralm_row");
+      if (!tr || !codec_runtime_write_tensor(tr, &s->kv_pos, sizeof(int32_t), &err)) {
+          st->last_error = err.empty() ? "row write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; } }
 
     const int32_t nth = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
     if (!codec_graph_compute(st->ctx, entry, nth, &err)) { st->last_error = err; return CODEC_STATUS_INTERNAL_ERROR; }
@@ -467,21 +495,8 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     codec_runtime_read_tensor(G("bm.cfm.fb_tslm"), s->feedback_tslm.data(), (size_t) I->h_barbet * sizeof(float), &err);
     codec_runtime_read_tensor(G("bm.cfm.fb_lm"), s->prev_feedback_lm.data(), (size_t) I->h_vox * sizeof(float), &err);
 
-    // Scatter the new token's K/V (per RALM layer) into the persistent cache at
-    // slot kv_pos.  The graph no longer writes the cache in-graph (kept static
-    // per bucket); we read the tiny (head_dim*n_kv) K/V outputs and place them
-    // via ggml_backend_tensor_set at the byte offset kv_pos * nb[2].
-    const size_t kv_bytes = (size_t) I->head_dim * (size_t) I->n_kv * sizeof(float);
-    std::vector<float> kvbuf((size_t) I->head_dim * (size_t) I->n_kv);
-    for (int32_t l = 0; l < I->n_ralm; ++l) {
-        ggml_tensor * kc = s->k_cache[(size_t) l];
-        ggml_tensor * vc = s->v_cache[(size_t) l];
-        const size_t off = (size_t) s->kv_pos * kc->nb[2];
-        if (codec_runtime_read_tensor(G(("bm.cfm.ralm_k." + std::to_string(l)).c_str()), kvbuf.data(), kv_bytes, &err))
-            ggml_backend_tensor_set(kc, kvbuf.data(), off, kv_bytes);
-        if (codec_runtime_read_tensor(G(("bm.cfm.ralm_v." + std::to_string(l)).c_str()), kvbuf.data(), kv_bytes, &err))
-            ggml_backend_tensor_set(vc, kvbuf.data(), off, kv_bytes);
-    }
+    // The new token's K/V were scattered into the persistent cache in-graph via
+    // ggml_set_rows (row = kv_pos), so no host readback + tensor_set is needed.
 
     // advance state: the RALM K/V for this position is now in the cache.
     s->kv_pos += 1;

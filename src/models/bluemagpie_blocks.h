@@ -13,17 +13,22 @@
 
 // MiniCPM decoder block (RMSNorm + GQA + baked-RoPE + SwiGLU, use_mup=false).
 // x_ht ne=(hidden, T); cos_dt/sin_dt ne=(head_dim, T) or NULL (no-rope).
+// rope_pos: optional shared I32 position vector (length >= T) for native
+// ggml_rope_ext; if NULL the block builds its own [0,T) arange (one per block).
+// Hoisting it out of the block kills the per-block ARANGE node.
 ggml_tensor * codec_bm_minicpm_block_ht(
     ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix, const codec_model * model,
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
-    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal);
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal,
+    ggml_tensor * rope_pos = nullptr);
 
 // Batched variant: x_htb ne=(hidden, T, B).  B branches share the linear
 // weights (folded into the token dim) but attend independently (B in ne[3]).
 ggml_tensor * codec_bm_minicpm_block_htb(
     ggml_context * ctx, ggml_tensor * x_htb, const std::string & prefix, const codec_model * model,
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
-    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal);
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal,
+    ggml_tensor * rope_pos = nullptr);
 
 // LocDiT estimator core: pre-projected x_h/cond_h (h_dit,P), mu_h (h_dit,n_mu),
 // t_h (h_dit,1) → predicted velocity patch (latent_dim, P).

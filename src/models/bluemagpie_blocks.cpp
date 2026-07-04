@@ -71,7 +71,8 @@ ggml_tensor * bm_time_mlp(ggml_context * ctx, const codec_model * model, const c
 ggml_tensor * codec_bm_minicpm_block_htb(
     ggml_context * ctx, ggml_tensor * x_htb, const std::string & prefix, const codec_model * model,
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
-    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal) {
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal,
+    ggml_tensor * rope_pos) {
 
     auto W  = [&](const char * s) -> ggml_tensor * { return codec_graph_weight(ctx, model, prefix + s); };
     auto WM = [&](const char * s) -> ggml_tensor * { return codec_graph_weight_mat(ctx, model, prefix + s); };
@@ -117,7 +118,12 @@ ggml_tensor * codec_bm_minicpm_block_htb(
         if (short_factor != nullptr) {
             const float theta       = codec_read_f32_kv(model->gguf, "codec.lm.rope_theta", 10000.0f);
             const float attn_factor = codec_read_f32_kv(model->gguf, "codec.lm.rope_attn_factor", 1.0f);
-            ggml_tensor * t_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
+            // Prefer the hoisted shared position vector (built once per graph).
+            // A length-T view avoids the per-block ARANGE + CAST nodes.
+            ggml_tensor * t_pos = (rope_pos != nullptr && rope_pos->ne[0] >= T)
+                ? ((rope_pos->ne[0] == T) ? rope_pos
+                   : ggml_view_1d(ctx, rope_pos, T, 0))
+                : ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
             auto rope_ext = [&](ggml_tensor * x) {
                 // x (head_dim, n_head, T, B); positions length T broadcast over B.
                 return ggml_rope_ext(ctx, x, t_pos, short_factor, head_dim,
@@ -150,6 +156,9 @@ ggml_tensor * codec_bm_minicpm_block_htb(
         scores = ggml_soft_max(ctx, scores);
     } else {
         // non-causal (LocDiT/LocEnc): fuse the 1/sqrt(d) scale into soft_max_ext.
+        // NOTE: ggml_flash_attn_ext was tried here (Vulkan) but did NOT win — the
+        // sequences are tiny (T=11/5), so FA's fixed kernel + F16 KV casts cancel
+        // the dispatch-count savings.  Manual QK^T/softmax/(attn·V) stays.
         scores = ggml_soft_max_ext(ctx, scores, nullptr, kq_scale, 0.0f);
     }
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // (T, d, n_kv, B)
@@ -160,20 +169,19 @@ ggml_tensor * codec_bm_minicpm_block_htb(
     ggml_tensor * x_flat = ggml_add(ctx, fold(x_htb), o);
 
     h = codec_op_rms_norm_ct(ctx, x_flat, eps, W(".ln2.w"));
-    ggml_tensor * gate;
-    ggml_tensor * up;
+    ggml_tensor * mlp;
     ggml_tensor * w_gu = codec_graph_weight_mat(ctx, model, prefix + ".gate_up.w");
     if (w_gu != nullptr) {
-        // Fused gate|up: one (in, 2*ffn) matmul, split the output rows.
+        // Fused gate|up: one (in, 2*ffn) matmul; SwiGLU over the split output.
+        // Converter concats [gate, up] along ne[0], so gate is the FIRST half.
+        // ggml_swiglu (non-swapped) silu's the first half → silu(gate) * up.
         ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, h);   // (2*ffn, T*B)
-        const int64_t ffn = gu->ne[0] / 2;
-        gate = ggml_view_2d(ctx, gu, ffn, gu->ne[1], gu->nb[1], 0);
-        up   = ggml_view_2d(ctx, gu, ffn, gu->ne[1], gu->nb[1], (size_t) ffn * gu->nb[0]);
+        mlp = ggml_swiglu(ctx, gu);                      // silu(gate) * up
     } else {
-        gate = ggml_mul_mat(ctx, WM(".gate.w"), h);
-        up   = ggml_mul_mat(ctx, WM(".up.w"), h);
+        ggml_tensor * gate = ggml_mul_mat(ctx, WM(".gate.w"), h);
+        ggml_tensor * up   = ggml_mul_mat(ctx, WM(".up.w"), h);
+        mlp = ggml_swiglu_split(ctx, gate, up);          // silu(gate) * up
     }
-    ggml_tensor * mlp = ggml_mul(ctx, ggml_silu(ctx, gate), up);
     ggml_tensor * down = ggml_mul_mat(ctx, WM(".down.w"), mlp);
     ggml_tensor * out = ggml_add(ctx, x_flat, down);                       // (hidden, T*B)
     return ggml_reshape_3d(ctx, out, hidden, T, B);
@@ -183,10 +191,11 @@ ggml_tensor * codec_bm_minicpm_block_htb(
 ggml_tensor * codec_bm_minicpm_block_ht(
     ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix, const codec_model * model,
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
-    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal) {
+    ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal,
+    ggml_tensor * rope_pos) {
     ggml_tensor * x_htb = ggml_reshape_3d(ctx, x_ht, x_ht->ne[0], x_ht->ne[1], 1);
     ggml_tensor * y = codec_bm_minicpm_block_htb(ctx, x_htb, prefix, model,
-        n_heads, n_kv, head_dim, eps, cos_dt, sin_dt, causal);
+        n_heads, n_kv, head_dim, eps, cos_dt, sin_dt, causal, rope_pos);
     return ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
 }
 
@@ -203,9 +212,12 @@ ggml_tensor * bm_locdit_core(
     ggml_tensor * seq = ggml_concat(ctx, mu_h, t_h, 1);
     seq = ggml_concat(ctx, seq, cond_h, 1);
     seq = ggml_concat(ctx, seq, x_h, 1);
+    // Shared rope position vector for all layers (hoisted; kills per-block ARANGE).
+    const int64_t T_seq = seq->ne[1];
+    ggml_tensor * rope_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T_seq, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < n_layers; ++i) {
         seq = codec_bm_minicpm_block_ht(ctx, seq, "lm.locdit.layers." + std::to_string(i), model,
-                                        n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false);
+                                        n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false, rope_pos);
     }
     seq = codec_op_rms_norm_ct(ctx, seq, eps, codec_graph_weight(ctx, model, "lm.locdit.norm.w"));
     const int64_t start = (int64_t) n_mu + 1 + P;
@@ -240,9 +252,11 @@ void bm_locdit_core_batched(
         ggml_reshape_3d(ctx, seq_pos, h_dit, T, 1),
         ggml_reshape_3d(ctx, seq_neg, h_dit, T, 1), 2);
 
+    // Shared rope position vector for all layers (hoisted; kills per-block ARANGE).
+    ggml_tensor * rope_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < n_layers; ++i) {
         seq = codec_bm_minicpm_block_htb(ctx, seq, "lm.locdit.layers." + std::to_string(i), model,
-                                         n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false);
+                                         n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false, rope_pos);
     }
     // rms_norm folds batch into token dim (per-token op, batch-safe)
     ggml_tensor * seq_flat = ggml_reshape_2d(ctx, seq, h_dit, T * 2);
