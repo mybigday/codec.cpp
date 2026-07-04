@@ -66,6 +66,10 @@ ggml_tensor * lin(ggml_context * c, ggml_tensor * w, ggml_tensor * x, ggml_tenso
     return b ? ggml_add(c, y, codec_graph_cast_f32(c, b)) : y;
 }
 
+// Matmul-weight accessor: no dequant CPY for F16/BF16 (see
+// codec_graph_weight_mat).  Use for every tensor that lands as the LHS of
+// ggml_mul_mat in this per-step graph.
+
 // One RALM layer, incremental KV (1 new token).  Causal, no rope, no qk_norm.
 // Attends over a fixed bucket cache[0..B) plus the 1 new token, where B is a
 // 64-multiple >= kv_pos+1 so the graph shape is kv_pos-independent within a
@@ -79,13 +83,24 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
     ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, int32_t bucket, ggml_tensor * mask,
     ggml_tensor ** kk_out, ggml_tensor ** vv_out) {
 
-    auto W = [&](const char * s) { return codec_graph_weight(ctx, model, prefix + s); };
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, prefix + s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, prefix + s); };
     const int32_t q_dim = n_heads * head_dim;
 
+    const int32_t kv_dim = n_kv * head_dim;
     ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln1.w"));
-    ggml_tensor * q  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_q.w"), h), head_dim, n_heads, 1);
-    ggml_tensor * kk = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_k.w"), h), head_dim, n_kv, 1);
-    ggml_tensor * vv = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_v.w"), h), head_dim, n_kv, 1);
+    ggml_tensor * q, * kk, * vv;
+    ggml_tensor * w_qkv = codec_graph_weight_mat(ctx, model, prefix + ".attn_qkv.w");
+    if (w_qkv != nullptr) {
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w_qkv, h);   // (q_dim+2*kv_dim, 1)
+        q  = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, qkv, q_dim,  0)), head_dim, n_heads, 1);
+        kk = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, qkv, kv_dim, (size_t) q_dim * qkv->nb[0])), head_dim, n_kv, 1);
+        vv = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, qkv, kv_dim, (size_t) (q_dim + kv_dim) * qkv->nb[0])), head_dim, n_kv, 1);
+    } else {
+        q  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_q.w"), h), head_dim, n_heads, 1);
+        kk = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_k.w"), h), head_dim, n_kv, 1);
+        vv = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, WM(".attn_v.w"), h), head_dim, n_kv, 1);
+    }
     *kk_out = kk;
     *vv_out = vv;
 
@@ -107,12 +122,22 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v_all, 1, 2, 0, 3));
     ggml_tensor * attn = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, v_p, scores), 0, 2, 1, 3));
     attn = ggml_reshape_2d(ctx, attn, q_dim, 1);
-    x_ht = ggml_add(ctx, x_ht, ggml_mul_mat(ctx, W(".attn_o.w"), attn));
+    x_ht = ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".attn_o.w"), attn));
 
     h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln2.w"));
-    ggml_tensor * g = ggml_silu(ctx, ggml_mul_mat(ctx, W(".gate.w"), h));
-    ggml_tensor * u = ggml_mul_mat(ctx, W(".up.w"), h);
-    return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, W(".down.w"), ggml_mul(ctx, g, u)));
+    ggml_tensor * g, * u;
+    ggml_tensor * w_gu = codec_graph_weight_mat(ctx, model, prefix + ".gate_up.w");
+    if (w_gu != nullptr) {
+        ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, h);   // (2*ffn, 1)
+        const int64_t ffn = gu->ne[0] / 2;
+        g = ggml_view_1d(ctx, gu, ffn, 0);
+        u = ggml_view_1d(ctx, gu, ffn, (size_t) ffn * gu->nb[0]);
+    } else {
+        g = ggml_mul_mat(ctx, WM(".gate.w"), h);
+        u = ggml_mul_mat(ctx, WM(".up.w"), h);
+    }
+    g = ggml_silu(ctx, g);
+    return ggml_add(ctx, x_ht, ggml_mul_mat(ctx, WM(".down.w"), ggml_mul(ctx, g, u)));
 }
 
 // Build the whole per-step graph.
@@ -138,8 +163,13 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     cfm_build * p = static_cast<cfm_build *>(ud);
     const cfm_impl & I = p->imp;
     const codec_model * model = p->model;
-    auto W = [&](const char * s) { return codec_graph_weight(ctx, model, s); };
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, s); };
     const int32_t P = I.patch_size, D = I.latent_dim;
+    // lin() wrapper that fetches the weight via the no-dequant matmul accessor.
+    auto linW = [&](const char * wn, ggml_tensor * x, const char * bn) {
+        return lin(ctx, WM(wn), x, bn ? W(bn) : nullptr);
+    };
 
     ggml_tensor * h_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_barbet, 1);  ggml_set_name(h_in, "bm.cfm.h_in");
     ggml_tensor * pfb_lm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I.h_vox, 1);      ggml_set_name(pfb_lm, "bm.cfm.pfb_lm");
@@ -150,21 +180,21 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
 
     // ---- tslm_adapter(h_in) → h_vox ----
     ggml_tensor * a = codec_op_rms_norm_ct(ctx, h_in, I.eps, W("lm.tslm_adapter.norm.w"));
-    a = lin(ctx, W("lm.tslm_adapter.proj.w"), a, W("lm.tslm_adapter.proj.b"));   // (h_vox,1)
+    a = linW("lm.tslm_adapter.proj.w", a, "lm.tslm_adapter.proj.b");   // (h_vox,1)
     {   // residual SwiGLU block
         ggml_tensor * bn = codec_op_rms_norm_ct(ctx, a, I.eps, W("lm.tslm_adapter.blk0.ln.w"));
-        ggml_tensor * g = ggml_silu(ctx, lin(ctx, W("lm.tslm_adapter.blk0.gate.w"), bn, nullptr));
-        ggml_tensor * u = lin(ctx, W("lm.tslm_adapter.blk0.up.w"), bn, nullptr);
-        a = ggml_add(ctx, a, lin(ctx, W("lm.tslm_adapter.blk0.down.w"), ggml_mul(ctx, g, u), nullptr));
+        ggml_tensor * g = ggml_silu(ctx, linW("lm.tslm_adapter.blk0.gate.w", bn, nullptr));
+        ggml_tensor * u = linW("lm.tslm_adapter.blk0.up.w", bn, nullptr);
+        a = ggml_add(ctx, a, linW("lm.tslm_adapter.blk0.down.w", ggml_mul(ctx, g, u), nullptr));
     }
     // ---- FSQ: round(tanh(in_proj(a))*s)/s then out_proj ----
-    ggml_tensor * q = ggml_tanh(ctx, lin(ctx, W("lm.fsq.in_proj.w"), a, W("lm.fsq.in_proj.b")));
+    ggml_tensor * q = ggml_tanh(ctx, linW("lm.fsq.in_proj.w", a, "lm.fsq.in_proj.b"));
     q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) I.fsq_scale)), 1.0f / (float) I.fsq_scale);
-    ggml_tensor * lm_hidden = lin(ctx, W("lm.fsq.out_proj.w"), q, W("lm.fsq.out_proj.b"));   // (h_vox,1)
+    ggml_tensor * lm_hidden = linW("lm.fsq.out_proj.w", q, "lm.fsq.out_proj.b");   // (h_vox,1)
 
     // ---- RALM input = fusion_concat_proj([lm_hidden ; prev_feedback_lm]) ----
     ggml_tensor * fus = ggml_concat(ctx, lm_hidden, pfb_lm, 0);                                // (2*h_vox,1)
-    ggml_tensor * ralm_new = lin(ctx, W("lm.proj.fusion_concat.w"), fus, W("lm.proj.fusion_concat.b")); // (h_vox,1)
+    ggml_tensor * ralm_new = linW("lm.proj.fusion_concat.w", fus, "lm.proj.fusion_concat.b"); // (h_vox,1)
 
     // ---- RALM: one incremental step over the persistent KV cache ----
     // Shared additive attention mask for all RALM layers.  scores has ne0 =
@@ -190,16 +220,16 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_tensor * residual_hidden = codec_op_rms_norm_ct(ctx, rh, I.eps, W("lm.ralm.norm.w"));  // (h_vox,1)
 
     // ---- mu = [lm_to_dit(lm_hidden) ; res_to_dit(residual_hidden)] → (h_dit, n_mu) ----
-    ggml_tensor * mu1 = lin(ctx, W("lm.proj.lm_to_dit.w"), lm_hidden, W("lm.proj.lm_to_dit.b"));
-    ggml_tensor * mu2 = lin(ctx, W("lm.proj.res_to_dit.w"), residual_hidden, W("lm.proj.res_to_dit.b"));
+    ggml_tensor * mu1 = linW("lm.proj.lm_to_dit.w", lm_hidden, "lm.proj.lm_to_dit.b");
+    ggml_tensor * mu2 = linW("lm.proj.res_to_dit.w", residual_hidden, "lm.proj.res_to_dit.b");
     ggml_tensor * mu = ggml_concat(ctx, mu1, mu2, 1);   // (h_dit, 2)
 
     // ---- CFM Euler solver (unrolled, cfg_zero_star) ----
-    ggml_tensor * cond_h = lin(ctx, W("lm.locdit.cond_proj.w"), cond, W("lm.locdit.cond_proj.b"));  // (h_dit,P)
+    ggml_tensor * cond_h = linW("lm.locdit.cond_proj.w", cond, "lm.locdit.cond_proj.b");  // (h_dit,P)
     ggml_tensor * mu_zero = ggml_scale(ctx, mu, 0.0f);
     auto time_mlp = [&](const char * pfx, ggml_tensor * s) {
-        ggml_tensor * h = ggml_silu(ctx, lin(ctx, W((std::string(pfx) + ".l1.w").c_str()), s, W((std::string(pfx) + ".l1.b").c_str())));
-        return lin(ctx, W((std::string(pfx) + ".l2.w").c_str()), h, W((std::string(pfx) + ".l2.b").c_str()));
+        ggml_tensor * h = ggml_silu(ctx, lin(ctx, WM((std::string(pfx) + ".l1.w").c_str()), s, W((std::string(pfx) + ".l1.b").c_str())));
+        return lin(ctx, WM((std::string(pfx) + ".l2.w").c_str()), h, W((std::string(pfx) + ".l2.b").c_str()));
     };
     ggml_tensor * dt_emb = time_mlp("lm.locdit.dtime_mlp", dtsin);
     const int64_t T = (int64_t) I.n_mu + 1 + 2 * P;
@@ -209,7 +239,7 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     const bool cfg_one = (p->cfg_value == 1.0f);
     ggml_tensor * x = z;
     for (int32_t s = 0; s < p->n_real; ++s) {
-        ggml_tensor * x_h = lin(ctx, W("lm.locdit.in_proj.w"), x, W("lm.locdit.in_proj.b"));
+        ggml_tensor * x_h = linW("lm.locdit.in_proj.w", x, "lm.locdit.in_proj.b");
         ggml_tensor * tsin_s = ggml_cont(ctx, ggml_view_2d(ctx, tsin, I.h_dit, 1, tsin->nb[1], (size_t) s * tsin->nb[1]));
         ggml_tensor * t_h = ggml_add(ctx, time_mlp("lm.locdit.time_mlp", tsin_s), dt_emb);
         ggml_tensor * dphi;
@@ -234,13 +264,13 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_set_output(x);
 
     // ---- stop head ----
-    ggml_tensor * sp = ggml_silu(ctx, lin(ctx, W("lm.stop.proj.w"), lm_hidden, W("lm.stop.proj.b")));
-    ggml_tensor * stop_logit = lin(ctx, W("lm.stop.head.w"), sp, nullptr);   // (2,1)
+    ggml_tensor * sp = ggml_silu(ctx, linW("lm.stop.proj.w", lm_hidden, "lm.stop.proj.b"));
+    ggml_tensor * stop_logit = linW("lm.stop.head.w", sp, nullptr);   // (2,1)
     ggml_set_name(stop_logit, "bm.cfm.stop");
     ggml_set_output(stop_logit);
 
     // ---- LocEnc(patch) → feedback ----
-    ggml_tensor * le = lin(ctx, W("lm.locenc.in_proj.w"), x, W("lm.locenc.in_proj.b"));   // (h_enc, P)
+    ggml_tensor * le = linW("lm.locenc.in_proj.w", x, "lm.locenc.in_proj.b");   // (h_enc, P)
     ggml_tensor * sptok = ggml_reshape_2d(ctx, codec_graph_cast_f32(ctx, W("lm.locenc.special_token")), I.h_enc, 1);
     le = ggml_concat(ctx, sptok, le, 1);                                                   // (h_enc, P+1)
     const int64_t Te = le->ne[1];
@@ -252,10 +282,10 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     }
     le = codec_op_rms_norm_ct(ctx, le, I.eps, W("lm.locenc.norm.w"));
     ggml_tensor * cls = ggml_cont(ctx, ggml_view_1d(ctx, le, I.h_enc, 0));                 // (h_enc,)
-    ggml_tensor * fb_tslm = lin(ctx, W("lm.proj.enc_to_tslm.w"), cls, W("lm.proj.enc_to_tslm.b"));  // (h_barbet,)
+    ggml_tensor * fb_tslm = linW("lm.proj.enc_to_tslm.w", cls, "lm.proj.enc_to_tslm.b");  // (h_barbet,)
     ggml_set_name(fb_tslm, "bm.cfm.fb_tslm");
     ggml_set_output(fb_tslm);
-    ggml_tensor * fb_lm = lin(ctx, W("lm.proj.enc_to_lm.w"), cls, W("lm.proj.enc_to_lm.b"));        // (h_vox,)
+    ggml_tensor * fb_lm = linW("lm.proj.enc_to_lm.w", cls, "lm.proj.enc_to_lm.b");        // (h_vox,)
     ggml_set_name(fb_lm, "bm.cfm.fb_lm");
     ggml_set_output(fb_lm);
 

@@ -53,10 +53,11 @@ ggml_tensor * bm_rope(ggml_context * ctx, ggml_tensor * x, ggml_tensor * cos_dt,
 
 // LocDiT time embedding: SiLU MLP over a sinusoidal embedding.
 ggml_tensor * bm_time_mlp(ggml_context * ctx, const codec_model * model, const char * pfx, ggml_tensor * sin_emb) {
-    auto W = [&](const std::string & s) { return codec_graph_weight(ctx, model, std::string(pfx) + s); };
-    ggml_tensor * h = bm_linear(ctx, W(".l1.w"), sin_emb, W(".l1.b"));
+    auto W  = [&](const std::string & s) { return codec_graph_weight(ctx, model, std::string(pfx) + s); };
+    auto WM = [&](const std::string & s) { return codec_graph_weight_mat(ctx, model, std::string(pfx) + s); };
+    ggml_tensor * h = bm_linear(ctx, WM(".l1.w"), sin_emb, W(".l1.b"));
     h = ggml_silu(ctx, h);
-    return bm_linear(ctx, W(".l2.w"), h, W(".l2.b"));
+    return bm_linear(ctx, WM(".l2.w"), h, W(".l2.b"));
 }
 
 }  // namespace
@@ -72,7 +73,8 @@ ggml_tensor * codec_bm_minicpm_block_htb(
     int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
     ggml_tensor * cos_dt, ggml_tensor * sin_dt, bool causal) {
 
-    auto W = [&](const char * s) -> ggml_tensor * { return codec_graph_weight(ctx, model, prefix + s); };
+    auto W  = [&](const char * s) -> ggml_tensor * { return codec_graph_weight(ctx, model, prefix + s); };
+    auto WM = [&](const char * s) -> ggml_tensor * { return codec_graph_weight_mat(ctx, model, prefix + s); };
     const int64_t hidden = x_htb->ne[0];
     const int64_t T = x_htb->ne[1];
     const int64_t B = x_htb->ne[2];
@@ -84,41 +86,95 @@ ggml_tensor * codec_bm_minicpm_block_htb(
     };
 
     ggml_tensor * h = codec_op_rms_norm_ct(ctx, fold(x_htb), eps, W(".ln1.w"));   // (hidden, T*B)
-    ggml_tensor * q = ggml_mul_mat(ctx, W(".attn_q.w"), h);
-    ggml_tensor * k = ggml_mul_mat(ctx, W(".attn_k.w"), h);
-    ggml_tensor * v = ggml_mul_mat(ctx, W(".attn_v.w"), h);
-    q = ggml_reshape_4d(ctx, q, head_dim, n_heads, T, B);
-    k = ggml_reshape_4d(ctx, k, head_dim, n_kv, T, B);
-    v = ggml_reshape_4d(ctx, v, head_dim, n_kv, T, B);
+    const int64_t TB = T * B;
+    const int32_t kv_dim = n_kv * head_dim;
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    ggml_tensor * w_qkv = codec_graph_weight_mat(ctx, model, prefix + ".attn_qkv.w");
+    if (w_qkv != nullptr) {
+        // Fused QKV: one (in, q_dim+2*kv_dim) matmul, split the output rows with
+        // views (the row = ne[0] split is contiguous per column).
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w_qkv, h);   // (q_dim+2*kv_dim, T*B)
+        ggml_tensor * qv = ggml_view_2d(ctx, qkv, q_dim,  TB, qkv->nb[1], 0);
+        ggml_tensor * kv = ggml_view_2d(ctx, qkv, kv_dim, TB, qkv->nb[1], (size_t) q_dim * qkv->nb[0]);
+        ggml_tensor * vv = ggml_view_2d(ctx, qkv, kv_dim, TB, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]);
+        q = ggml_reshape_4d(ctx, ggml_cont(ctx, qv), head_dim, n_heads, T, B);
+        k = ggml_reshape_4d(ctx, ggml_cont(ctx, kv), head_dim, n_kv, T, B);
+        v = ggml_reshape_4d(ctx, ggml_cont(ctx, vv), head_dim, n_kv, T, B);
+    } else {
+        q = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, WM(".attn_q.w"), h), head_dim, n_heads, T, B);
+        k = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, WM(".attn_k.w"), h), head_dim, n_kv, T, B);
+        v = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, WM(".attn_v.w"), h), head_dim, n_kv, T, B);
+    }
     if (cos_dt != nullptr) {
-        // cos/sin (d,T) → (d,1,T,1) broadcasts over heads (ne[1]) and batch (ne[3])
-        ggml_tensor * cos_b = ggml_reshape_4d(ctx, cos_dt, head_dim, 1, T, 1);
-        ggml_tensor * sin_b = ggml_reshape_4d(ctx, sin_dt, head_dim, 1, T, 1);
-        auto rope4 = [&](ggml_tensor * x) {
-            ggml_tensor * xr = bm_rotate_half(ctx, x);
-            return ggml_add(ctx, ggml_mul(ctx, x, cos_b), ggml_mul(ctx, xr, sin_b));
-        };
-        q = rope4(q);
-        k = rope4(k);
+        // Prefer native ggml_rope_ext (one node per q/k) over the baked cos/sin
+        // rotate_half (~8 nodes).  The GGUF bakes the LongRoPE short_factor branch
+        // as freq_factors + theta/attn_factor KV; NEOX mode + ext_factor=0 +
+        // freq_scale=1 reproduces the table exactly.  Falls back to the baked
+        // cos/sin path if short_factor is absent (older GGUFs).
+        ggml_tensor * short_factor = codec_graph_weight_or_null(ctx, model, "lm.rope.short_factor");
+        if (short_factor != nullptr) {
+            const float theta       = codec_read_f32_kv(model->gguf, "codec.lm.rope_theta", 10000.0f);
+            const float attn_factor = codec_read_f32_kv(model->gguf, "codec.lm.rope_attn_factor", 1.0f);
+            ggml_tensor * t_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
+            auto rope_ext = [&](ggml_tensor * x) {
+                // x (head_dim, n_head, T, B); positions length T broadcast over B.
+                return ggml_rope_ext(ctx, x, t_pos, short_factor, head_dim,
+                                     GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0, theta,
+                                     /*freq_scale=*/1.0f, /*ext_factor=*/0.0f,
+                                     attn_factor, /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+            };
+            q = rope_ext(q);
+            k = rope_ext(k);
+        } else {
+            // cos/sin (d,T) → (d,1,T,1) broadcasts over heads (ne[1]) and batch (ne[3])
+            ggml_tensor * cos_b = ggml_reshape_4d(ctx, cos_dt, head_dim, 1, T, 1);
+            ggml_tensor * sin_b = ggml_reshape_4d(ctx, sin_dt, head_dim, 1, T, 1);
+            auto rope4 = [&](ggml_tensor * x) {
+                ggml_tensor * xr = bm_rotate_half(ctx, x);
+                return ggml_add(ctx, ggml_mul(ctx, x, cos_b), ggml_mul(ctx, xr, sin_b));
+            };
+            q = rope4(q);
+            k = rope4(k);
+        }
     }
     ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // (d, T, n_heads, B)
     ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // (d, T, n_kv, B)
     ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);                     // (T_k, T_q, n_heads, B)
-    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
-    if (causal) scores = ggml_diag_mask_inf(ctx, scores, 0);
-    scores = ggml_soft_max(ctx, scores);
+    const float kq_scale = 1.0f / std::sqrt((float) head_dim);
+    if (causal) {
+        // causal path: scale, mask, softmax (soft_max_ext has no built-in causal mask)
+        scores = ggml_scale(ctx, scores, kq_scale);
+        scores = ggml_diag_mask_inf(ctx, scores, 0);
+        scores = ggml_soft_max(ctx, scores);
+    } else {
+        // non-causal (LocDiT/LocEnc): fuse the 1/sqrt(d) scale into soft_max_ext.
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, kq_scale, 0.0f);
+    }
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // (T, d, n_kv, B)
     ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);                    // (d, T_q, n_heads, B)
     attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));            // (d, n_heads, T, B)
     attn = ggml_reshape_2d(ctx, attn, q_dim, T * B);
-    ggml_tensor * o = ggml_mul_mat(ctx, W(".attn_o.w"), attn);              // (hidden, T*B)
+    ggml_tensor * o = ggml_mul_mat(ctx, WM(".attn_o.w"), attn);             // (hidden, T*B)
     ggml_tensor * x_flat = ggml_add(ctx, fold(x_htb), o);
 
     h = codec_op_rms_norm_ct(ctx, x_flat, eps, W(".ln2.w"));
-    ggml_tensor * gate = ggml_mul_mat(ctx, W(".gate.w"), h);
-    ggml_tensor * up = ggml_mul_mat(ctx, W(".up.w"), h);
+    ggml_tensor * gate;
+    ggml_tensor * up;
+    ggml_tensor * w_gu = codec_graph_weight_mat(ctx, model, prefix + ".gate_up.w");
+    if (w_gu != nullptr) {
+        // Fused gate|up: one (in, 2*ffn) matmul, split the output rows.
+        ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, h);   // (2*ffn, T*B)
+        const int64_t ffn = gu->ne[0] / 2;
+        gate = ggml_view_2d(ctx, gu, ffn, gu->ne[1], gu->nb[1], 0);
+        up   = ggml_view_2d(ctx, gu, ffn, gu->ne[1], gu->nb[1], (size_t) ffn * gu->nb[0]);
+    } else {
+        gate = ggml_mul_mat(ctx, WM(".gate.w"), h);
+        up   = ggml_mul_mat(ctx, WM(".up.w"), h);
+    }
     ggml_tensor * mlp = ggml_mul(ctx, ggml_silu(ctx, gate), up);
-    ggml_tensor * down = ggml_mul_mat(ctx, W(".down.w"), mlp);
+    ggml_tensor * down = ggml_mul_mat(ctx, WM(".down.w"), mlp);
     ggml_tensor * out = ggml_add(ctx, x_flat, down);                       // (hidden, T*B)
     return ggml_reshape_3d(ctx, out, hidden, T, B);
 }
@@ -154,7 +210,7 @@ ggml_tensor * bm_locdit_core(
     seq = codec_op_rms_norm_ct(ctx, seq, eps, codec_graph_weight(ctx, model, "lm.locdit.norm.w"));
     const int64_t start = (int64_t) n_mu + 1 + P;
     ggml_tensor * xt = ggml_cont(ctx, ggml_view_2d(ctx, seq, h_dit, P, seq->nb[1], start * seq->nb[1]));
-    return bm_linear(ctx, codec_graph_weight(ctx, model, "lm.locdit.out_proj.w"), xt,
+    return bm_linear(ctx, codec_graph_weight_mat(ctx, model, "lm.locdit.out_proj.w"), xt,
                      codec_graph_weight(ctx, model, "lm.locdit.out_proj.b"));
 }
 
@@ -199,7 +255,7 @@ void bm_locdit_core_batched(
                                                    seq->nb[1], seq->nb[2], start * seq->nb[1]));
     // out_proj stays batched (fold 2 into token dim), then split.
     ggml_tensor * xt_flat = ggml_reshape_2d(ctx, xt, h_dit, P * 2);
-    ggml_tensor * vel = bm_linear(ctx, codec_graph_weight(ctx, model, "lm.locdit.out_proj.w"), xt_flat,
+    ggml_tensor * vel = bm_linear(ctx, codec_graph_weight_mat(ctx, model, "lm.locdit.out_proj.w"), xt_flat,
                                   codec_graph_weight(ctx, model, "lm.locdit.out_proj.b"));  // (latent, P*2)
     const int64_t D = vel->ne[0];
     ggml_tensor * vel3 = ggml_reshape_3d(ctx, vel, D, P, 2);
@@ -223,7 +279,8 @@ struct bm_cfm_build {
 
 bool bm_build_cfm(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     bm_cfm_build * p = static_cast<bm_cfm_build *>(ud);
-    auto W = [&](const char * s) { return codec_graph_weight(ctx, p->model, s); };
+    auto W  = [&](const char * s) { return codec_graph_weight(ctx, p->model, s); };
+    auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, p->model, s); };
     const int32_t D = p->latent_dim;
 
     ggml_tensor * z    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, p->P);          ggml_set_name(z, "bm.cfm.z");
@@ -232,7 +289,7 @@ bool bm_build_cfm(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_tensor * tsin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, p->h_dit, p->n_real); ggml_set_name(tsin, "bm.cfm.tsin");
     ggml_tensor * dtsin= ggml_new_tensor_2d(ctx, GGML_TYPE_F32, p->h_dit, 1);       ggml_set_name(dtsin, "bm.cfm.dtsin");
 
-    ggml_tensor * cond_h  = bm_linear(ctx, W("lm.locdit.cond_proj.w"), cond, W("lm.locdit.cond_proj.b"));
+    ggml_tensor * cond_h  = bm_linear(ctx, WM("lm.locdit.cond_proj.w"), cond, W("lm.locdit.cond_proj.b"));
     ggml_tensor * mu_zero = ggml_scale(ctx, mu, 0.0f);
     ggml_tensor * dt_emb  = bm_time_mlp(ctx, p->model, "lm.locdit.dtime_mlp", dtsin);
 
@@ -243,7 +300,7 @@ bool bm_build_cfm(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     const bool cfg_one = (p->cfg_value == 1.0f);
     ggml_tensor * x = z;
     for (int32_t s = 0; s < p->n_real; ++s) {
-        ggml_tensor * x_h   = bm_linear(ctx, W("lm.locdit.in_proj.w"), x, W("lm.locdit.in_proj.b"));
+        ggml_tensor * x_h   = bm_linear(ctx, WM("lm.locdit.in_proj.w"), x, W("lm.locdit.in_proj.b"));
         ggml_tensor * tsin_s = ggml_cont(ctx, ggml_view_2d(ctx, tsin, p->h_dit, 1, tsin->nb[1], (size_t) s * tsin->nb[1]));
         ggml_tensor * t_h   = ggml_add(ctx, bm_time_mlp(ctx, p->model, "lm.locdit.time_mlp", tsin_s), dt_emb);
         ggml_tensor * dphi;

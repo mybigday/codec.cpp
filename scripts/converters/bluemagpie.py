@@ -290,19 +290,22 @@ class BlueMagpieConverter(BaseConverter):
                 raise KeyError(f"missing LM tensor: {name}")
             return np.asarray(arr)
 
-        # LM weight-streaming acceleration: 2D matmul weights under lm.* are
-        # quantized to Q8_0 (halves the FP16 bytes streamed per CFM step).  The
-        # gguf Q8_0 helper quantizes along ne[0] (the innermost dim = the matmul
-        # contraction dim), so rows must be a multiple of the 32-elem block.
-        # Anything else (norms, biases, 1D vectors, non-.w tensors, or rows not
-        # /32) falls back to F16 — matching the rest of the LM section's default.
-        # This is independent of the global --quantization flag so the AudioVAE
-        # section keeps its existing F16 behaviour untouched.
+        # LM matmul weight dtype follows the --quantization flag:
+        #   - Q8_0  → 2D lm.* matmul weights are Q8_0 (halves the bytes streamed
+        #             per CFM step; the gguf Q8_0 helper quantizes along ne[0] =
+        #             the matmul contraction dim, so rows must be a 32-multiple).
+        #   - else  → F16 (the genuine "F16 GGUF"), which the runtime feeds to
+        #             ggml_mul_mat natively (no per-eval dequant CPY, see
+        #             codec_graph_weight_mat).  On CPU the F16 path is markedly
+        #             faster AND higher-parity than cast-from-Q8, so the two
+        #             GGUFs are meant to be genuinely different here.
+        # Anything not eligible (norms, biases, 1D vectors, rows not /32) is F16.
         _Q8_BLK = 32
+        _lm_use_q8 = (self.quantization == "Q8_0")
 
         def _add_lm_weight(name: str, arr: np.ndarray) -> None:
             arr = np.asarray(arr)
-            if arr.ndim == 2 and (int(arr.shape[-1]) % _Q8_BLK) == 0:
+            if _lm_use_q8 and arr.ndim == 2 and (int(arr.shape[-1]) % _Q8_BLK) == 0:
                 self._add_tensor(writer, name, arr, "Q8_0")
             else:
                 self._add_tensor(writer, name, arr, "F16")
@@ -318,12 +321,19 @@ class BlueMagpieConverter(BaseConverter):
         def add_minicpm_stack(src: str, out: str, n_layers: int) -> None:
             for i in range(n_layers):
                 s, o = f"{src}.layers.{i}", f"{out}.layers.{i}"
-                add_lin(f"{s}.self_attn.q_proj", o + ".attn_q")
-                add_lin(f"{s}.self_attn.k_proj", o + ".attn_k")
-                add_lin(f"{s}.self_attn.v_proj", o + ".attn_v")
+                # Fuse Q|K|V and gate|up into single matmul weights (concat along
+                # the output dim = PyTorch axis 0 of the (out,in) weight).  The
+                # contraction dim ne[0]=in is unchanged, so Q8_0 block alignment
+                # (in % 32) is preserved.  The runtime splits the outputs with
+                # views (see codec_bm_minicpm_block_htb).
+                q = lm_t(f"{s}.self_attn.q_proj.weight")
+                k = lm_t(f"{s}.self_attn.k_proj.weight")
+                v = lm_t(f"{s}.self_attn.v_proj.weight")
+                _add_lm_weight(o + ".attn_qkv.w", np.concatenate([q, k, v], axis=0))
                 add_lin(f"{s}.self_attn.o_proj", o + ".attn_o")
-                add_lin(f"{s}.mlp.gate_proj", o + ".gate")
-                add_lin(f"{s}.mlp.up_proj", o + ".up")
+                g  = lm_t(f"{s}.mlp.gate_proj.weight")
+                up = lm_t(f"{s}.mlp.up_proj.weight")
+                _add_lm_weight(o + ".gate_up.w", np.concatenate([g, up], axis=0))
                 add_lin(f"{s}.mlp.down_proj", o + ".down")
                 add_norm(f"{s}.input_layernorm", o + ".ln1")
                 add_norm(f"{s}.post_attention_layernorm", o + ".ln2")
@@ -383,6 +393,16 @@ class BlueMagpieConverter(BaseConverter):
         emb = np.concatenate([freqs, freqs], axis=-1)                   # [n_pos, head_dim]
         self._add_tensor(writer, "lm.rope.cos", (np.cos(emb) * scaling).astype(np.float32), "F32")
         self._add_tensor(writer, "lm.rope.sin", (np.sin(emb) * scaling).astype(np.float32), "F32")
+
+        # Native-rope path: ggml_rope_ext(mode=NEOX, freq_base=theta,
+        # freq_factors=short, attn_factor=scaling, ext_factor=0, freq_scale=1)
+        # reproduces the LongRoPE short_factor branch above in a single node per
+        # q/k (vs the ~8-node baked cos/sin rotate_half).  short_factor is stored
+        # F32 len head_dim/2; theta + attn_factor go to KV.  The cos/sin table is
+        # retained so older runtimes / a fallback path still work.
+        self._add_tensor(writer, "lm.rope.short_factor", short.astype(np.float32), "F32")
+        writer.add_float32("codec.lm.rope_theta", float(cfg["rope_theta"]))
+        writer.add_float32("codec.lm.rope_attn_factor", float(scaling))
 
         # LM metadata
         writer.add_bool("codec.lm.has_adaptor", True)
