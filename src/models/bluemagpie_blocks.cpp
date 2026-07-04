@@ -329,7 +329,7 @@ extern "C" int codec_bluemagpie_cfm_eval(
     std::vector<float> dtsin((size_t) b.h_dit);
     bm_sinusoidal(0.0, b.h_dit, dtsin.data());
 
-    codec_graph_eval_guard guard(ctx);
+    codec_graph_eval_guard guard(ctx, /*persist=*/true);
     std::string err;
     codec_graph_cache_entry * entry = nullptr;
     codec_graph_cache_key key = {};

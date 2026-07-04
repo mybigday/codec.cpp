@@ -67,11 +67,17 @@ ggml_tensor * lin(ggml_context * c, ggml_tensor * w, ggml_tensor * x, ggml_tenso
 }
 
 // One RALM layer, incremental KV (1 new token).  Causal, no rope, no qk_norm.
-// Attends over k/v_cache[0..kv_pos] + the new token; writes new K/V to slot
-// kv_pos (side-effect roots).  O(kv_pos) instead of an O(T) full recompute.
+// Attends over a fixed bucket cache[0..B) plus the 1 new token, where B is a
+// 64-multiple >= kv_pos+1 so the graph shape is kv_pos-independent within a
+// bucket.  The additive `mask` (B, 1) input (0 for valid slots <= kv_pos,
+// -inf beyond) zeroes out slots the host hasn't filled yet.  The new K/V are
+// NOT written into the cache in-graph — they are surfaced as named outputs
+// (kk_out/vv_out) so the host can scatter them into the persistent cache after
+// compute, keeping the graph fully static per bucket.
 ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std::string & prefix,
     const codec_model * model, int32_t n_heads, int32_t n_kv, int32_t head_dim, float eps,
-    ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, int32_t kv_pos) {
+    ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, int32_t bucket, ggml_tensor * mask,
+    ggml_tensor ** kk_out, ggml_tensor ** vv_out) {
 
     auto W = [&](const char * s) { return codec_graph_weight(ctx, model, prefix + s); };
     const int32_t q_dim = n_heads * head_dim;
@@ -80,30 +86,28 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
     ggml_tensor * q  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_q.w"), h), head_dim, n_heads, 1);
     ggml_tensor * kk = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_k.w"), h), head_dim, n_kv, 1);
     ggml_tensor * vv = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W(".attn_v.w"), h), head_dim, n_kv, 1);
+    *kk_out = kk;
+    *vv_out = vv;
 
-    ggml_tensor * k_all = kk, * v_all = vv;
-    if (kv_pos > 0) {
-        ggml_tensor * k_old = ggml_view_3d(ctx, k_cache_l, head_dim, n_kv, kv_pos, k_cache_l->nb[1], k_cache_l->nb[2], 0);
-        ggml_tensor * v_old = ggml_view_3d(ctx, v_cache_l, head_dim, n_kv, kv_pos, v_cache_l->nb[1], v_cache_l->nb[2], 0);
-        k_all = ggml_concat(ctx, k_old, kk, 2);
-        v_all = ggml_concat(ctx, v_old, vv, 2);
-    }
-    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k_all, 0, 2, 1, 3));
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
-    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
-    scores = ggml_diag_mask_inf(ctx, scores, kv_pos);
-    scores = ggml_soft_max(ctx, scores);
+    // Bucketed key/value: first `bucket` slots from the persistent cache (the
+    // new token's slot kv_pos is inside the bucket and gets host-filled after
+    // this step, but the additive mask keeps it -inf for the current query, so
+    // attention over the cache view + the freshly computed kk/vv is exact).
+    ggml_tensor * k_old = ggml_view_3d(ctx, k_cache_l, head_dim, n_kv, bucket, k_cache_l->nb[1], k_cache_l->nb[2], 0);
+    ggml_tensor * v_old = ggml_view_3d(ctx, v_cache_l, head_dim, n_kv, bucket, v_cache_l->nb[1], v_cache_l->nb[2], 0);
+    ggml_tensor * k_all = ggml_concat(ctx, k_old, kk, 2);   // (head_dim, n_kv, bucket+1)
+    ggml_tensor * v_all = ggml_concat(ctx, v_old, vv, 2);
+
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));       // (head_dim, 1, n_heads)
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k_all, 0, 2, 1, 3));   // (head_dim, bucket+1, n_kv)
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);                          // (bucket+1, 1, n_heads)
+    // Fused scale + additive mask + softmax.  mask is (bucket+1, 1): valid
+    // slots (<= kv_pos and the self slot) are 0, unfilled slots are -inf.
+    scores = ggml_soft_max_ext(ctx, scores, mask, 1.0f / std::sqrt((float) head_dim), 0.0f);
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v_all, 1, 2, 0, 3));
     ggml_tensor * attn = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, v_p, scores), 0, 2, 1, 3));
     attn = ggml_reshape_2d(ctx, attn, q_dim, 1);
     x_ht = ggml_add(ctx, x_ht, ggml_mul_mat(ctx, W(".attn_o.w"), attn));
-
-    // write new K/V into the persistent cache at slot kv_pos (side-effect roots)
-    ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache_l, head_dim, n_kv, 1, k_cache_l->nb[1], k_cache_l->nb[2], (size_t) kv_pos * k_cache_l->nb[2]);
-    ggml_tensor * v_dst = ggml_view_3d(ctx, v_cache_l, head_dim, n_kv, 1, v_cache_l->nb[1], v_cache_l->nb[2], (size_t) kv_pos * v_cache_l->nb[2]);
-    ggml_set_output(ggml_cpy(ctx, kk, k_dst));
-    ggml_set_output(ggml_cpy(ctx, vv, v_dst));
 
     h = codec_op_rms_norm_ct(ctx, x_ht, eps, W(".ln2.w"));
     ggml_tensor * g = ggml_silu(ctx, ggml_mul_mat(ctx, W(".gate.w"), h));
@@ -112,9 +116,16 @@ ggml_tensor * bm_ralm_kv_step(ggml_context * ctx, ggml_tensor * x_ht, const std:
 }
 
 // Build the whole per-step graph.
+//
+// IMPORTANT: the graph shape depends ONLY on (bucket, n_real, cfg_value) — NOT
+// on kv_pos.  Two steps in the same 64-bucket produce byte-identical
+// build_user_data, so the runtime's consecutive-call fast path (see
+// codec_graph_cache_get_or_build) can skip the rebuild + galloc re-plan.  The
+// per-step variation (which cache slots are valid) is carried entirely by the
+// runtime `bm.cfm.ralm_mask` input.
 struct cfm_build {
     cfm_impl  imp;
-    int32_t   kv_pos;       // RALM positions cached so far
+    int32_t   bucket;       // RALM cache view length (round_up(kv_pos+1, 64))
     int32_t   n_real;       // CFM real (non-zero-init) steps
     float     cfg_value;
     float     dt[64];
@@ -156,11 +167,25 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     ggml_tensor * ralm_new = lin(ctx, W("lm.proj.fusion_concat.w"), fus, W("lm.proj.fusion_concat.b")); // (h_vox,1)
 
     // ---- RALM: one incremental step over the persistent KV cache ----
+    // Shared additive attention mask for all RALM layers.  scores has ne0 =
+    // bucket+1 (bucket cache slots + the 1 concatenated new token), so the
+    // mask is (bucket+1, 1).  Host fills it each step.
+    ggml_tensor * ralm_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, p->bucket + 1, 1);
+    ggml_set_name(ralm_mask, "bm.cfm.ralm_mask");
+    ggml_set_input(ralm_mask);
+
     ggml_tensor * rh = ralm_new;   // 1 new token
     for (int32_t i = 0; i < I.n_ralm; ++i) {
+        ggml_tensor * kk_i = nullptr, * vv_i = nullptr;
         rh = bm_ralm_kv_step(ctx, rh, "lm.ralm.layers." + std::to_string(i), model,
                              I.n_heads, I.n_kv, I.head_dim, I.eps,
-                             p->k_cache[i], p->v_cache[i], p->kv_pos);
+                             p->k_cache[i], p->v_cache[i], p->bucket, ralm_mask, &kk_i, &vv_i);
+        // Surface the new token's K/V as named outputs for host-side scatter
+        // into the persistent cache after compute.
+        ggml_set_name(kk_i, ("bm.cfm.ralm_k." + std::to_string(i)).c_str());
+        ggml_set_output(kk_i);
+        ggml_set_name(vv_i, ("bm.cfm.ralm_v." + std::to_string(i)).c_str());
+        ggml_set_output(vv_i);
     }
     ggml_tensor * residual_hidden = codec_op_rms_norm_ct(ctx, rh, I.eps, W("lm.ralm.norm.w"));  // (h_vox,1)
 
@@ -312,7 +337,13 @@ bool alloc_kv(cfm_state * s, const cfm_impl * I, codec_model * codec) {
         if (!s->k_cache[(size_t) l] || !s->v_cache[(size_t) l]) return false;
     }
     s->buf_kv = ggml_backend_alloc_ctx_tensors(s->ctx_kv, codec->backend);
-    return s->buf_kv != nullptr;
+    if (s->buf_kv == nullptr) return false;
+    // Zero the cache: bucketed attention views slots [kv_pos..bucket) whose
+    // contents are masked to -inf, but uninitialised backend memory could be
+    // NaN, and NaN survives the additive mask (NaN + -inf = NaN).  Zeroing
+    // guarantees finite scores so masked slots softmax to exactly 0.
+    ggml_backend_buffer_clear(s->buf_kv, 0);
+    return true;
 }
 
 void sinusoidal(double val, int32_t dim, float * out) {
@@ -343,8 +374,12 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     if (s->kv_pos >= s->max_T) { st->last_error = "RALM KV cache full (max_T)"; return CODEC_STATUS_INVALID_STATE; }
 
     const int32_t zero_init = std::max(1, (int32_t) ((double) (n + 1) * 0.04));
+    // Bucket the RALM cache view length so the graph shape is kv_pos-independent
+    // within a 64-step window: consecutive steps reuse the same cache entry.
+    const int32_t kBucketQuantum = 64;
+    const int32_t bucket = ((s->kv_pos + 1 + kBucketQuantum - 1) / kBucketQuantum) * kBucketQuantum;
     cfm_build b = {};
-    b.imp = *I; b.kv_pos = s->kv_pos; b.cfg_value = cfg_value; b.model = st->lm->codec;
+    b.imp = *I; b.bucket = bucket; b.cfg_value = cfg_value; b.model = st->lm->codec;
     for (int32_t l = 0; l < I->n_ralm; ++l) { b.k_cache[l] = s->k_cache[(size_t) l]; b.v_cache[l] = s->v_cache[(size_t) l]; }
     std::vector<double> t_real;
     double t = tspan[0], dt = tspan[0] - tspan[1];
@@ -361,12 +396,12 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     std::vector<float> zbuf;
     if (noise == nullptr) { zbuf.assign(dp, 0.0f); noise = zbuf.data(); }
 
-    codec_graph_eval_guard guard(st->ctx);
+    codec_graph_eval_guard guard(st->ctx, /*persist=*/true);
     std::string err;
     codec_graph_cache_entry * entry = nullptr;
     codec_graph_cache_key key = {};
     key.kind = CODEC_GRAPH_BLUEMAGPIE_CFM_STEP;
-    key.n_frames = s->kv_pos;     // graph depends on the cached prefix length (KV view + mask offset)
+    key.n_frames = bucket;        // graph shape depends only on the 64-bucketed KV view length
     key.n_q = n_timesteps;
     key.hop = (cfg_value == 1.0f) ? 1 : 0;  // cfg==1 builds a different (single-branch) graph shape
     if (!codec_graph_cache_get_or_build(st->ctx, key, build_step, &b, sizeof(b), &entry, &err)) {
@@ -378,9 +413,16 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     auto wr = [&](const char * nm, const float * d, size_t n_el) -> bool {
         ggml_tensor * tt = G(nm); return tt && codec_runtime_write_tensor(tt, d, n_el * sizeof(float), &err);
     };
+    // RALM additive attention mask, shape (bucket+1, 1).  Layout of the
+    // concatenated keys: slots [0..bucket) are the cache view, slot [bucket] is
+    // the freshly computed new token.  Valid slots: old cache [0..kv_pos) and
+    // the self slot [bucket]; unfilled cache slots [kv_pos..bucket) are -inf.
+    std::vector<float> ralm_mask((size_t) bucket + 1, 0.0f);
+    for (int32_t j = s->kv_pos; j < bucket; ++j) ralm_mask[(size_t) j] = -INFINITY;
     bool ok = wr("bm.cfm.h_in", h_in, I->h_barbet) && wr("bm.cfm.pfb_lm", s->prev_feedback_lm.data(), I->h_vox)
         && wr("bm.cfm.cond", s->prev_patch.data(), dp) && wr("bm.cfm.z", noise, dp)
-        && wr("bm.cfm.tsin", tsin_all.data(), tsin_all.size()) && wr("bm.cfm.dtsin", dtsin.data(), dtsin.size());
+        && wr("bm.cfm.tsin", tsin_all.data(), tsin_all.size()) && wr("bm.cfm.dtsin", dtsin.data(), dtsin.size())
+        && wr("bm.cfm.ralm_mask", ralm_mask.data(), ralm_mask.size());
     if (!ok) { st->last_error = err.empty() ? "write failed" : err; return CODEC_STATUS_INTERNAL_ERROR; }
 
     const int32_t nth = st->lm->codec->n_threads > 0 ? st->lm->codec->n_threads : 1;
@@ -395,8 +437,23 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     codec_runtime_read_tensor(G("bm.cfm.fb_tslm"), s->feedback_tslm.data(), (size_t) I->h_barbet * sizeof(float), &err);
     codec_runtime_read_tensor(G("bm.cfm.fb_lm"), s->prev_feedback_lm.data(), (size_t) I->h_vox * sizeof(float), &err);
 
-    // advance state: the RALM K/V for this position was written into the cache
-    // by the graph (side-effect roots), so just bump the cached length.
+    // Scatter the new token's K/V (per RALM layer) into the persistent cache at
+    // slot kv_pos.  The graph no longer writes the cache in-graph (kept static
+    // per bucket); we read the tiny (head_dim*n_kv) K/V outputs and place them
+    // via ggml_backend_tensor_set at the byte offset kv_pos * nb[2].
+    const size_t kv_bytes = (size_t) I->head_dim * (size_t) I->n_kv * sizeof(float);
+    std::vector<float> kvbuf((size_t) I->head_dim * (size_t) I->n_kv);
+    for (int32_t l = 0; l < I->n_ralm; ++l) {
+        ggml_tensor * kc = s->k_cache[(size_t) l];
+        ggml_tensor * vc = s->v_cache[(size_t) l];
+        const size_t off = (size_t) s->kv_pos * kc->nb[2];
+        if (codec_runtime_read_tensor(G(("bm.cfm.ralm_k." + std::to_string(l)).c_str()), kvbuf.data(), kv_bytes, &err))
+            ggml_backend_tensor_set(kc, kvbuf.data(), off, kv_bytes);
+        if (codec_runtime_read_tensor(G(("bm.cfm.ralm_v." + std::to_string(l)).c_str()), kvbuf.data(), kv_bytes, &err))
+            ggml_backend_tensor_set(vc, kvbuf.data(), off, kv_bytes);
+    }
+
+    // advance state: the RALM K/V for this position is now in the cache.
     s->kv_pos += 1;
     std::memcpy(s->prev_patch.data(), out_patch, dp * sizeof(float));
     return CODEC_STATUS_SUCCESS;

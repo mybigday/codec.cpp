@@ -71,12 +71,27 @@ bool codec_graph_prepare_io(
 void codec_graph_release(codec_context * ctx);
 ggml_tensor * codec_graph_get_tensor(codec_context * ctx, codec_graph_cache_entry * entry, const char * name);
 
+// RAII cleanup for the per-call eval graph.  By default the guard releases the
+// eval graph (freeing eval_ctx + clearing the galloc allocation) when it goes
+// out of scope — this is the behaviour every model relies on.
+//
+// When `persist` is true the guard leaves the eval graph alive so the next
+// public call can hit the consecutive-call fast path in
+// codec_graph_cache_get_or_build (same entry + identical user_data → skip
+// rebuild).  Any intervening call for a DIFFERENT entry takes the slow path,
+// which releases the stale graph before rebuilding, so persisting is safe.
+// Only callers that issue back-to-back identical graph calls (e.g. the
+// BlueMagpie per-step CFM loop) should set persist=true.
 struct codec_graph_eval_guard {
-    explicit codec_graph_eval_guard(codec_context * ctx_) : ctx(ctx_) {}
+    explicit codec_graph_eval_guard(codec_context * ctx_, bool persist_ = false)
+        : ctx(ctx_), persist(persist_) {}
     ~codec_graph_eval_guard() {
-        codec_graph_release(ctx);
+        if (!persist) {
+            codec_graph_release(ctx);
+        }
     }
     codec_context * ctx;
+    bool persist;
 };
 
 #endif
