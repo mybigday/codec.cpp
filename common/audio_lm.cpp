@@ -48,6 +48,18 @@ struct audio_lm_context {
     bool    prompt_needs_composed = false;
     int32_t speech_pad_code       = 0;   // codec.lm.speech_pad_token
 
+    // Qwen3-TTS talker prompt control tags (codec-vocab, looked up in
+    // audio_embd_0 = codec_embedding).  -1 when absent (non-Qwen3-TTS).
+    int32_t q3_nothink_id   = -1;
+    int32_t q3_think_bos_id = -1;
+    int32_t q3_think_eos_id = -1;
+    int32_t q3_codec_pad_id = -1;
+    int32_t q3_codec_bos_id = -1;
+    int32_t q3_tts_pad_id   = -1;   // text-vocab (projected)
+    int32_t q3_tts_bos_id   = -1;   // text-vocab (projected)
+    int32_t q3_tts_eos_id   = -1;   // text-vocab (projected)
+    bool    has_talker_proj = false;
+
     // Type A audio-token range.  `audio_tok_offset < 0` → disabled
     // (every token surfaces as PASSTHROUGH).  Set from GGUF metadata
     // at init; hosts override via `audio_lm_set_audio_token_range`.
@@ -226,6 +238,24 @@ static void init_decode_transform(audio_lm_context * ctx) {
         if (const char * v = meta_str(ctx, "codec.lm.speech_pad_token")) {
             ctx->speech_pad_code = std::atoi(v);
         }
+    }
+
+    // Qwen3-TTS talker control tags + text projection (residual_depth_ar
+    // with the qwen3tts metadata baked in).  Present only for the Qwen3-TTS
+    // talker; other residual models leave these -1 / has_talker_proj=false.
+    auto read_i = [&](const char * key, int32_t & dst) {
+        if (const char * v = meta_str(ctx, key)) dst = std::atoi(v);
+    };
+    read_i("codec.lm.qwen3tts.nothink_id",   ctx->q3_nothink_id);
+    read_i("codec.lm.qwen3tts.think_bos_id", ctx->q3_think_bos_id);
+    read_i("codec.lm.qwen3tts.think_eos_id", ctx->q3_think_eos_id);
+    read_i("codec.lm.pad_code_c0",           ctx->q3_codec_pad_id);
+    read_i("codec.lm.bos_code_c0",           ctx->q3_codec_bos_id);
+    read_i("codec.lm.qwen3tts.tts_pad_id",   ctx->q3_tts_pad_id);
+    read_i("codec.lm.qwen3tts.tts_bos_id",   ctx->q3_tts_bos_id);
+    read_i("codec.lm.qwen3tts.tts_eos_id",   ctx->q3_tts_eos_id);
+    if (ctx->lm != nullptr) {
+        ctx->has_talker_proj = codec_lm_text_proj_dim(ctx->lm) > 0;
     }
 }
 
@@ -896,7 +926,37 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
             out->parse_special = true;
             return true;
         }
-        // ChatML for Qwen3-TTS / MOSS-TTS-Realtime.
+        // MOSS-TTS-Realtime (residual_depth_ar, ChatML): the reference
+        // processor (processing_mossttsrealtime.py) prefixes a fixed TTS
+        // system prompt describing the engine, then puts the text in a user
+        // turn and opens an assistant turn where the 16 audio channels are
+        // generated.  Without the system prompt the backbone hidden states
+        // drift off-distribution and the depth decoder emits noise.  We
+        // detect realtime by the n_codebook==16 depth layout carried in
+        // metadata (Qwen3-TTS is 16-group residual too, but host_arch is
+        // still "qwen3"; the realtime kind ships codec.lm.n_codebook=16 and
+        // c0_input_modality="none").
+        {
+            const char * c0mod = meta_str(ctx, "codec.lm.residual.c0_input_modality");
+            const bool is_realtime = is_depth && c0mod &&
+                                     std::strcmp(c0mod, "none") == 0;
+            if (is_realtime) {
+                out->prompt_prefix =
+                    "<|im_start|>system\nYou are a highly expressive "
+                    "text-to-speech (TTS) engine developed by Mosi "
+                    "Intelligence. \nYou possess natural language "
+                    "understanding, emotional modeling, and multi-style "
+                    "speech generation capabilities, allowing you to generate "
+                    "the corresponding speech based on the text given in the "
+                    "assistant.<|im_end|>\n<|im_start|>user\n";
+                out->prompt_suffix =
+                    "<|im_end|>\n<|im_start|>assistant\n";
+                out->add_bos       = false;
+                out->parse_special = true;
+                return true;
+            }
+        }
+        // ChatML for Qwen3-TTS.
         out->prompt_prefix = "<|im_start|>user\n";
         out->prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n";
         out->add_bos       = false;
@@ -1015,6 +1075,139 @@ bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
         const char * raw = codec_lm_get_last_error(ctx->lm);
         ctx->last_error = std::string("audio_lm_compose_prompt_embd: compose failed (")
                            + (raw && *raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+bool audio_lm_talker_has_projection(const audio_lm_context * ctx) {
+    return ctx != nullptr && ctx->has_talker_proj &&
+           ctx->q3_nothink_id >= 0 && ctx->q3_codec_bos_id >= 0;
+}
+
+// Helper: codec lane lookup — codec_embedding[code] (= audio_embd cb 0),
+// dequanting from the F16 table.
+static bool talker_codec_embd(audio_lm_context * ctx, int32_t code,
+                              float * out, int32_t dim) {
+    if (!codec_lm_codec_embd_row(ctx->lm, code, out, dim)) {
+        const char * raw = codec_lm_get_last_error(ctx->lm);
+        ctx->last_error = std::string("talker: codec_embedding lookup failed (")
+                          + (raw && *raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+bool audio_lm_build_talker_prefix(audio_lm_context * ctx,
+                                  const int32_t *    role_tokens,
+                                  int32_t            n_role,
+                                  const int32_t *    text_tokens,
+                                  int32_t            n_text,
+                                  const float *      xvector,
+                                  int32_t            xvec_dim,
+                                  float *            out_embds,
+                                  int32_t            out_cap_rows,
+                                  int32_t *          out_n_rows,
+                                  int32_t *          out_text_consumed) {
+    if (!ctx || !out_embds || !out_n_rows || !out_text_consumed) return false;
+    if (!audio_lm_talker_has_projection(ctx)) {
+        ctx->last_error = "audio_lm_build_talker_prefix: no talker projection";
+        return false;
+    }
+    const int32_t H = ctx->hidden;
+    if (xvector != nullptr && xvec_dim != H) {
+        ctx->last_error = "audio_lm_build_talker_prefix: xvector dim != hidden";
+        return false;
+    }
+    if (n_text < 1) {
+        ctx->last_error = "audio_lm_build_talker_prefix: need >=1 text token";
+        return false;
+    }
+
+    // The codec control stream (auto-language, with x-vector row inserted):
+    //   [nothink, think_bos, think_eos, <XVEC>, codec_pad, codec_bos]
+    // The text lane aligned to it (all but last col):
+    //   [tts_pad, tts_pad, tts_pad, tts_pad, tts_bos]
+    // and text[0] is summed with the final codec col (codec_bos).
+    const int32_t n_ctrl = 5 + (xvector ? 1 : 0);   // control rows (excl. text[0] row)
+    const int32_t n_rows = n_role + n_ctrl + 1;      // + text[0] row
+    if (n_rows > out_cap_rows) {
+        ctx->last_error = "audio_lm_build_talker_prefix: output row cap too small";
+        return false;
+    }
+
+    std::vector<float> tmp((size_t) H);
+    auto proj = [&](int32_t tok, float * dst) -> bool {
+        if (!codec_lm_project_text(ctx->lm, tok, dst, H)) {
+            const char * raw = codec_lm_get_last_error(ctx->lm);
+            ctx->last_error = std::string("talker: project_text failed (")
+                              + (raw && *raw ? raw : "?") + ")";
+            return false;
+        }
+        return true;
+    };
+
+    int32_t r = 0;
+    // Role header: projected text only (codec lane empty → zero).
+    for (int32_t i = 0; i < n_role; ++i, ++r) {
+        if (!proj(role_tokens[i], out_embds + (size_t) r * H)) return false;
+    }
+    // Control stream text lane = tts_pad for all but the last (tts_bos).
+    // codec lane cycles [nothink, think_bos, think_eos, XVEC, codec_pad].
+    struct CtrlRow { int32_t text_tok; int32_t codec_tag; bool is_xvec; };
+    std::vector<CtrlRow> ctrl;
+    ctrl.push_back({ctx->q3_tts_pad_id, ctx->q3_nothink_id,   false});
+    ctrl.push_back({ctx->q3_tts_pad_id, ctx->q3_think_bos_id, false});
+    ctrl.push_back({ctx->q3_tts_pad_id, ctx->q3_think_eos_id, false});
+    if (xvector) ctrl.push_back({ctx->q3_tts_pad_id, -1, true});
+    ctrl.push_back({ctx->q3_tts_bos_id, ctx->q3_codec_pad_id, false});
+    for (const CtrlRow & c : ctrl) {
+        float * dst = out_embds + (size_t) r * H;
+        if (!proj(c.text_tok, dst)) return false;
+        if (c.is_xvec) {
+            for (int32_t i = 0; i < H; ++i) dst[i] += xvector[i];
+        } else {
+            if (!talker_codec_embd(ctx, c.codec_tag, tmp.data(), H)) return false;
+            for (int32_t i = 0; i < H; ++i) dst[i] += tmp[i];
+        }
+        ++r;
+    }
+    // Final row: text_proj(text[0]) + codec_embd[codec_bos].
+    {
+        float * dst = out_embds + (size_t) r * H;
+        if (!proj(text_tokens[0], dst)) return false;
+        if (!talker_codec_embd(ctx, ctx->q3_codec_bos_id, tmp.data(), H)) return false;
+        for (int32_t i = 0; i < H; ++i) dst[i] += tmp[i];
+        ++r;
+    }
+
+    *out_n_rows        = r;
+    *out_text_consumed = 1;   // text[0] folded into the prefix
+    return true;
+}
+
+bool audio_lm_talker_trailing_text_embd(audio_lm_context * ctx,
+                                        const int32_t *    text_tokens,
+                                        int32_t            n_text,
+                                        int32_t            trailing_idx,
+                                        float *            out_embd,
+                                        int32_t            out_dim) {
+    if (!ctx || !out_embd) return false;
+    if (out_dim < ctx->hidden) {
+        ctx->last_error = "talker_trailing_text_embd: out buffer too small";
+        return false;
+    }
+    // trailing_idx counts from the first *trailing* token (text[1]).  Once
+    // the text is exhausted, feed tts_eos (matches the reference's
+    // trailing_text_hidden = proj(text[1:]) ++ tts_eos).
+    const int32_t tok_pos = trailing_idx + 1;   // maps to text_tokens[tok_pos]
+    const int32_t tok = (tok_pos < n_text && text_tokens)
+                      ? text_tokens[tok_pos]
+                      : ctx->q3_tts_eos_id;
+    if (!codec_lm_project_text(ctx->lm, tok, out_embd, out_dim)) {
+        const char * raw = codec_lm_get_last_error(ctx->lm);
+        ctx->last_error = std::string("talker_trailing_text_embd: project failed (")
+                          + (raw && *raw ? raw : "?") + ")";
         return false;
     }
     return true;

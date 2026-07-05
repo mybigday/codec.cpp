@@ -176,15 +176,25 @@ def _write_prompt_metadata(writer, cfg: Dict[str, Any], arch_name: str) -> None:
     caller-side helper can assemble prompts without re-reading
     config.json.  codec_lm itself doesn't consume these."""
 
+    # HF stops MOSS-TTSD generation on generation_config.eos_token_id, which
+    # differs from config.eos_token_id: v0.5/v0.7 stop on 152694 (an
+    # end-of-speech sentinel above the speech vocab), while config.json's
+    # eos_token_id=151643 is the plain text EOS that never fires during
+    # audio decode.  Prefer the generation-config value for the cb0
+    # end-of-audio signal; fall back to config.eos_token_id.
+    gen_cfg = cfg.get("generation_config") or {}
+
     if arch_name in ("MossTTSDForCausalLM", "AsteroidTTSModel"):
         if "bos_token_id" in cfg:
             writer.add_uint32("codec.lm.text_bos_id", int(cfg["bos_token_id"]))
         if "eos_token_id" in cfg:
             writer.add_uint32("codec.lm.text_eos_id", int(cfg["eos_token_id"]))
-            # channel 0 is the text-vocab channel; end-of-audio = text EOS
-            # sampled on cb0.  Mirror the value under the uniform eos_code_c0
-            # key (eos_min_step=0).  text_eos_id is kept for back-compat.
-            writer.add_int32("codec.lm.eos_code_c0", int(cfg["eos_token_id"]))
+            # channel 0 is the text-vocab channel; end-of-audio = the
+            # sampled cb0 EOS.  Mirror the generation-config EOS under the
+            # uniform eos_code_c0 key (eos_min_step=0).  text_eos_id keeps
+            # the config-level value for back-compat.
+            eos_c0 = int(gen_cfg.get("eos_token_id", cfg["eos_token_id"]))
+            writer.add_int32("codec.lm.eos_code_c0", eos_c0)
             writer.add_int32("codec.lm.eos_min_step", 0)
         if "pad_token" in cfg:
             writer.add_array("codec.lm.pad_token_per_channel",

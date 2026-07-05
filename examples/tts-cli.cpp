@@ -378,6 +378,20 @@ static std::string replace_all_str(std::string s, const std::string & from, cons
 }
 
 // Tokenize prefix + text + suffix through the backbone vocab.
+// Tokenize a raw string with explicit bos/special controls.
+std::vector<llama_token> tokenize_str(const llama_vocab * vocab,
+                                      const std::string & s,
+                                      bool add_bos, bool parse_special) {
+    int32_t cap = (int32_t) s.size() + 8;
+    std::vector<llama_token> toks(cap);
+    int32_t n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(),
+                               toks.data(), cap, add_bos, parse_special);
+    if (n < 0) { toks.resize(-n); n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(),
+                               toks.data(), (int32_t) toks.size(), add_bos, parse_special); }
+    toks.resize(std::max(0, n));
+    return toks;
+}
+
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab,
                                          const codec_common::audio_lm_prompt_info & pi,
                                          const std::string & text_in) {
@@ -484,13 +498,58 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
                      int32_t max_frames, Sampler & sampler,
                      float temp, float top_p, int32_t top_k,
                      const std::vector<float> & speaker_prefix,
+                     const std::string & payload_text,
                      int32_t * out_frames, const char ** out_stop) {
     codec_common::audio_lm_set_uses_embed_override(ctx, true, 1);
     int32_t n_past = 0;
-    // Speaker x-vector prefix (Qwen3-TTS voice clone): the ECAPA-TDNN
-    // x-vector is prepended as inputs_embeds row 0 before the text prompt,
-    // conditioning the talker on the reference voice.  Decode it first so
-    // the text tokens attend to it via the KV cache.
+
+    // ── Qwen3-TTS talker: faithful additive dual-lane prompt ───────────
+    // When the model carries the talker text_projection + control tags, the
+    // prompt is not raw ChatML tokens: it's a composed inputs_embeds prefix
+    // (projected text lane + codec control-tag lane, with the ECAPA x-vector
+    // inserted between the think-tags and pad/bos), and the trailing text is
+    // injected per-step summed with the audio next-embed (delay-pattern).
+    std::vector<llama_token> talker_text;   // payload text tokens (for trailing)
+    int32_t talker_trailing = 0;            // index into trailing text stream
+    const bool talker = codec_common::audio_lm_talker_has_projection(ctx);
+    if (talker) {
+        // Role header = "<|im_start|>assistant\n" (projected text, no codec).
+        std::vector<llama_token> role =
+            tokenize_str(vocab, "<|im_start|>assistant\n", /*add_bos=*/false,
+                         /*parse_special=*/true);
+        talker_text = tokenize_str(vocab, payload_text,
+                                   /*add_bos=*/false, /*parse_special=*/false);
+        if (talker_text.empty()) { std::fprintf(stderr, "talker: empty text\n"); return false; }
+
+        const int32_t cap_rows = (int32_t) role.size() + 6 + 4;
+        std::vector<float> prefix((size_t) cap_rows * hidden);
+        int32_t n_rows = 0, consumed = 0;
+        const float * xv = (!speaker_prefix.empty() &&
+                            (int32_t) speaker_prefix.size() == hidden)
+                         ? speaker_prefix.data() : nullptr;
+        if (!codec_common::audio_lm_build_talker_prefix(
+                ctx, role.data(), (int32_t) role.size(),
+                talker_text.data(), (int32_t) talker_text.size(),
+                xv, xv ? hidden : 0,
+                prefix.data(), cap_rows, &n_rows, &consumed)) {
+            std::fprintf(stderr, "build_talker_prefix failed: %s\n",
+                         codec_common::audio_lm_last_error(ctx));
+            return false;
+        }
+        talker_trailing = 0;   // trailing token 0 → text[1]
+        llama_batch b = llama_batch_init(n_rows, hidden, 1);
+        std::memcpy(b.embd, prefix.data(), (size_t) n_rows * hidden * sizeof(float));
+        b.token = nullptr; b.n_tokens = n_rows;
+        for (int32_t i = 0; i < n_rows; ++i) {
+            b.pos[i] = n_past + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0;
+            b.logits[i] = (i == n_rows - 1) ? 1 : 0;
+        }
+        int rc = llama_decode(lctx, b);
+        llama_batch_free(b);
+        if (rc != 0) { std::fprintf(stderr, "talker prefill decode failed\n"); return false; }
+        n_past += n_rows;
+    } else
+    // Speaker x-vector prefix (non-talker fallback): prepend as row 0.
     if (!speaker_prefix.empty() && (int32_t) speaker_prefix.size() == hidden) {
         std::vector<float> pfx(speaker_prefix);
         if (!decode_embed(lctx, pfx.data(), hidden, n_past)) {
@@ -498,6 +557,7 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
         }
         n_past += 1;
     }
+    if (!talker) {
     // Merged-cb0 models (MOSS-TTSD) need the multi-modal prompt embedding:
     // each position is sum(embed_cb0[text_tok], embed_cb1..7[speech_pad]).
     // Feed those via the inputs_embeds path instead of the raw token path so
@@ -529,6 +589,7 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
         std::fprintf(stderr, "prefill decode failed\n"); return false;
     }
     n_past += (int32_t) toks.size();
+    }  // end if (!talker)
 
     std::vector<float> cur(hidden);
     const float * h0 = llama_get_embeddings_ith(lctx, -1);
@@ -568,6 +629,21 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
         const float * nb = codec_common::audio_lm_get_next_embed(ctx, &dim);
         if (!nb || dim != hidden) return false;
         std::vector<float> nbc(nb, nb + dim);
+        // Qwen3-TTS talker: the next backbone input is the audio next-embed
+        // SUMMED with the projected trailing text token (delay-pattern text
+        // injection, mirrors the reference trailing_text_hidden add).
+        if (talker) {
+            std::vector<float> tt(hidden);
+            if (!codec_common::audio_lm_talker_trailing_text_embd(
+                    ctx, talker_text.data(), (int32_t) talker_text.size(),
+                    talker_trailing, tt.data(), hidden)) {
+                std::fprintf(stderr, "talker trailing text failed: %s\n",
+                             codec_common::audio_lm_last_error(ctx));
+                return false;
+            }
+            for (int32_t i = 0; i < hidden; ++i) nbc[i] += tt[i];
+            ++talker_trailing;
+        }
         if (!decode_embed(lctx, nbc.data(), dim, n_past++)) return false;
         const float * h = llama_get_embeddings_ith(lctx, -1);
         if (!h) return false;
@@ -707,7 +783,7 @@ int cmd_synthesize(const args & a) {
         // Flow 2/3: codebook AR (residual depth-AR + parallel-heads delay).
         ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,
                                 max_frames, sampler, temp, top_p, top_k,
-                                speaker_prefix, &n_frames, &stop_reason);
+                                speaker_prefix, a.text, &n_frames, &stop_reason);
     }
 
     llama_free(lctx);

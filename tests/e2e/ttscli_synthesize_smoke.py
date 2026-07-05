@@ -101,17 +101,22 @@ def _try_cer(wav, ref, lang):
 
 
 def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
-          require_stop=True, cer_report_only=False, dur_max=30.0):
+          require_stop=True, cer_report_only=False, dur_max=30.0,
+          audio_report_only=False):
     """Drive one synthesize case.
 
-    require_stop=False   → stop-reason is reported, not asserted (models
-                           that don't reliably hit EOS free-running).
-    cer_report_only=True → the ASR transcript + CER are printed but never
-                           fail the case.  Used for models whose intrinsic
-                           llama.cpp-vs-HF backbone numerical drift makes
-                           free-running generation diverge (MOSS-TTSD) or
-                           whose full talker prompt assembly isn't wired
-                           yet (Qwen3-TTS voice clone).
+    require_stop=False    → stop-reason is reported, not asserted (models
+                            that don't reliably hit EOS free-running).
+    cer_report_only=True  → the ASR transcript + CER are printed but never
+                            fail the case.  Used for models whose full
+                            prompt assembly isn't wired yet (Qwen3-TTS
+                            talker needs MRoPE) or that need streaming the
+                            host loop doesn't do (MOSS-TTS-Realtime).
+    audio_report_only=True→ duration/silence are reported, not asserted.
+                            For models whose sampled output isn't reliable
+                            end-to-end yet (MOSS-TTS-Realtime): the case
+                            proves the decode path runs + exits 0, but the
+                            audio content is not guaranteed.
     """
     if not codec.exists() or not backbone.exists():
         print(f"[skip] {name}: missing assets ({codec.name} / {backbone.name})")
@@ -134,9 +139,15 @@ def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
         else:
             print(f"[WARN] {name}: stop={stop} (wanted {want_stop})")
     if not (0.3 <= dur <= dur_max):
-        print(f"[FAIL] {name}: duration {dur:.2f}s out of bounds"); ok = False
+        if audio_report_only:
+            print(f"[WARN] {name}: duration {dur:.2f}s out of bounds")
+        else:
+            print(f"[FAIL] {name}: duration {dur:.2f}s out of bounds"); ok = False
     if rms < 0.005:
-        print(f"[FAIL] {name}: silent (rms={rms:.4f})"); ok = False
+        if audio_report_only:
+            print(f"[WARN] {name}: near-silent (rms={rms:.4f})")
+        else:
+            print(f"[FAIL] {name}: silent (rms={rms:.4f})"); ok = False
     cer_res = _try_cer(out, text, lang)
     cer_str = ""
     if cer_res is not None:
@@ -178,38 +189,63 @@ def main():
 
     # MOSS-TTSD v0.5 — parallel-heads-delay.  Exercises the full codes→PCM
     # transform (cb0 speech-range remap + delay un-shift, 8→codec n_q=8) and
-    # the multi-modal composed prompt prefill.  The codec transform is
-    # correct (audio is speech-shaped, non-silent), but free-running AR on
-    # llama.cpp's F16 Qwen3 backbone vs HF's BF16 diverges on the first frame
-    # (backbone corr 0.999998 but max_abs_diff ~6e-3 flips close-call parallel
-    # heads → ~10 % per-step flips compound), so the transcript is babble.
-    # Asserted: exit 0, non-silent, sane duration.  CER report-only; stop not
-    # required (free-running rarely reaches text EOS).  Cap frames ≤ the
-    # XY-Tokenizer post_rvq_adapter pos_emb limit (375).
+    # the multi-modal composed prompt prefill.  NOW INTELLIGIBLE: two fixes
+    # landed — (a) the BF16 qwen3 backbone (the F16 downcast's ~6e-3 hidden
+    # deltas flipped close-call parallel-head argmaxes → babble; BF16 matches
+    # HF's native precision), and (b) the converter now bakes the correct
+    # end-of-audio EOS (generation_config.eos_token_id=152694, not
+    # config.eos_token_id=151643) so cb0 stops the audio.  Greedy (--temp 0)
+    # on BF16 reproduces the input sentence and stops via eos_code_c0.
     results.append(_case(
         "moss_ttsd_v05",
         REPO / "models" / "moss_ttsd_v0_5" / "moss_ttsd_v0_5.gguf",
-        REPO / "models" / "moss_ttsd_v0_5" / "qwen3_backbone.gguf",
+        REPO / "models" / "moss_ttsd_v0_5" / "qwen3_backbone_bf16.gguf",
         "[S1]你好，欢迎使用语音合成系统。",
-        "zh", want_stop="eos_code_c0", cer_max=1.0,
+        "zh", want_stop="eos_code_c0", cer_max=0.35,
         extra=["--max-frames", "360"],
-        require_stop=False, cer_report_only=True,
+    ))
+
+    # MOSS-TTS-Realtime — residual depth-AR, 16 RVQ codebooks decoded through
+    # the MOSS-Audio codec (native 32-quantizer RVQ, truncated to the LM's 16
+    # via the decode-time n_q remap).  The 16→32 decode mismatch is FIXED
+    # (moss_audio honours a partial n_q).  Decode succeeds + stops on the
+    # audio EOS (1026).  Full intelligibility additionally needs the
+    # streaming delay-pattern text/audio interleaving (the reference feeds
+    # text incrementally per-step with a 12-token delay + repetition penalty),
+    # which the single-shot host loop does not yet implement — so this is
+    # report-only for the transcript, and stop is not required (sampling can
+    # overrun the frame cap).  Uses the reference sampling regime.
+    results.append(_case(
+        "moss_tts_realtime",
+        REPO / "models" / "moss_tts_realtime" / "moss_tts_realtime.gguf",
+        REPO / "models" / "moss_tts_realtime" / "qwen3_backbone_bf16.gguf",
+        "你好，欢迎使用语音合成。",
+        "zh", want_stop="eos_code_c0", cer_max=1.0,
+        extra=["--temp", "0.8", "--top-p", "0.6", "--top-k", "30",
+               "--seed", "42", "--max-frames", "400"],
+        require_stop=False, cer_report_only=True, audio_report_only=True,
+        dur_max=35.0,
     ))
 
     # Qwen3-TTS-0.6B-Base — residual depth-AR + ECAPA-TDNN speaker encoder.
-    # With a --ref-audio x-vector prefix the talker stops on eos_code_c0
-    # (2150) — the conditioning path is structurally wired.  Full voice-clone
-    # intelligibility needs the talker's projected prompt assembly
-    # (text_projection MLP + codec control-tag interleaving) which is not
-    # dumped into the GGUF, so the raw-x-vector + ChatML approximation is not
-    # yet intelligible.  Asserted: exit 0, non-silent.  CER report-only.
+    # The faithful talker prompt is now assembled (converter bakes
+    # text_projection + text_embedding + control-tag ids; codec_common builds
+    # the additive dual-lane prefix — projected text lane summed with the
+    # codec control-tag lane, ECAPA x-vector inserted between the think-tags
+    # and pad/bos; tts-cli injects the projected trailing text per-step).
+    # Structurally faithful, but the talker BACKBONE requires 3D MRoPE, which
+    # the plain `qwen3` gguf + llama.cpp apply as 1D RoPE — so the attention
+    # positions are wrong and the output is not yet intelligible.  Asserted:
+    # exit 0, non-silent.  CER report-only until MRoPE lands.
     results.append(_case(
         "qwen3_tts_refaudio",
         REPO / "models" / "qwen3_tts" / "qwen3_tts_06b_base.gguf",
         REPO / "models" / "qwen3_tts" / "qwen3_tts_talker.gguf",
         "你好，欢迎使用语音合成。",
         "zh", want_stop="eos_code_c0", cer_max=1.0,
-        extra=["--ref-audio", str(REPO / "test.wav"), "--max-frames", "300"],
+        extra=["--ref-audio", str(REPO / "test.wav"),
+               "--temp", "0.9", "--top-k", "50", "--seed", "42",
+               "--max-frames", "300"],
         require_stop=False, cer_report_only=True,
     ))
 

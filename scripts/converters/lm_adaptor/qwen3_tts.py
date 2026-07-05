@@ -147,6 +147,40 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     if "codec_pad_id" in tk_cfg:
         writer.add_int32 ("codec.lm.pad_code_c0", int(tk_cfg["codec_pad_id"]))
 
+    # --- talker prompt-assembly control tags (Qwen3-TTS specific) --------
+    # The talker prefix interleaves two lanes summed position-wise:
+    #   text lane  = text_projection(text_embedding[text_tok])   (2048->1024)
+    #   codec lane = codec_embedding[control_tag]                (already 1024)
+    # The codec-tag stream (auto-language) is:
+    #   [nothink, think_bos, think_eos, <X-VECTOR>, pad, bos]
+    # and the text lane is [tts_pad * (len-2), tts_bos] aligned to it, then
+    # the first payload text token is summed with codec_bos.  See
+    # modeling_qwen3_tts.py::Qwen3TTSTalkerModel.generate.  These ids come
+    # straight from the checkpoint's talker_config so the runtime can
+    # assemble the prefix without re-reading config.json.
+    for meta_key, cfg_key in [
+        ("codec.lm.qwen3tts.nothink_id",   "codec_nothink_id"),
+        ("codec.lm.qwen3tts.think_id",     "codec_think_id"),
+        ("codec.lm.qwen3tts.think_bos_id", "codec_think_bos_id"),
+        ("codec.lm.qwen3tts.think_eos_id", "codec_think_eos_id"),
+        ("codec.lm.qwen3tts.tts_pad_id",   "tts_pad_token_id"),
+        ("codec.lm.qwen3tts.tts_bos_id",   "tts_bos_token_id"),
+        ("codec.lm.qwen3tts.tts_eos_id",   "tts_eos_token_id"),
+    ]:
+        val = tk_cfg.get(cfg_key, cfg.get(cfg_key))
+        if val is not None:
+            writer.add_int32(meta_key, int(val))
+    # Language-id map (codec-vocab tokens looked up in codec_embedding).
+    # The runtime default is "auto" (no explicit language → 3-tag nothink
+    # form), so only the common per-language ids are surfaced as scalars for
+    # an optional explicit-language path.  (String-keyed maps aren't cleanly
+    # representable as GGUF metadata the runtime reads.)
+    lang_map = tk_cfg.get("codec_language_id", cfg.get("codec_language_id")) or {}
+    for lang in ("chinese", "english"):
+        if lang in lang_map:
+            writer.add_int32(f"codec.lm.qwen3tts.language_{lang}",
+                             int(lang_map[lang]))
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_hidden)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)
@@ -185,6 +219,34 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
             )
         writer.add_tensor(f"lm.audio_embd_{i+1}.weight",
                           arr.astype(np.float32), st_dtype="F16")
+
+    # --- talker text projection + text embedding ------------------------
+    # The talker prompt projects backbone/text-vocab embeds (2048) into
+    # talker hidden (1024) via a 2-layer SiLU MLP (Qwen3TTSTalkerResizeMLP:
+    # linear_fc2(silu(linear_fc1(x))), bias=True), then sums them with the
+    # codec-tag lane.  Both the projection weights and the talker's own text
+    # embedding table (151936 x 2048) are needed runtime-side, so bake them.
+    for src, dst, expect in [
+        ("talker.text_projection.linear_fc1.weight", "lm.text_projection.fc1.weight",
+         (talker_hidden * 2, 2048)),
+        ("talker.text_projection.linear_fc1.bias",   "lm.text_projection.fc1.bias",   None),
+        ("talker.text_projection.linear_fc2.weight", "lm.text_projection.fc2.weight",
+         (talker_hidden, talker_hidden * 2)),
+        ("talker.text_projection.linear_fc2.bias",   "lm.text_projection.fc2.bias",   None),
+    ]:
+        if src not in sd:
+            raise RuntimeError(f"missing tensor: {src}")
+        arr = sd[src]
+        if expect is not None and arr.shape != expect:
+            raise RuntimeError(f"{src} shape {arr.shape} != expected {expect}")
+        dt = "F32" if dst.endswith(".bias") else "F16"
+        writer.add_tensor(dst, arr.astype(np.float32), st_dtype=dt)
+
+    txt_embd = sd["talker.model.text_embedding.weight"]
+    text_vocab = int(txt_embd.shape[0])
+    writer.add_uint32("codec.lm.qwen3tts.text_vocab", text_vocab)
+    writer.add_uint32("codec.lm.qwen3tts.text_embed_dim", int(txt_embd.shape[1]))
+    writer.add_tensor("lm.text_embd.weight", txt_embd.astype(np.float32), st_dtype="F16")
 
     # --- c0 head --------------------------------------------------------
     c0 = sd["talker.codec_head.weight"]

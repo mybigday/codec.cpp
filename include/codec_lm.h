@@ -228,6 +228,22 @@ const float * codec_lm_audio_embd(
     int32_t           cb_idx,
     int32_t           code);
 
+// Qwen3-TTS talker text-projection.  Projects one text-vocab token
+// through the talker `text_projection` MLP (fc2 ∘ silu ∘ fc1 applied to
+// `text_embd[text_token]`) and writes the talker-hidden-dim result into
+// `out` (size `out_cap`).  Returns false when the model has no text
+// projection (non-Qwen3-TTS) or on error.  `codec_lm_text_proj_dim`
+// returns that output dim, or 0 when absent.
+bool    codec_lm_project_text(struct codec_lm * lm, int32_t text_token,
+                              float * out, int32_t out_cap);
+int32_t codec_lm_text_proj_dim(struct codec_lm * lm);
+
+// Read one row of the codec_embedding table (audio_embd codebook 0) into
+// `out` (size `out_cap`), dequanting from F16/BF16/F32.  Used for the
+// Qwen3-TTS talker codec control-tag lane.
+bool    codec_lm_codec_embd_row(struct codec_lm * lm, int32_t code,
+                                float * out, int32_t out_cap);
+
 // Sum-of-codebook compose: write `sum_i audio_embd[i][codes[i]]` into
 // `out_embd[hidden_dim]`.  `codes[i] == -1` means "skip codebook i"
 // (treated as a zero contribution — same as multiplying that channel's

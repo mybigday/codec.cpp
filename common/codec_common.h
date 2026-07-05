@@ -458,6 +458,62 @@ bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
                                   float *            out_embd,
                                   int32_t            out_dim);
 
+// ─────────────────────────────────────────────────────────────────────
+// Qwen3-TTS talker prompt assembly.
+//
+// The talker prompt is a two-lane additive prefix (see
+// modeling_qwen3_tts.py::Qwen3TTSTalkerModel.generate):
+//
+//   text lane  = text_projection(text_embd[text_tok])   (projected, H)
+//   codec lane = codec_embedding[control_tag]           (H)
+//
+// summed position-wise.  With auto-language + an ECAPA x-vector the
+// prefix (role header + control stream) is:
+//
+//   0..2 : text_proj(role_tok[0..2])                     (codec lane empty)
+//   3    : text_proj(tts_pad) + codec_embd[nothink]
+//   4    : text_proj(tts_pad) + codec_embd[think_bos]
+//   5    : text_proj(tts_pad) + codec_embd[think_eos]
+//   6    : text_proj(tts_pad) + X-VECTOR
+//   7    : text_proj(tts_bos) + codec_embd[codec_pad]
+//   8    : text_proj(text[0]) + codec_embd[codec_bos]
+//
+// after which generation runs; the trailing text (text_proj(text[i]) for
+// i>=1, then tts_eos) is injected per-step by the host via
+// `audio_lm_talker_trailing_text_embd`.
+//
+// `role_tokens` are the tokenized "<|im_start|>assistant\n" header (host
+// tokenizes them), `text_tokens` the payload text tokens.  `xvector` (may
+// be null) is the ECAPA x-vector (hidden floats).  On success writes the
+// prefix rows (row-major, `out_n_rows * hidden` floats) into `out_embds`
+// (host sizes it to at least `(3 + 5 + n_text_prefix) * hidden`), sets
+// `*out_n_rows`, and reports how many payload text tokens were consumed by
+// the prefix in `*out_text_consumed` (1: text[0] summed at row 8).
+bool audio_lm_talker_has_projection(const audio_lm_context * ctx);
+
+bool audio_lm_build_talker_prefix(audio_lm_context * ctx,
+                                  const int32_t *    role_tokens,
+                                  int32_t            n_role,
+                                  const int32_t *    text_tokens,
+                                  int32_t            n_text,
+                                  const float *      xvector,   // may be null
+                                  int32_t            xvec_dim,
+                                  float *            out_embds,
+                                  int32_t            out_cap_rows,
+                                  int32_t *          out_n_rows,
+                                  int32_t *          out_text_consumed);
+
+// Per-step trailing-text embedding: text_proj(text_tokens[i]) for the
+// i-th trailing token, or text_proj(tts_eos) once the text is exhausted.
+// Writes `hidden` floats into `out_embd`.  The host sums this with the
+// audio next-embed before feeding the next backbone step.
+bool audio_lm_talker_trailing_text_embd(audio_lm_context * ctx,
+                                        const int32_t *    text_tokens,
+                                        int32_t            n_text,
+                                        int32_t            trailing_idx,
+                                        float *            out_embd,
+                                        int32_t            out_dim);
+
 }  // namespace codec_common
 
 #endif  // CODEC_COMMON_H

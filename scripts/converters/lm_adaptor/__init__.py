@@ -99,6 +99,20 @@ def _load_lm_source(lm_source, *, verbose: bool = False) -> Tuple[Dict[str, np.n
     with open(cfg_path, "r") as f:
         cfg = json.load(f)
 
+    # generation_config.json overrides the model-config defaults at
+    # inference time (HF `model.generation_config`).  Some families ship a
+    # *different* end-of-audio EOS there than in config.json — e.g.
+    # MOSS-TTSD v0.5/v0.7 stop on generation_config.eos_token_id=152694,
+    # not config.eos_token_id=151643.  Surface it so handlers can prefer it.
+    gen_path = (local / "generation_config.json") if local.is_dir() \
+        else local.parent / "generation_config.json"
+    if gen_path.is_file():
+        try:
+            with open(gen_path, "r") as f:
+                cfg["generation_config"] = json.load(f)
+        except Exception:
+            pass
+
     sd = _load_state_dict(local)
     if verbose:
         print(f"[lm_adaptor] loaded {len(sd)} tensors from {local}")
