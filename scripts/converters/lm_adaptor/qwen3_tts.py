@@ -135,6 +135,18 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_array ("codec.lm.delay_pattern",   [0] * n_codebook)
     writer.add_bool  ("codec.lm.parallel.tied_heads_to_embd", False)
 
+    # End-of-audio: the talker stops when codebook-0 samples
+    # `codec_eos_token_id` (2150 for 0.6B).  Also record bos/pad codes
+    # since the config carries them.  All read from the checkpoint's own
+    # talker_config.  eos_min_step=0 (honored from the first frame).
+    if "codec_eos_token_id" in tk_cfg:
+        writer.add_int32 ("codec.lm.eos_code_c0", int(tk_cfg["codec_eos_token_id"]))
+        writer.add_int32 ("codec.lm.eos_min_step", 0)
+    if "codec_bos_id" in tk_cfg:
+        writer.add_int32 ("codec.lm.bos_code_c0", int(tk_cfg["codec_bos_id"]))
+    if "codec_pad_id" in tk_cfg:
+        writer.add_int32 ("codec.lm.pad_code_c0", int(tk_cfg["codec_pad_id"]))
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_hidden)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)

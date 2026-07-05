@@ -150,6 +150,19 @@ struct codec_lm_info {
     bool            is_continuous;
     int32_t         patch_size;
     int32_t         latent_dim;
+
+    // End-of-audio metadata (ABI-appended after the continuous fields;
+    // zero-init safe).  For codebook kinds (residual_depth_ar,
+    // parallel_heads_delay), sampling `eos_code_c0` on codebook 0 signals
+    // end-of-audio, but only from AR step `eos_min_step` onwards (0-based
+    // frame index).  `eos_code_c0 == -1` means the model has no such
+    // sentinel (e.g. Moshi, which stops via a text-EOS on the backbone,
+    // or continuous-latent kinds, which signal stop via step_generate).
+    // Read from GGUF keys `codec.lm.eos_code_c0` (default -1) and
+    // `codec.lm.eos_min_step` (default 0).  Consume via
+    // codec_lm_step_is_eos.
+    int32_t         eos_code_c0;
+    int32_t         eos_min_step;
 };
 
 // Return CODEC_STATUS_NOT_SUPPORTED via NULL when the codec_model has
@@ -317,6 +330,51 @@ enum codec_status codec_lm_step_push_code(
 enum codec_status codec_lm_step_finish(
     struct codec_lm_state * st,
     int32_t *               out_codes);  // [n_codebook]
+
+// ─────────────────────────────────────────────────────────────────────
+// End-of-audio decision (codebook kinds only).
+//
+// Given a just-emitted frame's `codes[n_codes]`, decide whether it is the
+// end-of-audio frame for this model.  Kind-aware:
+//
+//   * residual_depth_ar / parallel_heads_delay — sets `*out_is_eos = 1`
+//     when `codes[0] == info->eos_code_c0` AND the state's internal frame
+//     counter is >= `info->eos_min_step`.  When `eos_code_c0 < 0` the model
+//     has no sentinel and `*out_is_eos` is always 0.
+//   * continuous_latent_cfm — returns CODEC_STATUS_NOT_SUPPORTED (the
+//     continuous kind signals stop via codec_lm_step_generate's out_stop).
+//
+// The frame counter lives in the kind-agnostic `codec_lm_state`: it is
+// incremented once per successful codec_lm_step_finish and reset by
+// codec_lm_state_reset.  So the intended call sequence per AR step is:
+//
+//   codec_lm_step_begin(st, h); ... push all codes ...; step_finish(st, codes);
+//   int32_t is_eos = 0;
+//   codec_lm_step_is_eos(st, codes, n_cb, &is_eos);
+//   if (is_eos) break;   // stop the AR loop
+//
+// TYPE-D (parallel_heads_delay) DELAY TAIL: when a delay pattern is in
+// use, an EOS sampled on cb0 does NOT mean the later codebooks are done —
+// their in-flight frames trail by up to `max(delay_pattern)` steps.  This
+// function reports the cb0 EOS at the frame it happens; it does NOT trim
+// or flush the delay tail, because the delay shift is applied at
+// sequence-assembly time OUTSIDE codec_lm (the state machine only ever
+// sees the flat, already-unshifted frame — see the delay_pattern doc on
+// codec_lm_info and src/lm/parallel_heads_delay.cpp).  The host is
+// responsible for continuing to step `max(delay_pattern)` more frames
+// after the reported EOS and then trimming the tail, exactly as the
+// reference processors do (MOSS-TTSD's pre-shift/post-reverse).  For the
+// MOSS-TTSD GGUFs the model itself sees a flat layout (delay applied by
+// the processor), so in practice `codes[0] == eos_code_c0` is the
+// terminal frame and no extra flush is needed at the codec_lm level.
+//
+// Returns INVALID_ARG on NULL args or n_codes <= 0; NOT_SUPPORTED for
+// kinds without the concept.  `*out_is_eos` is written 0/1 on SUCCESS.
+enum codec_status codec_lm_step_is_eos(
+    struct codec_lm_state * st,
+    const int32_t *         codes,
+    int32_t                 n_codes,
+    int32_t *               out_is_eos);
 
 // ─────────────────────────────────────────────────────────────────────
 // Continuous-latent step machine (CONTINUOUS_LATENT_CFM kind only).

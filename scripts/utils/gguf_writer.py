@@ -80,6 +80,11 @@ class GGUFWriter:
         """Add uint32 metadata."""
         self.kv.append((key, KV_UINT32, int(val)))
 
+    def add_int32(self, key: str, val: int):
+        """Add signed int32 metadata (use when the value may be negative,
+        e.g. an eos sentinel of -1)."""
+        self.kv.append((key, KV_INT32, int(val)))
+
     def add_float32(self, key: str, val: float):
         """Add float32 metadata."""
         self.kv.append((key, KV_FLOAT32, float(val)))

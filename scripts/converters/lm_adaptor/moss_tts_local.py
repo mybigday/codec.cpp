@@ -91,6 +91,20 @@ def _dump_realtime(writer, sd: Dict[str, np.ndarray],
     writer.add_array  ("codec.lm.delay_pattern",   [0] * n_codebook)
     writer.add_bool   ("codec.lm.parallel.tied_heads_to_embd", False)
 
+    # End-of-audio: MOSS-TTS-Realtime channel 0 is an AUDIO codebook
+    # (text comes from the backbone).  The streaming reference stops when
+    # `audio_tokens[:, 0] == audio_eos_token`.  audio_bos/eos are class
+    # defaults on the streaming inferencer (1025 / 1026), not stored in
+    # config.json — the audio_vocab_size=1027 layout is [0..1023 codes,
+    # 1024 pad, 1025 bos, 1026 eos].  Read overrides from config if present.
+    audio_eos_token = int(cfg.get("audio_eos_token", audio_vocab - 1))  # 1026
+    writer.add_int32 ("codec.lm.eos_code_c0", audio_eos_token)
+    writer.add_int32 ("codec.lm.eos_min_step", 0)
+    if "audio_bos_token" in cfg:
+        writer.add_int32 ("codec.lm.bos_code_c0", int(cfg["audio_bos_token"]))
+    else:
+        writer.add_int32 ("codec.lm.bos_code_c0", audio_vocab - 2)          # 1025
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_hidden)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)

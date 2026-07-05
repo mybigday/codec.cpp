@@ -228,6 +228,12 @@ static bool codec_lm_populate_info(codec_lm * lm) {
     lm->info.host_arch        = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
     }
 
+    // End-of-audio metadata (applies to every kind; continuous kinds get
+    // the -1 default since they signal stop via step_generate).  Default
+    // eos_code_c0 = -1 (no sentinel), eos_min_step = 0.
+    lm->info.eos_code_c0  = codec_read_i32_kv(gf, "codec.lm.eos_code_c0", -1);
+    lm->info.eos_min_step = codec_read_i32_kv(gf, "codec.lm.eos_min_step", 0);
+
     // Speaker-conditioning encoder section is optional.  Absent means
     // codec_lm_speaker_get_info returns NULL and codec_lm_speaker_encode
     // returns CODEC_STATUS_NOT_SUPPORTED.
@@ -412,6 +418,7 @@ struct codec_lm_state * codec_lm_state_new(struct codec_lm * lm) {
     st->next_cb            = 0;
     st->step_in_progress   = false;
     st->logits_pending     = false;
+    st->ar_frame           = 0;
 
     if (lm->vtable->state_init != nullptr && !lm->vtable->state_init(st)) {
         if (lm->vtable->state_free != nullptr) {
@@ -447,6 +454,7 @@ void codec_lm_state_reset(struct codec_lm_state * st) {
     st->step_in_progress   = false;
     st->logits_pending     = false;
     st->text_token_context = -1;
+    st->ar_frame           = 0;
     std::fill(st->codes_buf.begin(), st->codes_buf.end(), 0);
     if (st->lm != nullptr && st->lm->vtable != nullptr && st->lm->vtable->state_reset != nullptr) {
         st->lm->vtable->state_reset(st);
@@ -656,6 +664,49 @@ enum codec_status codec_lm_step_finish(
                     (size_t) st->lm->info.n_codebook * sizeof(int32_t));
     }
     st->step_in_progress = false;
+    st->ar_frame        += 1;   // one more AR frame completed
+    return CODEC_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// End-of-audio decision
+// ---------------------------------------------------------------------
+
+enum codec_status codec_lm_step_is_eos(
+    struct codec_lm_state * st,
+    const int32_t * codes,
+    int32_t n_codes,
+    int32_t * out_is_eos) {
+    if (st == nullptr || st->lm == nullptr || codes == nullptr ||
+        out_is_eos == nullptr || n_codes <= 0) {
+        if (st != nullptr) {
+            st->last_error = "codec_lm_step_is_eos: null args or n_codes <= 0";
+        }
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    *out_is_eos = 0;
+
+    // Only codebook kinds carry a cb0 EOS sentinel.  Continuous-latent
+    // kinds signal stop via codec_lm_step_generate's out_stop flag.
+    if (st->lm->kind != CODEC_LM_KIND_RESIDUAL_DEPTH_AR &&
+        st->lm->kind != CODEC_LM_KIND_PARALLEL_HEADS_DELAY) {
+        st->last_error = "codec_lm_step_is_eos: kind has no cb0 EOS concept";
+        return CODEC_STATUS_NOT_SUPPORTED;
+    }
+
+    const int32_t eos_c0 = st->lm->info.eos_code_c0;
+    if (eos_c0 < 0) {
+        // Model has no sentinel (e.g. Moshi) — never EOS.
+        return CODEC_STATUS_SUCCESS;
+    }
+
+    // `ar_frame` was incremented by the preceding step_finish, so the
+    // frame index of the just-emitted `codes` is `ar_frame - 1`.  Gate the
+    // sentinel behind eos_min_step on that index.
+    const int32_t this_frame = st->ar_frame - 1;
+    if (this_frame >= st->lm->info.eos_min_step && codes[0] == eos_c0) {
+        *out_is_eos = 1;
+    }
     return CODEC_STATUS_SUCCESS;
 }
 

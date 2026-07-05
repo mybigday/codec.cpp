@@ -40,6 +40,8 @@ class codec_model_params(ctypes.Structure):
 
 
 class codec_lm_info(ctypes.Structure):
+    # Field order MUST mirror struct codec_lm_info in include/codec_lm.h
+    # exactly (ABI-append discipline: new fields at the end).
     _fields_ = [
         ("kind",                    ctypes.c_int),   # enum codec_lm_kind
         ("hidden_dim",              ctypes.c_int32),
@@ -49,6 +51,13 @@ class codec_lm_info(ctypes.Structure):
         ("codebook_sizes",          ctypes.POINTER(ctypes.c_int32)),
         ("delay_pattern",           ctypes.POINTER(ctypes.c_int32)),
         ("host_arch",               ctypes.c_char_p),
+        # continuous-latent fields
+        ("is_continuous",           ctypes.c_bool),
+        ("patch_size",              ctypes.c_int32),
+        ("latent_dim",              ctypes.c_int32),
+        # end-of-audio metadata (Phase A)
+        ("eos_code_c0",             ctypes.c_int32),
+        ("eos_min_step",            ctypes.c_int32),
     ]
 
 
@@ -109,6 +118,14 @@ lib.codec_lm_step_push_code.restype  = ctypes.c_int
 
 lib.codec_lm_step_finish.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
 lib.codec_lm_step_finish.restype  = ctypes.c_int
+
+lib.codec_lm_step_is_eos.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32),
+]
+lib.codec_lm_step_is_eos.restype  = ctypes.c_int
 
 lib.codec_lm_compose_audio_embd.argtypes = [
     ctypes.c_void_p,
@@ -258,6 +275,8 @@ class CodecLM:
         self.codebook_sizes  = [int(self.info.codebook_sizes[i]) for i in range(self.n_cb)]
         self.delay_pattern   = [int(self.info.delay_pattern[i])  for i in range(self.n_cb)]
         self.host_arch       = (self.info.host_arch or b"").decode()
+        self.eos_code_c0     = int(self.info.eos_code_c0)
+        self.eos_min_step    = int(self.info.eos_min_step)
 
     def state(self) -> "CodecLMState":
         s = lib.codec_lm_state_new(self.lm)
@@ -344,6 +363,21 @@ class CodecLMState:
             err = (lib.codec_lm_state_get_last_error(self.ptr) or b"").decode()
             raise RuntimeError(f"step_finish rc={rc}, err='{err}'")
         return list(codes)
+
+    def step_is_eos(self, codes) -> bool:
+        """Ask the model whether the just-emitted frame `codes` is EOS.
+        Returns False for NOT_SUPPORTED kinds / absent sentinel."""
+        import numpy as np
+        c = np.ascontiguousarray(np.asarray(codes, dtype=np.int32))
+        out = ctypes.c_int32(0)
+        rc = lib.codec_lm_step_is_eos(
+            self.ptr,
+            c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_int32(int(c.shape[0])),
+            ctypes.byref(out),
+        )
+        # NOT_SUPPORTED (rc != SUCCESS) → treat as "not EOS".
+        return rc == CODEC_STATUS_SUCCESS and out.value != 0
 
     def reset(self) -> None:
         lib.codec_lm_state_reset(self.ptr)

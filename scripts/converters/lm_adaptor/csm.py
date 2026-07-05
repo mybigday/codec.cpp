@@ -119,6 +119,15 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_array ("codec.lm.delay_pattern",   [0] * n_codebook)
     writer.add_bool  ("codec.lm.parallel.tied_heads_to_embd", False)
 
+    # End-of-audio: CSM stops when codebook-0 samples the audio-EOS code.
+    # The reference (CsmForConditionalGeneration.generate) ignores frame 0
+    # and stops at frame >= 1 when cb0 == codebook_eos_token_id (=0).  So
+    # eos_min_step=1.  Read the code from the checkpoint's own config
+    # rather than hardcoding.
+    eos_c0 = int(cfg.get("codebook_eos_token_id", 0))
+    writer.add_int32("codec.lm.eos_code_c0", eos_c0)
+    writer.add_int32("codec.lm.eos_min_step", 1)
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_h)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)

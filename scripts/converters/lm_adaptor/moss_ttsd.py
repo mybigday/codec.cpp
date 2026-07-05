@@ -181,6 +181,11 @@ def _write_prompt_metadata(writer, cfg: Dict[str, Any], arch_name: str) -> None:
             writer.add_uint32("codec.lm.text_bos_id", int(cfg["bos_token_id"]))
         if "eos_token_id" in cfg:
             writer.add_uint32("codec.lm.text_eos_id", int(cfg["eos_token_id"]))
+            # channel 0 is the text-vocab channel; end-of-audio = text EOS
+            # sampled on cb0.  Mirror the value under the uniform eos_code_c0
+            # key (eos_min_step=0).  text_eos_id is kept for back-compat.
+            writer.add_int32("codec.lm.eos_code_c0", int(cfg["eos_token_id"]))
+            writer.add_int32("codec.lm.eos_min_step", 0)
         if "pad_token" in cfg:
             writer.add_array("codec.lm.pad_token_per_channel",
                              [int(v) for v in cfg["pad_token"]])
@@ -196,6 +201,9 @@ def _write_prompt_metadata(writer, cfg: Dict[str, Any], arch_name: str) -> None:
             writer.add_uint32("codec.lm.text_bos_id", int(lcfg["bos_token_id"]))
         if "eos_token_id" in lcfg:
             writer.add_uint32("codec.lm.text_eos_id", int(lcfg["eos_token_id"]))
+            # channel 0 (text vocab) EOS also signals end-of-audio.
+            writer.add_int32("codec.lm.eos_code_c0", int(lcfg["eos_token_id"]))
+            writer.add_int32("codec.lm.eos_min_step", 0)
         if "audio_pad_code" in cfg:
             writer.add_uint32("codec.lm.audio_pad_code", int(cfg["audio_pad_code"]))
         for k in ("audio_start_token_id", "audio_end_token_id",

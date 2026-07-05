@@ -202,6 +202,21 @@ void audio_lm_get_audio_token_range(
         int32_t * out_eos_id);
 
 // ─────────────────────────────────────────────────────────────────────
+// codec_lm end-of-audio metadata (codebook-AR kinds).
+//
+// Surfaces the codec_lm's `codec.lm.eos_code_c0` / `codec.lm.eos_min_step`
+// (see codec_lm.h).  This is the model-owned end-of-audio decision the
+// host used to hardcode; `audio_lm_observe_codes` already acts on it, but
+// hosts may want to read the raw values (e.g. to display / log the stop
+// code).  Writes -1 / 0 when no codec_lm is loaded or no sentinel exists.
+// Any out-pointer may be NULL.
+// ─────────────────────────────────────────────────────────────────────
+void audio_lm_get_lm_eos(
+        const audio_lm_context * ctx,
+        int32_t * out_eos_code_c0,
+        int32_t * out_eos_min_step);
+
+// ─────────────────────────────────────────────────────────────────────
 // Type B embed-override flag
 //
 // When `true`, observe_token treats audio-range tokens as Type B

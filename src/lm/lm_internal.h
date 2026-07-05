@@ -69,6 +69,13 @@ struct codec_lm_state {
     std::vector<int32_t> codes_buf;
     int32_t next_cb        = 0;
     bool    step_in_progress = false;
+
+    // Kind-agnostic AR frame counter for the end-of-audio decision.
+    // Incremented once per successful codec_lm_step_finish (0-based frame
+    // index of the NEXT frame to be produced; equivalently, the count of
+    // frames already finished).  Reset to 0 by codec_lm_state_reset.  Used
+    // by codec_lm_step_is_eos to gate the cb0 sentinel behind eos_min_step.
+    int32_t ar_frame       = 0;
     // logits_pending == true after step_logits; cleared by push_code.
     // Used to enforce the alternating logits/push_code order.
     bool    logits_pending = false;

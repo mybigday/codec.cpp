@@ -276,9 +276,30 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
     n_match_per_cb = [0] * n_cb
     first_mismatch_step = -1
 
+    # Phase A: end-of-audio metadata parity.  MOSS-TTSD channel 0 is the
+    # text vocab; end-of-audio == text EOS sampled on cb0.  eos_code_c0
+    # must equal the HF reference's text_eos.
+    text_eos = int(ref["text_eos"])
+    must(cpp_lm.eos_code_c0 == text_eos,
+         f"eos_code_c0={cpp_lm.eos_code_c0} != HF text_eos={text_eos}")
+    must(cpp_lm.eos_min_step == 0,
+         f"expected eos_min_step=0, got {cpp_lm.eos_min_step}")
+    # HF stopped early iff its LAST frame's cb0 == text_eos.
+    hf_stopped_on_eos = int(ref["codes"][-1][0]) == text_eos
+    cpp_eos_step = -1
+
     for step in range(actual_steps):
         codes, _ = codec_lm_greedy_step(state, cur_hidden)
         cpp_codes.append(codes)
+
+        # Model-owned EOS decision: assert step_is_eos fires exactly on
+        # the frame whose cb0 == eos_code_c0 (teacher-forced feeds HF's
+        # codes back, so on the terminal frame both sides agree on cb0).
+        if state.step_is_eos(codes) and cpp_eos_step < 0:
+            cpp_eos_step = step
+        # step_is_eos must agree with the raw cb0 == eos test at each step.
+        must(state.step_is_eos(codes) == (codes[0] == text_eos),
+             f"step {step}: step_is_eos({codes[0]}) disagrees with cb0==eos")
 
         ref_step = ref["codes"][step]
         for cb in range(n_cb):
@@ -309,6 +330,20 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
               f"({rate*100:.1f}%)  vocab={cpp_lm.codebook_sizes[cb]}")
     print(f"first full-frame mismatch step: "
           f"{first_mismatch_step if first_mismatch_step >= 0 else 'none'}")
+
+    # EOS-parity report: in teacher-forced mode the cb0 codes are HF's, so
+    # step_is_eos must fire at exactly HF's stop frame (the last one) when
+    # HF stopped on EOS, and never otherwise.
+    print(f"[eos] hf_stopped_on_eos={hf_stopped_on_eos} "
+          f"cpp_eos_step={cpp_eos_step} actual_steps={actual_steps}", flush=True)
+    if mode == "teacher_forced":
+        if hf_stopped_on_eos:
+            must(cpp_eos_step == actual_steps - 1,
+                 f"step_is_eos should fire at HF's stop frame "
+                 f"{actual_steps - 1}, got {cpp_eos_step}")
+        else:
+            must(cpp_eos_step == -1,
+                 f"step_is_eos fired at {cpp_eos_step} but HF never stopped on EOS")
 
     state.close()
     cpp_lm.close()

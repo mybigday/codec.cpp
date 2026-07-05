@@ -400,6 +400,20 @@ void audio_lm_get_audio_token_range(const audio_lm_context * ctx,
     if (out_eos_id) *out_eos_id = ctx ? ctx->audio_tok_eos    : -1;
 }
 
+void audio_lm_get_lm_eos(const audio_lm_context * ctx,
+                         int32_t * out_eos_code_c0, int32_t * out_eos_min_step) {
+    int32_t eos_c0 = -1, eos_min = 0;
+    if (ctx != nullptr && ctx->lm != nullptr) {
+        const codec_lm_info * info = codec_lm_get_info(ctx->lm);
+        if (info != nullptr) {
+            eos_c0  = info->eos_code_c0;
+            eos_min = info->eos_min_step;
+        }
+    }
+    if (out_eos_code_c0)  *out_eos_code_c0  = eos_c0;
+    if (out_eos_min_step) *out_eos_min_step = eos_min;
+}
+
 // ─── Type B embed-override config ───────────────────────────────────
 
 void audio_lm_set_uses_embed_override(audio_lm_context * ctx,
@@ -523,6 +537,20 @@ observe_action audio_lm_observe_codes(
     ctx->codes.resize(prev + (size_t) n_codes);
     std::memcpy(ctx->codes.data() + prev, codes, (size_t) n_codes * sizeof(int32_t));
     ctx->codes_n_frames += 1;
+
+    // Model-owned end-of-audio: if the codec_lm declares a cb0 EOS
+    // sentinel (codec.lm.eos_code_c0 metadata), let it decide.  This is a
+    // no-op when metadata is absent (eos_code_c0 defaults to -1 →
+    // out_is_eos always 0) or for kinds without the concept (NOT_SUPPORTED,
+    // treated as "not EOS").  The host used to hardcode this per-model.
+    if (ctx->lm != nullptr && ctx->state != nullptr) {
+        int32_t is_eos = 0;
+        const enum codec_status ers =
+            codec_lm_step_is_eos(ctx->state, codes, n_codes, &is_eos);
+        if (ers == CODEC_STATUS_SUCCESS && is_eos) {
+            return OBSERVE_STOP;
+        }
+    }
 
     // Type B/C/D: compose next backbone-input embed when override is on
     // AND we have a codec_lm to compose with.  For residual_depth_ar

@@ -137,6 +137,14 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_array ("codec.lm.delay_pattern",    [0] * n_codebook)
     writer.add_bool  ("codec.lm.parallel.tied_heads_to_embd", depth_tie)
 
+    # End-of-audio: the reference (`generate_sequential`) stops when
+    # codebook-0 samples the EOAudio code, which is the last index of the
+    # 2049-wide head, i.e. `audio_vocab_size` (2048).  `audio_vocab` here
+    # is already audio_vocab_size + 1, so the EOAudio slot is audio_vocab-1.
+    # eos_min_step=0 (honored from the first frame).
+    writer.add_int32 ("codec.lm.eos_code_c0", audio_vocab - 1)
+    writer.add_int32 ("codec.lm.eos_min_step", 0)
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_hidden)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)

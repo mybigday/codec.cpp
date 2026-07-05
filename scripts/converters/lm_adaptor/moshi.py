@@ -156,6 +156,15 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_array ("codec.lm.delay_pattern",   [0] * n_codebook)
     writer.add_bool  ("codec.lm.parallel.tied_heads_to_embd", False)
 
+    # NO codec.lm.eos_code_c0 for Moshi: channel 0 is a TEXT token
+    # (c0_input_modality="text") and Moshi is a full-duplex streaming
+    # model with no audio-codebook-0 end-of-audio sentinel.  Its
+    # `depth_decoder_config.eos_token_id` is None and the audio
+    # `pad_token_id=audio_vocab_size` is a delay-pattern pad, not an EOS.
+    # Termination is text-EOS on the backbone text head, handled by the
+    # host, so no eos_code_c0 is written (the runtime defaults to -1 →
+    # codec_lm_step_is_eos always reports not-EOS).
+
     writer.add_uint32 ("codec.lm.residual.depth_layers",     depth_layers)
     writer.add_uint32 ("codec.lm.residual.depth_hidden",     depth_hidden)
     writer.add_uint32 ("codec.lm.residual.depth_n_heads",    depth_nh)

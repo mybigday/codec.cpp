@@ -139,6 +139,28 @@ def main() -> int:
     must(cpp_lm.host_arch == "qwen3",
          f"unexpected host_arch={cpp_lm.host_arch!r}")
 
+    # Phase A: end-of-audio metadata must be populated from the talker
+    # config (codec_eos_token_id=2150, honored from frame 0).
+    print(f"[cpp] eos_code_c0={cpp_lm.eos_code_c0} eos_min_step={cpp_lm.eos_min_step}",
+          flush=True)
+    must(cpp_lm.eos_code_c0 == 2150,
+         f"expected eos_code_c0=2150 (codec_eos_token_id), got {cpp_lm.eos_code_c0}")
+    must(cpp_lm.eos_min_step == 0,
+         f"expected eos_min_step=0, got {cpp_lm.eos_min_step}")
+    # And step_is_eos must fire iff cb0 == eos on a finished frame.
+    _eos_state = cpp_lm.state()
+    _eos_state.step_begin(np.zeros(cpp_lm.hidden_dim, dtype=np.float32))
+    for k in range(cpp_lm.n_cb):
+        _eos_state.step_logits()
+        _eos_state.step_push_code(cpp_lm.eos_code_c0 if k == 0 else 0)
+    _eos_codes = _eos_state.step_finish()
+    must(_eos_state.step_is_eos(_eos_codes),
+         "step_is_eos should fire when cb0 == eos_code_c0")
+    _eos_codes[0] = 0
+    must(not _eos_state.step_is_eos(_eos_codes),
+         "step_is_eos should NOT fire when cb0 != eos_code_c0")
+    _eos_state.close()
+
     h_in = rng.normal(0.0, 0.1, cpp_lm.hidden_dim).astype(np.float32)
 
     ref_logits, ref_codes = hf_reference(h_in)

@@ -140,6 +140,14 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
                        START_SPEECH_TOKEN)
     writer.add_uint32 ("codec.lm.chatterbox.stop_speech_token",
                        STOP_SPEECH_TOKEN)
+
+    # End-of-audio (uniform schema): T3's single speech codebook stops
+    # when it samples the stop-speech token.  Mirror stop_speech_token
+    # under eos_code_c0 (eos_min_step=0); chatterbox.* keys kept for
+    # back-compat.
+    writer.add_int32  ("codec.lm.eos_code_c0", STOP_SPEECH_TOKEN)
+    writer.add_int32  ("codec.lm.eos_min_step", 0)
+    writer.add_int32  ("codec.lm.bos_code_c0", START_SPEECH_TOKEN)
     writer.add_uint32 ("codec.lm.chatterbox.max_text_tokens",
                        MAX_TEXT_TOKENS)
     writer.add_uint32 ("codec.lm.chatterbox.max_speech_tokens",

@@ -124,6 +124,37 @@ def main() -> int:
     must(cpp_lm.host_arch == "llama",
          f"unexpected host_arch={cpp_lm.host_arch!r}")
 
+    # Phase A: end-of-audio metadata.  CSM's audio-EOS code is the
+    # codebook_eos_token_id (=0), honored only from frame 1 onwards
+    # (the reference ignores frame 0).
+    print(f"[cpp] eos_code_c0={cpp_lm.eos_code_c0} eos_min_step={cpp_lm.eos_min_step}",
+          flush=True)
+    must(cpp_lm.eos_code_c0 == 0,
+         f"expected eos_code_c0=0 (codebook_eos_token_id), got {cpp_lm.eos_code_c0}")
+    must(cpp_lm.eos_min_step == 1,
+         f"expected eos_min_step=1 (frame 0 ignored), got {cpp_lm.eos_min_step}")
+    # Verify the eos_min_step gate: a cb0==0 frame at index 0 must NOT be
+    # reported as EOS, but the same at index >=1 must be.
+    _eos_state = cpp_lm.state()
+
+    def _drive_eos_frame(cb0):
+        _eos_state.step_begin(np.zeros(cpp_lm.hidden_dim, dtype=np.float32))
+        for k in range(cpp_lm.n_cb):
+            _eos_state.step_logits()
+            _eos_state.step_push_code(cb0 if k == 0 else 0)
+        return _eos_state.step_finish()
+
+    frame0 = _drive_eos_frame(0)   # frame index 0, cb0 == eos code
+    must(not _eos_state.step_is_eos(frame0),
+         "frame 0 with cb0==eos must be ignored (eos_min_step=1)")
+    frame1 = _drive_eos_frame(0)   # frame index 1, cb0 == eos code
+    must(_eos_state.step_is_eos(frame1),
+         "frame 1 with cb0==eos must fire EOS")
+    frame2 = _drive_eos_frame(5)   # frame index 2, cb0 != eos
+    must(not _eos_state.step_is_eos(frame2),
+         "frame with cb0 != eos must not fire EOS")
+    _eos_state.close()
+
     h_in = rng.normal(0.0, 0.1, cpp_lm.hidden_dim).astype(np.float32)
 
     ref_logits, ref_codes = hf_reference(h_in)
