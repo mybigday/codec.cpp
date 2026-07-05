@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,13 @@ struct cfm_state {
     // consumption; the flag is set via codec_lm_set_teacher_patch.
     bool               has_teacher_patch = false;
     std::vector<float> teacher_patch;           // [latent_dim*patch_size]
+
+    // CFM init-noise RNG for the noise==NULL path.  The reference samples
+    // z ~ N(0,1) per step (torch.randn); zero-init instead yields degenerate
+    // "mean" ODE trajectories - muffled audio whose stop head never crosses.
+    // Seeded from the codec context seed at state_init/state_reset so a fresh
+    // state replays the same noise sequence (deterministic per utterance).
+    std::mt19937       rng;
 
     // Persistent per-layer RALM K/V cache (incremental decode, llama.cpp /
     // residual_depth_ar style).  Each step computes Q/K/V for the 1 new token,
@@ -646,6 +654,7 @@ bool state_init(codec_lm_state * st) {
     s->feedback_tslm.assign((size_t) I->h_barbet, 0.0f);
     s->prefill_lm_hidden.assign((size_t) I->h_vox, 0.0f);
     s->prefill_residual_hidden.assign((size_t) I->h_vox, 0.0f);
+    s->rng.seed((uint32_t) (st->ctx && st->ctx->params.seed >= 0 ? st->ctx->params.seed : 0));
     st->impl = s;
     return true;
 }
@@ -669,6 +678,7 @@ void state_reset(codec_lm_state * st) {
     std::fill(s->feedback_tslm.begin(), s->feedback_tslm.end(), 0.0f);
     std::fill(s->prefill_lm_hidden.begin(), s->prefill_lm_hidden.end(), 0.0f);
     std::fill(s->prefill_residual_hidden.begin(), s->prefill_residual_hidden.end(), 0.0f);
+    s->rng.seed((uint32_t) (st->ctx && st->ctx->params.seed >= 0 ? st->ctx->params.seed : 0));
     // min_len override is preserved across reset (host set it deliberately).
 }
 
@@ -755,7 +765,14 @@ enum codec_status step_generate(codec_lm_state * st, const float * h_in, float c
     for (int32_t k = 0; k < b.n_real; ++k) sinusoidal(t_real[(size_t) k], I->h_dit, tsin_all.data() + (size_t) k * I->h_dit);
     sinusoidal(0.0, I->h_dit, dtsin.data());
     std::vector<float> zbuf;
-    if (noise == nullptr) { zbuf.assign(dp, 0.0f); noise = zbuf.data(); }
+    if (noise == nullptr) {
+        // Sample z ~ N(0,1) like the reference (torch.randn) - zero init is NOT
+        // a valid fallback, it collapses the CFM to its mean trajectory.
+        zbuf.resize(dp);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (size_t i = 0; i < dp; ++i) zbuf[i] = nd(s->rng);
+        noise = zbuf.data();
+    }
 
     codec_graph_eval_guard guard(st->ctx, /*persist=*/true);
     std::string err;
