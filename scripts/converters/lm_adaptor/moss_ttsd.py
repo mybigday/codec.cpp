@@ -190,8 +190,17 @@ def _write_prompt_metadata(writer, cfg: Dict[str, Any], arch_name: str) -> None:
             writer.add_array("codec.lm.pad_token_per_channel",
                              [int(v) for v in cfg["pad_token"]])
         if "speech_token_range" in cfg:
-            writer.add_array("codec.lm.speech_token_range",
-                             [int(v) for v in cfg["speech_token_range"]])
+            rng = [int(v) for v in cfg["speech_token_range"]]
+            writer.add_array("codec.lm.speech_token_range", rng)
+            # Scalar mirror of speech_token_range[0].  Channel 0 is the merged
+            # text+speech vocab; during audio generation its codes live at
+            # [speech_token_range[0], speech_token_range[1]).  The codes→PCM
+            # decode transform (codec_common audio_lm_decode_audio) subtracts
+            # this offset from cb0 to recover raw quantizer indices, matching
+            # the HF processor's shifting_outputs().  Exposed as a scalar
+            # because codec_gguf_metadata doesn't surface array element values.
+            if rng:
+                writer.add_int32("codec.lm.cb0_speech_offset", rng[0])
         if "speech_pad_token" in cfg:
             writer.add_uint32("codec.lm.speech_pad_token", int(cfg["speech_pad_token"]))
 

@@ -366,10 +366,28 @@ bool load_ref_audio(const args & a, codec_common::audio_lm_input & in, std::vect
     return true;
 }
 
+// Replace all occurrences of `from` with `to` in `s`.
+static std::string replace_all_str(std::string s, const std::string & from, const std::string & to) {
+    if (from.empty()) return s;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return s;
+}
+
 // Tokenize prefix + text + suffix through the backbone vocab.
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab,
                                          const codec_common::audio_lm_prompt_info & pi,
-                                         const std::string & text) {
+                                         const std::string & text_in) {
+    std::string text = text_in;
+    // MOSS-TTSD dialogue tags: the processor maps [S1]/[S2] → <speaker1>/
+    // <speaker2> before tokenizing (see processing_moss_ttsd prepare_sample).
+    if (pi.model_kind == codec_common::audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY) {
+        text = replace_all_str(text, "[S1]", "<speaker1>");
+        text = replace_all_str(text, "[S2]", "<speaker2>");
+    }
     const std::string full = pi.prompt_prefix + text + pi.prompt_suffix;
     int32_t cap = (int32_t) full.size() + 8;
     std::vector<llama_token> toks(cap);
@@ -465,12 +483,52 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
                      const std::vector<llama_token> & toks, int32_t hidden, int32_t n_cb,
                      int32_t max_frames, Sampler & sampler,
                      float temp, float top_p, int32_t top_k,
+                     const std::vector<float> & speaker_prefix,
                      int32_t * out_frames, const char ** out_stop) {
     codec_common::audio_lm_set_uses_embed_override(ctx, true, 1);
-    if (!decode_tokens(lctx, toks, 0, /*all_pos=*/false)) {
+    int32_t n_past = 0;
+    // Speaker x-vector prefix (Qwen3-TTS voice clone): the ECAPA-TDNN
+    // x-vector is prepended as inputs_embeds row 0 before the text prompt,
+    // conditioning the talker on the reference voice.  Decode it first so
+    // the text tokens attend to it via the KV cache.
+    if (!speaker_prefix.empty() && (int32_t) speaker_prefix.size() == hidden) {
+        std::vector<float> pfx(speaker_prefix);
+        if (!decode_embed(lctx, pfx.data(), hidden, n_past)) {
+            std::fprintf(stderr, "speaker prefix decode failed\n"); return false;
+        }
+        n_past += 1;
+    }
+    // Merged-cb0 models (MOSS-TTSD) need the multi-modal prompt embedding:
+    // each position is sum(embed_cb0[text_tok], embed_cb1..7[speech_pad]).
+    // Feed those via the inputs_embeds path instead of the raw token path so
+    // the backbone sees the same prefill the HF processor produces.
+    if (codec_common::audio_lm_prompt_needs_composed_embd(ctx)) {
+        std::vector<float> prompt_embd((size_t) toks.size() * hidden);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            if (!codec_common::audio_lm_compose_prompt_embd(
+                    ctx, toks[i], prompt_embd.data() + i * hidden, hidden)) {
+                std::fprintf(stderr, "compose_prompt_embd failed: %s\n",
+                             codec_common::audio_lm_last_error(ctx));
+                return false;
+            }
+        }
+        llama_batch b = llama_batch_init((int32_t) toks.size(), hidden, 1);
+        std::memcpy(b.embd, prompt_embd.data(), prompt_embd.size() * sizeof(float));
+        b.token = nullptr;
+        b.n_tokens = (int32_t) toks.size();
+        for (size_t i = 0; i < toks.size(); ++i) {
+            b.pos[i] = n_past + (int32_t) i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = (i == toks.size() - 1) ? 1 : 0;
+        }
+        int rc = llama_decode(lctx, b);
+        llama_batch_free(b);
+        if (rc != 0) { std::fprintf(stderr, "prefill (composed) decode failed\n"); return false; }
+    } else if (!decode_tokens(lctx, toks, n_past, /*all_pos=*/false)) {
         std::fprintf(stderr, "prefill decode failed\n"); return false;
     }
-    int32_t n_past = (int32_t) toks.size();
+    n_past += (int32_t) toks.size();
 
     std::vector<float> cur(hidden);
     const float * h0 = llama_get_embeddings_ith(lctx, -1);
@@ -550,26 +608,10 @@ int cmd_synthesize(const args & a) {
                 pi.host_arch.c_str(), (int) pi.model_kind, n_cb, hidden,
                 (int) pi.cb0_from_backbone, pi.audio_codebook_offset, pi.eos_code_c0);
 
-    // Preflight: codec_common's decode_audio feeds the accumulated frame
-    // straight into codec_decode.  Models whose LM codebooks need a
-    // model-specific transform before decode — delay-pattern un-shift
-    // and/or a cb0 (text/control) slice (`audio_codebook_offset > 0`) —
-    // aren't wired through decode_audio yet, so the generated codes would
-    // be rejected (or worse) by the codec.  Refuse cleanly instead of
-    // feeding it garbage.  The AR loop itself (prompt → step machine →
-    // observe_codes) is exercised regardless; this only gates decode.
-    if (!pi.is_continuous && pi.audio_codebook_offset > 0) {
-        std::fprintf(stderr,
-            "synthesize: %s needs a model-specific decode transform "
-            "(audio_codebook_offset=%d%s) that codec_common's decode_audio "
-            "does not implement yet.  The host AR loop is wired but the "
-            "codes→PCM step is blocked for this family.\n",
-            pi.host_arch.c_str(), pi.audio_codebook_offset,
-            pi.model_kind == codec_common::audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY
-                ? " + delay-pattern un-shift" : "");
-        codec_common::audio_lm_free(ctx);
-        return 10;
-    }
+    // codec_common's decode_audio now applies the model-specific codes→PCM
+    // transform (cb0 text/control slice via audio_codebook_offset + delay-
+    // pattern un-shift) for parallel-heads-delay + control-cb0 models, so
+    // no family is refused here anymore.
 
     // ── Backbone init ──────────────────────────────────────────────
     llama_backend_init();
@@ -613,6 +655,39 @@ int cmd_synthesize(const args & a) {
     std::printf("prompt: \"%s%s%s\" → %zu tokens\n",
                 pi.prompt_prefix.c_str(), a.text.c_str(), pi.prompt_suffix.c_str(), toks.size());
 
+    // ── Speaker conditioning (voice clone) ────────────────────────────
+    // When --ref-audio is supplied and the model has a speaker encoder
+    // (Qwen3-TTS ECAPA-TDNN), build_prompt runs the encoder to produce a
+    // 1×hidden x-vector; run_codebook_ar prepends it as inputs_embeds row 0.
+    std::vector<float> speaker_prefix;
+    {
+        codec_common::audio_lm_input in;
+        in.text = a.text;
+        std::vector<float> ref_pcm;
+        if (!load_ref_audio(a, in, ref_pcm)) {
+            llama_free(lctx); llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
+            return 5;
+        }
+        if (codec_common::audio_lm_has_speaker_enc(ctx) && in.ref_pcm != nullptr) {
+            codec_common::audio_lm_prompt sp;
+            if (!codec_common::audio_lm_build_prompt(ctx, in, &sp)) {
+                std::fprintf(stderr, "build_prompt (speaker) failed: %s\n",
+                             codec_common::audio_lm_last_error(ctx));
+                llama_free(lctx); llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
+                return 5;
+            }
+            if (!sp.embeds_prefix.empty() && sp.embeds_prefix_hidden == hidden) {
+                // Use only the first row as the conditioning x-vector.
+                speaker_prefix.assign(sp.embeds_prefix.begin(),
+                                      sp.embeds_prefix.begin() + hidden);
+                std::printf("speaker: x-vector prefix rows=%d hidden=%d (from %s)\n",
+                            sp.embeds_prefix_rows, sp.embeds_prefix_hidden, a.ref_audio.c_str());
+            }
+        } else if (!a.ref_audio.empty() && !codec_common::audio_lm_has_speaker_enc(ctx)) {
+            std::printf("note: --ref-audio given but model has no speaker encoder; ignoring\n");
+        }
+    }
+
     const float temp  = a.temp  ? *a.temp  : pi.default_temperature;
     const float top_p = a.top_p ? *a.top_p : pi.default_top_p;
     const int32_t top_k = a.top_k ? *a.top_k : pi.default_top_k;
@@ -632,7 +707,7 @@ int cmd_synthesize(const args & a) {
         // Flow 2/3: codebook AR (residual depth-AR + parallel-heads delay).
         ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,
                                 max_frames, sampler, temp, top_p, top_k,
-                                &n_frames, &stop_reason);
+                                speaker_prefix, &n_frames, &stop_reason);
     }
 
     llama_free(lctx);

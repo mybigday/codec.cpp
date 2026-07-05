@@ -23,6 +23,31 @@ struct audio_lm_context {
     int32_t  hidden        = 0;
     bool     has_spk_enc   = false;
 
+    // codes→PCM decode transform (parallel_heads_delay / control-cb0 models).
+    // Populated at init from GGUF metadata + codec_lm_info; the decode path
+    // reads them so no model-name switch is needed.
+    //
+    //   audio_cb_offset: number of leading codebooks that are PURE text/
+    //     control and get dropped entirely before decode (Moshi-style
+    //     c0_input_modality="text").  0 for CSM / Qwen3-TTS / Realtime and
+    //     also for MOSS-TTSD (whose cb0 is a *merged* text+speech channel,
+    //     handled via cb0_speech_offset below, not dropped).
+    //   cb0_speech_offset: value subtracted from codebook-0 codes to map the
+    //     merged text+speech vocab back into raw quantizer index space
+    //     (MOSS-TTSD: speech_token_range[0]).  0 = no remap.
+    //   delay_pattern[q] (indexed over the FULL n_cb): per-codebook emission
+    //     delay to reverse before forming the codec buffer (MOSS-TTSD
+    //     [0,1,…,7]).  Empty when all-zero.
+    int32_t              audio_cb_offset   = 0;
+    int32_t              cb0_speech_offset = 0;
+    std::vector<int32_t> delay_pattern;   // empty → no delay to unshift
+
+    // Merged-cb0 models (MOSS-TTSD): the prompt embedding is the sum over all
+    // n_cb embedding tables (cb0=text token, cb1..N-1=speech_pad).  When true,
+    // the host must feed composed prompt embeddings via inputs_embeds.
+    bool    prompt_needs_composed = false;
+    int32_t speech_pad_code       = 0;   // codec.lm.speech_pad_token
+
     // Type A audio-token range.  `audio_tok_offset < 0` → disabled
     // (every token surfaces as PASSTHROUGH).  Set from GGUF metadata
     // at init; hosts override via `audio_lm_set_audio_token_range`.
@@ -140,6 +165,70 @@ static uint32_t read_modality_or_infer(audio_lm_context * ctx) {
     return mask;
 }
 
+static const char * meta_str(const audio_lm_context * ctx, const char * key);
+
+// Determine the codes→PCM decode transform from GGUF metadata.  This is
+// the single source of truth for both `audio_lm_get_prompt_info` (which
+// reports it) and `audio_lm_decode_audio` (which applies it).
+//
+//   audio_cb_offset = 1  when codebook 0 is a text/control channel that is
+//     NOT an audio quantizer level.  Two cases:
+//       * parallel_heads_delay: cb0 is the backbone text vocab (MOSS-TTSD).
+//       * residual_depth_ar with `c0_input_modality="text"` (Moshi).
+//     For residual_depth_ar with c0 modality "audio" (CSM, Qwen3-TTS) or
+//     "none" (MOSS-TTS-Realtime, LFM2) cb0 IS an audio codebook → offset 0.
+//   delay_pattern = codec_lm_info.delay_pattern (over the full n_cb), used
+//     to reverse the per-codebook emission shift before decode.
+static void init_decode_transform(audio_lm_context * ctx) {
+    ctx->audio_cb_offset   = 0;
+    ctx->cb0_speech_offset = 0;
+    ctx->delay_pattern.clear();
+    if (ctx->lm == nullptr) return;
+
+    const codec_lm_info * info = codec_lm_get_info(ctx->lm);
+    if (info == nullptr) return;
+
+    const char * kind = meta_str(ctx, "codec.lm.kind");
+    const bool is_depth = kind && std::strcmp(kind, "residual_depth_ar") == 0;
+
+    // Pure text/control leading codebooks are DROPPED before decode.  This
+    // is the Moshi-style residual_depth_ar case (c0_input_modality="text"):
+    // cb0 is a backbone text token with no audio content.  MOSS-TTSD is NOT
+    // this case — its cb0 is a merged text+speech channel and stays in the
+    // decode via cb0_speech_offset below.
+    if (is_depth) {
+        const char * c0mod = meta_str(ctx, "codec.lm.residual.c0_input_modality");
+        ctx->audio_cb_offset = (c0mod && std::strcmp(c0mod, "text") == 0) ? 1 : 0;
+    }
+
+    // MOSS-TTSD merged-cb0 remap: subtract speech_token_range[0] from cb0
+    // codes to map the merged text+speech vocab back into raw quantizer
+    // index space (mirrors the HF processor shifting_outputs()).  Written by
+    // the converter as a scalar since array element values aren't surfaced.
+    if (const char * v = meta_str(ctx, "codec.lm.cb0_speech_offset")) {
+        ctx->cb0_speech_offset = std::atoi(v);
+    }
+
+    if (info->delay_pattern != nullptr && info->n_codebook > 0) {
+        bool any_delay = false;
+        ctx->delay_pattern.assign(info->delay_pattern,
+                                  info->delay_pattern + info->n_codebook);
+        for (int32_t d : ctx->delay_pattern) if (d != 0) { any_delay = true; break; }
+        if (!any_delay) ctx->delay_pattern.clear();   // nothing to unshift
+    }
+
+    // Merged-cb0 models need the composed multi-modal prompt embedding.  The
+    // cb0_speech_offset is the distinguishing signal: it is only set for the
+    // merged text+speech cb0 (MOSS-TTSD).  Read the speech-pad code used to
+    // fill cb1..N-1 during prompt/prefill.
+    if (ctx->cb0_speech_offset != 0) {
+        ctx->prompt_needs_composed = true;
+        if (const char * v = meta_str(ctx, "codec.lm.speech_pad_token")) {
+            ctx->speech_pad_code = std::atoi(v);
+        }
+    }
+}
+
 // =====================================================================
 // Lifecycle
 // =====================================================================
@@ -192,6 +281,7 @@ audio_lm_context * audio_lm_init(const audio_lm_params & p, std::string * err) {
     }
 
     ctx->modality_mask = read_modality_or_infer(ctx);
+    init_decode_transform(ctx);
     return ctx;
 }
 
@@ -773,21 +863,37 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
         out->add_bos       = true;
         out->parse_special = true;
         out->cb0_from_backbone = false;
-        out->audio_codebook_offset = 0;
+        out->audio_codebook_offset = ctx->audio_cb_offset;   // 0 for CSM
         return true;
     }
 
     // qwen3 family — MOSS-TTSD (delay) is a plain [S1] pass-through;
     // Qwen3-TTS / MOSS-TTS-Realtime (depth) use ChatML.
     if (out->host_arch == "qwen3") {
+        out->audio_codebook_offset = ctx->audio_cb_offset;
+        // cb0_from_backbone = "the backbone lm_head samples cb0 as a text
+        // token".  MOSS-TTSD (parallel_heads_delay): cb0 is the merged
+        // text+speech vocab sampled from the backbone, so true.  Qwen3-TTS /
+        // MOSS-TTS-Realtime (residual_depth_ar): cb0 is an audio codebook the
+        // depth decoder samples, so false.
+        out->cb0_from_backbone     = is_delay;
         if (is_delay) {
-            // MOSS-TTSD: caller already supplies [S1]…[S2]… dialogue text.
-            out->prompt_prefix = "";
-            out->prompt_suffix = "";
+            // MOSS-TTSD chat template (fnlp/MOSS-TTSD-v0.5 tokenizer_config):
+            //   <|begin_of_style|>{system}<|end_of_style|>
+            //   <|begin_of_text|>{text}<|end_of_text|>
+            //   <|begin_of_speech|>
+            // where the caller's [S1]/[S2] speaker tags map to
+            // <speaker1>/<speaker2> (host does that substitution before
+            // tokenizing).  The trailing <|begin_of_speech|> opens the audio
+            // channel; generation then emits speech frames until cb0 samples
+            // the text EOS (eos_code_c0=151643).
+            out->prompt_prefix =
+                "<|begin_of_style|>You are a speech synthesizer that generates "
+                "natural, realistic, and human-like conversational audio from "
+                "dialogue text.<|end_of_style|>\n<|begin_of_text|>";
+            out->prompt_suffix = "<|end_of_text|>\n<|begin_of_speech|>";
             out->add_bos       = false;
             out->parse_special = true;
-            out->cb0_from_backbone = true;          // cb0 is text-modality
-            out->audio_codebook_offset = 1;
             return true;
         }
         // ChatML for Qwen3-TTS / MOSS-TTS-Realtime.
@@ -795,11 +901,6 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
         out->prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n";
         out->add_bos       = false;
         out->parse_special = true;
-        out->cb0_from_backbone = false;
-        // MOSS-TTS-Realtime declares a cb0 control sentinel (bos/eos on a
-        // 1027-wide control codebook) → cb0 is not an audio codebook.
-        // Qwen3-TTS has no such sentinel → all 16 codebooks are audio.
-        out->audio_codebook_offset = (info && info->eos_code_c0 >= 0) ? 1 : 0;
         return true;
     }
 
@@ -882,6 +983,43 @@ bool audio_lm_step_finish(audio_lm_context * ctx, int32_t * out_codes, int32_t n
     return true;
 }
 
+bool audio_lm_prompt_needs_composed_embd(const audio_lm_context * ctx) {
+    return ctx != nullptr && ctx->prompt_needs_composed;
+}
+
+bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
+                                  int32_t            text_token,
+                                  float *            out_embd,
+                                  int32_t            out_dim) {
+    if (ctx == nullptr || out_embd == nullptr) return false;
+    if (ctx->lm == nullptr) {
+        ctx->last_error = "audio_lm_compose_prompt_embd: no codec_lm adaptor";
+        return false;
+    }
+    if (out_dim < ctx->hidden) {
+        ctx->last_error = "audio_lm_compose_prompt_embd: out buffer smaller than hidden_dim";
+        return false;
+    }
+    if (ctx->n_cb <= 0) {
+        ctx->last_error = "audio_lm_compose_prompt_embd: n_codebook unknown";
+        return false;
+    }
+    // cb0 = raw text token (merged vocab, NOT speech-offset); cb1..N-1 =
+    // speech_pad code — exactly the HF processor's prompt grid before the
+    // delay shift.  compose_audio_embd sums the per-channel embeddings.
+    std::vector<int32_t> codes((size_t) ctx->n_cb, ctx->speech_pad_code);
+    codes[0] = text_token;
+    const enum codec_status rc =
+        codec_lm_compose_audio_embd(ctx->lm, codes.data(), out_embd);
+    if (rc != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_get_last_error(ctx->lm);
+        ctx->last_error = std::string("audio_lm_compose_prompt_embd: compose failed (")
+                           + (raw && *raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out) {
     if (ctx == nullptr || out == nullptr) return false;
 
@@ -927,17 +1065,84 @@ bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out) 
         return false;
     }
 
+    // ── LM codes → codec quantizer codes transform ──────────────────────
+    // The AR loop accumulated the FULL (T, n_cb) frame, including a possible
+    // text/control cb0 and a per-codebook emission delay.  Mirror the
+    // upstream MOSS processor (see rn-tts decodeAudioTokens):
+    //   * slice codebooks [0, audio_cb_offset) — they aren't audio levels;
+    //   * reverse the delay_pattern shift so codebook q at output frame t
+    //     comes from input frame t + delay[audio_cb_offset + q];
+    //   * decode the remaining n_q = n_cb - offset codebooks (RVQ decodes
+    //     with fewer levels than the codec's native n_q — Realtime's codec
+    //     has 32 levels but the LM only predicts the first 16/15).
+    const int32_t n_cb_in = ctx->n_cb;
+    const int32_t offset  = ctx->audio_cb_offset;
+    const int32_t n_q     = n_cb_in - offset;
+    if (n_q <= 0) {
+        ctx->last_error = "audio_lm_decode_audio: audio_cb_offset >= n_codebook";
+        return false;
+    }
+
+    // Per-audio-codebook delays (indexed within the audio slice).
+    std::vector<int32_t> audio_delays((size_t) n_q, 0);
+    int32_t max_delay = 0;
+    if (!ctx->delay_pattern.empty() &&
+        (int32_t) ctx->delay_pattern.size() >= n_cb_in) {
+        for (int32_t q = 0; q < n_q; ++q) {
+            const int32_t d = ctx->delay_pattern[(size_t) (offset + q)];
+            audio_delays[(size_t) q] = d;
+            if (d > max_delay) max_delay = d;
+        }
+    }
+
+    const int32_t n_frames_in = ctx->codes_n_frames;
+    if (max_delay > 0 && n_frames_in <= max_delay) {
+        ctx->last_error = "audio_lm_decode_audio: too few frames to cover delay_pattern";
+        return false;
+    }
+    const int32_t n_frames_out = (max_delay > 0) ? (n_frames_in - max_delay) : n_frames_in;
+
+    const int32_t codebook_sz = codec_model_codebook_size(ctx->model);
+    std::vector<int32_t> decode_codes;
+    const int32_t * codes_ptr = ctx->codes.data();
+    if (offset > 0 || max_delay > 0 || ctx->cb0_speech_offset != 0) {
+        decode_codes.resize((size_t) n_frames_out * (size_t) n_q);
+        for (int32_t t = 0; t < n_frames_out; ++t) {
+            for (int32_t q = 0; q < n_q; ++q) {
+                const int32_t src_t = t + audio_delays[(size_t) q];
+                int32_t code = ctx->codes[(size_t) src_t * n_cb_in + (offset + q)];
+                // Merged text+speech cb0 (MOSS-TTSD): map back to raw
+                // quantizer index space.  Only the first *audio* codebook
+                // (q==0 after any pure-control slice) carries the offset.
+                if (q == 0 && ctx->cb0_speech_offset != 0) {
+                    code -= ctx->cb0_speech_offset;
+                }
+                // Guard the codec's embedding get_rows against pad / control
+                // codes (speech_pad=1024, bos/eos sentinels) that the LM can
+                // emit before stop — the HF processor drops such frames; we
+                // clamp into the valid quantizer range instead of aborting.
+                if (codebook_sz > 0) {
+                    if (code < 0)            code = 0;
+                    if (code >= codebook_sz) code = codebook_sz - 1;
+                }
+                decode_codes[(size_t) t * n_q + q] = code;
+            }
+        }
+        codes_ptr = decode_codes.data();
+    }
+
     codec_token_buffer tokens = {};
-    tokens.data         = ctx->codes.data();
-    tokens.n_tokens     = (int32_t) ctx->codes.size();
-    tokens.n_frames     = ctx->codes_n_frames;
-    tokens.n_q          = ctx->n_cb;
+    tokens.data         = const_cast<int32_t *>(codes_ptr);
+    tokens.n_tokens     = n_frames_out * n_q;
+    tokens.n_frames     = n_frames_out;
+    tokens.n_q          = n_q;
     tokens.codebook_size = codec_model_codebook_size(ctx->model);
     tokens.sample_rate   = codec_model_sample_rate(ctx->model);
     tokens.hop_size      = codec_model_hop_size(ctx->model);
 
     codec_pcm_buffer pcm = {};
     auto dp = codec_decode_default_params();
+    dp.n_q = n_q;
     const enum codec_status rc =
         codec_decode(ctx->codec_ctx, &tokens, &pcm, dp);
     if (rc != CODEC_STATUS_SUCCESS) {

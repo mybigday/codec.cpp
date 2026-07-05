@@ -435,6 +435,29 @@ const float * audio_lm_step_logits     (audio_lm_context * ctx, int32_t * out_cb
 bool          audio_lm_step_push_code  (audio_lm_context * ctx, int32_t code);
 bool          audio_lm_step_finish     (audio_lm_context * ctx, int32_t * out_codes, int32_t n_codes);
 
+// ─── Multi-modal prompt embedding (Type D / merged-cb0 models) ──────
+//
+// For parallel-heads-delay models whose cb0 is a merged text+speech vocab
+// (MOSS-TTSD), the backbone prompt embedding is NOT the plain text-token
+// embedding — it's the per-position sum over all n_codebook embedding
+// tables with cb0 = the text token and cb1..N-1 = the speech-pad code
+// (mirrors the HF processor's `_prepare_multi_modal_inputs`).  The host
+// must feed these composed embeddings via the inputs_embeds path during
+// prefill instead of the raw token path.
+//
+// Returns true iff this model needs the composed-prompt path; when false
+// the host should prefill with the plain token path.  `out_needs_composed`
+// is set accordingly even on the false branch.
+bool audio_lm_prompt_needs_composed_embd(const audio_lm_context * ctx);
+
+// Compose one prompt position's backbone input embedding for text token
+// `text_token`.  Writes `hidden_dim` floats into `out_embd`.  cb0 = the raw
+// text token (merged vocab, no speech offset), cb1..N-1 = speech-pad code.
+bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
+                                  int32_t            text_token,
+                                  float *            out_embd,
+                                  int32_t            out_dim);
+
 }  // namespace codec_common
 
 #endif  // CODEC_COMMON_H
