@@ -22,11 +22,18 @@
 #include "utils/wav_io.h"
 #include "utils/npy_io.h"
 
+#ifdef TTS_CLI_HAVE_BACKBONE
+#include "llama.h"
+#endif
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -39,8 +46,16 @@ void print_usage(const char * prog) {
         "subcommands:\n"
         "  info       --model PATH\n"
         "  decode     --model PATH --codes PATH.npy --output PATH.wav [--n-threads N]\n"
-        "  synthesize --model PATH --text STRING --output PATH.wav\n"
-        "             [--ref-audio PATH.wav] [--emotion FLOAT] [--n-threads N]\n"
+        "  synthesize --model CODEC.gguf --backbone LLAMA.gguf --text STRING\n"
+        "             --output PATH.wav [--ref-audio PATH.wav] [--emotion FLOAT]\n"
+        "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
+        "             [--cfg F] [--timesteps N] [--min-len N] [--n-threads N]\n"
+        "             Full host AR loop: a llama.cpp backbone (--backbone) drives\n"
+        "             the codec_common per-step hooks end-to-end.  Flow is chosen\n"
+        "             from the model's GGUF metadata (host_arch / codec.lm.kind):\n"
+        "             continuous CFM (BlueMagpie), residual depth-AR (CSM,\n"
+        "             Qwen3-TTS), or parallel-heads delay (MOSS-TTSD).  Sampling\n"
+        "             defaults to the model's training-time knobs; --temp 0 = greedy.\n"
         "  trace      --model PATH --tokens \"id1,id2,...\"\n"
         "             [--audio-offset N --audio-count K [--audio-eos M]]\n"
         "             dispatch the given token stream through observe_token;\n"
@@ -134,6 +149,14 @@ struct args {
     float       cont_cfg     = 2.0f;
     int32_t     cont_timesteps = 10;
     int32_t     cont_min_len = -1;   // -1 = model default (GGUF codec.lm.min_len / 2)
+
+    // synthesize (host AR loop)
+    std::string backbone;            // llama.cpp backbone gguf
+    int32_t     max_frames = 0;      // 0 → per-model default
+    uint32_t    seed       = 0xC0DEC1AB;
+    std::optional<float>   temp;     // sampler overrides (unset → model default)
+    std::optional<float>   top_p;
+    std::optional<int32_t> top_k;
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -168,6 +191,12 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--cfg")        { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cont_cfg)) return false; i++; }
         else if (a == "--timesteps")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->cont_timesteps)) return false; i++; }
         else if (a == "--min-len")    { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->cont_min_len)) return false; i++; }
+        else if (a == "--backbone")   { const char * v = need(); if (!v) return false; out->backbone = v; i++; }
+        else if (a == "--max-frames") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->max_frames)) return false; i++; }
+        else if (a == "--seed")       { const char * v = need(); if (!v) return false; int32_t s; if (!parse_i32(v, &s)) return false; out->seed = (uint32_t) s; i++; }
+        else if (a == "--temp")       { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->temp = f; i++; }
+        else if (a == "--top-p")      { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->top_p = f; i++; }
+        else if (a == "--top-k")      { const char * v = need(); if (!v) return false; int32_t k; if (!parse_i32(v, &k)) return false; out->top_k = k; i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -258,12 +287,249 @@ int cmd_decode(const args & a) {
 }
 
 // ─── Subcommand: synthesize ──────────────────────────────────────
-// Step 2 deliverable: build_prompt runs the speaker-encode pipeline
-// when --ref-audio is given (or implicitly via speaker_emb in a
-// future invocation).  AR loop + decode_audio require host llama.cpp
-// integration (step 3+); we print prompt structure as proof the
-// speaker-encode side reaches `embeds_prefix` correctly.
+// Full host AR loop: a llama.cpp backbone (`--backbone`) drives the
+// codec_common per-step hooks end-to-end.  Three flows keyed on the
+// model's `audio_lm_get_prompt_info` (host_arch / kind metadata):
+//   * continuous CFM (BlueMagpie / barbet) — text_prefill + observe_hidden
+//   * residual depth-AR (CSM / Qwen3-TTS / MOSS-TTS-Realtime) — codebook
+//     step machine + observe_codes
+//   * parallel-heads delay (MOSS-TTSD) — cb0 from backbone lm_head +
+//     set_text_context + step machine + observe_codes
+#ifndef TTS_CLI_HAVE_BACKBONE
 int cmd_synthesize(const args & a) {
+    (void) a;
+    std::fprintf(stderr,
+        "synthesize: tts-cli was built without the llama backbone "
+        "(CODEC_TTS_BACKBONE=OFF).  Reconfigure with the backbone to enable.\n");
+    return 1;
+}
+#else
+
+namespace {
+
+// Minimal xorshift64* sampler mirroring rn-tts's sample_codec_logits:
+// temp<=0 → greedy argmax; else softmax(temp) → top-k → top-p → sample.
+struct Sampler {
+    std::mt19937_64 rng;
+    explicit Sampler(uint32_t seed) : rng(seed ? seed : 0xC0DEC1ABull) {}
+
+    int32_t sample(const float * logits, int32_t n, float temp, float top_p, int32_t top_k) {
+        if (n <= 0) return 0;
+        if (temp <= 0.0f) {
+            int32_t best = 0; float bv = logits[0];
+            for (int32_t i = 1; i < n; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
+            return best;
+        }
+        std::vector<std::pair<float,int32_t>> p(n);
+        float mx = logits[0];
+        for (int32_t i = 1; i < n; ++i) mx = std::max(mx, logits[i]);
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; ++i) { double e = std::exp((logits[i]-mx)/temp); p[i] = {(float)e, i}; sum += e; }
+        for (auto & q : p) q.first = (float)(q.first / sum);
+        std::sort(p.begin(), p.end(), [](auto&x,auto&y){ return x.first > y.first; });
+        int32_t keep = n;
+        if (top_k > 0 && top_k < keep) keep = top_k;
+        if (top_p > 0.0f && top_p < 1.0f) {
+            double c = 0.0; int32_t kk = 0;
+            for (; kk < keep; ++kk) { c += p[kk].first; if (c >= top_p) { kk++; break; } }
+            keep = std::max(1, kk);
+        }
+        double norm = 0.0;
+        for (int32_t i = 0; i < keep; ++i) norm += p[i].first;
+        std::uniform_real_distribution<double> u(0.0, norm);
+        double r = u(rng), acc = 0.0;
+        for (int32_t i = 0; i < keep; ++i) { acc += p[i].first; if (r <= acc) return p[i].second; }
+        return p[keep-1].second;
+    }
+};
+
+// Load ref audio (mono F32) into `in` if given.  Returns false on error.
+bool load_ref_audio(const args & a, codec_common::audio_lm_input & in, std::vector<float> & ref_pcm) {
+    if (a.ref_audio.empty()) return true;
+    codec_example_wav_data w;
+    std::string werr;
+    if (!codec_example_load_wav_pcm16(a.ref_audio.c_str(), &w, &werr)) {
+        std::fprintf(stderr, "failed to load %s: %s\n", a.ref_audio.c_str(), werr.c_str());
+        return false;
+    }
+    const int32_t nch = w.n_channels > 0 ? w.n_channels : 1;
+    const int32_t nframes = (int32_t) (w.pcm_i16.size() / (size_t) nch);
+    ref_pcm.assign((size_t) nframes, 0.0f);
+    for (int32_t i = 0; i < nframes; ++i) {
+        float acc = 0.0f;
+        for (int32_t c = 0; c < nch; ++c) acc += w.pcm_i16[(size_t) i * nch + c] / 32768.0f;
+        ref_pcm[(size_t) i] = acc / (float) nch;
+    }
+    in.ref_pcm = ref_pcm.data();
+    in.ref_n_samples = (int32_t) ref_pcm.size();
+    in.ref_sample_rate = w.sample_rate;
+    return true;
+}
+
+// Tokenize prefix + text + suffix through the backbone vocab.
+std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab,
+                                         const codec_common::audio_lm_prompt_info & pi,
+                                         const std::string & text) {
+    const std::string full = pi.prompt_prefix + text + pi.prompt_suffix;
+    int32_t cap = (int32_t) full.size() + 8;
+    std::vector<llama_token> toks(cap);
+    int32_t n = llama_tokenize(vocab, full.c_str(), (int32_t) full.size(),
+                               toks.data(), cap, pi.add_bos, pi.parse_special);
+    if (n < 0) { toks.resize(-n); n = llama_tokenize(vocab, full.c_str(), (int32_t) full.size(),
+                               toks.data(), (int32_t) toks.size(), pi.add_bos, pi.parse_special); }
+    toks.resize(std::max(0, n));
+    return toks;
+}
+
+// Decode a token batch, requesting per-position embeddings (logits at
+// every position when `all_pos` else only last).  Returns pointer to the
+// last position's hidden after decode (owned by ctx).
+bool decode_tokens(llama_context * lctx, const std::vector<llama_token> & toks,
+                   int32_t n_past, bool all_pos) {
+    llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+    for (size_t i = 0; i < toks.size(); ++i) {
+        b.token[i] = toks[i];
+        b.pos[i] = n_past + (int32_t) i;
+        b.n_seq_id[i] = 1;
+        b.seq_id[i][0] = 0;
+        b.logits[i] = (all_pos || i == toks.size() - 1) ? 1 : 0;
+    }
+    b.n_tokens = (int32_t) toks.size();
+    int rc = llama_decode(lctx, b);
+    llama_batch_free(b);
+    return rc == 0;
+}
+
+// Decode a single embedding vector (inputs_embeds path).
+bool decode_embed(llama_context * lctx, const float * embd, int32_t dim, int32_t n_past) {
+    llama_batch b = llama_batch_init(1, dim, 1);
+    std::memcpy(b.embd, embd, (size_t) dim * sizeof(float));
+    b.token = nullptr;
+    b.pos[0] = n_past;
+    b.n_seq_id[0] = 1;
+    b.seq_id[0][0] = 0;
+    b.logits[0] = 1;
+    b.n_tokens = 1;
+    int rc = llama_decode(lctx, b);
+    llama_batch_free(b);
+    return rc == 0;
+}
+
+// Flow 1 — continuous CFM (BlueMagpie).  Logits-all prefill → text_prefill
+// → per-step observe_hidden ↔ feedback embed inject.
+bool run_continuous(codec_common::audio_lm_context * ctx, llama_context * lctx,
+                    const std::vector<llama_token> & toks, int32_t hidden,
+                    int32_t max_frames, const args & a,
+                    int32_t * out_frames, const char ** out_stop) {
+    codec_common::audio_lm_set_continuous_params(ctx, a.cont_cfg, a.cont_timesteps, a.cont_min_len);
+    if (!decode_tokens(lctx, toks, 0, /*all_pos=*/true)) {
+        std::fprintf(stderr, "prefill decode failed\n"); return false;
+    }
+    const int32_t np = (int32_t) toks.size();
+    std::vector<float> hid((size_t) np * hidden);
+    for (int32_t i = 0; i < np; ++i) {
+        const float * h = llama_get_embeddings_ith(lctx, i);
+        if (!h) { std::fprintf(stderr, "no embeddings at pos %d\n", i); return false; }
+        std::memcpy(hid.data() + (size_t) i * hidden, h, (size_t) hidden * sizeof(float));
+    }
+    int32_t n_past = np;
+    if (!codec_common::audio_lm_text_prefill(ctx, hid.data(), np, hidden)) return false;
+
+    std::vector<float> cur(hid.end() - hidden, hid.end());
+    for (int32_t step = 0; step < max_frames; ++step) {
+        auto act = codec_common::audio_lm_observe_hidden(ctx, cur.data(), hidden, nullptr);
+        if (act == codec_common::OBSERVE_STOP) {
+            const char * e = codec_common::audio_lm_last_error(ctx);
+            if (e && *e) return false;
+            *out_stop = "stop_head"; break;
+        }
+        (*out_frames)++;
+        int32_t dim = 0;
+        const float * fb = codec_common::audio_lm_get_next_embed(ctx, &dim);
+        if (!fb || dim != hidden) return false;
+        std::vector<float> fbc(fb, fb + dim);
+        if (!decode_embed(lctx, fbc.data(), dim, n_past++)) return false;
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (!h) return false;
+        std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
+    }
+    return true;
+}
+
+// Flow 2/3 — codebook AR.  Prefill → per-step { [cb0 from backbone] +
+// step machine cb0..N-1 } → observe_codes (accumulate + EOS + compose) →
+// inject next embed.
+bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
+                     const llama_vocab * vocab,
+                     const codec_common::audio_lm_prompt_info & pi,
+                     const std::vector<llama_token> & toks, int32_t hidden, int32_t n_cb,
+                     int32_t max_frames, Sampler & sampler,
+                     float temp, float top_p, int32_t top_k,
+                     int32_t * out_frames, const char ** out_stop) {
+    codec_common::audio_lm_set_uses_embed_override(ctx, true, 1);
+    if (!decode_tokens(lctx, toks, 0, /*all_pos=*/false)) {
+        std::fprintf(stderr, "prefill decode failed\n"); return false;
+    }
+    int32_t n_past = (int32_t) toks.size();
+
+    std::vector<float> cur(hidden);
+    const float * h0 = llama_get_embeddings_ith(lctx, -1);
+    if (!h0) return false;
+    std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
+
+    std::vector<int32_t> codes(n_cb);
+    for (int32_t step = 0; step < max_frames; ++step) {
+        if (pi.cb0_from_backbone) {
+            const float * bl = llama_get_logits_ith(lctx, -1);
+            if (!bl) return false;
+            int32_t nv = llama_vocab_n_tokens(vocab);
+            int32_t c0 = sampler.sample(bl, nv, temp, top_p, top_k);
+            if (!codec_common::audio_lm_step_set_text_context(ctx, c0)) return false;
+            codes[0] = c0;
+        }
+        if (!codec_common::audio_lm_step_begin(ctx, cur.data(), hidden)) return false;
+        for (int32_t cb = 0; cb < n_cb; ++cb) {
+            int32_t idx = 0, nlog = 0;
+            const float * lg = codec_common::audio_lm_step_logits(ctx, &idx, &nlog);
+            if (!lg) return false;
+            int32_t code = (pi.cb0_from_backbone && cb == 0)
+                         ? codes[0]
+                         : sampler.sample(lg, nlog, temp, top_p, top_k);
+            if (!codec_common::audio_lm_step_push_code(ctx, code)) return false;
+        }
+        if (!codec_common::audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
+
+        auto act = codec_common::audio_lm_observe_codes(ctx, codes.data(), n_cb, cur.data(), hidden);
+        if (act == codec_common::OBSERVE_STOP) {
+            const char * e = codec_common::audio_lm_last_error(ctx);
+            if (e && *e) return false;
+            *out_stop = "eos_code_c0"; break;
+        }
+        (*out_frames)++;
+        int32_t dim = 0;
+        const float * nb = codec_common::audio_lm_get_next_embed(ctx, &dim);
+        if (!nb || dim != hidden) return false;
+        std::vector<float> nbc(nb, nb + dim);
+        if (!decode_embed(lctx, nbc.data(), dim, n_past++)) return false;
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (!h) return false;
+        std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
+    }
+    return true;
+}
+
+}  // namespace
+
+int cmd_synthesize(const args & a) {
+    if (a.backbone.empty()) {
+        std::fprintf(stderr, "synthesize requires --backbone PATH.gguf (llama.cpp model)\n");
+        return 1;
+    }
+    if (a.output.empty()) {
+        std::fprintf(stderr, "synthesize requires --output PATH.wav\n");
+        return 1;
+    }
+
     codec_common::audio_lm_params p;
     p.codec_path = a.model;
     p.use_gpu    = a.use_gpu;
@@ -272,66 +538,142 @@ int cmd_synthesize(const args & a) {
     auto * ctx = codec_common::audio_lm_init(p, &err);
     if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
 
-    codec_common::audio_lm_input in;
-    in.text = a.text;
-    if (a.emotion) in.emotion = &a.emotion.value();
+    codec_common::audio_lm_prompt_info pi;
+    if (!codec_common::audio_lm_get_prompt_info(ctx, &pi)) {
+        std::fprintf(stderr, "get_prompt_info failed: %s\n", codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 3;
+    }
+    const int32_t hidden = codec_common::audio_lm_hidden_dim(ctx);
+    const int32_t n_cb   = codec_common::audio_lm_n_codebook(ctx);
+    std::printf("model: arch=%s kind=%d n_cb=%d hidden=%d cb0_backbone=%d audio_offset=%d eos_c0=%d\n",
+                pi.host_arch.c_str(), (int) pi.model_kind, n_cb, hidden,
+                (int) pi.cb0_from_backbone, pi.audio_codebook_offset, pi.eos_code_c0);
 
-    // Optional ref audio: WAV load + auto-resample to the encoder's
-    // declared sample rate is the host's job in a real integration;
-    // tts-cli reads the WAV as-is and refuses if the SR doesn't match
-    // (forces the user to bring resampled audio for now — a simple
-    // resampler can land alongside Type C/D once it's broadly useful).
-    std::vector<float> ref_pcm;
-    int32_t ref_sr = 0;
-    if (!a.ref_audio.empty()) {
-        codec_example_wav_data w;
-        std::string werr;
-        if (!codec_example_load_wav_pcm16(a.ref_audio.c_str(), &w, &werr)) {
-            std::fprintf(stderr, "failed to load %s: %s\n", a.ref_audio.c_str(), werr.c_str());
-            codec_common::audio_lm_free(ctx);
-            return 3;
-        }
-        // Downmix to mono + convert PCM16 → F32.
-        const int32_t nch = w.n_channels > 0 ? w.n_channels : 1;
-        const int32_t nframes = (int32_t) (w.pcm_i16.size() / (size_t) nch);
-        ref_pcm.assign((size_t) nframes, 0.0f);
-        for (int32_t i = 0; i < nframes; ++i) {
-            float acc = 0.0f;
-            for (int32_t c = 0; c < nch; ++c) {
-                acc += w.pcm_i16[(size_t) i * (size_t) nch + (size_t) c] / 32768.0f;
-            }
-            ref_pcm[(size_t) i] = acc / (float) nch;
-        }
-        ref_sr  = w.sample_rate;
-        in.ref_pcm         = ref_pcm.data();
-        in.ref_n_samples   = (int32_t) ref_pcm.size();
-        in.ref_sample_rate = ref_sr;
+    // Preflight: codec_common's decode_audio feeds the accumulated frame
+    // straight into codec_decode.  Models whose LM codebooks need a
+    // model-specific transform before decode — delay-pattern un-shift
+    // and/or a cb0 (text/control) slice (`audio_codebook_offset > 0`) —
+    // aren't wired through decode_audio yet, so the generated codes would
+    // be rejected (or worse) by the codec.  Refuse cleanly instead of
+    // feeding it garbage.  The AR loop itself (prompt → step machine →
+    // observe_codes) is exercised regardless; this only gates decode.
+    if (!pi.is_continuous && pi.audio_codebook_offset > 0) {
+        std::fprintf(stderr,
+            "synthesize: %s needs a model-specific decode transform "
+            "(audio_codebook_offset=%d%s) that codec_common's decode_audio "
+            "does not implement yet.  The host AR loop is wired but the "
+            "codes→PCM step is blocked for this family.\n",
+            pi.host_arch.c_str(), pi.audio_codebook_offset,
+            pi.model_kind == codec_common::audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY
+                ? " + delay-pattern un-shift" : "");
+        codec_common::audio_lm_free(ctx);
+        return 10;
     }
 
-    codec_common::audio_lm_prompt prompt;
-    if (!codec_common::audio_lm_build_prompt(ctx, in, &prompt)) {
-        std::fprintf(stderr, "build_prompt failed: %s\n",
-                     codec_common::audio_lm_last_error(ctx));
-        codec_common::audio_lm_free(ctx);
+    // ── Backbone init ──────────────────────────────────────────────
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model * lmodel = llama_model_load_from_file(a.backbone.c_str(), mp);
+    if (!lmodel) {
+        std::fprintf(stderr, "llama_model_load_from_file failed: %s\n", a.backbone.c_str());
+        codec_common::audio_lm_free(ctx); llama_backend_free();
         return 4;
     }
+    const int32_t n_embd = llama_model_n_embd(lmodel);
+    if (n_embd != hidden) {
+        std::fprintf(stderr, "backbone n_embd=%d != codec hidden=%d — wrong backbone?\n", n_embd, hidden);
+        llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
+        return 4;
+    }
+    const int32_t max_frames = a.max_frames > 0 ? a.max_frames : 512;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx        = (uint32_t) std::max(4096, max_frames + 256);
+    cp.n_batch      = cp.n_ctx;
+    cp.n_ubatch     = cp.n_ctx;
+    cp.embeddings   = true;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    if (a.n_threads > 0) { cp.n_threads = a.n_threads; cp.n_threads_batch = a.n_threads; }
+    llama_context * lctx = llama_init_from_model(lmodel, cp);
+    if (!lctx) {
+        std::fprintf(stderr, "llama_init_from_model failed\n");
+        llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
+        return 4;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(lmodel);
 
-    std::printf("build_prompt OK\n");
-    std::printf("  tokens.size        = %zu\n", prompt.tokens.size());
-    std::printf("  embeds_prefix_rows = %d\n",  prompt.embeds_prefix_rows);
-    std::printf("  embeds_prefix_hidd = %d\n",  prompt.embeds_prefix_hidden);
-    std::printf("  embeds_prefix.size = %zu (= rows×hidden)\n", prompt.embeds_prefix.size());
+    // ── Prompt tokenize + prefill ─────────────────────────────────
+    std::vector<llama_token> toks = tokenize_prompt(vocab, pi, a.text);
+    if (toks.empty()) {
+        std::fprintf(stderr, "empty prompt after tokenize\n");
+        llama_free(lctx); llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
+        return 5;
+    }
+    std::printf("prompt: \"%s%s%s\" → %zu tokens\n",
+                pi.prompt_prefix.c_str(), a.text.c_str(), pi.prompt_suffix.c_str(), toks.size());
 
-    // Host-side llama.cpp AR loop + observe_token + decode_audio land
-    // in roadmap step 3+.  Bail cleanly here so the user knows where
-    // tts-cli sits relative to the doc.
-    std::fprintf(stderr,
-        "\nsynthesize: AR loop not yet wired (roadmap step 3+).  "
-        "Output file %s NOT written.\n",
-        a.output.empty() ? "<unspecified>" : a.output.c_str());
+    const float temp  = a.temp  ? *a.temp  : pi.default_temperature;
+    const float top_p = a.top_p ? *a.top_p : pi.default_top_p;
+    const int32_t top_k = a.top_k ? *a.top_k : pi.default_top_k;
+    Sampler sampler(a.seed);
+
+    const char * stop_reason = "max_frames";
+    int32_t n_frames = 0;
+    bool    ar_ok    = false;
+
+    // ── Run the appropriate flow.  Each returns via ar_ok; cleanup of
+    //    the llama handles happens once, after. ─────────────────────
+    if (pi.is_continuous) {
+        // Flow 1: continuous CFM (BlueMagpie / barbet).
+        ar_ok = run_continuous(ctx, lctx, toks, hidden, max_frames, a,
+                               &n_frames, &stop_reason);
+    } else {
+        // Flow 2/3: codebook AR (residual depth-AR + parallel-heads delay).
+        ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,
+                                max_frames, sampler, temp, top_p, top_k,
+                                &n_frames, &stop_reason);
+    }
+
+    llama_free(lctx);
+    llama_model_free(lmodel);
+    llama_backend_free();
+
+    if (!ar_ok) {
+        std::fprintf(stderr, "AR loop failed: %s\n", codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 6;
+    }
+    std::printf("AR loop done: %d frames, stop=%s\n", n_frames, stop_reason);
+    if (n_frames == 0) {
+        std::fprintf(stderr, "no audio frames generated\n");
+        codec_common::audio_lm_free(ctx);
+        return 7;
+    }
+
+    codec_common::audio_lm_audio_output pcm;
+    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+        std::fprintf(stderr, "decode_audio failed: %s\n", codec_common::audio_lm_last_error(ctx));
+        codec_common::audio_lm_free(ctx);
+        return 8;
+    }
+    {
+        std::string wav_err;
+        const int32_t nsamp = (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels);
+        if (!codec_example_write_wav_pcm16(a.output.c_str(), pcm.pcm.data(), nsamp,
+                                           pcm.sample_rate, &wav_err, pcm.n_channels)) {
+            std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+            codec_common::audio_lm_free(ctx);
+            return 9;
+        }
+        const double secs = (double) nsamp / (double) (pcm.sample_rate > 0 ? pcm.sample_rate : 1);
+        std::printf("wrote %s: %d samples @ %d Hz (%.2fs, %d ch)\n",
+                    a.output.c_str(), nsamp, pcm.sample_rate, secs, pcm.n_channels);
+    }
     codec_common::audio_lm_free(ctx);
     return 0;
 }
+#endif  // TTS_CLI_HAVE_BACKBONE
 
 // ─── Subcommand: trace ───────────────────────────────────────────
 // Dispatch a comma-separated token stream through observe_token and

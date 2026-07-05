@@ -360,6 +360,81 @@ bool audio_lm_push_codes(audio_lm_context * ctx,
 // ─────────────────────────────────────────────────────────────────────
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out);
 
+// ═════════════════════════════════════════════════════════════════════
+// Host-driven AR (Phase B): prompt assembly + codebook step machine
+//
+// These entries let a host that owns a llama.cpp backbone drive the full
+// synthesize loop.  Model-specific prompt formats live here (keyed on
+// `codec.lm.host_arch` / `codec.lm.kind` GGUF metadata) so the host stays
+// model-agnostic; the host only supplies the backbone tokenizer + decode
+// loop.  The codebook step machine (Type C/D) is exposed as thin
+// passthroughs onto the internal codec_lm_state so the host never touches
+// raw codec_lm handles.
+// ═════════════════════════════════════════════════════════════════════
+
+// Per-model prompt-assembly descriptor.  The host builds its backbone
+// prompt as tokenize(prefix + input.text + suffix) with add_bos /
+// parse_special as flagged, then decodes it to seed the AR loop.
+struct audio_lm_prompt_info {
+    // Coarse inference type, derived from `codec.lm.kind` + metadata.
+    enum kind {
+        KIND_UNKNOWN = 0,
+        KIND_RESIDUAL_DEPTH_AR,   // Type C — CSM, Qwen3-TTS, MOSS-TTS-Realtime
+        KIND_PARALLEL_HEADS_DELAY,// Type D — MOSS-TTSD
+        KIND_CONTINUOUS_CFM,      // BlueMagpie / VoxCPM
+    } model_kind = KIND_UNKNOWN;
+
+    std::string host_arch;        // "llama" / "qwen3" / "barbet"
+    std::string prompt_prefix;    // literal text prepended to input.text
+    std::string prompt_suffix;    // literal text appended to input.text
+    bool        add_bos       = false;  // ask the tokenizer to prepend BOS
+    bool        parse_special  = false; // let special tokens in the template resolve
+
+    // cb0 source.  When true (MOSS-TTSD delay-pattern text-modality cb0),
+    // the host samples cb0 from the BACKBONE's own logits and calls
+    // audio_lm_step_set_text_context(cb0) before step_begin; the step
+    // machine then fills cb1..N-1.  When false (CSM / Qwen3-TTS /
+    // MOSS-TTS-Realtime), the step machine produces all N codebooks.
+    bool cb0_from_backbone = false;
+
+    // audio_codebook_offset — codebooks [0, offset) are text/control and
+    // are NOT decoded to audio; decode_audio slices them off.  0 for CSM /
+    // Qwen3-TTS; 1 for MOSS-TTSD / MOSS-TTS-Realtime.
+    int32_t audio_codebook_offset = 0;
+
+    bool    is_continuous = false;  // use the observe_hidden path instead
+    int32_t n_codebook    = 0;
+    int32_t hidden_dim    = 0;
+    int32_t eos_code_c0   = -1;     // cb0 EOS sentinel (-1 = none)
+    int32_t eos_min_step  = 0;
+
+    // Sampling defaults (rn-tts convention): temp 0.9 / top_p 0.95 /
+    // top_k 50.  Host may override.  0 → greedy.
+    float   default_temperature = 0.0f;
+    float   default_top_p       = 0.0f;
+    int32_t default_top_k       = 0;
+};
+
+// Fill `*out` from the loaded model's metadata.  Returns false + sets
+// last_error when the model has no codec_lm (no AR profile to describe).
+bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
+                              audio_lm_prompt_info    * out);
+
+// ─── Codebook step machine passthroughs (Type C/D) ──────────────────
+//
+// Drive the internal codec_lm_state per AR step.  Sequence per frame:
+//   [set_text_context(cb0)]        (MOSS-TTSD only, before step_begin)
+//   step_begin(last_hidden)
+//   for cb in 0..n_codebook-1:  step_logits(&idx,&n) → sample → step_push_code
+//   step_finish(codes)            → codes[0..n_codebook-1]
+// then hand `codes` to audio_lm_observe_codes for accumulation + compose.
+// All return false / nullptr + set last_error on misuse.
+bool          audio_lm_step_set_text_context(audio_lm_context * ctx, int32_t text_token);
+bool          audio_lm_step_begin      (audio_lm_context * ctx, const float * last_hidden, int32_t hidden_dim);
+const float * audio_lm_step_logits     (audio_lm_context * ctx, int32_t * out_cb_idx, int32_t * out_n);
+bool          audio_lm_step_push_code  (audio_lm_context * ctx, int32_t code);
+bool          audio_lm_step_finish     (audio_lm_context * ctx, int32_t * out_codes, int32_t n_codes);
+
 }  // namespace codec_common
 
 #endif  // CODEC_COMMON_H

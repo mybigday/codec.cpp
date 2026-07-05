@@ -702,6 +702,186 @@ observe_action audio_lm_observe_hidden(audio_lm_context * ctx,
     return OBSERVE_CONSUMED_EMBED;
 }
 
+// =====================================================================
+// Phase B: prompt assembly + codebook step machine passthroughs
+// =====================================================================
+
+// Look up a raw GGUF metadata string value by key.  Returns nullptr when
+// absent.  Used to key model-specific prompt assembly off host_arch / kind.
+static const char * meta_str(const audio_lm_context * ctx, const char * key) {
+    if (ctx == nullptr || ctx->model == nullptr) return nullptr;
+    const codec_gguf_metadata * meta = codec_model_metadata(ctx->model);
+    if (meta == nullptr) return nullptr;
+    for (size_t i = 0; i < meta->n_items; ++i) {
+        if (meta->items[i].key && std::strcmp(meta->items[i].key, key) == 0) {
+            return meta->items[i].value;
+        }
+    }
+    return nullptr;
+}
+
+bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
+                              audio_lm_prompt_info    * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    *out = audio_lm_prompt_info();
+    if (ctx->lm == nullptr) {
+        if (ctx) const_cast<audio_lm_context*>(ctx)->last_error =
+            "audio_lm_get_prompt_info: no codec_lm adaptor";
+        return false;
+    }
+
+    const codec_lm_info * info = codec_lm_get_info(ctx->lm);
+    const char * arch = meta_str(ctx, "codec.lm.host_arch");
+    const char * kind = meta_str(ctx, "codec.lm.kind");
+    out->host_arch    = arch ? arch : (info && info->host_arch ? info->host_arch : "");
+    out->n_codebook   = ctx->n_cb;
+    out->hidden_dim   = ctx->hidden;
+    out->is_continuous = ctx->is_continuous;
+    if (info != nullptr) {
+        out->eos_code_c0  = info->eos_code_c0;
+        out->eos_min_step = info->eos_min_step;
+    }
+    // rn-tts sampling defaults.
+    out->default_temperature = 0.9f;
+    out->default_top_p       = 0.95f;
+    out->default_top_k       = 50;
+
+    const bool is_delay = kind && std::strcmp(kind, "parallel_heads_delay") == 0;
+    const bool is_depth = kind && std::strcmp(kind, "residual_depth_ar") == 0;
+    if (ctx->is_continuous)        out->model_kind = audio_lm_prompt_info::KIND_CONTINUOUS_CFM;
+    else if (is_delay)             out->model_kind = audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY;
+    else if (is_depth)             out->model_kind = audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR;
+
+    // ── Per-arch / per-family prompt template ──────────────────────────
+    // barbet == BlueMagpie continuous latent CFM.
+    if (out->host_arch == "barbet" || ctx->is_continuous) {
+        // <|bm_spk|> text <|bm_audio_start|>  (control tokens, no BOS)
+        out->prompt_prefix = "<|bm_spk|>";
+        out->prompt_suffix = "<|bm_audio_start|>";
+        out->add_bos       = false;
+        out->parse_special = true;
+        out->cb0_from_backbone = false;
+        out->is_continuous = true;
+        return true;
+    }
+
+    if (out->host_arch == "llama") {
+        // CSM: [<speaker_id>]text<|end_of_text|>.  add_bos=true handles BOS;
+        // speaker id defaults to 0 (host may override the prefix via extra).
+        out->prompt_prefix = "[0]";
+        out->prompt_suffix = "<|end_of_text|>";
+        out->add_bos       = true;
+        out->parse_special = true;
+        out->cb0_from_backbone = false;
+        out->audio_codebook_offset = 0;
+        return true;
+    }
+
+    // qwen3 family — MOSS-TTSD (delay) is a plain [S1] pass-through;
+    // Qwen3-TTS / MOSS-TTS-Realtime (depth) use ChatML.
+    if (out->host_arch == "qwen3") {
+        if (is_delay) {
+            // MOSS-TTSD: caller already supplies [S1]…[S2]… dialogue text.
+            out->prompt_prefix = "";
+            out->prompt_suffix = "";
+            out->add_bos       = false;
+            out->parse_special = true;
+            out->cb0_from_backbone = true;          // cb0 is text-modality
+            out->audio_codebook_offset = 1;
+            return true;
+        }
+        // ChatML for Qwen3-TTS / MOSS-TTS-Realtime.
+        out->prompt_prefix = "<|im_start|>user\n";
+        out->prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+        out->add_bos       = false;
+        out->parse_special = true;
+        out->cb0_from_backbone = false;
+        // MOSS-TTS-Realtime declares a cb0 control sentinel (bos/eos on a
+        // 1027-wide control codebook) → cb0 is not an audio codebook.
+        // Qwen3-TTS has no such sentinel → all 16 codebooks are audio.
+        out->audio_codebook_offset = (info && info->eos_code_c0 >= 0) ? 1 : 0;
+        return true;
+    }
+
+    // Unknown arch — return the raw kind but empty template.
+    return true;
+}
+
+// ─── Codebook step machine passthroughs ─────────────────────────────
+
+bool audio_lm_step_set_text_context(audio_lm_context * ctx, int32_t text_token) {
+    if (ctx == nullptr || ctx->state == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_step_set_text_context: no codec_lm state";
+        return false;
+    }
+    if (codec_lm_state_set_text_context(ctx->state, text_token) != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("set_text_context failed (") + (raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+bool audio_lm_step_begin(audio_lm_context * ctx, const float * last_hidden, int32_t hidden_dim) {
+    if (ctx == nullptr || ctx->state == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_step_begin: no codec_lm state";
+        return false;
+    }
+    if (last_hidden == nullptr || hidden_dim != ctx->hidden) {
+        ctx->last_error = "audio_lm_step_begin: null hidden or wrong dim";
+        return false;
+    }
+    if (codec_lm_step_begin(ctx->state, last_hidden) != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("step_begin failed (") + (raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+const float * audio_lm_step_logits(audio_lm_context * ctx, int32_t * out_cb_idx, int32_t * out_n) {
+    if (ctx == nullptr || ctx->state == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_step_logits: no codec_lm state";
+        return nullptr;
+    }
+    const float * lg = codec_lm_step_logits(ctx->state, out_cb_idx, out_n);
+    if (lg == nullptr) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("step_logits returned null (") + (raw ? raw : "?") + ")";
+    }
+    return lg;
+}
+
+bool audio_lm_step_push_code(audio_lm_context * ctx, int32_t code) {
+    if (ctx == nullptr || ctx->state == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_step_push_code: no codec_lm state";
+        return false;
+    }
+    if (codec_lm_step_push_code(ctx->state, code) != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("step_push_code failed (") + (raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+bool audio_lm_step_finish(audio_lm_context * ctx, int32_t * out_codes, int32_t n_codes) {
+    if (ctx == nullptr || ctx->state == nullptr || out_codes == nullptr) {
+        if (ctx) ctx->last_error = "audio_lm_step_finish: null state / out_codes";
+        return false;
+    }
+    if (n_codes < ctx->n_cb) {
+        ctx->last_error = "audio_lm_step_finish: out_codes buffer smaller than n_codebook";
+        return false;
+    }
+    if (codec_lm_step_finish(ctx->state, out_codes) != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_state_get_last_error(ctx->state);
+        ctx->last_error = std::string("step_finish failed (") + (raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out) {
     if (ctx == nullptr || out == nullptr) return false;
 

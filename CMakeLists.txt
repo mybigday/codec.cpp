@@ -160,4 +160,16 @@ if(CODEC_BUILD_TTS_CLI)
         examples/tts-cli.cpp
     )
     target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
+
+    # Optional isolated llama.cpp backbone → enables `tts-cli synthesize`.
+    option(CODEC_TTS_BACKBONE "Build the isolated llama.cpp backbone for tts-cli synthesize" ON)
+    if(CODEC_TTS_BACKBONE)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupTtsBackbone.cmake)
+        add_dependencies(tts-cli ttsbackbone)
+        target_compile_definitions(tts-cli PRIVATE TTS_CLI_HAVE_BACKBONE=1)
+        target_include_directories(tts-cli PRIVATE ${TTS_BACKBONE_INCLUDE_DIRS})
+        target_link_libraries(tts-cli PRIVATE "${TTS_BACKBONE_SO}")
+        set_target_properties(tts-cli PROPERTIES
+            BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
+    endif()
 endif()

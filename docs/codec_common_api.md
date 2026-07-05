@@ -373,6 +373,39 @@ model-specific.
    minimal per-step branch + embed-path batch construction generalised
    from the existing temporary patch.
 
+### Phase B (landed): `tts-cli synthesize` reference host
+
+`examples/tts-cli.cpp` now drives the full host AR loop against a real
+llama.cpp backbone (`--backbone LLAMA.gguf`), proving codec_common's
+per-step hooks end-to-end.  Verified E2E (whisper ASR): **CSM** (English,
+CER 0.0, stops on `eos_code_c0`) and **BlueMagpie** (continuous CFM,
+zh, stops on the diffusion stop head).  Smoke: `tests/e2e/
+ttscli_synthesize_smoke.py`.
+
+New codec_common surface (`audio_lm_get_prompt_info` + step-machine
+passthroughs `audio_lm_step_{set_text_context,begin,logits,push_code,
+finish}`) keeps model-specific prompt assembly + the codebook step
+machine inside codec_common, keyed on `codec.lm.host_arch` /
+`codec.lm.kind` metadata — the host stays model-agnostic (tokenizer +
+llama_decode loop only).
+
+Build integration: the pinned llama.cpp submodule bundles ggml 0.15
+under the SAME `libggml.so.0` soname as codec's ggml 0.9 — a runtime ABI
+collision.  `cmake/SetupTtsBackbone.cmake` builds llama.cpp + its ggml
+STATIC/PIC via ExternalProject, then wraps the archives into one
+`libttsbackbone.so` whose dynamic table exports only `llama_*` (ggml_*
+hidden via version script).  tts-cli links codec's ggml 0.9 (shared) +
+the isolated backbone; the two ggml instances never see each other.
+Gated by `-DCODEC_TTS_BACKBONE=ON` (default; CPU-only).
+
+Remaining (blocked on per-model decode transforms, not the loop):
+MOSS-TTSD / MOSS-TTS-Realtime need cb0 (control/text) slicing at decode
+(`audio_codebook_offset > 0`) + delay-pattern un-shift; Qwen3-TTS runs
+E2E but needs speaker/voice conditioning for intelligible output; LFM2
+and Chatterbox lack documented prompt formats / a supported decode.
+tts-cli refuses these cleanly (exit 10) rather than feeding the codec
+invalid codes.
+
 ## Open questions / follow-ups
 
 * **`extra` schema** — what keys does each model accept?  Document as
