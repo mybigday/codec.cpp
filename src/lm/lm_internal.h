@@ -12,6 +12,12 @@
 
 struct codec_lm_kind_vtable;
 
+// Free the lazily-allocated Chatterbox T3 host-orchestration state
+// (tokenizer + dequanted embed tables) registered by the
+// `codec_lm_chatterbox_*` helpers.  No-op when none was created.
+// Implemented in chatterbox_t3.cpp; called from codec_lm_free.
+void codec_lm_chatterbox_free_state(struct codec_lm * lm);
+
 struct codec_lm {
     // Borrowed; not freed by codec_lm_free.  All weights and the
     // ggml_backend live on this codec_model.

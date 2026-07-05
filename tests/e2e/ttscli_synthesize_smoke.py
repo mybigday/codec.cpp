@@ -30,16 +30,17 @@ REPO = Path(__file__).resolve().parents[2]
 TTS_CLI = REPO / "build" / "tts-cli"
 
 
-def _run_synth(codec, backbone, text, out_wav, extra=None):
+def _run_synth(codec, backbone, text, out_wav, extra=None, greedy=True):
     cmd = [
         str(TTS_CLI), "synthesize",
         "--model", str(codec),
         "--backbone", str(backbone),
         "--text", text,
         "--output", str(out_wav),
-        "--temp", "0",
         "--n-threads", "8",
     ]
+    if greedy:
+        cmd += ["--temp", "0"]
     if extra:
         cmd += extra
     env = dict(os.environ)
@@ -102,7 +103,7 @@ def _try_cer(wav, ref, lang):
 
 def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
           require_stop=True, cer_report_only=False, dur_max=30.0,
-          audio_report_only=False):
+          audio_report_only=False, greedy=True, stop_line="AR loop done"):
     """Drive one synthesize case.
 
     require_stop=False    → stop-reason is reported, not asserted (models
@@ -124,11 +125,11 @@ def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
     out = Path("/tmp") / f"ttscli_{name}.wav"
     if out.exists():
         out.unlink()
-    proc = _run_synth(codec, backbone, text, out, extra)
+    proc = _run_synth(codec, backbone, text, out, extra, greedy=greedy)
     if proc.returncode != 0:
         print(f"[FAIL] {name}: exit {proc.returncode}\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}")
         return False
-    line = [ln for ln in proc.stdout.splitlines() if "AR loop done" in ln]
+    line = [ln for ln in proc.stdout.splitlines() if stop_line in ln]
     stop = line[0].split("stop=")[-1].strip() if line else "?"
     assert out.exists(), f"{name}: no wav written"
     sr, dur, rms = _wav_stats(out)
@@ -174,6 +175,23 @@ def main():
         "Hello, this is a test of the emergency broadcast system.",
         "en", want_stop="eos_code_c0", cer_max=0.15,
         extra=["--max-frames", "300"],
+    ))
+
+    # Chatterbox T3 — embd-driven Llama backbone with the T3 LM adaptor
+    # (own EnTokenizer BPE + cond_enc perceiver + text/speech learned PEs +
+    # speech_head), CFG dual-sequence sampling, builtin voice conds, decode
+    # via Chatterbox-S3G.  Sampled (not greedy) with the reference regime
+    # (temp 0.8 / min_p 0.05 / rep 1.2 / cfg 0.5); a fixed seed keeps it
+    # deterministic.  Stops on the T3 stop-speech token (eos_code_c0=6562)
+    # and English ASR should match the input closely.
+    results.append(_case(
+        "chatterbox_t3",
+        REPO / "models" / "chatterbox" / "chatterbox.gguf",
+        REPO / "models" / "chatterbox" / "llama_backbone.gguf",
+        "Hello, this is a test of the emergency broadcast system.",
+        "en", want_stop="eos_code_c0", cer_max=0.3,
+        extra=["--seed", "42", "--max-frames", "600"],
+        greedy=False, stop_line="chatterbox AR done",
     ))
 
     # BlueMagpie — continuous CFM, stops via the diffusion stop head.

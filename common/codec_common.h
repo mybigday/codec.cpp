@@ -156,6 +156,11 @@ int32_t      audio_lm_n_codebook     (const audio_lm_context * ctx);
 int32_t      audio_lm_hidden_dim     (const audio_lm_context * ctx);
 const char * audio_lm_last_error     (const audio_lm_context * ctx);
 
+// Borrowed handle to the underlying codec_lm (NULL when none loaded).
+// Lets a host reach model-specific helpers not wrapped by codec_common
+// (e.g. the Chatterbox T3 `codec_lm_chatterbox_*` prompt/tokenizer API).
+struct codec_lm * audio_lm_get_lm(audio_lm_context * ctx);
+
 // ─────────────────────────────────────────────────────────────────────
 // Prompt build (one shot, before the AR loop)
 //

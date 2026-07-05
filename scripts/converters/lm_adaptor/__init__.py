@@ -151,6 +151,11 @@ def _load_chatterbox_lm_source_if_present(
                 "architectures": ["ChatterboxT3"],
                 "chatterbox_t3_checkpoint": fn,
                 "chatterbox_text_vocab_size": text_vocab,
+                # Directory hosting the checkpoint — the chatterbox handler
+                # reads `tokenizer.json` (EnTokenizer BPE) and `conds.pt`
+                # (builtin T3 speaker conditioning) from here so the runtime
+                # can tokenize + synthesise with no external files.
+                "chatterbox_source_dir": str(local),
             }
             if verbose:
                 print(f"[lm_adaptor] loaded {len(sd)} tensors from {t3_path} "

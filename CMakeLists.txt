@@ -71,6 +71,7 @@ set(CODEC_SOURCES
     src/lm/bluemagpie_cfm.cpp
     src/lm/parallel_heads_delay.cpp
     src/lm/residual_depth_ar.cpp
+    src/lm/chatterbox_t3.cpp
     src/lm/speaker_chatterbox.cpp
     src/lm/speaker_qwen3_tts.cpp
 )

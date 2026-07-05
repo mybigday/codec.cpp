@@ -204,6 +204,15 @@ bool codec_read_bool_kv(struct gguf_context * gf, const char * key, bool fallbac
     return fallback;
 }
 
+std::string codec_read_str_kv(struct gguf_context * gf, const char * key, const char * fallback) {
+    const int key_id = gguf_find_key(gf, key);
+    if (key_id < 0 || gguf_get_kv_type(gf, key_id) != GGUF_TYPE_STRING) {
+        return fallback ? std::string(fallback) : std::string();
+    }
+    const char * v = gguf_get_val_str(gf, key_id);
+    return v ? std::string(v) : std::string();
+}
+
 int codec_count_tensors_with_prefix(const struct codec_model * model, const char * prefix) {
     int count = 0;
     for (int i = 0; i < model->n_tensors; ++i) {

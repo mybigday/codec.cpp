@@ -157,6 +157,11 @@ struct args {
     std::optional<float>   temp;     // sampler overrides (unset → model default)
     std::optional<float>   top_p;
     std::optional<int32_t> top_k;
+
+    // Chatterbox T3 synthesize knobs (mirror ChatterboxTTS.generate).
+    std::optional<float>   cfg_weight;         // unset → 0.5
+    std::optional<float>   min_p;              // unset → 0.05
+    std::optional<float>   repetition_penalty; // unset → 1.2
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -197,6 +202,9 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--temp")       { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->temp = f; i++; }
         else if (a == "--top-p")      { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->top_p = f; i++; }
         else if (a == "--top-k")      { const char * v = need(); if (!v) return false; int32_t k; if (!parse_i32(v, &k)) return false; out->top_k = k; i++; }
+        else if (a == "--cfg-weight") { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->cfg_weight = f; i++; }
+        else if (a == "--min-p")      { const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->min_p = f; i++; }
+        else if (a == "--rep-penalty"){ const char * v = need(); if (!v) return false; float f; if (!parse_f32(v, &f)) return false; out->repetition_penalty = f; i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -652,6 +660,276 @@ bool run_codebook_ar(codec_common::audio_lm_context * ctx, llama_context * lctx,
     return true;
 }
 
+// T3-faithful per-step sampler over the CFG-combined speech logits.
+// Mirrors t3.py inference: repetition_penalty → /temperature → min_p →
+// top_p → multinomial.  `generated` is the running list of already-
+// sampled speech ids (incl BOS) used for the repetition penalty.
+int32_t sample_t3(std::mt19937_64 & rng, std::vector<float> logits,
+                  const std::vector<int32_t> & generated,
+                  float temperature, float min_p, float top_p,
+                  float repetition_penalty) {
+    const int32_t n = (int32_t) logits.size();
+    if (n <= 0) return 0;
+
+    // temperature<=0 → greedy argmax (parity/debug path).
+    if (temperature <= 0.0f) {
+        int32_t best = 0; for (int32_t i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+
+    // 1. Repetition penalty (HF RepetitionPenaltyLogitsProcessor).
+    if (repetition_penalty != 1.0f) {
+        for (int32_t id : generated) {
+            if (id < 0 || id >= n) continue;
+            float & l = logits[id];
+            l = (l > 0.0f) ? (l / repetition_penalty) : (l * repetition_penalty);
+        }
+    }
+    // 2. Temperature.
+    if (temperature > 0.0f && temperature != 1.0f) {
+        for (float & l : logits) l /= temperature;
+    }
+    // Softmax → probs.
+    float mx = logits[0];
+    for (int32_t i = 1; i < n; ++i) mx = std::max(mx, logits[i]);
+    std::vector<float> probs(n);
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; ++i) { double e = std::exp((double) logits[i] - mx); probs[i] = (float) e; sum += e; }
+    for (float & p : probs) p = (float) (p / sum);
+
+    // 3. min_p filter: keep tokens with prob >= min_p * max_prob.
+    if (min_p > 0.0f) {
+        float pmax = 0.0f;
+        for (float p : probs) pmax = std::max(pmax, p);
+        const float thresh = min_p * pmax;
+        for (int32_t i = 0; i < n; ++i) if (probs[i] < thresh) probs[i] = 0.0f;
+    }
+    // 4. top_p (nucleus): sort desc, keep smallest set with cumsum >= top_p.
+    if (top_p > 0.0f && top_p < 1.0f) {
+        std::vector<int32_t> idx(n);
+        for (int32_t i = 0; i < n; ++i) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](int32_t x, int32_t y){ return probs[x] > probs[y]; });
+        double c = 0.0; bool cut = false;
+        for (int32_t r = 0; r < n; ++r) {
+            if (cut) { probs[idx[r]] = 0.0f; continue; }
+            c += probs[idx[r]];
+            if (c >= top_p) cut = true;   // keep this one, drop the rest
+        }
+    }
+    // Renormalise + multinomial sample.
+    double z = 0.0; for (float p : probs) z += p;
+    if (z <= 0.0) {  // degenerate → argmax of original logits
+        int32_t best = 0; for (int32_t i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+    std::uniform_real_distribution<double> u(0.0, z);
+    double r = u(rng), acc = 0.0;
+    for (int32_t i = 0; i < n; ++i) { acc += probs[i]; if (r <= acc) return i; }
+    return n - 1;
+}
+
+// Decode a batch of `n_seq` embed rows (one per CFG lane) at a single
+// position, requesting logits at the last (only) row of each lane.
+// Rows are laid out [seq0_row | seq1_row]; each lane is its own llama seq.
+bool decode_embed_batch(llama_context * lctx, const float * embds, int32_t dim,
+                        int32_t n_seq, int32_t pos) {
+    llama_batch b = llama_batch_init(n_seq, dim, 1);
+    std::memcpy(b.embd, embds, (size_t) n_seq * dim * sizeof(float));
+    b.token = nullptr;
+    b.n_tokens = n_seq;
+    for (int32_t s = 0; s < n_seq; ++s) {
+        b.pos[s] = pos;
+        b.n_seq_id[s] = 1;
+        b.seq_id[s][0] = s;
+        b.logits[s] = 1;
+    }
+    int rc = llama_decode(lctx, b);
+    llama_batch_free(b);
+    return rc == 0;
+}
+
+// Flow 4 — Chatterbox T3.  Prompt = [cond_enc | text_emb+pos | BOS],
+// batched over 1 (no CFG) or 2 (CFG) llama sequences; per-step CFG-blended
+// speech_head logits → sample → speech_emb[code]+speech_pos_emb[step+1].
+bool run_chatterbox(codec_common::audio_lm_context * ctx, llama_context * lctx,
+                    codec_lm * lm, const codec_lm_chatterbox_info * ci,
+                    const args & a, int32_t hidden, int32_t max_frames,
+                    std::vector<int32_t> * out_codes,
+                    int32_t * out_frames, const char ** out_stop) {
+    const float cfg_weight = a.cfg_weight ? *a.cfg_weight : 0.5f;
+    const float temperature = a.temp ? *a.temp : 0.8f;
+    const float top_p = a.top_p ? *a.top_p : 1.0f;
+    const float min_p = a.min_p ? *a.min_p : 0.05f;
+    const float rep_pen = a.repetition_penalty ? *a.repetition_penalty : 1.2f;
+
+    // Tokenize the text with the baked EnTokenizer.
+    std::vector<int32_t> text_ids(a.text.size() + 64);
+    int32_t n_text = 0;
+    if (codec_lm_chatterbox_tokenize(lm, a.text.c_str(), text_ids.data(),
+                                     (int32_t) text_ids.size(), &n_text) != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "chatterbox tokenize failed: %s\n", codec_lm_get_last_error(lm));
+        return false;
+    }
+    text_ids.resize(n_text);
+    std::printf("chatterbox: %d text tokens, cfg_weight=%.2f temp=%.2f min_p=%.2f top_p=%.2f rep=%.2f\n",
+                n_text, cfg_weight, temperature, min_p, top_p, rep_pen);
+
+    // Ref-audio conditioning: when --ref-audio is given, run VE+cond_enc
+    // from the waveform (cond-prompt speech tokens fall back to builtin).
+    // Otherwise use the builtin baked conds.
+    std::vector<float> ref_pcm;
+    const float * ref_pcm_ptr = nullptr;
+    int32_t ref_n = 0, ref_sr = 0;
+    if (!a.ref_audio.empty()) {
+        codec_common::audio_lm_input in;
+        in.text = a.text;
+        if (!load_ref_audio(a, in, ref_pcm)) return false;
+        if (in.ref_pcm != nullptr) {
+            // The Chatterbox VE expects 16 kHz mono; linearly resample.
+            const int32_t target_sr = 16000;
+            if (in.ref_sample_rate != target_sr && in.ref_sample_rate > 0) {
+                const int32_t n_in = (int32_t) ref_pcm.size();
+                const int64_t n_out = (int64_t) n_in * target_sr / in.ref_sample_rate;
+                std::vector<float> rs((size_t) n_out);
+                for (int64_t i = 0; i < n_out; ++i) {
+                    double src = (double) i * in.ref_sample_rate / target_sr;
+                    int64_t i0 = (int64_t) src;
+                    double f = src - i0;
+                    float a0 = ref_pcm[(size_t) std::min<int64_t>(i0, n_in - 1)];
+                    float a1 = ref_pcm[(size_t) std::min<int64_t>(i0 + 1, n_in - 1)];
+                    rs[(size_t) i] = (float) (a0 * (1.0 - f) + a1 * f);
+                }
+                ref_pcm.swap(rs);
+            }
+            ref_pcm_ptr = ref_pcm.data();
+            ref_n = (int32_t) ref_pcm.size();
+            ref_sr = 16000;
+            std::printf("chatterbox: using ref audio %s (%d samples @ 16000 Hz after resample)\n",
+                        a.ref_audio.c_str(), ref_n);
+        }
+    }
+
+    const int32_t cond_rows = ci->cond_rows;
+    const int32_t seq_len_cap = cond_rows + (n_text + 2) + 2;
+    const int32_t n_seq_cap = (cfg_weight > 0.0f) ? 2 : 1;
+    std::vector<float> prompt((size_t) seq_len_cap * n_seq_cap * hidden);
+    int32_t seq_len = 0, n_seq = 0;
+    if (codec_lm_chatterbox_build_prompt(
+            lm, text_ids.data(), n_text, cfg_weight,
+            nullptr, 0, nullptr, 0, nullptr,
+            ref_pcm_ptr, ref_n, ref_sr,
+            prompt.data(), seq_len_cap * n_seq_cap, &seq_len, &n_seq) != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "chatterbox build_prompt failed: %s\n", codec_lm_get_last_error(lm));
+        return false;
+    }
+    std::printf("chatterbox: prompt seq_len=%d n_seq=%d (%d rows total)\n",
+                seq_len, n_seq, seq_len * n_seq);
+
+    // Prefill: feed each lane's rows as its own llama sequence.  Logits
+    // requested only at the last row of each lane.
+    {
+        const int32_t total = seq_len * n_seq;
+        llama_batch b = llama_batch_init(total, hidden, 1);
+        b.token = nullptr;
+        b.n_tokens = total;
+        int32_t bi = 0;
+        for (int32_t s = 0; s < n_seq; ++s) {
+            for (int32_t r = 0; r < seq_len; ++r) {
+                std::memcpy(b.embd + (size_t) bi * hidden,
+                            prompt.data() + ((size_t) s * seq_len + r) * hidden,
+                            (size_t) hidden * sizeof(float));
+                b.pos[bi] = r;
+                b.n_seq_id[bi] = 1;
+                b.seq_id[bi][0] = s;
+                b.logits[bi] = (r == seq_len - 1) ? 1 : 0;
+                ++bi;
+            }
+        }
+        int rc = llama_decode(lctx, b);
+        llama_batch_free(b);
+        if (rc != 0) { std::fprintf(stderr, "chatterbox prefill decode failed\n"); return false; }
+    }
+
+    const int32_t V = ci->speech_vocab_size;
+    std::mt19937_64 rng(a.seed ? a.seed : 0xC0DEC1ABull);
+    std::vector<int32_t> generated;       // sampled ids incl BOS (for rep penalty)
+    generated.push_back(ci->start_speech_token);
+    int32_t n_past = seq_len;             // both lanes share the same length
+
+    // The backbone's own lm_head is a vocab=8 placeholder — the real speech
+    // logits come from applying the T3 speech_head (lm.heads_0) to the
+    // backbone hidden.  codec_common's step machine does exactly that.
+    // Lane batch indices for the last row: lane s's last-row output is the
+    // (s+1)-th flagged output → read via llama_get_embeddings_ith at the
+    // last row's batch position.
+    auto lane_hidden = [&](int32_t lane) -> const float * {
+        // Last row of lane `lane`: batch index lane*seq_len + (seq_len-1)
+        // on prefill; on per-step decode each lane contributes one row so
+        // the index is just `lane` there.  We pass the absolute output
+        // index; llama maps it via output_ids.
+        return llama_get_embeddings_ith(lctx, -(n_seq - lane));
+    };
+    // On prefill both lanes' last rows are the only flagged outputs, in
+    // lane order → lane 0 = ith(-2 or -1), lane 1 = ith(-1).  After a
+    // per-step decode of n_seq rows (all flagged) the same holds.
+    auto speech_logits = [&](const float * h, std::vector<float> * out) -> bool {
+        if (!codec_common::audio_lm_step_begin(ctx, h, hidden)) return false;
+        int32_t cb = 0, nlog = 0;
+        const float * lg = codec_common::audio_lm_step_logits(ctx, &cb, &nlog);
+        if (!lg || nlog <= 0) return false;
+        out->assign(lg, lg + nlog);
+        // Close the step without accumulating (we manage codes ourselves).
+        codec_common::audio_lm_step_push_code(ctx, 0);
+        int32_t dummy = 0;
+        codec_common::audio_lm_step_finish(ctx, &dummy, 1);
+        return true;
+    };
+
+    for (int32_t step = 0; step < max_frames; ++step) {
+        const float * hc = lane_hidden(0);
+        const float * hu = (n_seq == 2) ? lane_hidden(1) : nullptr;
+        if (!hc) { std::fprintf(stderr, "no hidden at step %d\n", step); return false; }
+        std::vector<float> cond, uncond;
+        if (!speech_logits(hc, &cond)) {
+            std::fprintf(stderr, "speech_head (cond) failed: %s\n", codec_common::audio_lm_last_error(ctx));
+            return false;
+        }
+        if (hu && !speech_logits(hu, &uncond)) {
+            std::fprintf(stderr, "speech_head (uncond) failed\n"); return false;
+        }
+        const int32_t VV = (int32_t) cond.size();
+        std::vector<float> logits(VV);
+        for (int32_t i = 0; i < VV; ++i)
+            logits[i] = hu ? (cond[i] + cfg_weight * (cond[i] - uncond[i])) : cond[i];
+        int32_t code = sample_t3(rng, std::move(logits), generated,
+                                 temperature, min_p, top_p, rep_pen);
+        (void) V;
+        generated.push_back(code);
+        if (code == ci->stop_speech_token) { *out_stop = "eos_code_c0"; break; }
+        // Real speech codes are < start_speech_token (6561); ignore control
+        // codes in the output stream (drop_invalid_tokens + <6561 filter).
+        if (code < ci->start_speech_token) out_codes->push_back(code);
+        (*out_frames)++;
+
+        // Next backbone input: speech_emb[code] + speech_pos_emb[step+1],
+        // fed to both lanes.
+        std::vector<float> nb(hidden);
+        if (codec_lm_chatterbox_compose_speech_embd(lm, code, step + 1, nb.data(), hidden)
+                != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "compose_speech_embd failed: %s\n", codec_lm_get_last_error(lm));
+            return false;
+        }
+        std::vector<float> row((size_t) n_seq * hidden);
+        for (int32_t s = 0; s < n_seq; ++s)
+            std::memcpy(row.data() + (size_t) s * hidden, nb.data(), (size_t) hidden * sizeof(float));
+        if (!decode_embed_batch(lctx, row.data(), hidden, n_seq, n_past)) {
+            std::fprintf(stderr, "chatterbox step decode failed\n"); return false;
+        }
+        ++n_past;
+    }
+    return true;
+}
+
 }  // namespace
 
 int cmd_synthesize(const args & a) {
@@ -705,11 +983,22 @@ int cmd_synthesize(const args & a) {
         llama_model_free(lmodel); codec_common::audio_lm_free(ctx); llama_backend_free();
         return 4;
     }
+    // Chatterbox T3 detection: the codec_lm carries a `codec.lm.chatterbox.*`
+    // section.  Its flow (embd prompt + CFG dual-sequence + own tokenizer)
+    // diverges from the generic token-prompt flows, so route it separately.
+    codec_lm * lm_handle = codec_common::audio_lm_get_lm(ctx);
+    const codec_lm_chatterbox_info * cbx =
+        lm_handle ? codec_lm_chatterbox_get_info(lm_handle) : nullptr;
+    const bool is_chatterbox = (cbx != nullptr);
+    const float cbx_cfg = a.cfg_weight ? *a.cfg_weight : 0.5f;
+    const int32_t cbx_n_seq = (is_chatterbox && cbx_cfg > 0.0f) ? 2 : 1;
+
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : 512;
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx        = (uint32_t) std::max(4096, max_frames + 256);
+    cp.n_ctx        = (uint32_t) std::max(4096, max_frames + 512);
     cp.n_batch      = cp.n_ctx;
     cp.n_ubatch     = cp.n_ctx;
+    cp.n_seq_max    = (uint32_t) cbx_n_seq;
     cp.embeddings   = true;
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
     if (a.n_threads > 0) { cp.n_threads = a.n_threads; cp.n_threads_batch = a.n_threads; }
@@ -720,6 +1009,60 @@ int cmd_synthesize(const args & a) {
         return 4;
     }
     const llama_vocab * vocab = llama_model_get_vocab(lmodel);
+
+    // ── Chatterbox T3 flow (Flow 4) ───────────────────────────────────
+    if (is_chatterbox) {
+        std::vector<int32_t> speech_codes;
+        int32_t n_frames = 0;
+        const char * stop_reason = "max_frames";
+        bool ok = run_chatterbox(ctx, lctx, lm_handle, cbx, a, hidden, max_frames,
+                                 &speech_codes, &n_frames, &stop_reason);
+        llama_free(lctx);
+        llama_model_free(lmodel);
+        llama_backend_free();
+        if (!ok) {
+            std::fprintf(stderr, "chatterbox AR failed: %s\n", codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+        std::printf("chatterbox AR done: %d frames, %zu speech codes, stop=%s\n",
+                    n_frames, speech_codes.size(), stop_reason);
+        if (speech_codes.empty()) {
+            std::fprintf(stderr, "no speech codes generated\n");
+            codec_common::audio_lm_free(ctx);
+            return 7;
+        }
+        // The per-step speech_head calls ran through the step machine,
+        // which accumulated placeholder codes into the context.  Clear
+        // that before pushing the real speech codes for decode.
+        codec_common::audio_lm_reset(ctx);
+        // Push codes (n_q=1) and decode through Chatterbox-S3G.
+        if (!codec_common::audio_lm_push_codes(ctx, speech_codes.data(),
+                                               (int32_t) speech_codes.size(), 1)) {
+            std::fprintf(stderr, "push_codes failed: %s\n", codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 8;
+        }
+        codec_common::audio_lm_audio_output pcm;
+        if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
+            std::fprintf(stderr, "decode_audio failed: %s\n", codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 8;
+        }
+        std::string wav_err;
+        const int32_t nsamp = (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels);
+        if (!codec_example_write_wav_pcm16(a.output.c_str(), pcm.pcm.data(), nsamp,
+                                           pcm.sample_rate, &wav_err, pcm.n_channels)) {
+            std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+            codec_common::audio_lm_free(ctx);
+            return 9;
+        }
+        const double secs = (double) nsamp / (double) (pcm.sample_rate > 0 ? pcm.sample_rate : 1);
+        std::printf("wrote %s: %d samples @ %d Hz (%.2fs, %d ch)\n",
+                    a.output.c_str(), nsamp, pcm.sample_rate, secs, pcm.n_channels);
+        codec_common::audio_lm_free(ctx);
+        return 0;
+    }
 
     // ── Prompt tokenize + prefill ─────────────────────────────────
     std::vector<llama_token> toks = tokenize_prompt(vocab, pi, a.text);

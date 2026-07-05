@@ -361,6 +361,10 @@ const char * audio_lm_last_error(const audio_lm_context * ctx) {
     return ctx ? ctx->last_error.c_str() : "";
 }
 
+struct codec_lm * audio_lm_get_lm(audio_lm_context * ctx) {
+    return ctx ? ctx->lm : nullptr;
+}
+
 // =====================================================================
 // Prompt build
 //

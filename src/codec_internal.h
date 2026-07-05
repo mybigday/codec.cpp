@@ -147,6 +147,7 @@ void codec_read_i32_array_kv_vec(gguf_context * gf, const char * key, std::vecto
 void codec_read_f32_array_kv(gguf_context * gf, const char * key, float * dst, int32_t dst_n);
 float codec_read_f32_kv(gguf_context * gf, const char * key, float fallback);
 bool codec_read_bool_kv(gguf_context * gf, const char * key, bool fallback);
+std::string codec_read_str_kv(gguf_context * gf, const char * key, const char * fallback);
 int codec_count_tensors_with_prefix(const codec_model * model, const char * prefix);
 int32_t codec_infer_n_q_from_tensor_names(const codec_model * model);
 

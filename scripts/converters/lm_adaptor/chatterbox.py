@@ -86,6 +86,8 @@ Metadata (codec.lm.*):
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -210,11 +212,128 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
         _emit(writer, f"lm.chatterbox.cond.perceiver.{suf}",
               _require(sd, f"cond_enc.perceiver.attn.{suf}"))
 
+    # ---- tokenizer (EnTokenizer BPE) + builtin conditioning ----------
+    # Both live next to the T3 checkpoint (the ResembleAI Chatterbox dir).
+    # Baking them into the GGUF lets the runtime tokenize English text and
+    # synthesise from a builtin voice with no external files (the
+    # equivalent of ChatterboxTTS + conds.pt).
+    src_dir = cfg.get("chatterbox_source_dir")
+    if src_dir:
+        _dump_tokenizer(writer, Path(src_dir), verbose=verbose)
+        _dump_builtin_conds(writer, Path(src_dir), verbose=verbose)
+
     if verbose:
         print(f"[lm_adaptor:chatterbox] parallel_heads_delay: "
               f"n_codebook=1 hidden={HIDDEN_DIM} "
               f"text_vocab={text_vocab} (multilingual={is_multilingual}) "
               f"speech_vocab={SPEECH_VOCAB_SIZE}")
+
+
+def _dump_tokenizer(writer, src_dir: Path, *, verbose: bool = False) -> None:
+    """Bake the EnTokenizer BPE (tokenizer.json) into GGUF metadata.
+
+    English Chatterbox uses a small HF `tokenizers` BPE: Whitespace
+    pre-tokenizer, no normalizer, `continuing_subword_prefix=""`,
+    `end_of_word_suffix=""`.  The runtime replays it as: replace ' ' with
+    the `[SPACE]` added token, split on the Whitespace regex
+    (`\\w+|[^\\w\\s]+`, extracting added-token strings first), then greedy
+    rank-based BPE merges.  We store the vocab (token strings, id-ordered)
+    and merge rules so the C++ side needs no HF dependency.
+    """
+    tok_path = src_dir / "tokenizer.json"
+    if not tok_path.is_file():
+        if verbose:
+            print(f"[lm_adaptor:chatterbox] no tokenizer.json at {tok_path} — skipping")
+        return
+    with open(tok_path, "r", encoding="utf-8") as f:
+        tj = json.load(f)
+    model = tj.get("model", {})
+    if model.get("type") != "BPE":
+        raise RuntimeError(f"chatterbox tokenizer: unexpected model type {model.get('type')!r}")
+
+    vocab: Dict[str, int] = model.get("vocab", {})
+    n_vocab = len(vocab)
+    # id-ordered token strings
+    id_to_tok = [""] * n_vocab
+    for tok, tid in vocab.items():
+        if 0 <= tid < n_vocab:
+            id_to_tok[tid] = tok
+    # merges: list of "a b" (or ["a","b"] in newer tokenizers.json)
+    merges_raw = model.get("merges", [])
+    merges: list[str] = []
+    for m in merges_raw:
+        if isinstance(m, (list, tuple)):
+            merges.append(f"{m[0]} {m[1]}")
+        else:
+            merges.append(str(m))
+    # added tokens (special atoms extracted before BPE, e.g. [SPACE])
+    added = tj.get("added_tokens", [])
+    added_content = [a["content"] for a in added]
+    added_ids = [int(a["id"]) for a in added]
+
+    # The project's GGUF writer only supports numeric arrays, so token
+    # strings + merge rules are stored as newline-joined blobs (tokens are
+    # single-line each; '\n' never appears in this vocab).  The runtime
+    # splits on '\n' to recover the id-ordered vocab and the merge list.
+    writer.add_string ("codec.lm.chatterbox.tokenizer.model", "bpe")
+    writer.add_uint32 ("codec.lm.chatterbox.tokenizer.n_vocab", n_vocab)
+    writer.add_string ("codec.lm.chatterbox.tokenizer.tokens", "\n".join(id_to_tok))
+    writer.add_string ("codec.lm.chatterbox.tokenizer.merges", "\n".join(merges))
+    # Added tokens as "content\tid" pairs, newline-joined.
+    writer.add_string ("codec.lm.chatterbox.tokenizer.added",
+                       "\n".join(f"{c}\t{i}" for c, i in zip(added_content, added_ids)))
+    unk = model.get("unk_token")
+    if unk is not None:
+        writer.add_string("codec.lm.chatterbox.tokenizer.unk_token", str(unk))
+    if verbose:
+        print(f"[lm_adaptor:chatterbox] tokenizer: {n_vocab} tokens, "
+              f"{len(merges)} merges, {len(added_content)} added")
+
+
+def _dump_builtin_conds(writer, src_dir: Path, *, verbose: bool = False) -> None:
+    """Bake the T3 builtin speaker conditioning (conds.pt `t3` dict) so the
+    runtime can synthesise with a default voice and no ref audio.
+
+    conds.t3 carries: speaker_emb (1,256), cond_prompt_speech_tokens
+    (1,150), emotion_adv (1,1,1).  These feed `chatterbox_speaker_encode_
+    from_emb` (spkr_enc | perceiver(speech_emb(prompt)+pos) | emotion) to
+    produce the (34,1024) cond prefix.
+    """
+    conds_path = src_dir / "conds.pt"
+    if not conds_path.is_file():
+        if verbose:
+            print(f"[lm_adaptor:chatterbox] no conds.pt at {conds_path} — skipping builtin conds")
+        return
+    try:
+        import torch
+    except ImportError:
+        if verbose:
+            print("[lm_adaptor:chatterbox] torch unavailable — skipping builtin conds")
+        return
+    obj = torch.load(str(conds_path), map_location="cpu", weights_only=False)
+    t3 = obj["t3"] if isinstance(obj, dict) else getattr(obj, "t3", None)
+    if t3 is None:
+        return
+    def _get(d, k):
+        return d[k] if isinstance(d, dict) else getattr(d, k, None)
+    spk   = _get(t3, "speaker_emb")
+    toks  = _get(t3, "cond_prompt_speech_tokens")
+    emo   = _get(t3, "emotion_adv")
+    if spk is None or toks is None:
+        return
+    spk_np  = spk.detach().cpu().float().numpy().reshape(-1)             # (256,)
+    toks_np = toks.detach().cpu().to(torch.int64).numpy().reshape(-1)    # (150,)
+    emo_f   = float(emo.reshape(-1)[0].item()) if emo is not None else 0.5
+
+    writer.add_bool   ("codec.lm.chatterbox.has_builtin_conds", True)
+    writer.add_array  ("codec.lm.chatterbox.builtin.speaker_emb",
+                       [float(x) for x in spk_np.tolist()])
+    writer.add_array  ("codec.lm.chatterbox.builtin.cond_prompt_speech_tokens",
+                       [int(x) for x in toks_np.tolist()])
+    writer.add_float32("codec.lm.chatterbox.builtin.emotion_adv", emo_f)
+    if verbose:
+        print(f"[lm_adaptor:chatterbox] builtin conds: speaker_emb={spk_np.shape} "
+              f"cond_prompt_tokens={toks_np.shape} emotion={emo_f:.3f}")
 
 
 # ---------------------------------------------------------------------

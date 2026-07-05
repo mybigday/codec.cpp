@@ -579,6 +579,98 @@ enum codec_status codec_lm_speaker_encode_from_embedding(
     float *                    out,
     int32_t                    out_n_elems);
 
+// ─── Chatterbox T3 host-orchestration helpers ───────────────────────
+// T3 is an embd-driven Llama backbone: the host owns the llama.cpp
+// decode loop; these helpers supply the T3-specific pieces (tokenizer,
+// prompt embeds, per-step speech embeds) that live on the codec.cpp
+// side.  All return CODEC_STATUS_NOT_SUPPORTED when the loaded model is
+// not a Chatterbox T3 adaptor (no `codec.lm.chatterbox.*` metadata).
+
+// Static config surfaced from `codec.lm.chatterbox.*` metadata.
+struct codec_lm_chatterbox_info {
+    int32_t hidden_dim;             // 1024
+    int32_t text_vocab_size;        // 704 (en) / 2454 (mtl)
+    int32_t speech_vocab_size;      // 8194
+    int32_t start_text_token;       // 255
+    int32_t stop_text_token;        // 0
+    int32_t start_speech_token;     // 6561
+    int32_t stop_speech_token;      // 6562
+    int32_t cond_rows;              // cond_enc output rows (34)
+    int32_t has_tokenizer;          // 1 if BPE tokenizer baked into GGUF
+    int32_t has_builtin_conds;      // 1 if builtin speaker conditioning baked
+    int32_t is_multilingual;        // 1 for the 2454-vocab variants
+};
+
+// Returns the chatterbox info, or NULL if the model is not a T3 adaptor.
+const struct codec_lm_chatterbox_info *
+codec_lm_chatterbox_get_info(struct codec_lm * lm);
+
+// Tokenize `text` with the baked EnTokenizer BPE (punc_norm applied
+// internally, mirroring ChatterboxTTS.generate).  Writes token ids into
+// `out_ids` (capacity `cap`); sets `*n_out` to the count.  Does NOT add
+// the start/stop text tokens — the host wraps those.  Returns
+// CODEC_STATUS_NOT_SUPPORTED if no tokenizer is baked.
+enum codec_status codec_lm_chatterbox_tokenize(
+    struct codec_lm * lm,
+    const char *      text,
+    int32_t *         out_ids,
+    int32_t           cap,
+    int32_t *         n_out);
+
+// Build the full backbone-input embed prefix for T3 inference:
+//   [ cond_emb (cond_rows) | text_emb+text_pos_emb (n_text_wrapped) | BOS ]
+// The caller passes RAW text ids (without start/stop text tokens); this
+// helper prepends start_text_token, appends stop_text_token, adds
+// text_pos_emb, then appends the speech BOS
+// (start_speech_token @ speech_pos_emb[0]).
+//
+// When `cfg_weight > 0` two rows are produced (cond, then uncond): the
+// uncond row is identical except its text-embedding content is zeroed
+// (text_pos_emb preserved), matching T3's `text_emb[1].zero_()`.  The
+// output is laid out row-major as `[n_rows_total × hidden]` where
+// n_rows_total = n_seq * (cond_rows + n_text_wrapped + 1) and n_seq is
+// 2 when cfg_weight>0 else 1.  `*out_seq_len` = per-sequence row count.
+//
+// Conditioning source: if `speaker_emb`!=NULL it is used (with
+// `ref_speech_tokens`/`emotion`); otherwise the builtin conds baked
+// into the GGUF are used (requires has_builtin_conds).
+// Conditioning source precedence:
+//   1. `ref_pcm` (mono F32, `ref_sample_rate`) → run the voice encoder
+//      (VE) + cond_enc to derive the speaker prefix from reference audio.
+//      The cond-prompt speech tokens come from `ref_speech_tokens` if
+//      given, else the builtin prompt tokens.
+//   2. else `speaker_emb` (256-d) → cond_enc from a cached embedding.
+//   3. else the builtin conds baked into the GGUF (has_builtin_conds).
+enum codec_status codec_lm_chatterbox_build_prompt(
+    struct codec_lm * lm,
+    const int32_t *   text_ids,
+    int32_t           n_text,
+    float             cfg_weight,
+    const float *     speaker_emb,          // NULL → builtin/ref
+    int32_t           speaker_emb_dim,
+    const int32_t *   ref_speech_tokens,    // NULL → builtin
+    int32_t           n_ref_speech_tokens,
+    const float *     emotion,              // NULL → builtin/default
+    const float *     ref_pcm,              // NULL → no ref audio
+    int32_t           ref_n_samples,
+    int32_t           ref_sample_rate,
+    float *           out_embeds,
+    int32_t           out_cap_rows,         // capacity in rows
+    int32_t *         out_seq_len,          // per-sequence rows
+    int32_t *         out_n_seq);           // 1 or 2 (CFG)
+
+// Compose the next backbone-input speech embed for AR step `pos`:
+//   speech_emb[code] + speech_pos_emb[pos].
+// `pos` is the speech-position index: BOS is 0, the first generated
+// token is 1, etc.  When CFG is active the host feeds the same embed to
+// both lanes.  Writes `hidden` floats to `out`.
+enum codec_status codec_lm_chatterbox_compose_speech_embd(
+    struct codec_lm * lm,
+    int32_t           code,
+    int32_t           pos,
+    float *           out,
+    int32_t           out_cap);
+
 #ifdef __cplusplus
 }
 #endif
