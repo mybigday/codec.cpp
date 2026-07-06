@@ -275,6 +275,38 @@ def main():
         require_stop=True, cer_report_only=False,
     ))
 
+    # Qwen3-TTS with a 48 kHz reference clip.  The ECAPA-TDNN speaker encoder
+    # works at 24 kHz (codec.speaker.ref_sample_rate); arbitrary --ref-audio
+    # rates (24k/44.1k/48k) must be resampled to that rate before the encode
+    # (audio_lm_build_prompt does this).  Regression guard for the bug where a
+    # non-24k ref wav hit "sample_rate mismatch" and aborted synthesize (→
+    # silence).  test.wav is 24 kHz; make a 48 kHz copy on the fly.
+    q3_ref48 = Path("/tmp") / "ttscli_qwen3_ref48k.wav"
+    try:
+        import soundfile as sf
+        import librosa as _lb
+        _x, _sr = sf.read(str(REPO / "test.wav"))
+        if _x.ndim > 1:
+            _x = _x.mean(axis=1)
+        _x48 = _lb.resample(_x.astype(np.float32), orig_sr=_sr, target_sr=48000)
+        sf.write(str(q3_ref48), _x48, 48000, subtype="PCM_16")
+        _have48 = True
+    except Exception as _e:
+        print(f"[skip] qwen3_tts_ref48k: could not build 48k ref ({_e})")
+        _have48 = False
+    if _have48:
+        results.append(_case(
+            "qwen3_tts_ref48k",
+            REPO / "models" / "qwen3_tts" / "qwen3_tts_06b_base.gguf",
+            REPO / "models" / "qwen3_tts" / "qwen3_tts_talker.gguf",
+            "你好，欢迎使用语音合成。",
+            "zh", want_stop="eos_code_c0", cer_max=0.3,
+            extra=["--ref-audio", str(q3_ref48),
+                   "--temp", "0.9", "--top-k", "50", "--seed", "42",
+                   "--max-frames", "300"],
+            require_stop=True, cer_report_only=False,
+        ))
+
     # LFM2-Audio-1.5B — sequential text→audio TTS (residual depth-AR, 8 Mimi
     # codebooks).  The backbone (lfm2 arch) first free-runs in TEXT modality
     # off its tied-embedding lm_head; the "Perform TTS. Use the US male voice."
