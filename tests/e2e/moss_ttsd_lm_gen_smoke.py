@@ -90,7 +90,11 @@ def hf_reference(prompt_text: str, max_frames: int):
     base = model.model
     n_cb       = model.config.channels
     speech_pad = int(model.config.speech_pad_token)
-    text_eos   = int(model.config.eos_token_id)
+    # HF generate() stops on generation_config.eos_token_id (152694), NOT the
+    # plain-text config.json eos (151643) - the converter bakes the former into
+    # codec.lm.eos_code_c0 (see lm_adaptor: generation_config preferred).
+    gen_eos = getattr(model.generation_config, "eos_token_id", None)
+    text_eos   = int(gen_eos if gen_eos is not None else model.config.eos_token_id)
 
     text_ids = tok(prompt_text, return_tensors="pt").input_ids[0]
     seq_len  = int(text_ids.shape[0])

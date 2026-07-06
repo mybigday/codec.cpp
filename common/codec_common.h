@@ -418,6 +418,29 @@ struct audio_lm_prompt_info {
     float   default_temperature = 0.0f;
     float   default_top_p       = 0.0f;
     int32_t default_top_k       = 0;
+
+    // ── Streaming text↔audio interleave (MOSS-TTS-Realtime) ─────────────
+    // When true the per-backbone-step input is composed as
+    //   text_embd[text_token] + compose_audio_embd(prev_frame_codes)
+    // where the text lane is fed one token per audio frame (the reference's
+    // streaming loop) rather than all text at prefill.  The spoken text
+    // goes in the ASSISTANT turn as a `text_prefix`: the host prefills the
+    // system+user+assistant-open context, then the first `prefill_text_len`
+    // text tokens (audio lanes = audio_pad_code, the LAST prefill row's cb0
+    // lane = bos_code_c0), and thereafter steps 1:1, filling the text lane
+    // with `text_pad_id` once the text is exhausted, until cb0 == eos_code_c0.
+    // The text embedding table lives in the backbone (not the codec), so the
+    // host adds it externally on top of compose_audio_embd — see
+    // `text_externally_added`.
+    bool    streaming_interleave  = false;
+    bool    text_externally_added = false;  // host adds text_embd[tok] on top
+                                            // of compose_audio_embd
+    int32_t prefill_text_len      = 12;     // text tokens before audio opens
+    int32_t text_pad_id           = -1;     // text lane fill once text ends
+    int32_t audio_pad_code        = -1;     // audio lane fill during text-only
+    int32_t bos_code_c0           = -1;     // audio BOS in last prefill row cb0
+    float   default_repetition_penalty = 1.0f;
+    int32_t repetition_window          = 0;
 };
 
 // Fill `*out` from the loaded model's metadata.  Returns false + sets
@@ -462,6 +485,20 @@ bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
                                   int32_t            text_token,
                                   float *            out_embd,
                                   int32_t            out_dim);
+
+// ─── Audio-lane compose (streaming residual_depth_ar) ───────────────
+// Compose the audio-lane contribution of one backbone-step input from a
+// full frame of `n_codes` codebook codes (the fused compose_audio_embd:
+// Σ_k audio_embd_k[codes[k]]).  For MOSS-TTS-Realtime the text lane is
+// added by the host on top (text_externally_added).  Writes `out_dim`
+// (= hidden) floats.  Used to build the streaming prefill rows (audio-pad
+// codes, plus BOS in the last row's cb0) and — equivalently to
+// audio_lm_get_next_embed — the per-step previous-frame audio embed.
+bool audio_lm_compose_audio_codes_embd(audio_lm_context * ctx,
+                                       const int32_t *    codes,
+                                       int32_t            n_codes,
+                                       float *            out_embd,
+                                       int32_t            out_dim);
 
 // ─────────────────────────────────────────────────────────────────────
 // Qwen3-TTS talker prompt assembly.

@@ -252,6 +252,17 @@ def _dump_realtime(writer, sd: Dict[str, np.ndarray],
         if k in cfg:
             writer.add_uint32(f"codec.lm.{k}", int(cfg[k]))
 
+    # Streaming interleave params (streaming_mossttsrealtime.py):
+    #   prefill_text_len / delay_tokens_len = 12 — the driver prefills this
+    #   many assistant text tokens before opening the audio channel (audio
+    #   BOS goes in the last prefill row's codebook-0 lane), then steps 1:1
+    #   (one text token per audio frame), filling the text lane with
+    #   `text_pad` once the text is exhausted.  Stored so the host doesn't
+    #   hardcode the constant.
+    prefill_text_len = int(cfg.get("delay_tokens_len",
+                                   cfg.get("prefill_text_len", 12)))
+    writer.add_uint32("codec.lm.compose.prefill_text_len", prefill_text_len)
+
     if verbose:
         print(f"[lm_adaptor:moss_tts_local:realtime] residual_depth_ar: "
               f"n_codebook={n_codebook} backbone_h={backbone_hid} "

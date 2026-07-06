@@ -844,6 +844,22 @@ static const char * meta_str(const audio_lm_context * ctx, const char * key) {
     return nullptr;
 }
 
+// Read an integer-valued KV (stored stringified) with a default fallback.
+static int32_t meta_i32_or(const audio_lm_context * ctx, const char * key,
+                           int32_t dflt) {
+    const char * v = meta_str(ctx, key);
+    if (v == nullptr || *v == '\0') return dflt;
+    return (int32_t) std::atoi(v);
+}
+
+// Read a bool-valued KV ("true"/"1" → true) with a default fallback.
+static bool parse_bool_meta(const audio_lm_context * ctx, const char * key,
+                            bool dflt) {
+    const char * v = meta_str(ctx, key);
+    if (v == nullptr || *v == '\0') return dflt;
+    return v[0] == 't' || v[0] == 'T' || v[0] == '1';
+}
+
 bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
                               audio_lm_prompt_info    * out) {
     if (ctx == nullptr || out == nullptr) return false;
@@ -945,6 +961,14 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
             const bool is_realtime = is_depth && c0mod &&
                                      std::strcmp(c0mod, "none") == 0;
             if (is_realtime) {
+                // Streaming interleave: the spoken text is fed one token per
+                // audio frame into the ASSISTANT turn (the system prompt says
+                // "based on the text given in the assistant").  The context
+                // prefix is the system prompt + an empty user turn + the
+                // assistant opener; the spoken text is NOT baked into it —
+                // the host streams it through the composed per-step input.
+                // (processing_mossttsrealtime.py tts_system_prompt +
+                //  streaming_mossttsrealtime.py prefill/step.)
                 out->prompt_prefix =
                     "<|im_start|>system\nYou are a highly expressive "
                     "text-to-speech (TTS) engine developed by Mosi "
@@ -957,6 +981,23 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
                     "<|im_end|>\n<|im_start|>assistant\n";
                 out->add_bos       = false;
                 out->parse_special = true;
+
+                // Streaming interleave params (metadata-driven, with the
+                // reference constants as fallbacks).
+                out->streaming_interleave  = true;
+                out->text_externally_added =
+                    parse_bool_meta(ctx, "codec.lm.compose.text_externally_added", true);
+                out->prefill_text_len =
+                    meta_i32_or(ctx, "codec.lm.compose.prefill_text_len", 12);
+                out->text_pad_id    = meta_i32_or(ctx, "codec.lm.text_pad", 151655);
+                out->audio_pad_code = meta_i32_or(ctx, "codec.lm.audio_pad_token", 1024);
+                out->bos_code_c0    = meta_i32_or(ctx, "codec.lm.bos_code_c0", 1025);
+                // Reference streaming sampling defaults.
+                out->default_temperature = 0.8f;
+                out->default_top_p       = 0.6f;
+                out->default_top_k       = 30;
+                out->default_repetition_penalty = 1.1f;
+                out->repetition_window          = 50;
                 return true;
             }
         }
@@ -1078,6 +1119,35 @@ bool audio_lm_compose_prompt_embd(audio_lm_context * ctx,
     if (rc != CODEC_STATUS_SUCCESS) {
         const char * raw = codec_lm_get_last_error(ctx->lm);
         ctx->last_error = std::string("audio_lm_compose_prompt_embd: compose failed (")
+                           + (raw && *raw ? raw : "?") + ")";
+        return false;
+    }
+    return true;
+}
+
+bool audio_lm_compose_audio_codes_embd(audio_lm_context * ctx,
+                                       const int32_t *    codes,
+                                       int32_t            n_codes,
+                                       float *            out_embd,
+                                       int32_t            out_dim) {
+    if (ctx == nullptr || codes == nullptr || out_embd == nullptr) return false;
+    if (ctx->lm == nullptr) {
+        ctx->last_error = "audio_lm_compose_audio_codes_embd: no codec_lm adaptor";
+        return false;
+    }
+    if (out_dim < ctx->hidden) {
+        ctx->last_error = "audio_lm_compose_audio_codes_embd: out buffer smaller than hidden_dim";
+        return false;
+    }
+    if (n_codes != ctx->n_cb) {
+        ctx->last_error = "audio_lm_compose_audio_codes_embd: n_codes != n_codebook";
+        return false;
+    }
+    const enum codec_status rc =
+        codec_lm_compose_audio_embd(ctx->lm, codes, out_embd);
+    if (rc != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_lm_get_last_error(ctx->lm);
+        ctx->last_error = std::string("audio_lm_compose_audio_codes_embd: compose failed (")
                            + (raw && *raw ? raw : "?") + ")";
         return false;
     }

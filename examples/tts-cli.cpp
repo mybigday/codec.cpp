@@ -24,6 +24,8 @@
 
 #ifdef TTS_CLI_HAVE_BACKBONE
 #include "llama.h"
+#include "ggml.h"
+#include "gguf.h"
 #endif
 
 #include <algorithm>
@@ -315,11 +317,99 @@ int cmd_synthesize(const args & a) {
 
 namespace {
 
+// ── Backbone text-embedding table reader ──────────────────────────────
+// MOSS-TTS-Realtime composes each backbone-step input as
+//   text_embd[text_token] + compose_audio_embd(prev_frame_codes)
+// where the audio part lives in the codec_lm but the TEXT embedding table
+// (`token_embd.weight`, [hidden, V_text]) lives in the backbone GGUF.
+// llama.cpp exposes no raw-embedding API, so we mmap the backbone GGUF a
+// second time and dequant embedding rows on demand via ggml type traits
+// (handles bf16 / f16 / quantised transparently).
+struct TextEmbdTable {
+    gguf_context * gg   = nullptr;
+    ggml_context * meta = nullptr;   // holds tensor metadata (no_alloc)
+    const uint8_t * base = nullptr;  // mmapped tensor-data region
+    std::vector<uint8_t> blob;       // owns the file bytes
+    int64_t hidden = 0;
+    int64_t vocab  = 0;
+    ggml_type type = GGML_TYPE_F32;
+    size_t row_bytes = 0;
+    ggml_to_float_t to_float = nullptr;
+
+    bool load(const char * path, int32_t want_hidden, std::string & err) {
+        struct ggml_init_params ip = { /*mem_size*/ 0, /*mem_buffer*/ nullptr,
+                                       /*no_alloc*/ true };
+        gguf_init_params gp = { /*no_alloc*/ true, /*ctx*/ &meta };
+        gg = gguf_init_from_file(path, gp);
+        if (!gg) { err = "gguf_init_from_file failed"; return false; }
+        const int64_t tid = gguf_find_tensor(gg, "token_embd.weight");
+        if (tid < 0) { err = "token_embd.weight not found in backbone"; return false; }
+        ggml_tensor * t = ggml_get_tensor(meta, "token_embd.weight");
+        if (!t) { err = "token_embd metadata lookup failed"; return false; }
+        hidden = t->ne[0];
+        vocab  = t->ne[1];
+        type   = t->type;
+        if ((int32_t) hidden != want_hidden) {
+            err = "token_embd hidden mismatch"; return false;
+        }
+        const ggml_type_traits * tr = ggml_get_type_traits(type);
+        to_float = tr ? tr->to_float : nullptr;
+        // For a quantised type to_float works on a whole row (k = hidden,
+        // which must be a multiple of block size for legal types).
+        if (!to_float) { err = "no to_float for token_embd type"; return false; }
+        row_bytes = ggml_row_size(type, hidden);
+
+        // Read the whole file into `blob`, then point `base` at the tensor
+        // data region (data_offset within the file).
+        FILE * f = std::fopen(path, "rb");
+        if (!f) { err = "fopen backbone failed"; return false; }
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        blob.resize((size_t) sz);
+        size_t rd = std::fread(blob.data(), 1, (size_t) sz, f);
+        std::fclose(f);
+        if (rd != (size_t) sz) { err = "backbone read short"; return false; }
+        const size_t data_off = gguf_get_data_offset(gg);
+        const size_t t_off     = gguf_get_tensor_offset(gg, tid);
+        base = blob.data() + data_off + t_off;
+        return true;
+    }
+
+    // Dequant embedding row `token` into `out` (hidden floats).
+    bool row(int32_t token, float * out) const {
+        if (token < 0 || token >= (int32_t) vocab || !base || !to_float) return false;
+        const void * src = base + (size_t) token * row_bytes;
+        to_float(src, out, hidden);
+        return true;
+    }
+
+    ~TextEmbdTable() {
+        if (gg)   gguf_free(gg);
+        if (meta) ggml_free(meta);
+    }
+};
+
 // Minimal xorshift64* sampler mirroring rn-tts's sample_codec_logits:
 // temp<=0 → greedy argmax; else softmax(temp) → top-k → top-p → sample.
 struct Sampler {
     std::mt19937_64 rng;
     explicit Sampler(uint32_t seed) : rng(seed ? seed : 0xC0DEC1ABull) {}
+
+    // Apply CTRL-style repetition penalty in place over `history` codes
+    // (mutates a caller-owned logits copy).  Mirrors
+    // streaming_mossttsrealtime.py apply_repetition_penalty.
+    static void apply_rep_penalty(float * logits, int32_t n,
+                                  const int32_t * history, int32_t n_hist,
+                                  float penalty) {
+        if (penalty == 1.0f || n_hist <= 0) return;
+        for (int32_t i = 0; i < n_hist; ++i) {
+            const int32_t tok = history[i];
+            if (tok < 0 || tok >= n) continue;
+            float v = logits[tok];
+            logits[tok] = (v < 0.0f) ? v * penalty : v / penalty;
+        }
+    }
 
     int32_t sample(const float * logits, int32_t n, float temp, float top_p, int32_t top_k) {
         if (n <= 0) return 0;
@@ -489,6 +579,176 @@ bool run_continuous(codec_common::audio_lm_context * ctx, llama_context * lctx,
         if (!fb || dim != hidden) return false;
         std::vector<float> fbc(fb, fb + dim);
         if (!decode_embed(lctx, fbc.data(), dim, n_past++)) return false;
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (!h) return false;
+        std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
+    }
+    return true;
+}
+
+// Decode a contiguous block of `n` inputs_embeds rows (single sequence),
+// flagging only the last for logits.  Rows are `n * dim` floats.
+bool decode_embed_block(llama_context * lctx, const float * embds, int32_t dim,
+                        int32_t n, int32_t n_past) {
+    if (n <= 0) return true;
+    llama_batch b = llama_batch_init(n, dim, 1);
+    std::memcpy(b.embd, embds, (size_t) n * dim * sizeof(float));
+    b.token = nullptr;
+    for (int32_t i = 0; i < n; ++i) {
+        b.pos[i] = n_past + i;
+        b.n_seq_id[i] = 1;
+        b.seq_id[i][0] = 0;
+        b.logits[i] = (i == n - 1) ? 1 : 0;
+    }
+    b.n_tokens = n;
+    int rc = llama_decode(lctx, b);
+    llama_batch_free(b);
+    return rc == 0;
+}
+
+// Flow 3-streaming — MOSS-TTS-Realtime.  The reference is a STREAMING model
+// (streaming_mossttsrealtime.py): text is interleaved one token per audio
+// frame rather than fed all at prefill.  Per backbone step the input embed
+// is  text_embd[text_token] + compose_audio_embd(prev_frame_codes)  where
+// the text table lives in the backbone (TextEmbdTable) and the audio sum in
+// the codec_lm.  The spoken text goes in the ASSISTANT turn.
+//
+// Phases (prefill_text_len = 12 by default):
+//   1. Prefill the system+user+assistant-open context (text lane = token,
+//      audio lanes = audio_pad → zero embed), then the first
+//      min(12, |text|) spoken-text rows (audio lanes = audio_pad; the LAST
+//      prefill row's cb0 lane = audio BOS).  → 1 audio frame.
+//   2. Stream: one spoken-text token per step, summed with the previous
+//      frame's audio compose.  → 1 frame/step.
+//   3. Drain: text lane = text_pad once text is exhausted, until cb0 == EOS
+//      or max_frames.
+bool run_realtime_streaming(codec_common::audio_lm_context * ctx,
+                            llama_context * lctx, const llama_vocab * vocab,
+                            const codec_common::audio_lm_prompt_info & pi,
+                            const TextEmbdTable & tetab,
+                            const std::string & payload_text,
+                            int32_t hidden, int32_t n_cb, int32_t max_frames,
+                            Sampler & sampler, float temp, float top_p,
+                            int32_t top_k, float rep_penalty, int32_t rep_window,
+                            int32_t * out_frames, const char ** out_stop) {
+    codec_common::audio_lm_set_uses_embed_override(ctx, true, 1);
+
+    // ── Tokenize context (system + empty user + assistant opener) and the
+    //    spoken text (assistant lane, streamed). ────────────────────────
+    std::vector<llama_token> ctx_toks =
+        tokenize_str(vocab, pi.prompt_prefix + pi.prompt_suffix,
+                     pi.add_bos, pi.parse_special);
+    std::vector<llama_token> text_toks =
+        tokenize_str(vocab, payload_text, /*add_bos=*/false, /*parse_special=*/false);
+    if (ctx_toks.empty() || text_toks.empty()) {
+        std::fprintf(stderr, "realtime: empty context or text tokens\n");
+        return false;
+    }
+
+    const int32_t audio_pad = pi.audio_pad_code;
+    const int32_t bos_c0    = pi.bos_code_c0;
+    const int32_t text_pad  = pi.text_pad_id;
+    const int32_t prefill_n = std::min<int32_t>(pi.prefill_text_len,
+                                                (int32_t) text_toks.size());
+
+    // Compose one row: text_embd[text_tok] + compose_audio_embd(codes).
+    std::vector<int32_t> pad_codes((size_t) n_cb, audio_pad);
+    auto compose_row = [&](int32_t text_tok, const int32_t * codes,
+                           float * dst) -> bool {
+        if (!tetab.row(text_tok, dst)) {
+            std::fprintf(stderr, "realtime: text_embd row %d failed\n", text_tok);
+            return false;
+        }
+        std::vector<float> aud((size_t) hidden, 0.0f);
+        if (!codec_common::audio_lm_compose_audio_codes_embd(
+                ctx, codes, n_cb, aud.data(), hidden)) {
+            std::fprintf(stderr, "realtime: compose_audio failed: %s\n",
+                         codec_common::audio_lm_last_error(ctx));
+            return false;
+        }
+        for (int32_t i = 0; i < hidden; ++i) dst[i] += aud[i];
+        return true;
+    };
+
+    // ── Build the prefill block: context rows + prefill_n spoken-text rows.
+    const int32_t n_rows = (int32_t) ctx_toks.size() + prefill_n;
+    std::vector<float> block((size_t) n_rows * hidden);
+    int32_t r = 0;
+    for (size_t i = 0; i < ctx_toks.size(); ++i, ++r) {
+        // context: audio lanes are all pad → zero embed contribution.
+        if (!compose_row(ctx_toks[i], pad_codes.data(),
+                         block.data() + (size_t) r * hidden)) return false;
+    }
+    for (int32_t i = 0; i < prefill_n; ++i, ++r) {
+        // last prefill row opens the audio channel: cb0 lane = BOS.
+        std::vector<int32_t> codes = pad_codes;
+        if (i == prefill_n - 1) codes[0] = bos_c0;
+        if (!compose_row(text_toks[(size_t) i], codes.data(),
+                         block.data() + (size_t) r * hidden)) return false;
+    }
+    if (!decode_embed_block(lctx, block.data(), hidden, n_rows, 0)) {
+        std::fprintf(stderr, "realtime: prefill decode failed\n");
+        return false;
+    }
+    int32_t n_past = n_rows;
+
+    std::vector<float> cur(hidden);
+    {
+        const float * h0 = llama_get_embeddings_ith(lctx, -1);
+        if (!h0) return false;
+        std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
+    }
+
+    // Per-codebook history for the CTRL repetition penalty (last frames).
+    std::vector<std::vector<int32_t>> hist((size_t) n_cb);
+
+    // text_idx = next spoken-text token to feed (prefill consumed [0,prefill_n)).
+    int32_t text_idx = prefill_n;
+    std::vector<int32_t> codes(n_cb);
+    for (int32_t step = 0; step < max_frames; ++step) {
+        // ── Depth-decode the frame from the current backbone hidden. ─────
+        if (!codec_common::audio_lm_step_begin(ctx, cur.data(), hidden)) return false;
+        for (int32_t cb = 0; cb < n_cb; ++cb) {
+            int32_t idx = 0, nlog = 0;
+            const float * lg = codec_common::audio_lm_step_logits(ctx, &idx, &nlog);
+            if (!lg) return false;
+            int32_t code;
+            if (rep_penalty == 1.0f) {
+                code = sampler.sample(lg, nlog, temp, top_p, top_k);
+            } else {
+                // CTRL-style penalty per codebook over its own last-window
+                // history, on a logits copy (mirrors the reference).
+                std::vector<float> lc(lg, lg + nlog);
+                const std::vector<int32_t> & h = hist[(size_t) cb];
+                const int32_t hn = (int32_t) h.size();
+                const int32_t w  = (rep_window > 0 && rep_window < hn) ? rep_window : hn;
+                Sampler::apply_rep_penalty(lc.data(), nlog,
+                                           h.data() + (hn - w), w, rep_penalty);
+                code = sampler.sample(lc.data(), nlog, temp, top_p, top_k);
+            }
+            if (!codec_common::audio_lm_step_push_code(ctx, code)) return false;
+        }
+        if (!codec_common::audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
+
+        // ── Accumulate + EOS check + compose the prev-frame audio embed. ──
+        auto act = codec_common::audio_lm_observe_codes(ctx, codes.data(), n_cb,
+                                                        cur.data(), hidden);
+        if (act == codec_common::OBSERVE_STOP) {
+            const char * e = codec_common::audio_lm_last_error(ctx);
+            if (e && *e) return false;
+            *out_stop = "eos_code_c0";
+            break;
+        }
+        (*out_frames)++;
+        for (int32_t cb = 0; cb < n_cb; ++cb) hist[(size_t) cb].push_back(codes[cb]);
+
+        // ── Next backbone input = text_embd[next_text] + audio(prev frame).
+        int32_t text_tok = (text_idx < (int32_t) text_toks.size())
+                         ? text_toks[(size_t) text_idx] : text_pad;
+        ++text_idx;
+        std::vector<float> row(hidden);
+        if (!compose_row(text_tok, codes.data(), row.data())) return false;
+        if (!decode_embed(lctx, row.data(), hidden, n_past++)) return false;
         const float * h = llama_get_embeddings_ith(lctx, -1);
         if (!h) return false;
         std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
@@ -1122,6 +1382,25 @@ int cmd_synthesize(const args & a) {
         // Flow 1: continuous CFM (BlueMagpie / barbet).
         ar_ok = run_continuous(ctx, lctx, toks, hidden, max_frames, a,
                                &n_frames, &stop_reason);
+    } else if (pi.streaming_interleave) {
+        // Flow 3-streaming: MOSS-TTS-Realtime.  Load the backbone text
+        // embedding table (composed on top of the codec audio embed) and
+        // run the incremental text↔audio interleave.
+        TextEmbdTable tetab;
+        std::string terr;
+        if (!tetab.load(a.backbone.c_str(), hidden, terr)) {
+            std::fprintf(stderr, "realtime: text_embd load failed: %s\n", terr.c_str());
+            llama_free(lctx); llama_model_free(lmodel); llama_backend_free();
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+        const float rep_pen = a.repetition_penalty ? *a.repetition_penalty
+                                                   : pi.default_repetition_penalty;
+        ar_ok = run_realtime_streaming(ctx, lctx, vocab, pi, tetab, a.text,
+                                       hidden, n_cb, max_frames, sampler,
+                                       temp, top_p, top_k, rep_pen,
+                                       pi.repetition_window,
+                                       &n_frames, &stop_reason);
     } else {
         // Flow 2/3: codebook AR (residual depth-AR + parallel-heads delay).
         ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,

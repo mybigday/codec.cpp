@@ -226,22 +226,24 @@ def main():
     # MOSS-TTS-Realtime — residual depth-AR, 16 RVQ codebooks decoded through
     # the MOSS-Audio codec (native 32-quantizer RVQ, truncated to the LM's 16
     # via the decode-time n_q remap).  The 16→32 decode mismatch is FIXED
-    # (moss_audio honours a partial n_q).  Decode succeeds + stops on the
-    # audio EOS (1026).  Full intelligibility additionally needs the
-    # streaming delay-pattern text/audio interleaving (the reference feeds
-    # text incrementally per-step with a 12-token delay + repetition penalty),
-    # which the single-shot host loop does not yet implement — so this is
-    # report-only for the transcript, and stop is not required (sampling can
-    # overrun the frame cap).  Uses the reference sampling regime.
+    # (moss_audio honours a partial n_q).  The streaming text↔audio interleave
+    # is now implemented (run_realtime_streaming in tts-cli): the spoken text
+    # is fed one token per audio frame into the ASSISTANT turn, the per-step
+    # backbone input is text_embd[token] + compose_audio_embd(prev_frame), the
+    # first prefill_text_len=12 text tokens open the audio channel (cb0 BOS),
+    # and generation stops on cb0 == audio EOS (1026).  Now intelligible: this
+    # case asserts stop==eos_code_c0, non-silent audio, and (when whisper is
+    # available) an ASR CER within bounds.  Uses the reference sampling regime
+    # (temp 0.8 / top-p 0.6 / top-k 30 / rep-penalty 1.1).
     results.append(_case(
         "moss_tts_realtime",
         REPO / "models" / "moss_tts_realtime" / "moss_tts_realtime.gguf",
         REPO / "models" / "moss_tts_realtime" / "qwen3_backbone_bf16.gguf",
         "你好，欢迎使用语音合成。",
-        "zh", want_stop="eos_code_c0", cer_max=1.0,
+        "zh", want_stop="eos_code_c0", cer_max=0.3,
         extra=["--temp", "0.8", "--top-p", "0.6", "--top-k", "30",
-               "--seed", "42", "--max-frames", "400"],
-        require_stop=False, cer_report_only=True, audio_report_only=True,
+               "--seed", "42", "--max-frames", "500"],
+        require_stop=True, cer_report_only=False, audio_report_only=False,
         dur_max=35.0,
     ))
 
