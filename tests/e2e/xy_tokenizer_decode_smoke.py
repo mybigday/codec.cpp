@@ -190,6 +190,50 @@ def main() -> int:
             print(f"FAIL: e2e corr {e2e_corr:.4f} < 0.95")
             return 1
 
+        # ---- 4. long decode crossing the chunk boundary ------------------
+        # The decode transformer pos_emb tables are sized for a single
+        # chunk_code_length (=375) window; longer sequences must be decoded in
+        # overlapping chunks (HF `decode(overlap_seconds=10)`).  Regression:
+        # decode a 500-code synthetic sequence (2 HF chunks) and check it
+        # (a) completes without the ggml_view_2d assert and (b) matches HF.
+        T_long = 500
+        rng = np.random.default_rng(1234)
+        long_codes = rng.integers(0, 1024, size=(int(hf_codes.shape[0]), T_long)).astype(np.int32)
+        long_hf_audio = None
+        try:
+            import torch as _torch
+            m_mod2 = sys.modules["modeling_xy_tokenizer"]
+            cfg2 = sys.modules["configuration_xy_tokenizer"].XYTokenizerConfig.from_pretrained(XY_DIR)
+            model2 = m_mod2.XYTokenizerModel.from_pretrained(XY_DIR, config=cfg2).eval()
+            with _torch.no_grad():
+                dec2 = model2.decode(_torch.from_numpy(long_codes.astype(np.int64))[:, None, :],
+                                     overlap_seconds=10)
+            long_hf_audio = dec2["audio_values"][0].cpu().numpy().flatten()
+        except Exception as exc:  # pragma: no cover
+            print(f"  (skipping HF long-decode parity: {exc})")
+
+        long_codes_npy = td / "long_codes.npy"
+        np.save(long_codes_npy, long_codes)
+        long_wav = td / "long_dec.wav"
+        run([str(CODEC_CLI), "decode", "--model", str(GGUF), "--codes", str(long_codes_npy),
+             "--out", str(long_wav), "--nq", str(hf_codes.shape[0])])
+        long_cpp, long_sr = read_wav_mono_f32(long_wav)
+        expected_long = T_long * 1920
+        print(f"  long decode: T={T_long} codes -> len={len(long_cpp)} (expected {expected_long})")
+        if not np.all(np.isfinite(long_cpp)):
+            print("FAIL: long decode contains non-finite samples")
+            return 1
+        if abs(len(long_cpp) - expected_long) > 1920:
+            print(f"FAIL: long decode length {len(long_cpp)} != expected {expected_long}")
+            return 1
+        if long_hf_audio is not None:
+            n = min(len(long_cpp), len(long_hf_audio))
+            long_corr = float(np.corrcoef(long_hf_audio[:n], long_cpp[:n])[0, 1])
+            print(f"  long decode corr_vs_hf={long_corr:.6f}")
+            if long_corr < 0.95:
+                print(f"FAIL: long decode corr {long_corr:.4f} < 0.95")
+                return 1
+
     print("XY-Tokenizer smoke test passed")
     return 0
 
