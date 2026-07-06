@@ -58,6 +58,15 @@ struct tts_runner_params {
     bool has_cfg_weight = false;         float cfg_weight = 0.0f;
     bool has_min_p = false;              float min_p = 0.0f;
     bool has_rep_penalty = false;        float repetition_penalty = 0.0f;
+
+    // Grammar (GBNF) constraint for the BACKBONE-logits sampler.  When
+    // non-empty this GBNF is attached to the common_sampler that samples
+    // backbone tokens (cb0-from-backbone / text warmup).  It never applies
+    // to codec_lm audio-codebook heads (those are arbitrary float arrays
+    // not tied to the backbone vocab).  A parse failure surfaces as a clean
+    // error, not a crash.  Empty → the model's auto-grammar (if any) is used
+    // instead; see codec_common::tts_auto_grammar.
+    std::string grammar;
 };
 
 // ─────────────────────────────────────────────────────────────────────

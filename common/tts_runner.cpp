@@ -19,6 +19,8 @@
 #include "utils/wav_io.h"
 
 #include "llama.h"
+#include "common.h"     // common_params_sampling, common_grammar
+#include "sampling.h"   // common_sampler_*
 #include "ggml.h"
 #include "gguf.h"
 
@@ -28,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
@@ -107,12 +110,97 @@ struct TextEmbdTable {
     }
 };
 
-// ── llama.cpp sampler-chain wrapper ───────────────────────────────────
-// Replaces the old hand-rolled samplers.  A SamplerChain owns one
-// llama_sampler chain and drives it over RAW float* logits (from either
-// the llama backbone or a codec_lm head) via llama_token_data_array — the
-// sampler API operates on arbitrary logits and never needs a vocab handle
-// for temp/top-k/top-p/min-p/penalties/dist/greedy.
+// ═══════════════════════════════════════════════════════════════════════
+// Two sampler families, split by logits SOURCE:
+//
+//  * BackboneSampler (common_sampler) — for logits produced by llama_decode
+//    and read via llama_get_logits_ith(lctx, idx).  This is the cb0-from-
+//    backbone token (MOSS-TTSD merged text+speech vocab).  We use llama.cpp's
+//    `common` sampling layer so we don't reimplement chain assembly, grammar
+//    apply/resample, or penalty bookkeeping.  Grammar (GBNF) only makes sense
+//    here — it constrains real backbone-vocab tokens.
+//
+//  * SamplerChain (raw llama_sampler over float*) — for logits that are NOT
+//    tied to a llama_context: codec_lm audio-codebook heads (residual depth
+//    decoder, Chatterbox speech_head) and the LFM2 recomputed text logits
+//    (llama.cpp omits the output head when embeddings=true).  common_sampler
+//    can't read those (it calls llama_get_logits_ith internally), so they keep
+//    the raw chain.  Grammar never applies to audio codebooks.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── common_sampler wrapper for BACKBONE logits ────────────────────────
+// Owns a common_sampler built from a common_params_sampling that mirrors the
+// old raw-chain knobs (temp / top-k / top-p / min-p / rep-penalty), plus an
+// optional GBNF grammar.  Samples from a llama_context position via
+// common_sampler_sample (which reads llama_get_logits_ith + applies the
+// chain + grammar apply/resample) and accepts the token (penalty + grammar
+// state).  build() returns false + err on a grammar parse failure (clean
+// error, not a crash).
+struct BackboneSampler {
+    common_sampler * smpl = nullptr;
+
+    BackboneSampler() = default;
+    BackboneSampler(const BackboneSampler &) = delete;
+    BackboneSampler & operator=(const BackboneSampler &) = delete;
+    ~BackboneSampler() { if (smpl) common_sampler_free(smpl); }
+
+    bool build(const llama_model * model, uint32_t seed, float temp,
+               int32_t top_k, float top_p, float min_p, float rep_penalty,
+               int32_t rep_last_n, const std::string & grammar,
+               std::string * err) {
+        common_params_sampling sp;
+        sp.seed          = seed;
+        sp.no_perf       = true;
+        sp.temp          = temp;                         // <=0 → greedy
+        sp.top_k         = top_k > 0 ? top_k : 0;        // 0 = disabled (vocab)
+        sp.top_p         = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
+        sp.min_p         = min_p > 0.0f ? min_p : 0.0f;
+        sp.penalty_repeat = rep_penalty;                 // 1.0 = disabled
+        sp.penalty_last_n = rep_penalty != 1.0f ? (rep_last_n > 0 ? rep_last_n : -1) : 0;
+        sp.penalty_freq   = 0.0f;
+        sp.penalty_present = 0.0f;
+        // Reduce the chain to exactly the reference warpers (no DRY / XTC /
+        // typical / top-n-sigma), matching the old SamplerChain order:
+        //   penalties → temp → top_k → min_p → top_p → dist.
+        sp.samplers = {
+            COMMON_SAMPLER_TYPE_PENALTIES,
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_MIN_P,
+            COMMON_SAMPLER_TYPE_TOP_P,
+            COMMON_SAMPLER_TYPE_TEMPERATURE,
+        };
+        if (!grammar.empty()) {
+            sp.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
+        }
+        try {
+            smpl = common_sampler_init(model, sp);
+        } catch (const std::exception & e) {
+            if (err) *err = std::string("grammar/sampler init failed: ") + e.what();
+            smpl = nullptr;
+            return false;
+        }
+        if (!smpl) {
+            if (err) *err = "common_sampler_init returned null (bad grammar?)";
+            return false;
+        }
+        return true;
+    }
+
+    // Sample the backbone token at context position `idx` (usually -1),
+    // apply the grammar (if any), and accept it (penalty + grammar state).
+    llama_token sample(llama_context * lctx, int32_t idx) {
+        const llama_token id = common_sampler_sample(smpl, lctx, idx, /*grammar_first=*/false);
+        common_sampler_accept(smpl, id, /*is_generated=*/true);
+        return id;
+    }
+};
+
+// ── llama.cpp sampler-chain wrapper (codec_lm / recomputed logits) ─────
+// A SamplerChain owns one llama_sampler chain and drives it over RAW
+// float* logits (from a codec_lm head or the LFM2 recomputed text logits)
+// via llama_token_data_array — the sampler API operates on arbitrary
+// logits and never needs a vocab handle for temp/top-k/top-p/min-p/
+// penalties/dist/greedy.
 //
 // We wrap each logit as {id=index, logit, p=0}; after llama_sampler_apply
 // the chosen token is data[cur_p.selected].id (== the code index, since
@@ -596,11 +684,12 @@ bool run_lfm2_sequential(audio_lm_context * ctx, llama_context * lctx,
 
 // Flow 2/3 — codebook AR.
 bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
-                     const llama_vocab * vocab,
+                     const llama_model * lmodel, const llama_vocab * vocab,
                      const audio_lm_prompt_info & pi,
                      const std::vector<llama_token> & toks, int32_t hidden, int32_t n_cb,
                      int32_t max_frames, uint32_t seed,
                      float temp, float top_p, int32_t top_k,
+                     const std::string & grammar,
                      const std::vector<float> & speaker_prefix,
                      const std::string & payload_text,
                      int32_t * out_frames, const char ** out_stop) {
@@ -688,21 +777,34 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
     if (!h0) return false;
     std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
 
-    // One chain (no rep penalty) for cb0-from-backbone + all codebooks,
-    // matching the old single-RNG-stream Sampler.  Greedy when temp<=0 so
-    // the CSM greedy path stays byte-identical.
+    // Raw chain (no rep penalty) for the codec_lm audio codebook heads —
+    // arbitrary float arrays, no llama_context / grammar.  Greedy when
+    // temp<=0 so the CSM greedy path stays byte-identical.
     SamplerChain smpl;
     if (temp <= 0.0f) smpl.init_greedy();
     else smpl.init_sampled(seed, temp, top_k, top_p, /*min_p=*/0.0f,
                            /*rep_penalty=*/1.0f, /*rep_last_n=*/0);
+
+    // cb0-from-backbone (MOSS-TTSD): sampled from the backbone's own logits
+    // via llama.cpp's common_sampler, with the optional GBNF grammar attached
+    // (constrains cb0 to the speech range ∪ eos).  Only built when needed.
+    BackboneSampler bbsmpl;
+    if (pi.cb0_from_backbone) {
+        std::string berr;
+        if (!bbsmpl.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
+                          /*rep_penalty=*/1.0f, /*rep_last_n=*/0, grammar, &berr)) {
+            std::fprintf(stderr, "backbone sampler init failed: %s\n", berr.c_str());
+            *out_stop = "grammar_error";
+            return false;
+        }
+    }
 
     std::vector<int32_t> codes(n_cb);
     for (int32_t step = 0; step < max_frames; ++step) {
         if (pi.cb0_from_backbone) {
             const float * bl = llama_get_logits_ith(lctx, -1);
             if (!bl) return false;
-            int32_t nv = llama_vocab_n_tokens(vocab);
-            int32_t c0 = smpl.sample(bl, nv);
+            int32_t c0 = bbsmpl.sample(lctx, -1);
             if (!audio_lm_step_set_text_context(ctx, c0)) return false;
             codes[0] = c0;
         }
@@ -1112,6 +1214,16 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     const int32_t top_k = a.has_top_k ? a.top_k : pi.default_top_k;
     const uint32_t seed = a.seed ? a.seed : 0xC0DEC1ABu;
 
+    // Grammar for the backbone sampler: an explicit user GBNF wins; else the
+    // model's metadata-derived auto-grammar (empty for models with none).
+    std::string grammar = !a.grammar.empty() ? a.grammar
+                                             : tts_auto_grammar(pi, a.text);
+    if (!grammar.empty()) {
+        std::printf("grammar: %s (%zu bytes)\n",
+                    !a.grammar.empty() ? "user-supplied" : "auto (model-derived)",
+                    grammar.size());
+    }
+
     const char * stop_reason = "max_frames";
     int32_t n_frames = 0;
     bool    ar_ok    = false;
@@ -1148,8 +1260,8 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
                                        pi.repetition_window,
                                        &n_frames, &stop_reason);
     } else {
-        ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,
-                                max_frames, seed, temp, top_p, top_k,
+        ar_ok = run_codebook_ar(ctx, lctx, lmodel, vocab, pi, toks, hidden, n_cb,
+                                max_frames, seed, temp, top_p, top_k, grammar,
                                 speaker_prefix, a.text, &n_frames, &stop_reason);
     }
 

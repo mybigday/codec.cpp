@@ -881,6 +881,11 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
         out->eos_code_c0  = info->eos_code_c0;
         out->eos_min_step = info->eos_min_step;
     }
+    // Merged-cb0 speech sub-range (MOSS-TTSD) — surfaced for the host's
+    // auto-grammar.  cb0_speech_offset is speech_token_range[0] (start);
+    // cb0_speech_range_end mirrors speech_token_range[1] (exclusive end).
+    out->cb0_speech_range_start = meta_i32_or(ctx, "codec.lm.cb0_speech_offset", -1);
+    out->cb0_speech_range_end   = meta_i32_or(ctx, "codec.lm.cb0_speech_range_end", -1);
     // rn-tts sampling defaults.
     out->default_temperature = 0.9f;
     out->default_top_p       = 0.95f;
@@ -1049,6 +1054,98 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
 
     // Unknown arch — return the raw kind but empty template.
     return true;
+}
+
+// Emit a GBNF alternation matching the decimal literals [lo, hi] (inclusive),
+// as `"<" ( ... ) ">"`-style terminals are assembled by the caller.  Rather
+// than a full digit-range decomposition we lean on the fact that GBNF can
+// enumerate a bounded set compactly via nested digit ranges; for a 0..N-1
+// speech vocab this stays small.  We build the classic "0..max" numeric rule
+// used by the rn-tts NeuTTS/Soprano grammars (decade/hundred/thousand digit
+// bands) generalised to `max`.
+static std::string gbnf_uint_range_rule(int32_t max_inclusive) {
+    // Produce alternatives for [0, max_inclusive].  We special-case up to
+    // 9999 (covers MOSS-TTSD's 0..1023); larger vocabs fall back to a loose
+    // "[0-9]+" (still correct membership-wise for the model's own emissions,
+    // just not a tight upper bound).
+    if (max_inclusive < 0) return "[0-9]+";
+    if (max_inclusive > 9999) return "[0-9]+";
+    // NOTE: keep the whole alternation on ONE line — llama.cpp's GBNF parser
+    // treats a bare newline as the end of a rule, so `\n | ...` continuations
+    // fail with "expecting name at |".
+    std::string out;
+    auto add = [&](const std::string & alt) {
+        if (!out.empty()) out += " | ";
+        out += alt;
+    };
+    // single digit 0..9 (bounded by max)
+    {
+        int hi = max_inclusive < 9 ? max_inclusive : 9;
+        add("[0-" + std::to_string(hi) + "]");
+    }
+    // two digits 10..99
+    if (max_inclusive >= 10) add("[1-9] [0-9]");
+    // three digits 100..999
+    if (max_inclusive >= 100) add("[1-9] [0-9] [0-9]");
+    // four digits 1000..max (tight upper bound on the leading digit band)
+    if (max_inclusive >= 1000) {
+        // Enumerate 1000..max_inclusive by leading-digit bands so we don't
+        // over-admit (e.g. max=1023 must not accept 1099).  Keep it simple:
+        // a loose "[1-9] [0-9] [0-9] [0-9]" would over-admit up to 9999; for
+        // the common 0..1023 case emit an exact band for the thousands.
+        const int thousands = max_inclusive / 1000;      // e.g. 1
+        const int rem       = max_inclusive % 1000;      // e.g. 23
+        // full lower thousands: [1 .. thousands-1] followed by any 3 digits
+        if (thousands >= 2) {
+            add("[1-" + std::to_string(thousands - 1) + "] [0-9] [0-9] [0-9]");
+        }
+        // the top thousand band, capped at rem
+        // thousands digit is fixed; the trailing 3 digits are 000..rem
+        std::string band = "\"" + std::to_string(thousands) + "\" ";
+        const int h = rem / 100, t = (rem / 10) % 10, o = rem % 10;
+        // 000..(h-1)99  |  h(0..t-1)9? ... approximate tight bound
+        std::string sub;
+        auto addsub = [&](const std::string & a) {
+            if (!sub.empty()) sub += " | ";
+            sub += a;
+        };
+        if (h >= 1) addsub("[0-" + std::to_string(h - 1) + "] [0-9] [0-9]");
+        if (t >= 1) addsub("\"" + std::to_string(h) + "\" [0-" + std::to_string(t - 1) + "] [0-9]");
+        addsub("\"" + std::to_string(h) + "\" \"" + std::to_string(t) + "\" [0-" + std::to_string(o) + "]");
+        add(band + "( " + sub + " )");
+    }
+    return out;
+}
+
+std::string tts_auto_grammar(const audio_lm_prompt_info & pi,
+                             const std::string & text) {
+    (void) text;  // reserved for future prompt-dependent grammars
+
+    // MOSS-TTSD (and any merged-cb0 parallel-heads-delay model): constrain
+    // decode-phase cb0 to the speech-token range ∪ {eos_code_c0}.  The
+    // backbone tokens for the speech sub-range detokenize as the decimal
+    // pieces "<0>".."<N-1>" (N = range_end - range_start); the end sentinel
+    // detokenizes to a fixed control string.  We match those piece strings.
+    if (pi.model_kind == audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY &&
+        pi.cb0_from_backbone &&
+        pi.cb0_speech_range_start >= 0 &&
+        pi.cb0_speech_range_end   > pi.cb0_speech_range_start) {
+        const int32_t n_speech = pi.cb0_speech_range_end - pi.cb0_speech_range_start;
+        const std::string num_rule = gbnf_uint_range_rule(n_speech - 1);
+        // A speech frame's cb0 is one "<CODE>" piece; audio ends with the
+        // end-of-speech sentinel.  The delay-pattern tail frames (cb0 forced
+        // to eos while cb1..N flush) are handled by the runtime, not the
+        // grammar, so `end` may appear once and then trailing eos repeats are
+        // allowed too (end+ ) to cover the flush window.
+        std::string g;
+        g += "root ::= speech* end+\n";
+        g += "speech ::= \"<\" SPEECHID \">\"\n";
+        g += "end ::= \"<|end_of_speech|>\"\n";
+        g += "SPEECHID ::= " + num_rule + "\n";
+        return g;
+    }
+
+    return "";
 }
 
 // ─── Codebook step machine passthroughs ─────────────────────────────

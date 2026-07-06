@@ -49,6 +49,10 @@ void print_usage(const char * prog) {
         "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
         "             [--cfg F] [--timesteps N] [--min-len N]\n"
         "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
+        "             [--grammar FILE|STRING]\n"
+        "             --grammar attaches a GBNF constraint to the backbone\n"
+        "             sampler (models with a metadata-derived auto-grammar use\n"
+        "             it by default; --grammar overrides).\n"
         "             Full host AR loop: a llama.cpp backbone (--backbone) drives\n"
         "             the codec_common per-step hooks end-to-end.  Flow is chosen\n"
         "             from the model's GGUF metadata.  Self-contained models\n"
@@ -72,6 +76,25 @@ bool parse_f32(const char * s, float * out) {
     if (end == s || *end != '\0') return false;
     *out = (float) v;
     return true;
+}
+
+// --grammar accepts either a path to a .gbnf FILE or a literal GBNF STRING.
+// Heuristic: if the arg names an existing readable file, load its contents;
+// otherwise treat the arg itself as the grammar text.  (A literal GBNF always
+// contains "::=", so a bare filename that happens not to exist just passes
+// through as-is and the grammar parser reports the error downstream.)
+std::string load_grammar_arg(const char * v) {
+    if (!v || !*v) return "";
+    if (FILE * f = std::fopen(v, "rb")) {
+        std::string s;
+        std::fseek(f, 0, SEEK_END);
+        long n = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (n > 0) { s.resize((size_t) n); size_t rd = std::fread(&s[0], 1, (size_t) n, f); s.resize(rd); }
+        std::fclose(f);
+        return s;
+    }
+    return v;
 }
 
 void print_modality_mask(uint32_t mask) {
@@ -111,6 +134,8 @@ struct args {
     bool has_cfg_weight = false;  float cfg_weight = 0.0f;   // Chatterbox T3
     bool has_min_p = false;       float min_p = 0.0f;
     bool has_rep_penalty = false; float repetition_penalty = 0.0f;
+
+    std::string grammar;   // GBNF for the backbone sampler (FILE contents or literal)
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -141,6 +166,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--cfg-weight") { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cfg_weight)) return false; out->has_cfg_weight = true; i++; }
         else if (a == "--min-p")      { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->min_p)) return false; out->has_min_p = true; i++; }
         else if (a == "--rep-penalty"){ const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->repetition_penalty)) return false; out->has_rep_penalty = true; i++; }
+        else if (a == "--grammar")    { const char * v = need(); if (!v) return false; out->grammar = load_grammar_arg(v); i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     return !out->model.empty();
@@ -244,6 +270,7 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.has_cfg_weight = a.has_cfg_weight; rp.cfg_weight = a.cfg_weight;
     rp.has_min_p = a.has_min_p; rp.min_p = a.min_p;
     rp.has_rep_penalty = a.has_rep_penalty; rp.repetition_penalty = a.repetition_penalty;
+    rp.grammar = a.grammar;
     return rp;
 }
 

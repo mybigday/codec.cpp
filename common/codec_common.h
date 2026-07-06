@@ -456,12 +456,47 @@ struct audio_lm_prompt_info {
     int32_t audio_start_id        = -1;  // text token → switch to AUDIO_OUT
     int32_t text_end_id           = -1;  // text token → end turn / stop
     int32_t max_text_tokens       = 64;  // safety cap on the text warmup phase
+
+    // ── Merged-cb0 speech sub-range (MOSS-TTSD) ─────────────────────────
+    // For parallel-heads-delay models whose cb0 is a merged text+speech
+    // vocab, speech codes occupy [cb0_speech_range_start, cb0_speech_range_end)
+    // of the backbone vocab (from codec.lm.speech_token_range) and end-of-
+    // audio is signalled by cb0 == eos_code_c0.  The host's auto-grammar
+    // (tts_auto_grammar) uses these to constrain decode-phase cb0 sampling
+    // to speech tokens ∪ {eos_code_c0}, keeping the model from drifting into
+    // arbitrary text tokens (babble) mid-utterance.  Both -1 when absent.
+    int32_t cb0_speech_range_start = -1;  // codec.lm.cb0_speech_offset
+    int32_t cb0_speech_range_end   = -1;  // codec.lm.cb0_speech_range_end (exclusive)
 };
 
 // Fill `*out` from the loaded model's metadata.  Returns false + sets
 // last_error when the model has no codec_lm (no AR profile to describe).
 bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
                               audio_lm_prompt_info    * out);
+
+// ─────────────────────────────────────────────────────────────────────
+// Auto-grammar (prompt/metadata-derived GBNF for the backbone sampler)
+//
+// Returns a GBNF grammar string derived from the model's metadata (the
+// `pi` filled by audio_lm_get_prompt_info) + the synthesis text, or "" for
+// models that don't benefit from one.  The grammar constrains the
+// BACKBONE-logits sampler only (cb0-from-backbone / text-warmup tokens);
+// it is meaningless for codec_lm audio-codebook heads (arbitrary float
+// arrays, no vocab).
+//
+// Precedent: llama.rn's rn-tts build_dynamic_grammar (OuteTTS/Soprano/
+// NeuTTS families).  The concept is ported; the first real application
+// here is MOSS-TTSD cb0 (merged text+speech vocab): the grammar allows
+// only the speech-token range [cb0_speech_range_start, cb0_speech_range_end)
+// plus the end-of-audio sentinel eos_code_c0, so the backbone can't drift
+// into arbitrary text tokens mid-utterance.  A non-speech cb0 token is the
+// reference's natural stop trigger, so eos_code_c0 stays permitted.
+//
+// `text` is unused today (MOSS-TTSD's grammar is text-independent) but is
+// threaded through for future prompt-dependent grammars (OuteTTS-style
+// word-sequence constraints).
+std::string tts_auto_grammar(const audio_lm_prompt_info & pi,
+                             const std::string & text);
 
 // ─── Codebook step machine passthroughs (Type C/D) ──────────────────
 //

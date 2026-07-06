@@ -211,6 +211,13 @@ def _write_prompt_metadata(writer, cfg: Dict[str, Any], arch_name: str) -> None:
             # because codec_gguf_metadata doesn't surface array element values.
             if rng:
                 writer.add_int32("codec.lm.cb0_speech_offset", rng[0])
+                # Scalar mirror of speech_token_range[1] (exclusive upper
+                # bound of the cb0 speech sub-range).  Used by the host's
+                # auto-grammar generator to constrain decode-phase cb0
+                # sampling to speech tokens ∪ {eos_code_c0}; exposed as a
+                # scalar for the same reason as cb0_speech_offset.
+                if len(rng) > 1:
+                    writer.add_int32("codec.lm.cb0_speech_range_end", rng[1])
         if "speech_pad_token" in cfg:
             writer.add_uint32("codec.lm.speech_pad_token", int(cfg["speech_pad_token"]))
 
