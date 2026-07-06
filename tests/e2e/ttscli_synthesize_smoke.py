@@ -248,25 +248,28 @@ def main():
     ))
 
     # Qwen3-TTS-0.6B-Base — residual depth-AR + ECAPA-TDNN speaker encoder.
-    # The faithful talker prompt is now assembled (converter bakes
-    # text_projection + text_embedding + control-tag ids; codec_common builds
-    # the additive dual-lane prefix — projected text lane summed with the
-    # codec control-tag lane, ECAPA x-vector inserted between the think-tags
-    # and pad/bos; tts-cli injects the projected trailing text per-step).
-    # Structurally faithful, but the talker BACKBONE requires 3D MRoPE, which
-    # the plain `qwen3` gguf + llama.cpp apply as 1D RoPE — so the attention
-    # positions are wrong and the output is not yet intelligible.  Asserted:
-    # exit 0, non-silent.  CER report-only until MRoPE lands.
+    # The faithful talker prompt is assembled (converter bakes text_projection
+    # + text_embedding + control-tag ids; codec_common builds the additive
+    # dual-lane prefix — projected text lane summed with the codec control-tag
+    # lane, ECAPA x-vector inserted between the think-tags and pad/bos; tts-cli
+    # injects the projected trailing text per-step).  The talker backbone runs
+    # as plain `qwen3` (1D RoPE) which is the exact reduction of the reference's
+    # interleaved-MRoPE for pure-audio TTS — see qwen3_tts_backbone_smoke.py.
+    # Intelligibility was fixed by carrying the depth-decoder FFN matmuls at F32
+    # (the SwiGLU intermediate reaches ~1.4e5, which overflowed the F16 mul_mat
+    # activation downcast to inf -> NaN codes; codec_op_lm_per_pos_linear now
+    # dequants F16 weights to F32 so activations stay F32).  Asserted: stop via
+    # eos_code_c0 and CER within bound.
     results.append(_case(
         "qwen3_tts_refaudio",
         REPO / "models" / "qwen3_tts" / "qwen3_tts_06b_base.gguf",
         REPO / "models" / "qwen3_tts" / "qwen3_tts_talker.gguf",
         "你好，欢迎使用语音合成。",
-        "zh", want_stop="eos_code_c0", cer_max=1.0,
+        "zh", want_stop="eos_code_c0", cer_max=0.3,
         extra=["--ref-audio", str(REPO / "test.wav"),
                "--temp", "0.9", "--top-k", "50", "--seed", "42",
                "--max-frames", "300"],
-        require_stop=False, cer_report_only=True,
+        require_stop=True, cer_report_only=False,
     ))
 
     ran = [r for r in results if r is not None]
