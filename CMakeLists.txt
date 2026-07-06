@@ -110,11 +110,26 @@ target_include_directories(codec_shared
 target_link_libraries(codec        PRIVATE ggml)
 target_link_libraries(codec_shared PRIVATE ggml)
 
+# Small reusable example IO helpers (WAV / NPY).  Declared before
+# codec_common so the self-contained FlowLM runner (which loads ref-audio
+# WAVs) can link it.  `examples` is on the public include path so consumers
+# resolve "utils/wav_io.h".
+add_library(codec-example-utils STATIC
+    examples/utils/wav_io.cpp
+    examples/utils/npy_io.cpp
+)
+target_include_directories(codec-example-utils
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+
 # codec_common — generic audio-LM API mirroring llama.cpp's `common/`.
 # See docs/codec_common_api.md.  Built as a static lib so example
-# binaries can link it without pulling it into libcodec.so.
+# binaries can link it without pulling it into libcodec.so.  The
+# self-contained (no-backbone) FlowLM reference synthesize lives here in
+# tts_runner_flow.cpp so it stays available even in CODEC_TTS_BACKBONE=OFF
+# builds; the full backbone-driven runner lives in codec_tts_runner.
 add_library(codec_common STATIC
     common/audio_lm.cpp
+    common/tts_runner_flow.cpp
 )
 target_include_directories(codec_common
     PUBLIC
@@ -122,18 +137,13 @@ target_include_directories(codec_common
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(codec_common PUBLIC codec)
+target_link_libraries(codec_common PUBLIC codec PRIVATE codec-example-utils)
 
 add_executable(inspect-codec
     examples/inspect-codec.cpp
 )
 
 target_link_libraries(inspect-codec PRIVATE codec)
-
-add_library(codec-example-utils STATIC
-    examples/utils/wav_io.cpp
-    examples/utils/npy_io.cpp
-)
 
 add_executable(codec-cli
     examples/codec-cli.cpp
@@ -165,14 +175,26 @@ if(CODEC_BUILD_TTS_CLI)
     )
     target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
 
-    # Optional isolated llama.cpp backbone → enables `tts-cli synthesize`.
+    # Optional isolated llama.cpp backbone → enables the full `synthesize`
+    # reference loop.  The loop itself lives in codec_tts_runner (common/
+    # tts_runner.*), a standalone library that links the backbone — so a
+    # future host (e.g. a server example) can link it without tts-cli.
     option(CODEC_TTS_BACKBONE "Build the isolated llama.cpp backbone for tts-cli synthesize" ON)
     if(CODEC_TTS_BACKBONE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupTtsBackbone.cmake)
+
+        add_library(codec_tts_runner STATIC
+            common/tts_runner.cpp
+        )
+        add_dependencies(codec_tts_runner ttsbackbone)
+        target_include_directories(codec_tts_runner
+            PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/common
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${TTS_BACKBONE_INCLUDE_DIRS})
+        target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE codec-example-utils "${TTS_BACKBONE_SO}")
+
         add_dependencies(tts-cli ttsbackbone)
         target_compile_definitions(tts-cli PRIVATE TTS_CLI_HAVE_BACKBONE=1)
-        target_include_directories(tts-cli PRIVATE ${TTS_BACKBONE_INCLUDE_DIRS})
-        target_link_libraries(tts-cli PRIVATE "${TTS_BACKBONE_SO}")
+        target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}")
         set_target_properties(tts-cli PROPERTIES
             BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
     endif()

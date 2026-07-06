@@ -31,7 +31,8 @@ codec_common provides per-step hooks, not a loop replacement.
 |---|---|
 | **llama.cpp / host AR loop** | tokenize, `llama_decode`, sampler, KV cache, batch construction |
 | **codec_common (new)** | ref-audio encoding (speaker_encode), prompt prefix (cond_emb), per-step codes bookkeeping (depth-AR for residual_depth_ar, delay for parallel_heads_delay), `compose_audio_embd`, codes → PCM decode, modality detection |
-| **App glue (rn-tts.cpp / examples/tts-cli.cpp)** | decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result (e.g. switch the next `llama_batch` between token and embd path) |
+| **codec_tts_runner (optional)** | a COMPLETE reference host loop for hosts that don't own their own — backbone load, tokenize/prefill, every per-model flow, sampling, CFG pair, streaming interleave, embed injection, EOS, decode→PCM.  Links the isolated llama backbone (`libttsbackbone`); composes the codec_common per-step hooks internally.  For hosts that want a ready-made loop (examples/tts-cli, a future server example), NOT for hosts that own the loop (llama.rn uses the hooks directly).  Built only with `CODEC_TTS_BACKBONE=ON`; the self-contained no-backbone FlowLM path (`tts_runner_synthesize_selfcontained`) lives in codec_common and is always available. |
+| **App glue (rn-tts.cpp / examples/tts-cli.cpp)** | for hook hosts (rn-tts): decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result.  For runner hosts (tts-cli): parse args → `tts_runner_synthesize(params)` → write WAV. |
 
 ## Inference patterns
 
