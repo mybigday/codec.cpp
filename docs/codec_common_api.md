@@ -1,8 +1,10 @@
 # codec_common — generic audio-LM API
 
 Status: landed.  Reference implementation in `common/audio_lm.cpp`,
-exercised by `examples/tts-cli` (`build/tts-cli {info,decode,synthesize,
-trace,simulate-typeA,simulate-typeB,simulate-multicb,simulate-continuous}`).
+exercised by `examples/tts-cli` (`build/tts-cli {info,decode,synthesize}`).
+Dev-time trace/simulate-* subcommands were removed once `synthesize`
+covered every model end-to-end; the e2e smokes (`tests/e2e/`) drive the
+same paths via ctypes.
 
 A small `codec_common::` namespace in codec.cpp that wraps the
 per-model audio-LM machinery (speaker_encode, prompt prefix assembly,
