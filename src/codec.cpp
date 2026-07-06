@@ -16,6 +16,7 @@
 #include "models/moss_audio.h"
 #include "models/xy_tokenizer.h"
 #include "models/bluemagpie_audiovae.h"
+#include "models/pocket_mimi.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
 #include "runtime/gguf_kv.h"
@@ -142,6 +143,9 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "bluemagpie_audiovae" || arch == "bluemagpie-audiovae") {
         return CODEC_ARCH_BLUEMAGPIE_AUDIOVAE;
     }
+    if (arch == "pocket_mimi" || arch == "pocket-mimi" || arch == "pocket_tts") {
+        return CODEC_ARCH_POCKET_MIMI;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -178,6 +182,8 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_xy_tokenizer_vtable();
         case CODEC_ARCH_BLUEMAGPIE_AUDIOVAE:
             return codec_bluemagpie_audiovae_vtable();
+        case CODEC_ARCH_POCKET_MIMI:
+            return codec_pocket_mimi_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -201,6 +207,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_MOSS_AUDIO:         return "MOSS-Audio-Tokenizer";
         case CODEC_ARCH_XY_TOKENIZER:       return "XY-Tokenizer";
         case CODEC_ARCH_BLUEMAGPIE_AUDIOVAE:return "BlueMagpie-AudioVAE";
+        case CODEC_ARCH_POCKET_MIMI:        return "Pocket-TTS-Mimi";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }

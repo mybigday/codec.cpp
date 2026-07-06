@@ -262,6 +262,208 @@ int cmd_decode(const args & a) {
     return 0;
 }
 
+// ─── Pocket-TTS FlowLM synthesize (self-contained, no backbone) ──────
+// FlowLM (codec.lm.kind="flow_lm") is a self-contained continuous-latent AR
+// model: the AR transformer, text LUT, LSD flow head and EOS head all live in
+// the codec GGUF, so there is NO llama.cpp backbone.  Everything runs through
+// the public codec C API + the codec_lm_flow_* helpers.  Returns >=0 exit code
+// when it handled the request, or -1 when the model is NOT a FlowLM (caller
+// falls through to the backbone-driven flows).
+
+// prepare_text_prompt mirrors pocket_tts/models/tts_model.py:prepare_text_prompt
+// (strip, collapse double spaces, uppercase first letter, ensure trailing
+// punctuation).  Returns the guessed frames_after_eos (3 if <=4 words else 1).
+int flow_prepare_text(std::string & text) {
+    // strip
+    size_t b = text.find_first_not_of(" \t\r\n");
+    size_t e = text.find_last_not_of(" \t\r\n");
+    text = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
+    // replace newlines with spaces + collapse double spaces
+    for (char & c : text) if (c == '\n' || c == '\r') c = ' ';
+    for (size_t i = text.find("  "); i != std::string::npos; i = text.find("  ")) text.replace(i, 2, " ");
+    if (text.empty()) return 3;
+    // word count
+    int words = 0; bool in_w = false;
+    for (char c : text) { if (c == ' ') in_w = false; else if (!in_w) { in_w = true; ++words; } }
+    const int frames_after_eos_guess = (words <= 4) ? 3 : 1;
+    // uppercase first letter
+    if (text[0] >= 'a' && text[0] <= 'z') text[0] = (char) (text[0] - 'a' + 'A');
+    // ensure trailing punctuation
+    const char last = text.back();
+    const bool alnum = (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') || (last >= '0' && last <= '9');
+    if (alnum) text += '.';
+    return frames_after_eos_guess;
+}
+
+int run_flow_lm_synthesize(const args & a) {
+    // Load the codec model + context (self-contained).
+    codec_model_params mparams = codec_model_default_params();
+    mparams.use_gpu   = a.use_gpu;
+    mparams.n_threads = a.n_threads > 0 ? a.n_threads : 1;
+    codec_model * model = codec_model_load_from_file(a.model.c_str(), mparams);
+    if (!model) { std::fprintf(stderr, "flow_lm: model load failed\n"); return 2; }
+
+    codec_lm * lm = codec_lm_create(model);
+    if (!lm) {
+        // Not an LM-bearing codec, or a different kind — let the caller decide.
+        codec_model_free(model);
+        return -1;
+    }
+    const codec_lm_flow_info * fi = codec_lm_flow_get_info(lm);
+    if (!fi) { codec_lm_free(lm); codec_model_free(model); return -1; }   // not flow_lm
+
+    if (a.output.empty()) {
+        std::fprintf(stderr, "synthesize requires --output PATH.wav\n");
+        codec_lm_free(lm); codec_model_free(model); return 1;
+    }
+
+    codec_context * cctx = codec_init_from_model(model, codec_context_default_params());
+    if (!cctx) { std::fprintf(stderr, "flow_lm: ctx init failed\n"); codec_lm_free(lm); codec_model_free(model); return 2; }
+
+    const int32_t ldim    = fi->ldim;
+    const int32_t d_model = fi->d_model;
+
+    // ── Text prep + tokenize ────────────────────────────────────────
+    std::string text = a.text;
+    const int32_t fae_guess = flow_prepare_text(text) + 2;   // reference adds +2
+    std::vector<int32_t> ids(512);
+    int32_t n_tok = 0;
+    if (codec_lm_flow_tokenize(lm, text.c_str(), ids.data(), (int32_t) ids.size(), &n_tok) != CODEC_STATUS_SUCCESS || n_tok <= 0) {
+        std::fprintf(stderr, "flow_lm: tokenize failed: %s\n", codec_lm_get_last_error(lm));
+        codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 5;
+    }
+    ids.resize(n_tok);
+    std::printf("flow_lm: text=\"%s\" -> %d tokens; d_model=%d ldim=%d\n", text.c_str(), n_tok, d_model, ldim);
+
+    // ── Optional voice conditioning (--ref-audio) ───────────────────
+    std::vector<float> voice_rows;
+    int32_t n_voice = 0;
+    if (!a.ref_audio.empty()) {
+        codec_example_wav_data wav;
+        std::string werr;
+        if (!codec_example_load_wav_pcm16(a.ref_audio.c_str(), &wav, &werr)) {
+            std::fprintf(stderr, "flow_lm: ref-audio load failed: %s\n", werr.c_str());
+            codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 5;
+        }
+        // Mono F32 (average channels), keep native rate — pocket_mimi encodes at
+        // 24 kHz; the CLI assumes the ref is already 24 kHz (as kyutai voices are).
+        const int32_t ch = wav.n_channels > 0 ? wav.n_channels : 1;
+        const int32_t ns = (int32_t) (wav.pcm_i16.size() / (size_t) ch);
+        std::vector<float> pcm((size_t) ns);
+        for (int32_t i = 0; i < ns; ++i) {
+            float s = 0; for (int32_t c = 0; c < ch; ++c) s += wav.pcm_i16[(size_t) i * ch + c];
+            pcm[(size_t) i] = s / (float) ch / 32768.0f;
+        }
+        codec_audio au; au.data = pcm.data(); au.n_samples = ns;
+        au.sample_rate = wav.sample_rate; au.n_channels = 1; au.pcm_type = CODEC_PCM_TYPE_F32;
+        codec_token_buffer tb; std::memset(&tb, 0, sizeof(tb));
+        codec_latent_buffer lb; std::memset(&lb, 0, sizeof(lb));
+        if (codec_encode_latent(cctx, &au, &tb, &lb, codec_encode_default_params()) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "flow_lm: ref-audio encode failed: %s\n", codec_get_last_error(cctx));
+            codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 5;
+        }
+        n_voice = lb.n_frames;
+        voice_rows.resize((size_t) n_voice * d_model);
+        // lb.data is channel-major [ldim, n_voice] (data[d*n_voice + t]).
+        if (codec_lm_flow_speaker_rows(lm, lb.data, n_voice, voice_rows.data(), n_voice) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "flow_lm: speaker_rows failed: %s\n", codec_lm_get_last_error(lm));
+            codec_latent_buffer_free(&lb);
+            codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 5;
+        }
+        codec_latent_buffer_free(&lb);
+        std::printf("flow_lm: voice conditioning from %s -> %d rows\n", a.ref_audio.c_str(), n_voice);
+    }
+
+    // ── State + prefill ─────────────────────────────────────────────
+    codec_lm_state * st = codec_lm_state_new(lm);
+    if (!st) { std::fprintf(stderr, "flow_lm: state_new failed\n"); codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 6; }
+    if (codec_lm_flow_prefill(st, ids.data(), n_tok, n_voice > 0 ? voice_rows.data() : nullptr, n_voice) != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "flow_lm: prefill failed: %s\n", codec_lm_state_get_last_error(st));
+        codec_lm_state_free(st); codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 6;
+    }
+
+    // frames_after_eos policy: fixed from GGUF if >= 0, else the word-count guess.
+    const int32_t frames_after_eos = (fi->frames_after_eos >= 0) ? fi->frames_after_eos : fae_guess;
+    // max_gen_len estimate mirrors _estimate_max_gen_len (frame_rate=12.5,
+    // ~3 tok/s + 2s padding); allow override via --max-frames.
+    int32_t max_gen = a.max_frames > 0 ? a.max_frames
+                    : (int32_t) std::ceil(((double) n_tok / 3.0 + 2.0) * 12.5);
+    if (max_gen < 8) max_gen = 8;
+
+    // ── AR loop ─────────────────────────────────────────────────────
+    // The CLI owns the CFM init-noise RNG (seeded from --seed) so runs are
+    // reproducible and seed-controllable; noise ~ N(0, temperature).  Uses an
+    // explicit Box-Muller transform on a uniform mt19937 stream rather than
+    // std::normal_distribution (whose libstdc++ polar method gives poor early
+    // draws — the FlowLM is very sensitive to the first frames' noise quality).
+    std::seed_seq seq{ (uint32_t) a.seed, 0x9E3779B9u, 0x243F6A88u, 0xB7E15162u };
+    std::mt19937 rng(seq);
+    const float noise_std = std::sqrt(fi->temperature);
+    auto gauss = [&]() -> float {
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        float u1 = u(rng), u2 = u(rng);
+        if (u1 < 1e-12f) u1 = 1e-12f;
+        return std::sqrt(-2.0f * std::log(u1)) * std::cos(6.28318530718f * u2) * noise_std;
+    };
+    std::vector<float> noise(ldim);
+    std::vector<float> latents;   // frame-major [n_frames * ldim] (denormalized)
+    std::vector<float> lat(ldim, 0.0f);
+    int32_t n_frames = 0, eos_step = -1;
+    const char * stop_reason = "max_frames";
+    for (int32_t step = 0; step < max_gen; ++step) {
+        for (int32_t d = 0; d < ldim; ++d) noise[(size_t) d] = gauss();
+        int32_t is_eos = 0; float eos_logit = 0.0f;
+        if (codec_lm_flow_step(st, noise.data(), lat.data(), &eos_logit, &is_eos) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "flow_lm: step %d failed: %s\n", step, codec_lm_state_get_last_error(st));
+            codec_lm_state_free(st); codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 6;
+        }
+        // Optional min-length guard: ignore EOS for the first --min-len frames.
+        // The FlowLM is a short-utterance model whose EOS head can fire on frame
+        // 0/1 for certain prompts + noise streams; --min-len lets the host force
+        // a minimum audio length (mirrors the continuous_latent_cfm min_len knob).
+        // Default 0 = honour EOS immediately (reference behaviour).
+        const int32_t min_len = (a.cont_min_len >= 0) ? a.cont_min_len : 0;
+        if (is_eos && eos_step < 0 && step >= min_len) eos_step = step;
+        if (eos_step >= 0 && step >= eos_step + frames_after_eos) { stop_reason = "eos_head"; break; }
+        // Denormalize the latent for Mimi decode and accumulate (channel-major).
+        std::vector<float> den(ldim);
+        codec_lm_flow_denorm_latent(lm, lat.data(), den.data());
+        latents.insert(latents.end(), den.begin(), den.end());
+        ++n_frames;
+    }
+    std::printf("flow_lm: AR done: %d frames, eos_step=%d, stop=%s\n", n_frames, eos_step, stop_reason);
+    codec_lm_state_free(st);
+
+    if (n_frames == 0) {
+        std::fprintf(stderr, "flow_lm: no frames generated\n");
+        codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 7;
+    }
+
+    // ── Decode: latents [ldim, n_frames] channel-major -> PCM ───────
+    // codec_decode_quantized_representation expects channel-major buffer[d*T+t];
+    // we accumulated frame-major [t*ldim+d], so transpose.
+    std::vector<float> lat_cm((size_t) ldim * n_frames);
+    for (int32_t t = 0; t < n_frames; ++t)
+        for (int32_t d = 0; d < ldim; ++d)
+            lat_cm[(size_t) d * n_frames + t] = latents[(size_t) t * ldim + d];
+
+    codec_pcm_buffer pcm; std::memset(&pcm, 0, sizeof(pcm));
+    if (codec_decode_quantized_representation(cctx, lat_cm.data(), ldim, n_frames, &pcm, codec_decode_default_params()) != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "flow_lm: decode failed: %s\n", codec_get_last_error(cctx));
+        codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 8;
+    }
+    std::string wav_err;
+    if (!codec_example_write_wav_pcm16(a.output.c_str(), pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, 1)) {
+        std::fprintf(stderr, "flow_lm: failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
+        codec_pcm_buffer_free(&pcm); codec_free(cctx); codec_lm_free(lm); codec_model_free(model); return 9;
+    }
+    const double secs = (double) pcm.n_samples / (double) (pcm.sample_rate > 0 ? pcm.sample_rate : 1);
+    std::printf("wrote %s: %d samples @ %d Hz (%.2fs, 1 ch)\n", a.output.c_str(), pcm.n_samples, pcm.sample_rate, secs);
+    codec_pcm_buffer_free(&pcm);
+    codec_free(cctx); codec_lm_free(lm); codec_model_free(model);
+    return 0;
+}
+
 // ─── Subcommand: synthesize ──────────────────────────────────────
 // Full host AR loop: a llama.cpp backbone (`--backbone`) drives the
 // codec_common per-step hooks end-to-end.  Three flows keyed on the
@@ -273,7 +475,9 @@ int cmd_decode(const args & a) {
 //     set_text_context + step machine + observe_codes
 #ifndef TTS_CLI_HAVE_BACKBONE
 int cmd_synthesize(const args & a) {
-    (void) a;
+    // Pocket-TTS FlowLM is self-contained (no backbone) — try it first.
+    int fl = run_flow_lm_synthesize(a);
+    if (fl >= 0) return fl;
     std::fprintf(stderr,
         "synthesize: tts-cli was built without the llama backbone "
         "(CODEC_TTS_BACKBONE=OFF).  Reconfigure with the backbone to enable.\n");
@@ -1274,6 +1478,12 @@ bool run_chatterbox(codec_common::audio_lm_context * ctx, llama_context * lctx,
 }  // namespace
 
 int cmd_synthesize(const args & a) {
+    // Pocket-TTS FlowLM is self-contained (no backbone) — try it first; a
+    // non-negative return means it handled the request.
+    {
+        int fl = run_flow_lm_synthesize(a);
+        if (fl >= 0) return fl;
+    }
     if (a.backbone.empty()) {
         std::fprintf(stderr, "synthesize requires --backbone PATH.gguf (llama.cpp model)\n");
         return 1;

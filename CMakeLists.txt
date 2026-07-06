@@ -67,8 +67,11 @@ set(CODEC_SOURCES
     src/models/xy_tokenizer.cpp
     src/models/bluemagpie_audiovae.cpp
     src/models/bluemagpie_blocks.cpp
+    src/models/pocket_mimi.cpp
     src/lm/lm.cpp
     src/lm/bluemagpie_cfm.cpp
+    src/lm/flow_lm.cpp
+    src/lm/spm_unigram.cpp
     src/lm/parallel_heads_delay.cpp
     src/lm/residual_depth_ar.cpp
     src/lm/chatterbox_t3.cpp

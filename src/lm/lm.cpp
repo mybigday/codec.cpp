@@ -32,6 +32,7 @@ static const char * codec_lm_kind_name_internal(enum codec_lm_kind kind) {
         case CODEC_LM_KIND_PARALLEL_HEADS_DELAY:  return "parallel_heads_delay";
         case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:     return "residual_depth_ar";
         case CODEC_LM_KIND_CONTINUOUS_LATENT_CFM: return "continuous_latent_cfm";
+        case CODEC_LM_KIND_FLOW_LM:               return "flow_lm";
         case CODEC_LM_KIND_UNKNOWN:               break;
     }
     return "unknown";
@@ -54,6 +55,9 @@ enum codec_lm_kind codec_lm_kind_from_string(const char * s) {
     if (std::strcmp(s, "continuous_latent_cfm") == 0) {
         return CODEC_LM_KIND_CONTINUOUS_LATENT_CFM;
     }
+    if (std::strcmp(s, "flow_lm") == 0) {
+        return CODEC_LM_KIND_FLOW_LM;
+    }
     return CODEC_LM_KIND_UNKNOWN;
 }
 
@@ -62,6 +66,7 @@ const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind) {
         case CODEC_LM_KIND_PARALLEL_HEADS_DELAY:  return &codec_lm_vtable_parallel_heads_delay;
         case CODEC_LM_KIND_RESIDUAL_DEPTH_AR:     return &codec_lm_vtable_residual_depth_ar;
         case CODEC_LM_KIND_CONTINUOUS_LATENT_CFM: return &codec_lm_vtable_continuous_latent_cfm;
+        case CODEC_LM_KIND_FLOW_LM:               return &codec_lm_vtable_flow_lm;
         case CODEC_LM_KIND_UNKNOWN:               break;
     }
     return nullptr;
@@ -166,7 +171,32 @@ static bool codec_lm_populate_info(codec_lm * lm) {
         return false;
     }
 
-    const int32_t hidden       = codec_read_i32_kv(gf, "codec.lm.hidden_dim", 0);
+    int32_t hidden             = codec_read_i32_kv(gf, "codec.lm.hidden_dim", 0);
+
+    // FlowLM (Pocket-TTS): self-contained continuous-latent AR.  No codebooks,
+    // no external backbone; uses codec.lm.d_model / ldim.  Populate minimal info
+    // and skip the codebook + continuous_latent_cfm metadata paths below.
+    if (lm->kind == CODEC_LM_KIND_FLOW_LM) {
+        const int32_t d_model    = codec_read_i32_kv(gf, "codec.lm.d_model", 0);
+        const int32_t ldim       = codec_read_i32_kv(gf, "codec.lm.ldim", 0);
+        if (d_model <= 0 || ldim <= 0) {
+            lm->last_error = "codec.lm flow_lm: d_model / ldim must be > 0";
+            return false;
+        }
+        lm->host_arch_buf   = codec_lm_read_string_kv(lm->codec, "codec.lm.host_arch");
+        lm->info.kind          = lm->kind;
+        lm->info.hidden_dim    = d_model;
+        lm->info.is_continuous = true;
+        lm->info.latent_dim    = ldim;
+        lm->info.patch_size    = 1;
+        lm->info.n_codebook    = 0;
+        lm->info.codebook_sizes = nullptr;
+        lm->info.delay_pattern  = nullptr;
+        lm->info.host_arch      = lm->host_arch_buf.empty() ? "" : lm->host_arch_buf.c_str();
+        lm->info.eos_code_c0    = -1;
+        lm->info.eos_min_step   = 0;
+        return true;
+    }
 
     // Continuous-latent kinds (CONTINUOUS_LATENT_CFM) don't have codebooks;
     // they emit a continuous latent patch per step.  Populate the continuous

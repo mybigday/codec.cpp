@@ -172,6 +172,7 @@ const codec_lm_kind_vtable * codec_lm_vtable_for_kind(enum codec_lm_kind kind);
 extern const codec_lm_kind_vtable codec_lm_vtable_parallel_heads_delay;
 extern const codec_lm_kind_vtable codec_lm_vtable_residual_depth_ar;
 extern const codec_lm_kind_vtable codec_lm_vtable_continuous_latent_cfm;
+extern const codec_lm_kind_vtable codec_lm_vtable_flow_lm;
 
 // Read a string KV from the codec_model's GGUF.  Returns empty string
 // if the key is absent.

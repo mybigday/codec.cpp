@@ -18,6 +18,7 @@ from .xy_tokenizer import XYTokenizerConverter
 from .csm import CsmConverter
 from .moshi import MoshiConverter
 from .bluemagpie import BlueMagpieConverter
+from .pocket_tts import PocketTTSConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -39,6 +40,7 @@ _CONVERTER_REGISTRY = {
     'csm': CsmConverter,
     'moshi': MoshiConverter,
     'bluemagpie': BlueMagpieConverter,
+    'pocket_tts': PocketTTSConverter,
 }
 
 
