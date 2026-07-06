@@ -756,6 +756,121 @@ bool run_realtime_streaming(codec_common::audio_lm_context * ctx,
     return true;
 }
 
+// Flow 5 — LFM2-Audio sequential text→audio TTS.  Prefill the ChatML prompt
+// (token path), free-run TEXT modality on the backbone's tied-embedding
+// lm_head until <|audio_start|>, then switch to AUDIO_OUT: depth-decode
+// 8-codebook Mimi frames, feed each frame back through
+// compose_audio_codes_embd, and stop on cb0 == EOAudio or <|im_end|>.
+// Mirrors liquid_audio.LFM2AudioModel.generate_sequential.
+bool run_lfm2_sequential(codec_common::audio_lm_context * ctx, llama_context * lctx,
+                         const llama_vocab * vocab,
+                         const codec_common::audio_lm_prompt_info & pi,
+                         const TextEmbdTable & tetab,
+                         const std::vector<llama_token> & toks, int32_t hidden,
+                         int32_t n_cb, int32_t max_frames, Sampler & sampler,
+                         float temp, float top_p, int32_t top_k,
+                         int32_t * out_frames, const char ** out_stop) {
+    codec_common::audio_lm_set_uses_embed_override(ctx, true, 1);
+
+    // ── Prefill the ChatML prompt via the raw token path. ────────────────
+    if (!decode_tokens(lctx, toks, 0, /*all_pos=*/false)) {
+        std::fprintf(stderr, "lfm2: prefill decode failed\n");
+        return false;
+    }
+    int32_t n_past = (int32_t) toks.size();
+    const int32_t n_vocab = (int32_t) tetab.vocab;
+
+    // Text logits from the current backbone hidden.  llama.cpp does NOT build
+    // the lm_head when embeddings are enabled (lfm2.cpp: `if
+    // (!cparams.embeddings)`), and we need embeddings for the depth decoder.
+    // The reference samples text via `linear(last_hidden, embed_tokens.weight)`
+    // — since LFM2 ties the output head to the input embedding, we reproduce
+    // it as hidden · token_embd[row] over the full vocab (the returned
+    // embeddings are already post-final-norm, matching HF's last_hidden_state).
+    std::vector<float> tlog((size_t) n_vocab);
+    std::vector<float> erow((size_t) hidden);
+    auto text_logits = [&](const float * h) -> const float * {
+        for (int32_t v = 0; v < n_vocab; ++v) {
+            if (!tetab.row(v, erow.data())) { tlog[v] = -1e30f; continue; }
+            double acc = 0.0;
+            for (int32_t i = 0; i < hidden; ++i) acc += (double) h[i] * (double) erow[i];
+            tlog[v] = (float) acc;
+        }
+        return tlog.data();
+    };
+
+    // ── Phase 1: TEXT warmup.  Sample text tokens from the tied lm_head
+    //    until the model emits <|audio_start|>.  A cap guards runaway text —
+    //    with the "Perform TTS." system prompt the model emits <|audio_start|>
+    //    as its very first generated token, so this loop runs once. ──
+    (void) vocab;
+    for (int32_t t = 0; t < pi.max_text_tokens; ++t) {
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (!h) { std::fprintf(stderr, "lfm2: no hidden for text logits\n"); return false; }
+        const float * bl = text_logits(h);
+        int32_t tok = sampler.sample(bl, n_vocab, temp, top_p, top_k);
+        if (tok == pi.audio_start_id) break;
+        if (tok == pi.text_end_id)    { *out_stop = "text_end"; return true; }
+        std::vector<llama_token> one(1, (llama_token) tok);
+        if (!decode_tokens(lctx, one, n_past++, /*all_pos=*/false)) {
+            std::fprintf(stderr, "lfm2: text step decode failed\n");
+            return false;
+        }
+    }
+    {
+        // Feed <|audio_start|> so the first audio frame is conditioned on it
+        // (reference embeds audio_start before switching to AUDIO_OUT).
+        std::vector<llama_token> as(1, (llama_token) pi.audio_start_id);
+        if (!decode_tokens(lctx, as, n_past++, /*all_pos=*/false)) return false;
+    }
+
+    // ── Phase 2: AUDIO_OUT.  One depth-decoded N-codebook frame per step. ──
+    std::vector<float> cur(hidden);
+    const float * h0 = llama_get_embeddings_ith(lctx, -1);
+    if (!h0) return false;
+    std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
+
+    std::vector<int32_t> codes(n_cb);
+    for (int32_t step = 0; step < max_frames; ++step) {
+        if (!codec_common::audio_lm_step_begin(ctx, cur.data(), hidden)) return false;
+        for (int32_t cb = 0; cb < n_cb; ++cb) {
+            int32_t idx = 0, nlog = 0;
+            const float * lg = codec_common::audio_lm_step_logits(ctx, &idx, &nlog);
+            if (!lg) return false;
+            int32_t code = sampler.sample(lg, nlog, temp, top_p, top_k);
+            if (!codec_common::audio_lm_step_push_code(ctx, code)) return false;
+        }
+        if (!codec_common::audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
+
+        // EOAudio: cb0 == eos_code_c0 (2048).  observe_codes handles the
+        // accumulate + EOS check; STOP means the frame was the terminator.
+        auto act = codec_common::audio_lm_observe_codes(ctx, codes.data(), n_cb,
+                                                        cur.data(), hidden);
+        if (act == codec_common::OBSERVE_STOP) {
+            const char * e = codec_common::audio_lm_last_error(ctx);
+            if (e && *e) return false;
+            *out_stop = "eos_code_c0";
+            break;
+        }
+        (*out_frames)++;
+
+        // Next backbone input = compose_audio_codes_embd(frame) — the
+        // reference's audio_embedding(codes + codebook_offsets).sum(0).
+        std::vector<float> row(hidden, 0.0f);
+        if (!codec_common::audio_lm_compose_audio_codes_embd(
+                ctx, codes.data(), n_cb, row.data(), hidden)) {
+            std::fprintf(stderr, "lfm2: compose_audio failed: %s\n",
+                         codec_common::audio_lm_last_error(ctx));
+            return false;
+        }
+        if (!decode_embed(lctx, row.data(), hidden, n_past++)) return false;
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (!h) return false;
+        std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
+    }
+    return true;
+}
+
 // Flow 2/3 — codebook AR.  Prefill → per-step { [cb0 from backbone] +
 // step machine cb0..N-1 } → observe_codes (accumulate + EOS + compose) →
 // inject next embed.
@@ -1227,6 +1342,31 @@ int cmd_synthesize(const args & a) {
     // pattern un-shift) for parallel-heads-delay + control-cb0 models, so
     // no family is refused here anymore.
 
+    // ── Moshi: formally out of scope for one-shot synthesize ────────────
+    // Moshi (host_arch=llama, residual_depth_ar, c0_input_modality=text, NO
+    // eos_code_c0) is a full-duplex dialogue model: its backbone is Helium
+    // (unsupported by the pinned llama.cpp submodule — there is no `helium`
+    // arch), and its audio stream has no cb0 EOS to stop a one-shot loop on.
+    // Its one-shot-TTS sibling is a different model (kyutai/dsm).  Refuse
+    // with a concrete message rather than running a stop-less loop against an
+    // unloadable backbone.  (CSM is also host_arch=llama but has eos_code_c0
+    // and c0_input_modality=audio, so it is NOT caught here.)  See
+    // docs/codec_common_api.md §"Moshi: why not in synthesize".
+    if (pi.host_arch == "llama" &&
+        pi.model_kind == codec_common::audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
+        pi.eos_code_c0 < 0 && !pi.cb0_from_backbone) {
+        std::fprintf(stderr,
+            "synthesize: this looks like a Moshi codec_lm (full-duplex dialogue, "
+            "no audio EOS, Helium backbone).  Moshi is not supported by "
+            "`synthesize`: the pinned llama.cpp has no Helium arch, moshiko.gguf "
+            "ships no backbone, and the duplex protocol has no one-shot stop "
+            "condition.  Its one-shot-TTS sibling is kyutai/dsm.  See "
+            "docs/codec_common_api.md.  The codec_lm side is still validated by "
+            "tests/e2e/moshi_lm_smoke.py.\n");
+        codec_common::audio_lm_free(ctx);
+        return 10;
+    }
+
     // ── Backbone init ──────────────────────────────────────────────
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -1382,6 +1522,21 @@ int cmd_synthesize(const args & a) {
         // Flow 1: continuous CFM (BlueMagpie / barbet).
         ar_ok = run_continuous(ctx, lctx, toks, hidden, max_frames, a,
                                &n_frames, &stop_reason);
+    } else if (pi.sequential_text_audio) {
+        // Flow 5: LFM2-Audio sequential text→audio TTS.  Load the backbone's
+        // tied token_embd table so the text warmup phase can compute lm_head
+        // logits (llama.cpp omits the output head when embeddings are on).
+        TextEmbdTable tetab;
+        std::string terr;
+        if (!tetab.load(a.backbone.c_str(), hidden, terr)) {
+            std::fprintf(stderr, "lfm2: text_embd load failed: %s\n", terr.c_str());
+            llama_free(lctx); llama_model_free(lmodel); llama_backend_free();
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+        ar_ok = run_lfm2_sequential(ctx, lctx, vocab, pi, tetab, toks, hidden,
+                                    n_cb, max_frames, sampler, temp, top_p,
+                                    top_k, &n_frames, &stop_reason);
     } else if (pi.streaming_interleave) {
         // Flow 3-streaming: MOSS-TTS-Realtime.  Load the backbone text
         // embedding table (composed on top of the codec audio embed) and

@@ -441,6 +441,21 @@ struct audio_lm_prompt_info {
     int32_t bos_code_c0           = -1;     // audio BOS in last prefill row cb0
     float   default_repetition_penalty = 1.0f;
     int32_t repetition_window          = 0;
+
+    // ── Sequential text→audio (LFM2-Audio) ──────────────────────────────
+    // When true the model is a *sequential* multimodal LM (LFM2-Audio):
+    // after the ChatML prompt is prefilled, the backbone first free-runs in
+    // TEXT modality (sampling text tokens from its OWN tied-embedding lm_head
+    // and feeding them back as ordinary tokens) until it emits
+    // `audio_start_id`, at which point it switches to AUDIO_OUT: the residual
+    // depth decoder emits one N-codebook frame per step (feedback through
+    // compose_audio_codes_embd on the backbone) and generation stops when cb0
+    // samples eos_code_c0 (EOAudio) or the backbone emits `text_end_id`.
+    // See liquid_audio.model.lfm2_audio.LFM2AudioModel.generate_sequential.
+    bool    sequential_text_audio = false;
+    int32_t audio_start_id        = -1;  // text token → switch to AUDIO_OUT
+    int32_t text_end_id           = -1;  // text token → end turn / stop
+    int32_t max_text_tokens       = 64;  // safety cap on the text warmup phase
 };
 
 // Fill `*out` from the loaded model's metadata.  Returns false + sets

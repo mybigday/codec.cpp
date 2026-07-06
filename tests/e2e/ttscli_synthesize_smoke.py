@@ -272,6 +272,28 @@ def main():
         require_stop=True, cer_report_only=False,
     ))
 
+    # LFM2-Audio-1.5B — sequential text→audio TTS (residual depth-AR, 8 Mimi
+    # codebooks).  The backbone (lfm2 arch) first free-runs in TEXT modality
+    # off its tied-embedding lm_head; the "Perform TTS. Use the US male voice."
+    # system prompt makes it emit <|audio_start|> as the first token, switching
+    # to AUDIO_OUT where the depth decoder emits 8-codebook frames fed back via
+    # compose_audio_codes_embd, stopping on cb0 == EOAudio (2048).  llama.cpp
+    # omits the output head when embeddings are enabled, so tts-cli recomputes
+    # text logits as hidden · token_embd (the tied head).  GREEDY TTS is
+    # degenerate for this model (the reference itself gets stuck on "Hello."),
+    # so this case samples (temp 0.8 / top-k 64, fixed seed) per the reference
+    # regime — it stops on eos_code_c0 at ~4-6s and English ASR matches.
+    results.append(_case(
+        "lfm2_audio",
+        REPO / "models" / "lfm2_audio" / "lfm2_audio.gguf",
+        REPO / "models" / "lfm2_audio" / "lfm_backbone.gguf",
+        "Hello, this is a test of the emergency broadcast system.",
+        "en", want_stop="eos_code_c0", cer_max=0.3,
+        extra=["--temp", "0.8", "--top-k", "64", "--seed", "42",
+               "--max-frames", "400"],
+        greedy=False, require_stop=True,
+    ))
+
     ran = [r for r in results if r is not None]
     if not ran:
         print("no cases ran (all assets missing)")

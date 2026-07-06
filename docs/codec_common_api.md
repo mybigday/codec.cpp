@@ -398,13 +398,74 @@ hidden via version script).  tts-cli links codec's ggml 0.9 (shared) +
 the isolated backbone; the two ggml instances never see each other.
 Gated by `-DCODEC_TTS_BACKBONE=ON` (default; CPU-only).
 
-Remaining (blocked on per-model decode transforms, not the loop):
-MOSS-TTSD / MOSS-TTS-Realtime need cb0 (control/text) slicing at decode
-(`audio_codebook_offset > 0`) + delay-pattern un-shift; Qwen3-TTS runs
-E2E but needs speaker/voice conditioning for intelligible output; LFM2
-and Chatterbox lack documented prompt formats / a supported decode.
-tts-cli refuses these cleanly (exit 10) rather than feeding the codec
-invalid codes.
+Wired + whisper-verified end-to-end (6/6 synthesize smoke): CSM,
+Chatterbox-T3, BlueMagpie, MOSS-TTSD v0.5, MOSS-TTS-Realtime, Qwen3-TTS,
+and **LFM2-Audio** (see below).
+
+### LFM2-Audio: sequential text→audio TTS (Flow 5)
+
+LFM2-Audio-1.5B is a *sequential* multimodal LM (`host_arch=lfm2`,
+`residual_depth_ar`, `depth_emits_c0=true`, 8 Mimi codebooks).  Unlike the
+other depth-AR models it does not start audio immediately — it first
+free-runs in TEXT modality and only switches to AUDIO_OUT when it samples
+`<|audio_start|>` (id 128).  The wiring (`run_lfm2_sequential` in
+`tts-cli.cpp` + the `lfm2` branch of `audio_lm_get_prompt_info`):
+
+* **Prompt** (the flip into audio): system turn
+  `"Perform TTS. Use the US male voice."` + user turn with the text +
+  assistant open.  With this system prompt the model emits `<|audio_start|>`
+  as its very first generated token.  (`Liquid4All/liquid-audio` TTS
+  recipe; the ChatState/generate_sequential path in
+  `liquid_audio.model.lfm2_audio`.)
+* **Text logits from a tied head** — llama.cpp's `lfm2` graph omits the
+  output head when embeddings are enabled (`if (!cparams.embeddings)` in
+  `models/lfm2.cpp`), and we need embeddings for the depth decoder.  Since
+  LFM2 ties its lm_head to `token_embd`, tts-cli recomputes text logits as
+  `hidden · token_embd[v]` over the vocab (the returned embeddings are
+  already post-final-norm, matching HF's `last_hidden_state`).
+* **Audio phase** — the depth decoder emits all 8 codebooks per step; each
+  frame feeds back through `compose_audio_codes_embd`
+  (`audio_embedding(codes + codebook_offsets).sum(0)`); stop on
+  cb0 == EOAudio (2048).
+* **Sampling, not greedy** — greedy TTS is *degenerate* for this model
+  (the reference itself gets stuck on "Hello."); the reference regime is
+  `audio_temperature=0.8, audio_top_k=64`.  With sampling it stops on
+  eos_code_c0 at ~4–6 s and English ASR reproduces the input (CER 0.0 with
+  a fixed seed).  The existing F16 `lfm_backbone.gguf` is sufficient (no
+  BF16 backbone needed once sampled).
+
+### Moshi: why not in `synthesize`
+
+Moshi is **formally out of scope** for `tts-cli synthesize`, for three
+concrete blockers:
+
+1. **No backbone asset, no arch support.**  Moshi's backbone is Helium-7B,
+   which the pinned llama.cpp submodule does not implement (no `helium`
+   arch — grep is empty).  The converter approximates `host_arch=llama`,
+   but the real Moshi backbone is not a plain Llama and there is no local
+   backbone GGUF (`models/moshi/` ships only `moshiko.gguf` = the Mimi
+   codec + depth-decoder adaptor; `~/.cache/huggingface/.../moshiko-*` has
+   only a README).
+2. **No single-shot audio EOS.**  `moshiko.gguf` carries
+   `eos_code_c0 = None` — Moshi is a **full-duplex dialogue** model whose
+   audio stream never terminates on a cb0 sentinel.  One-shot TTS is the
+   wrong frame; the host AR loop has no stop condition to key on.
+3. **Duplex protocol needs a different host loop.**  Moshi interleaves
+   input-audio + input-text + output-text + output-audio every step
+   (the "MoshiVoice / full duplex (future)" row in *Per-model fit*); that
+   is a bidirectional loop, not the unidirectional prompt→audio flow
+   `synthesize` implements.  Kyutai's one-shot-TTS sibling is a *different*
+   model (`kyutai/dsm`, delayed-streams TTS), not Moshi.
+
+The codec_lm side stays validated: `tests/e2e/moshi_lm_smoke.py` checks the
+`depth_decoder.* → lm.depth.*` flexible-tensor conversion + the
+`c0_input_modality=text` depth-step graph against HF Moshi (no backbone /
+no full generation).  `tts-cli synthesize` now **refuses a Moshi codec_lm
+with a clear message** (missing Helium backbone arch + duplex protocol)
+instead of running a stop-less loop against an unloadable backbone.
+
+Historic note — the earlier "refuses these cleanly (exit 10)" set (MOSS-*,
+Qwen3-TTS, LFM2, Chatterbox) is now all wired; only Moshi is refused.
 
 ## Open questions / follow-ups
 

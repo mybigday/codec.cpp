@@ -1009,6 +1009,44 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
         return true;
     }
 
+    // lfm2 — LFM2-Audio-1.5B sequential text→audio TTS.  The reference
+    // (liquid_audio ChatState + generate_sequential) prefills a ChatML
+    // conversation whose system turn primes pure read-aloud TTS, puts the
+    // input text in a user turn, and opens an assistant turn.  Generation
+    // then free-runs in TEXT modality (backbone tied-embedding lm_head) until
+    // the model emits <|audio_start|> (id 128), switches to AUDIO_OUT and
+    // depth-decodes 8-codebook Mimi frames until cb0 == EOAudio (2048) or the
+    // backbone emits <|im_end|> (id 7).  The <|startoftext|> BOS is prepended
+    // by the tokenizer (add_bos=true).
+    if (out->host_arch == "lfm2") {
+        // TTS system prompt: "Perform TTS. Use the [voice] voice." — this is
+        // what flips the model into immediate AUDIO_OUT (it emits
+        // <|audio_start|> as the first generated token).  Voice ∈ {US male,
+        // US female, UK male, UK female}; US male is the default.  (Liquid4All/
+        // liquid-audio TTS example.)
+        out->prompt_prefix =
+            "<|im_start|>system\nPerform TTS. Use the US male voice."
+            "<|im_end|>\n<|im_start|>user\n";
+        out->prompt_suffix =
+            "<|im_end|>\n<|im_start|>assistant\n";
+        out->add_bos       = true;   // <|startoftext|>
+        out->parse_special = true;
+        out->cb0_from_backbone = false;      // depth decoder emits all 8 cb
+        out->audio_codebook_offset = ctx->audio_cb_offset;  // 0 for LFM2
+        // Sequential text→audio switch.  Special-token ids are fixed for the
+        // LFM2-Audio tokenizer (added_tokens_decoder in tokenizer_config).
+        out->sequential_text_audio = true;
+        out->audio_start_id = meta_i32_or(ctx, "codec.lm.audio_start_id", 128);
+        out->text_end_id    = meta_i32_or(ctx, "codec.lm.text_end_id",    7);
+        out->max_text_tokens = meta_i32_or(ctx, "codec.lm.max_text_tokens", 64);
+        // Reference TTS defaults: greedy text, greedy audio (temperature=None
+        // → argmax in generate_sequential).  Host --temp overrides.
+        out->default_temperature = 0.0f;
+        out->default_top_p       = 1.0f;
+        out->default_top_k       = 0;
+        return true;
+    }
+
     // Unknown arch — return the raw kind but empty template.
     return true;
 }
