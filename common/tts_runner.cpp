@@ -28,7 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -107,54 +107,91 @@ struct TextEmbdTable {
     }
 };
 
-// Minimal xorshift64* sampler mirroring rn-tts's sample_codec_logits:
-// temp<=0 → greedy argmax; else softmax(temp) → top-k → top-p → sample.
-struct Sampler {
-    std::mt19937_64 rng;
-    explicit Sampler(uint32_t seed) : rng(seed ? seed : 0xC0DEC1ABull) {}
+// ── llama.cpp sampler-chain wrapper ───────────────────────────────────
+// Replaces the old hand-rolled samplers.  A SamplerChain owns one
+// llama_sampler chain and drives it over RAW float* logits (from either
+// the llama backbone or a codec_lm head) via llama_token_data_array — the
+// sampler API operates on arbitrary logits and never needs a vocab handle
+// for temp/top-k/top-p/min-p/penalties/dist/greedy.
+//
+// We wrap each logit as {id=index, logit, p=0}; after llama_sampler_apply
+// the chosen token is data[cur_p.selected].id (== the code index, since
+// samplers reorder/shrink the array but preserve ids).  For penalty-based
+// chains we call llama_sampler_accept(sampled) to maintain the ring-buffer
+// window (llama.cpp's penalties sampler needs accept per emitted token).
+//
+// Semantics verified against the pinned llama.cpp llama-sampler.cpp:
+//  * penalties: logit<=0 ? *repeat : /repeat  (freq=present=0) — matches
+//    the HF RepetitionPenaltyLogitsProcessor / apply_repetition_penalty
+//    convention used by chatterbox-T3 and MOSS-realtime.
+//  * temp: divides logits by t (no softmax); top-k/top-p/min-p each
+//    recompute softmax internally, mirroring HF's per-warper softmax.
+//  * greedy: strict-`>` argmax from index 0 — byte-identical to the old
+//    greedy path (needed for the CSM greedy WAV parity).
+struct SamplerChain {
+    llama_sampler * chain = nullptr;
+    bool has_penalties = false;
+    std::vector<llama_token_data> buf;
 
-    // Apply CTRL-style repetition penalty in place over `history` codes
-    // (mutates a caller-owned logits copy).  Mirrors
-    // streaming_mossttsrealtime.py apply_repetition_penalty.
-    static void apply_rep_penalty(float * logits, int32_t n,
-                                  const int32_t * history, int32_t n_hist,
-                                  float penalty) {
-        if (penalty == 1.0f || n_hist <= 0) return;
-        for (int32_t i = 0; i < n_hist; ++i) {
-            const int32_t tok = history[i];
-            if (tok < 0 || tok >= n) continue;
-            float v = logits[tok];
-            logits[tok] = (v < 0.0f) ? v * penalty : v / penalty;
-        }
+    SamplerChain() = default;
+    SamplerChain(const SamplerChain &) = delete;
+    SamplerChain & operator=(const SamplerChain &) = delete;
+    ~SamplerChain() { if (chain) llama_sampler_free(chain); }
+
+    // Greedy chain (temp<=0): argmax only, no RNG.
+    void init_greedy() {
+        reset();
+        llama_sampler_chain_params sp = llama_sampler_chain_default_params();
+        sp.no_perf = true;
+        chain = llama_sampler_chain_init(sp);
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+        has_penalties = false;
     }
 
-    int32_t sample(const float * logits, int32_t n, float temp, float top_p, int32_t top_k) {
-        if (n <= 0) return 0;
-        if (temp <= 0.0f) {
-            int32_t best = 0; float bv = logits[0];
-            for (int32_t i = 1; i < n; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
-            return best;
+    // Sampled chain in the reference order.  Any argument left at its
+    // "disabled" sentinel (penalty==1, top_k<=0, top_p>=1, min_p<=0)
+    // becomes a no-op in llama.cpp, so a single builder serves every flow.
+    //   penalties → temp → top_k → min_p → top_p → dist(seed)
+    // The min_p-before-top_p order matches chatterbox-T3's reference
+    // (min_p_warper then top_p_warper); realtime leaves min_p=0 (noop) so it
+    // reduces to temp → top_k → top_p, mirroring the old Sampler which
+    // truncated to top_k on the sorted list then applied top_p within it.
+    void init_sampled(uint32_t seed, float temp, int32_t top_k, float top_p,
+                      float min_p, float rep_penalty, int32_t rep_last_n) {
+        reset();
+        llama_sampler_chain_params sp = llama_sampler_chain_default_params();
+        sp.no_perf = true;
+        chain = llama_sampler_chain_init(sp);
+        if (rep_penalty != 1.0f) {
+            const int32_t last_n = rep_last_n > 0 ? rep_last_n : -1;  // -1 = full history
+            llama_sampler_chain_add(chain,
+                llama_sampler_init_penalties(last_n, rep_penalty, 0.0f, 0.0f));
+            has_penalties = true;
         }
-        std::vector<std::pair<float,int32_t>> p(n);
-        float mx = logits[0];
-        for (int32_t i = 1; i < n; ++i) mx = std::max(mx, logits[i]);
-        double sum = 0.0;
-        for (int32_t i = 0; i < n; ++i) { double e = std::exp((logits[i]-mx)/temp); p[i] = {(float)e, i}; sum += e; }
-        for (auto & q : p) q.first = (float)(q.first / sum);
-        std::sort(p.begin(), p.end(), [](auto&x,auto&y){ return x.first > y.first; });
-        int32_t keep = n;
-        if (top_k > 0 && top_k < keep) keep = top_k;
-        if (top_p > 0.0f && top_p < 1.0f) {
-            double c = 0.0; int32_t kk = 0;
-            for (; kk < keep; ++kk) { c += p[kk].first; if (c >= top_p) { kk++; break; } }
-            keep = std::max(1, kk);
-        }
-        double norm = 0.0;
-        for (int32_t i = 0; i < keep; ++i) norm += p[i].first;
-        std::uniform_real_distribution<double> u(0.0, norm);
-        double r = u(rng), acc = 0.0;
-        for (int32_t i = 0; i < keep; ++i) { acc += p[i].first; if (r <= acc) return p[i].second; }
-        return p[keep-1].second;
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+        if (top_k > 0)               llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+        if (min_p > 0.0f)            llama_sampler_chain_add(chain, llama_sampler_init_min_p(min_p, 1));
+        if (top_p > 0.0f && top_p < 1.0f)
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+    }
+
+    void reset() {
+        if (chain) { llama_sampler_free(chain); chain = nullptr; }
+        has_penalties = false;
+    }
+
+    // Sample one token from raw logits[0..n).  Returns the chosen index.
+    int32_t sample(const float * logits, int32_t n) {
+        if (n <= 0 || !chain) return 0;
+        buf.resize((size_t) n);
+        for (int32_t i = 0; i < n; ++i) buf[(size_t) i] = { (llama_token) i, logits[i], 0.0f };
+        llama_token_data_array cur = { buf.data(), (size_t) n, -1, false };
+        llama_sampler_apply(chain, &cur);
+        const int64_t sel = cur.selected >= 0 ? cur.selected : 0;
+        const llama_token id = cur.data[sel].id;
+        llama_sampler_accept(chain, id);  // maintain penalty window (no-op otherwise)
+        return (int32_t) id;
     }
 };
 
@@ -347,7 +384,7 @@ bool run_realtime_streaming(audio_lm_context * ctx,
                             const TextEmbdTable & tetab,
                             const std::string & payload_text,
                             int32_t hidden, int32_t n_cb, int32_t max_frames,
-                            Sampler & sampler, float temp, float top_p,
+                            uint32_t seed, float temp, float top_p,
                             int32_t top_k, float rep_penalty, int32_t rep_window,
                             int32_t * out_frames, const char ** out_stop) {
     audio_lm_set_uses_embed_override(ctx, true, 1);
@@ -412,7 +449,16 @@ bool run_realtime_streaming(audio_lm_context * ctx,
         std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
     }
 
-    std::vector<std::vector<int32_t>> hist((size_t) n_cb);
+    // Per-codebook sampler chains: each carries its own penalty ring-buffer
+    // (window = rep_window) so the CTRL-style repetition penalty is applied
+    // per codebook exactly like the old windowed apply_rep_penalty.
+    std::vector<std::unique_ptr<SamplerChain>> cb_smpl((size_t) n_cb);
+    for (int32_t cb = 0; cb < n_cb; ++cb) {
+        cb_smpl[(size_t) cb] = std::make_unique<SamplerChain>();
+        if (temp <= 0.0f) cb_smpl[(size_t) cb]->init_greedy();
+        else cb_smpl[(size_t) cb]->init_sampled(seed, temp, top_k, top_p,
+                                                /*min_p=*/0.0f, rep_penalty, rep_window);
+    }
 
     int32_t text_idx = prefill_n;
     std::vector<int32_t> codes(n_cb);
@@ -422,18 +468,7 @@ bool run_realtime_streaming(audio_lm_context * ctx,
             int32_t idx = 0, nlog = 0;
             const float * lg = audio_lm_step_logits(ctx, &idx, &nlog);
             if (!lg) return false;
-            int32_t code;
-            if (rep_penalty == 1.0f) {
-                code = sampler.sample(lg, nlog, temp, top_p, top_k);
-            } else {
-                std::vector<float> lc(lg, lg + nlog);
-                const std::vector<int32_t> & h = hist[(size_t) cb];
-                const int32_t hn = (int32_t) h.size();
-                const int32_t w  = (rep_window > 0 && rep_window < hn) ? rep_window : hn;
-                Sampler::apply_rep_penalty(lc.data(), nlog,
-                                           h.data() + (hn - w), w, rep_penalty);
-                code = sampler.sample(lc.data(), nlog, temp, top_p, top_k);
-            }
+            int32_t code = cb_smpl[(size_t) cb]->sample(lg, nlog);
             if (!audio_lm_step_push_code(ctx, code)) return false;
         }
         if (!audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
@@ -447,7 +482,6 @@ bool run_realtime_streaming(audio_lm_context * ctx,
             break;
         }
         (*out_frames)++;
-        for (int32_t cb = 0; cb < n_cb; ++cb) hist[(size_t) cb].push_back(codes[cb]);
 
         int32_t text_tok = (text_idx < (int32_t) text_toks.size())
                          ? text_toks[(size_t) text_idx] : text_pad;
@@ -468,7 +502,7 @@ bool run_lfm2_sequential(audio_lm_context * ctx, llama_context * lctx,
                          const audio_lm_prompt_info & pi,
                          const TextEmbdTable & tetab,
                          const std::vector<llama_token> & toks, int32_t hidden,
-                         int32_t n_cb, int32_t max_frames, Sampler & sampler,
+                         int32_t n_cb, int32_t max_frames, uint32_t seed,
                          float temp, float top_p, int32_t top_k,
                          int32_t * out_frames, const char ** out_stop) {
     audio_lm_set_uses_embed_override(ctx, true, 1);
@@ -493,11 +527,18 @@ bool run_lfm2_sequential(audio_lm_context * ctx, llama_context * lctx,
     };
 
     (void) vocab;
+    // One chain (no rep penalty) drives both the text warm-up and the audio
+    // codebooks, matching the old single-RNG-stream Sampler.
+    SamplerChain smpl;
+    if (temp <= 0.0f) smpl.init_greedy();
+    else smpl.init_sampled(seed, temp, top_k, top_p, /*min_p=*/0.0f,
+                           /*rep_penalty=*/1.0f, /*rep_last_n=*/0);
+
     for (int32_t t = 0; t < pi.max_text_tokens; ++t) {
         const float * h = llama_get_embeddings_ith(lctx, -1);
         if (!h) { std::fprintf(stderr, "lfm2: no hidden for text logits\n"); return false; }
         const float * bl = text_logits(h);
-        int32_t tok = sampler.sample(bl, n_vocab, temp, top_p, top_k);
+        int32_t tok = smpl.sample(bl, n_vocab);
         if (tok == pi.audio_start_id) break;
         if (tok == pi.text_end_id)    { *out_stop = "text_end"; return true; }
         std::vector<llama_token> one(1, (llama_token) tok);
@@ -523,7 +564,7 @@ bool run_lfm2_sequential(audio_lm_context * ctx, llama_context * lctx,
             int32_t idx = 0, nlog = 0;
             const float * lg = audio_lm_step_logits(ctx, &idx, &nlog);
             if (!lg) return false;
-            int32_t code = sampler.sample(lg, nlog, temp, top_p, top_k);
+            int32_t code = smpl.sample(lg, nlog);
             if (!audio_lm_step_push_code(ctx, code)) return false;
         }
         if (!audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
@@ -558,7 +599,7 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
                      const llama_vocab * vocab,
                      const audio_lm_prompt_info & pi,
                      const std::vector<llama_token> & toks, int32_t hidden, int32_t n_cb,
-                     int32_t max_frames, Sampler & sampler,
+                     int32_t max_frames, uint32_t seed,
                      float temp, float top_p, int32_t top_k,
                      const std::vector<float> & speaker_prefix,
                      const std::string & payload_text,
@@ -647,13 +688,21 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
     if (!h0) return false;
     std::memcpy(cur.data(), h0, (size_t) hidden * sizeof(float));
 
+    // One chain (no rep penalty) for cb0-from-backbone + all codebooks,
+    // matching the old single-RNG-stream Sampler.  Greedy when temp<=0 so
+    // the CSM greedy path stays byte-identical.
+    SamplerChain smpl;
+    if (temp <= 0.0f) smpl.init_greedy();
+    else smpl.init_sampled(seed, temp, top_k, top_p, /*min_p=*/0.0f,
+                           /*rep_penalty=*/1.0f, /*rep_last_n=*/0);
+
     std::vector<int32_t> codes(n_cb);
     for (int32_t step = 0; step < max_frames; ++step) {
         if (pi.cb0_from_backbone) {
             const float * bl = llama_get_logits_ith(lctx, -1);
             if (!bl) return false;
             int32_t nv = llama_vocab_n_tokens(vocab);
-            int32_t c0 = sampler.sample(bl, nv, temp, top_p, top_k);
+            int32_t c0 = smpl.sample(bl, nv);
             if (!audio_lm_step_set_text_context(ctx, c0)) return false;
             codes[0] = c0;
         }
@@ -664,7 +713,7 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
             if (!lg) return false;
             int32_t code = (pi.cb0_from_backbone && cb == 0)
                          ? codes[0]
-                         : sampler.sample(lg, nlog, temp, top_p, top_k);
+                         : smpl.sample(lg, nlog);
             if (!audio_lm_step_push_code(ctx, code)) return false;
         }
         if (!audio_lm_step_finish(ctx, codes.data(), n_cb)) return false;
@@ -698,64 +747,6 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
         std::memcpy(cur.data(), h, (size_t) hidden * sizeof(float));
     }
     return true;
-}
-
-// T3-faithful per-step sampler over the CFG-combined speech logits.
-int32_t sample_t3(std::mt19937_64 & rng, std::vector<float> logits,
-                  const std::vector<int32_t> & generated,
-                  float temperature, float min_p, float top_p,
-                  float repetition_penalty) {
-    const int32_t n = (int32_t) logits.size();
-    if (n <= 0) return 0;
-
-    if (temperature <= 0.0f) {
-        int32_t best = 0; for (int32_t i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
-        return best;
-    }
-
-    if (repetition_penalty != 1.0f) {
-        for (int32_t id : generated) {
-            if (id < 0 || id >= n) continue;
-            float & l = logits[id];
-            l = (l > 0.0f) ? (l / repetition_penalty) : (l * repetition_penalty);
-        }
-    }
-    if (temperature > 0.0f && temperature != 1.0f) {
-        for (float & l : logits) l /= temperature;
-    }
-    float mx = logits[0];
-    for (int32_t i = 1; i < n; ++i) mx = std::max(mx, logits[i]);
-    std::vector<float> probs(n);
-    double sum = 0.0;
-    for (int32_t i = 0; i < n; ++i) { double e = std::exp((double) logits[i] - mx); probs[i] = (float) e; sum += e; }
-    for (float & p : probs) p = (float) (p / sum);
-
-    if (min_p > 0.0f) {
-        float pmax = 0.0f;
-        for (float p : probs) pmax = std::max(pmax, p);
-        const float thresh = min_p * pmax;
-        for (int32_t i = 0; i < n; ++i) if (probs[i] < thresh) probs[i] = 0.0f;
-    }
-    if (top_p > 0.0f && top_p < 1.0f) {
-        std::vector<int32_t> idx(n);
-        for (int32_t i = 0; i < n; ++i) idx[i] = i;
-        std::sort(idx.begin(), idx.end(), [&](int32_t x, int32_t y){ return probs[x] > probs[y]; });
-        double c = 0.0; bool cut = false;
-        for (int32_t r = 0; r < n; ++r) {
-            if (cut) { probs[idx[r]] = 0.0f; continue; }
-            c += probs[idx[r]];
-            if (c >= top_p) cut = true;
-        }
-    }
-    double z = 0.0; for (float p : probs) z += p;
-    if (z <= 0.0) {
-        int32_t best = 0; for (int32_t i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
-        return best;
-    }
-    std::uniform_real_distribution<double> u(0.0, z);
-    double r = u(rng), acc = 0.0;
-    for (int32_t i = 0; i < n; ++i) { acc += probs[i]; if (r <= acc) return i; }
-    return n - 1;
 }
 
 // Flow 4 — Chatterbox T3.
@@ -858,9 +849,16 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
     }
 
     const int32_t V = ci->speech_vocab_size;
-    std::mt19937_64 rng(a.seed ? a.seed : 0xC0DEC1ABull);
-    std::vector<int32_t> generated;
-    generated.push_back(ci->start_speech_token);
+    // T3-faithful chain: penalties(full history) → temp → min_p → top_p →
+    // dist(seed).  Seed the penalty ring buffer with start_speech_token, as
+    // the old sample_t3 pre-loaded `generated` with it before step 0.
+    SamplerChain smpl;
+    if (temperature <= 0.0f) smpl.init_greedy();
+    else {
+        smpl.init_sampled(a.seed ? a.seed : 0xC0DEC1ABu, temperature, /*top_k=*/0,
+                          top_p, min_p, rep_pen, /*rep_last_n=*/-1);
+        if (smpl.has_penalties) llama_sampler_accept(smpl.chain, ci->start_speech_token);
+    }
     int32_t n_past = seq_len;
 
     auto lane_hidden = [&](int32_t lane) -> const float * {
@@ -894,10 +892,8 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
         std::vector<float> logits(VV);
         for (int32_t i = 0; i < VV; ++i)
             logits[i] = hu ? (cond[i] + cfg_weight * (cond[i] - uncond[i])) : cond[i];
-        int32_t code = sample_t3(rng, std::move(logits), generated,
-                                 temperature, min_p, top_p, rep_pen);
+        int32_t code = smpl.sample(logits.data(), VV);
         (void) V;
-        generated.push_back(code);
         if (code == ci->stop_speech_token) { *out_stop = "eos_code_c0"; break; }
         if (code < ci->start_speech_token) out_codes->push_back(code);
         (*out_frames)++;
@@ -1114,7 +1110,7 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     const float temp  = a.has_temp  ? a.temp  : pi.default_temperature;
     const float top_p = a.has_top_p ? a.top_p : pi.default_top_p;
     const int32_t top_k = a.has_top_k ? a.top_k : pi.default_top_k;
-    Sampler sampler(a.seed);
+    const uint32_t seed = a.seed ? a.seed : 0xC0DEC1ABu;
 
     const char * stop_reason = "max_frames";
     int32_t n_frames = 0;
@@ -1133,7 +1129,7 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
             return false;
         }
         ar_ok = run_lfm2_sequential(ctx, lctx, vocab, pi, tetab, toks, hidden,
-                                    n_cb, max_frames, sampler, temp, top_p,
+                                    n_cb, max_frames, seed, temp, top_p,
                                     top_k, &n_frames, &stop_reason);
     } else if (pi.streaming_interleave) {
         TextEmbdTable tetab;
@@ -1147,13 +1143,13 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         const float rep_pen = a.has_rep_penalty ? a.repetition_penalty
                                                 : pi.default_repetition_penalty;
         ar_ok = run_realtime_streaming(ctx, lctx, vocab, pi, tetab, a.text,
-                                       hidden, n_cb, max_frames, sampler,
+                                       hidden, n_cb, max_frames, seed,
                                        temp, top_p, top_k, rep_pen,
                                        pi.repetition_window,
                                        &n_frames, &stop_reason);
     } else {
         ar_ok = run_codebook_ar(ctx, lctx, vocab, pi, toks, hidden, n_cb,
-                                max_frames, sampler, temp, top_p, top_k,
+                                max_frames, seed, temp, top_p, top_k,
                                 speaker_prefix, a.text, &n_frames, &stop_reason);
     }
 
