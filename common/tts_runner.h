@@ -26,16 +26,17 @@
 #include <string>
 #include <vector>
 
-// llama_logit_bias — replicated inline so this header is includable by TUs
-// that do NOT have llama.h on their include path (e.g. tts_runner_flow.cpp,
-// which lives in the always-built codec_common library).  The layout is
-// identical to llama.h's typedef.  Gated on !LLAMA_H so that TUs that
-// already included llama.h (which defines the same struct) don't redeclare it.
+// llama_logit_bias / llama_token — replicated inline so this header is
+// includable by TUs that do NOT have llama.h on their include path (e.g.
+// tts_runner_flow.cpp, which lives in the always-built codec_common library).
+// Layouts are identical to llama.h's typedefs.  Gated on !LLAMA_H so that
+// TUs that already included llama.h don't see a redeclaration.
 #ifndef LLAMA_H
 typedef struct llama_logit_bias {
     int32_t token;
     float   bias;
 } llama_logit_bias;
+typedef int32_t llama_token;
 #endif  // !LLAMA_H
 
 // Forward-declare llama_vocab so the detection helpers below can accept a
@@ -80,6 +81,23 @@ bool neutts_audio_token_range(const llama_vocab * vocab,
                               int32_t * offset,
                               int32_t * count,
                               int32_t * eos_id);
+
+// Build the full NeuTTS ICL prefill token sequence.
+//
+// Assembles the verbatim prompt string (phonemes mode):
+//   "user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phonemes} {input_phonemes}"
+//   "<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>"
+// tokenized with parse_special=true so the <|...|> markers resolve to their
+// special ids, then appends one vocab id (offset + c) for each code in
+// ref_codes.
+//
+// Guards: returns an empty vector if vocab is null, if llama_tokenize fails,
+// or if any ref_code is out of [0, count).
+std::vector<llama_token> build_neutts_prompt(
+    const llama_vocab          * vocab,
+    const std::string          & ref_text_phonemes,
+    const std::string          & input_phonemes,
+    const std::vector<int32_t> & ref_codes);
 
 // ─────────────────────────────────────────────────────────────────────
 // Params — everything the reference loop needs.  Unset optionals fall

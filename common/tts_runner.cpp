@@ -1226,6 +1226,54 @@ bool neutts_audio_token_range(const llama_vocab * vocab,
     return true;
 }
 
+// Build the full NeuTTS ICL prefill token sequence.
+//
+// 1. Assembles the verbatim prompt string (phonemes mode, per neutts-facts §Step 5):
+//      "user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phonemes} {input_phonemes}"
+//      "<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>"
+// 2. Tokenizes it with parse_special=true so the <|...|> markers resolve.
+// 3. Appends one vocab id (offset + c) per ref code.
+// Guard: returns empty vector on any error (null vocab, tokenize failure, out-of-range code).
+std::vector<llama_token> build_neutts_prompt(
+        const llama_vocab          * vocab,
+        const std::string          & ref_text_phonemes,
+        const std::string          & input_phonemes,
+        const std::vector<int32_t> & ref_codes) {
+    if (!vocab) return {};
+
+    // 1. Verbatim template (neutts-facts §Step 5).
+    const std::string prompt_str =
+        "user: Convert the text to speech:<|TEXT_PROMPT_START|>"
+        + ref_text_phonemes + " " + input_phonemes
+        + "<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>";
+
+    // 2. Tokenize with parse_special=true (mirrors tokenize_str idiom).
+    std::vector<llama_token> toks = tokenize_str(vocab, prompt_str, /*add_bos=*/false, /*parse_special=*/true);
+    if (toks.empty()) {
+        std::fprintf(stderr, "[neutts] build_neutts_prompt: tokenize returned empty\n");
+        return {};
+    }
+
+    // 3. Resolve speech-token range and append ref code ids.
+    int32_t offset = -1, count = -1, eos_id = -1;
+    if (!neutts_audio_token_range(vocab, &offset, &count, &eos_id)) {
+        std::fprintf(stderr, "[neutts] build_neutts_prompt: neutts_audio_token_range failed\n");
+        return {};
+    }
+
+    toks.reserve(toks.size() + ref_codes.size());
+    for (int32_t c : ref_codes) {
+        if (c < 0 || c >= count) {
+            std::fprintf(stderr,
+                "[neutts] build_neutts_prompt: ref code %d out of range [0, %d) — aborting\n",
+                c, count);
+            return {};
+        }
+        toks.push_back(offset + c);
+    }
+    return toks;
+}
+
 bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out) {
     // Pocket-TTS FlowLM is self-contained (no backbone) — try it first; a
     // non-zero return means it handled the request.
@@ -1380,6 +1428,101 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         fill_result_from_output(pcm, n_frames, stop_reason, out);
         audio_lm_free(ctx);
         return true;
+    }
+
+    // ── NeuTTS ICL ref-encode + prompt assembly (Task 3 → Task 4 seam) ──────
+    // When the backbone is a NeuTTS model, the prefill is built from:
+    //   1. The verbatim ICL template (ref phonemes + input phonemes)
+    //   2. The NeuCodec-encoded reference audio codes appended as speech tokens
+    // Task 4 will add the KIND_TOKEN_SINGLE_CB decode-loop dispatch that
+    // CONSUMES neutts_prompt_toks.  Here we only build + log it.
+    std::vector<llama_token> neutts_prompt_toks;
+    const bool is_neutts = detect_neutts(vocab);
+    if (is_neutts) {
+        if (a.ref_audio_path.empty() || a.ref_text.empty()) {
+            out->error =
+                "NeuTTS requires both --ref-audio and --ref-text for in-context learning; "
+                "re-run with a reference audio clip and its transcript.";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        // Load reference audio (mono F32).
+        std::vector<float> ref_pcm;
+        int32_t ref_n = 0, ref_sr = 0;
+        std::string ref_err;
+        if (!load_ref_audio(a.ref_audio_path, ref_pcm, &ref_n, &ref_sr, &ref_err)) {
+            out->error = ref_err;
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        // Resample to 16000 Hz (NeuCodec encode_sample_rate; neutts-facts §Step 4).
+        const int32_t enc_sr = 16000;
+        if (ref_sr > 0 && ref_sr != enc_sr) {
+            ref_pcm = resample_mono_f32(ref_pcm, ref_sr, enc_sr);
+        }
+        ref_n = (int32_t) ref_pcm.size();
+
+        // Load the NeuCodec encoder (base variant, has_encoder=True).
+        // The encoder-capable gguf is models/neucodec/neucodec.gguf; the
+        // repo-root neucodec.gguf is decode-only and will fail here.
+        codec_model_params cmp = codec_model_default_params();
+        cmp.use_gpu   = a.use_gpu;
+        cmp.n_threads = a.n_threads > 0 ? a.n_threads : 1;
+        codec_model * cmodel = codec_model_load_from_file(a.codec_path.c_str(), cmp);
+        if (!cmodel) {
+            out->error = std::string("NeuTTS: failed to load NeuCodec model from ") + a.codec_path;
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        codec_context * cctx = codec_init_from_model(cmodel, codec_context_default_params());
+        if (!cctx) {
+            out->error = "NeuTTS: codec_init_from_model failed";
+            codec_model_free(cmodel);
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        codec_audio au;
+        au.data        = ref_pcm.data();
+        au.n_samples   = ref_n;
+        au.sample_rate = enc_sr;
+        au.n_channels  = 1;
+        au.pcm_type    = CODEC_PCM_TYPE_F32;
+
+        codec_token_buffer tb;
+        std::memset(&tb, 0, sizeof(tb));
+        const codec_status enc_status = codec_encode(cctx, &au, &tb, codec_encode_default_params());
+        if (enc_status != CODEC_STATUS_SUCCESS) {
+            out->error =
+                std::string("NeuTTS: codec_encode failed — ensure the encoder-capable gguf is "
+                            "used (models/neucodec/neucodec.gguf, has_encoder=true); "
+                            "the repo-root neucodec.gguf is decode-only.  Error: ")
+                + codec_get_last_error(cctx);
+            codec_free(cctx); codec_model_free(cmodel);
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // Extract 1-D code vector (n_q=1; layout data[t*n_q + q]).
+        std::vector<int32_t> ref_codes;
+        ref_codes.reserve((size_t) tb.n_frames);
+        for (int32_t t = 0; t < tb.n_frames; ++t) {
+            ref_codes.push_back(tb.data[t]);   // n_q=1 so q=0 only
+        }
+        codec_token_buffer_free(&tb);
+        codec_free(cctx);
+        codec_model_free(cmodel);
+
+        // Assemble the ICL prefill token sequence.
+        // (ref_text and text pass through as-is here; espeak phonemization is Task 5.)
+        neutts_prompt_toks = build_neutts_prompt(vocab, a.ref_text, a.text, ref_codes);
+        if (neutts_prompt_toks.empty()) {
+            out->error = "NeuTTS: build_neutts_prompt returned empty (bad vocab or out-of-range codes)";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        std::printf("[neutts] ICL prompt: %d ref codes, %zu prompt tokens\n",
+                    (int) ref_codes.size(), neutts_prompt_toks.size());
     }
 
     // ── Prompt tokenize + prefill ─────────────────────────────────

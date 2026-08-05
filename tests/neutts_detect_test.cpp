@@ -45,6 +45,72 @@ static int g_fail = 0;
         }                                                                       \
     } while (0)
 
+// Non-tautological oracle for build_neutts_prompt:
+// Independently build the same template string (hardcoded), tokenize it with
+// parse_special=true, then append the three expected speech token ids.
+// This verifies the function emits the RIGHT sequence without copying the
+// function's own template — if build_neutts_prompt uses a wrong prefix or
+// wrong code offset, the check fails.
+static void test_build_neutts_prompt(const llama_vocab * vocab) {
+    // Hardcoded oracle string (verbatim per neutts-facts §Step 5).
+    // ref_text="a", input="b"
+    const std::string oracle_str =
+        "user: Convert the text to speech:<|TEXT_PROMPT_START|>a b"
+        "<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>";
+
+    // Tokenize the oracle string independently (same idiom as tokenize_str in tts_runner.cpp).
+    int32_t cap = (int32_t) oracle_str.size() + 8;
+    std::vector<llama_token> expected_prefix((size_t) cap);
+    int32_t n = llama_tokenize(vocab, oracle_str.c_str(), (int32_t) oracle_str.size(),
+                               expected_prefix.data(), cap, /*add_bos=*/false, /*parse_special=*/true);
+    if (n < 0) {
+        expected_prefix.resize((size_t) -n);
+        n = llama_tokenize(vocab, oracle_str.c_str(), (int32_t) oracle_str.size(),
+                           expected_prefix.data(), (int32_t) expected_prefix.size(),
+                           /*add_bos=*/false, /*parse_special=*/true);
+    }
+    expected_prefix.resize((size_t) std::max(0, n));
+
+    // Append speech token ids: codes {0,1,2} → offset+0, offset+1, offset+2.
+    // neutts-nano oracle (Task 0 §Step 2): offset=128262.
+    std::vector<llama_token> expected = expected_prefix;
+    expected.push_back(128262);
+    expected.push_back(128263);
+    expected.push_back(128264);
+
+    // Call the function under test.
+    std::vector<llama_token> got =
+        codec_common::build_neutts_prompt(vocab, "a", "b", {0, 1, 2});
+
+    CHECK(!got.empty(), "build_neutts_prompt returned empty vector");
+    CHECK(got.size() == expected.size(), "build_neutts_prompt: token count mismatch");
+    if (got.size() == expected.size()) {
+        bool match = true;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (got[i] != expected[i]) {
+                std::printf("FAIL build_neutts_prompt: token[%zu] got %d want %d\n",
+                            i, got[i], expected[i]);
+                match = false;
+                g_fail = 1;
+            }
+        }
+        if (match) std::printf("[neutts_detect_test] build_neutts_prompt oracle PASS"
+                               " (%zu tokens)\n", got.size());
+    } else {
+        std::printf("FAIL build_neutts_prompt: got %zu tokens, expected %zu\n",
+                    got.size(), expected.size());
+        g_fail = 1;
+    }
+
+    // Guard: out-of-range code must return empty.
+    std::vector<llama_token> bad =
+        codec_common::build_neutts_prompt(vocab, "a", "b", {0, -1, 2});
+    CHECK(bad.empty(), "build_neutts_prompt: out-of-range code must yield empty vector");
+    std::vector<llama_token> bad2 =
+        codec_common::build_neutts_prompt(vocab, "a", "b", {0, 65536, 2});
+    CHECK(bad2.empty(), "build_neutts_prompt: code >= count must yield empty vector");
+}
+
 int main() {
     // ── Positive test ────────────────────────────────────────────────────────
     const char * neutts_gguf = std::getenv("NEUTTS_GGUF");
@@ -78,6 +144,9 @@ int main() {
     CHECK_EQ_I32(offset, 128262);
     CHECK_EQ_I32(count,  65536);
     CHECK_EQ_I32(eos_id, 128261);
+
+    // ── build_neutts_prompt oracle ───────────────────────────────────────────
+    test_build_neutts_prompt(vocab);
 
     llama_model_free(model);
 
