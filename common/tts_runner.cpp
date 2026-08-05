@@ -1099,6 +1099,20 @@ static bool vocab_has_piece(const llama_vocab * vocab, const char * piece) {
     return false;
 }
 
+// ── NeuTTS detection ─────────────────────────────────────────────────────────
+//
+// Find the vocab id for a given piece by linear scan; returns -1 if absent.
+// (vocab_has_piece does the same but returns bool — we need the id here.)
+static int32_t vocab_piece_id(const llama_vocab * vocab, const char * piece) {
+    if (!vocab || !piece) return -1;
+    const int32_t n = llama_vocab_n_tokens(vocab);
+    for (int32_t id = 0; id < n; ++id) {
+        const char * t = llama_vocab_get_text(vocab, id);
+        if (t && std::strcmp(t, piece) == 0) return id;
+    }
+    return -1;
+}
+
 // Identify an OuteTTS backbone from vocab signature tokens.  V3 carries
 // per-word feature/paired-code markers; V2 carries <|space|> + bare code
 // tokens and lacks the V3 markers.  Return false on anything ambiguous so
@@ -1172,6 +1186,43 @@ static tts_constraint resolve_constraint(const llama_model * lmodel,
 }
 
 }  // namespace
+
+// ── NeuTTS detection (public API, declared in tts_runner.h) ──────────────────
+//
+// Identify a NeuTTS backbone from its vocab signature tokens.  Both nano
+// (Llama 229M) and air (Qwen2 0.5B) carry these three special tokens; no
+// other supported backbone does.  Fail-closed: returns false on anything
+// ambiguous.
+bool detect_neutts(const llama_vocab * vocab) {
+    return vocab_has_piece(vocab, "<|SPEECH_GENERATION_END|>")
+        && vocab_has_piece(vocab, "<|TEXT_PROMPT_START|>")
+        && vocab_has_piece(vocab, "<|speech_0|>");
+}
+
+// Derive the audio-token range from a NeuTTS backbone vocab.
+// *offset = id of <|speech_0|>; *count = contiguous block length (65536 for
+// both backbones); *eos_id = id of <|SPEECH_GENERATION_END|>.
+// Returns false if any marker token is absent.
+bool neutts_audio_token_range(const llama_vocab * vocab,
+                              int32_t * offset,
+                              int32_t * count,
+                              int32_t * eos_id) {
+    const int32_t off = vocab_piece_id(vocab, "<|speech_0|>");
+    const int32_t eos = vocab_piece_id(vocab, "<|SPEECH_GENERATION_END|>");
+    if (off < 0 || eos < 0) return false;
+    // Count contiguous <|speech_N|> tokens from N=0 upward.
+    int32_t n = 0;
+    char buf[32];
+    for (;;) {
+        std::snprintf(buf, sizeof(buf), "<|speech_%d|>", n);
+        if (vocab_piece_id(vocab, buf) != off + n) break;
+        ++n;
+    }
+    *offset = off;
+    *count  = n;
+    *eos_id = eos;
+    return true;
+}
 
 bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out) {
     // Pocket-TTS FlowLM is self-contained (no backbone) — try it first; a

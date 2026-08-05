@@ -201,6 +201,12 @@ if(CODEC_BUILD_TTS_CLI)
         add_executable(tts-constraint-test tests/tts_constraint_test.cpp)
         target_link_libraries(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
         target_include_directories(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>)
+
+        add_executable(neutts-detect-test tests/neutts_detect_test.cpp)
+        target_link_libraries(neutts-detect-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
+        target_include_directories(neutts-detect-test PRIVATE
+            $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>
+            ${TTS_BACKBONE_INCLUDE_DIRS})
     endif()
 
     option(CODEC_TTS_ESPEAK "Link espeak-ng into tts-cli for NeuTTS phonemization" OFF)

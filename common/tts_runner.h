@@ -38,6 +38,10 @@ typedef struct llama_logit_bias {
 } llama_logit_bias;
 #endif  // !LLAMA_H
 
+// Forward-declare llama_vocab so the detection helpers below can accept a
+// pointer without requiring callers to include llama.h.
+struct llama_vocab;
+
 namespace codec_common {
 
 // ─────────────────────────────────────────────────────────────────────
@@ -55,6 +59,27 @@ struct tts_constraint {
 // eos_id < 0 = no sentinel.  offset < 0 → returns {} (Type A disabled).
 std::vector<llama_logit_bias> build_flat_audio_mask(int32_t offset, int32_t count,
                                                     int32_t eos_id, int32_t n_vocab);
+
+// ── NeuTTS detection ─────────────────────────────────────────────────────────
+//
+// Identifies a NeuTTS backbone from its vocab signature tokens.
+// Returns true when the vocab contains the three marker pieces that together
+// uniquely identify a NeuTTS backbone (nano or air).
+//
+// Both helpers are non-static so they can be called from the test binary
+// (separate TU).  The llama_vocab* pointer type is forward-declared above;
+// callers that also include llama.h see the same concrete type.
+
+bool detect_neutts(const llama_vocab * vocab);
+
+// Derives the audio-token range from the NeuTTS backbone vocab.
+// On success: *offset = id of <|speech_0|>, *count = contiguous <|speech_N|>
+// block length, *eos_id = id of <|SPEECH_GENERATION_END|>.  Returns false if
+// any of the marker tokens are absent.
+bool neutts_audio_token_range(const llama_vocab * vocab,
+                              int32_t * offset,
+                              int32_t * count,
+                              int32_t * eos_id);
 
 // ─────────────────────────────────────────────────────────────────────
 // Params — everything the reference loop needs.  Unset optionals fall
