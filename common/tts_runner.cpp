@@ -914,6 +914,102 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Type A single-codebook token AR decode (KIND_TOKEN_SINGLE_CB).
+//
+// NeuTTS-family backbones emit `<|speech_N|>` tokens DIRECTLY from the backbone
+// lm_head — there is no codec_lm depth decoder, no codebook heads, and no embed
+// feedback.  The loop is a plain token-in/token-out AR over the backbone vocab,
+// constrained to the speech range ∪ eos via a flat logit-bias mask.  Each
+// sampled speech token is observed (which internally accumulates the FSQ code
+// into `ctx->codes`), then fed straight back as a 1-token batch.  The model
+// stops when it emits `<|SPEECH_GENERATION_END|>` (OBSERVE_STOP).
+//
+// Contract (verified in audio_lm.cpp):
+//   * `audio_lm_observe_token` appends the code to `ctx->codes` internally and
+//     returns OBSERVE_CONSUMED (Type A; uses_embed_override left false), so the
+//     caller runs `audio_lm_decode_audio` directly with NO manual push.
+//   * `build_flat_audio_mask` leaves the eos id UN-biased (allowed set =
+//     [off, off+count) ∪ {eos}), so the model can always reach eos and stop.
+bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
+                         const llama_model * lmodel, const llama_vocab * vocab,
+                         const audio_lm_prompt_info & /*pi*/,
+                         const std::vector<llama_token> & prompt_toks,
+                         int32_t off, int32_t count, int32_t eos_id,
+                         int32_t max_frames, uint32_t seed,
+                         float temp, float top_p, int32_t top_k,
+                         int32_t * out_frames, const char ** out_stop) {
+    // 1) Teach observe_token the speech range + eos BEFORE any observe call so
+    //    <|speech_N|> classifies as OBSERVE_CONSUMED and eos as OBSERVE_STOP.
+    audio_lm_set_audio_token_range(ctx, off, count, eos_id);
+
+    // 2) Flat mask: constrain the backbone to speech ∪ eos.  This is the first
+    //    runnable consumer of the Type A mask.  Empty ⇒ bad range → error.
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<llama_logit_bias> mask =
+        build_flat_audio_mask(off, count, eos_id, n_vocab);
+    if (mask.empty()) {
+        std::fprintf(stderr,
+            "run_token_single_cb: flat audio mask empty (off=%d count=%d eos=%d n_vocab=%d)\n",
+            off, count, eos_id, n_vocab);
+        return false;
+    }
+
+    // 3) Backbone sampler with the mask attached (no grammar for Type A).
+    BackboneSampler bbsmpl;
+    std::string berr;
+    if (!bbsmpl.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
+                      /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
+                      /*grammar=*/std::string(), mask, &berr)) {
+        std::fprintf(stderr, "run_token_single_cb: sampler init failed: %s\n", berr.c_str());
+        *out_stop = "grammar_error";
+        return false;
+    }
+
+    // 4) Prefill the ICL prompt.
+    int32_t n_past = 0;
+    if (!decode_tokens(lctx, prompt_toks, n_past, /*all_pos=*/false)) {
+        std::fprintf(stderr, "run_token_single_cb: prefill decode failed\n");
+        return false;
+    }
+    n_past += (int32_t) prompt_toks.size();
+
+    // 5) AR loop — sample → observe → feed back.
+    for (int32_t step = 0; step < max_frames; ++step) {
+        llama_token tok = bbsmpl.sample(lctx, -1);
+        observe_action act =
+            audio_lm_observe_token(ctx, tok, /*last_hidden=*/nullptr, /*hidden_dim=*/0);
+        if (act == OBSERVE_STOP) {
+            // For Type A (uses_embed_override off, no codec_lm) observe_token
+            // only returns STOP on the clean eos sentinel — the error-bearing
+            // STOP path (compose_next_embd failure) is unreachable here.  Do
+            // NOT gate on audio_lm_last_error: it can hold a stale message from
+            // an earlier deferred get_prompt_info and would misflag a clean eos.
+            *out_stop = "eos";
+            break;
+        }
+        if (act == OBSERVE_CONSUMED_EMBED) {
+            // Type A must never compose an embed (uses_embed_override is off).
+            std::fprintf(stderr,
+                "run_token_single_cb: unexpected OBSERVE_CONSUMED_EMBED (Type A "
+                "contract violation)\n");
+            return false;
+        }
+        // Feed the just-sampled token back (standard 1-token path).
+        if (!decode_tokens(lctx, std::vector<llama_token>{tok}, n_past, /*all_pos=*/false)) {
+            std::fprintf(stderr, "run_token_single_cb: feedback decode failed\n");
+            return false;
+        }
+        n_past += 1;
+        if (act == OBSERVE_CONSUMED) {
+            (*out_frames)++;
+        }
+        // OBSERVE_PASSTHROUGH mid-audio is unexpected under the mask (only
+        // speech ∪ eos are reachable); fed back but not counted as a frame.
+    }
+    return true;
+}
+
 // Flow 4 — Chatterbox T3.
 bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
                     codec_lm * lm, const codec_lm_chatterbox_info * ci,
@@ -1299,20 +1395,40 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     auto * ctx = audio_lm_init(p, &err);
     if (!ctx) { out->error = "audio_lm_init failed: " + err; return false; }
 
+    // audio_lm_get_prompt_info requires a codec_lm adaptor.  NeuTTS uses a
+    // codec-only NeuCodec gguf (no codec_lm — the backbone lm_head emits the
+    // audio tokens directly), so get_prompt_info fails there.  DEFER the abort:
+    // load the backbone, detect NeuTTS from its vocab, and if it IS NeuTTS run
+    // the self-contained Type A flow (which never touches `pi`).  If it is NOT
+    // NeuTTS, abort below with the original error.  Gate the deferral on the
+    // exact codec-only signal (no codec_lm handle), not on the error string.
     audio_lm_prompt_info pi;
-    if (!audio_lm_get_prompt_info(ctx, &pi)) {
-        out->error = std::string("get_prompt_info failed: ") + audio_lm_last_error(ctx);
-        audio_lm_free(ctx);
-        return false;
+    const bool pi_ok = audio_lm_get_prompt_info(ctx, &pi);
+    std::string deferred_pi_err;
+    if (!pi_ok) {
+        // Capture the error now — later ctx calls overwrite audio_lm_last_error.
+        deferred_pi_err = std::string("get_prompt_info failed: ") + audio_lm_last_error(ctx);
+        if (audio_lm_get_lm(ctx) != nullptr) {
+            // A real codec_lm is present but prompt-info still failed — that is
+            // a genuine error, not the codec-only NeuTTS case.  Abort now.
+            out->error = deferred_pi_err;
+            audio_lm_free(ctx);
+            return false;
+        }
     }
     const int32_t hidden = audio_lm_hidden_dim(ctx);
     const int32_t n_cb   = audio_lm_n_codebook(ctx);
-    std::printf("model: arch=%s kind=%d n_cb=%d hidden=%d cb0_backbone=%d audio_offset=%d eos_c0=%d\n",
-                pi.host_arch.c_str(), (int) pi.model_kind, n_cb, hidden,
-                (int) pi.cb0_from_backbone, pi.audio_codebook_offset, pi.eos_code_c0);
+    if (pi_ok) {
+        std::printf("model: arch=%s kind=%d n_cb=%d hidden=%d cb0_backbone=%d audio_offset=%d eos_c0=%d\n",
+                    pi.host_arch.c_str(), (int) pi.model_kind, n_cb, hidden,
+                    (int) pi.cb0_from_backbone, pi.audio_codebook_offset, pi.eos_code_c0);
+    } else {
+        std::printf("model: no codec_lm adaptor (codec-only gguf) — deferring to NeuTTS detection\n");
+    }
 
     // ── Moshi: formally out of scope for one-shot synthesize ────────────
-    if (pi.host_arch == "llama" &&
+    if (pi_ok &&
+        pi.host_arch == "llama" &&
         pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
         pi.eos_code_c0 < 0 && !pi.cb0_from_backbone) {
         out->error =
@@ -1337,7 +1453,11 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         return false;
     }
     const int32_t n_embd = llama_model_n_embd(lmodel);
-    if (n_embd != hidden) {
+    // The n_embd==codec-hidden invariant only applies to codec_lm-backed flows
+    // (the backbone hidden feeds the codec_lm adaptor).  NeuTTS is codec-only
+    // (hidden==0, pi_ok==false); its backbone drives the codec purely via token
+    // ids, so skip this check there.
+    if (pi_ok && n_embd != hidden) {
         char buf[128];
         std::snprintf(buf, sizeof(buf), "backbone n_embd=%d != codec hidden=%d — wrong backbone?", n_embd, hidden);
         out->error = buf;
@@ -1430,14 +1550,25 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         return true;
     }
 
-    // ── NeuTTS ICL ref-encode + prompt assembly (Task 3 → Task 4 seam) ──────
+    // ── NeuTTS ICL ref-encode + prompt assembly + self-contained decode ─────
     // When the backbone is a NeuTTS model, the prefill is built from:
     //   1. The verbatim ICL template (ref phonemes + input phonemes)
     //   2. The NeuCodec-encoded reference audio codes appended as speech tokens
-    // Task 4 will add the KIND_TOKEN_SINGLE_CB decode-loop dispatch that
-    // CONSUMES neutts_prompt_toks.  Here we only build + log it.
+    // then run_token_single_cb drives the Type A decode and returns directly
+    // (self-contained; never touches `pi` or the codec_lm switch below).
     std::vector<llama_token> neutts_prompt_toks;
     const bool is_neutts = detect_neutts(vocab);
+
+    // If get_prompt_info was deferred (codec-only gguf) but this is NOT a
+    // NeuTTS backbone, the model genuinely lacks a usable codec_lm — abort now
+    // with the original deferred error rather than fall through to the
+    // codec_lm-backed flows (which would dereference an unpopulated `pi`).
+    if (!pi_ok && !is_neutts) {
+        out->error = deferred_pi_err;
+        llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+        return false;
+    }
+
     if (is_neutts) {
         if (a.ref_audio_path.empty() || a.ref_text.empty()) {
             out->error =
@@ -1523,6 +1654,76 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         }
         std::printf("[neutts] ICL prompt: %d ref codes, %zu prompt tokens\n",
                     (int) ref_codes.size(), neutts_prompt_toks.size());
+
+        // ── Type A single-cb decode (self-contained, mirrors chatterbox) ──
+        // NeuTTS is backbone-only: the lm_head emits <|speech_N|> directly, so
+        // it does NOT route through the pi.model_kind switch / run_codebook_ar.
+        int32_t off = -1, count = -1, eos_id = -1;
+        if (!neutts_audio_token_range(vocab, &off, &count, &eos_id)) {
+            out->error = "NeuTTS: neutts_audio_token_range failed at decode dispatch";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // Validate prefill fits the backbone context.  n_ctx was sized as
+        // max(4096, max_frames+512); a long ref clip yields many ref codes, so
+        // fail cleanly if prefill + generation budget overruns it.
+        const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
+        if ((int32_t) neutts_prompt_toks.size() + 1 >= n_ctx) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "NeuTTS: ICL prefill (%zu tokens) does not fit backbone n_ctx=%d; "
+                "use a shorter reference clip or raise --max-frames.",
+                neutts_prompt_toks.size(), n_ctx);
+            out->error = buf;
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // NeuTTS sampling defaults.  `pi` is unpopulated for the codec-only
+        // gguf (pi.default_* == 0 ⇒ greedy), which tends to loop under a
+        // direct-token AR; fall back to the NeuTTS reference knobs
+        // (temp 1.0 / top_k 50) unless the user overrode them.
+        const float   nt_temp  = a.has_temp  ? a.temp  : (pi_ok ? pi.default_temperature : 1.0f);
+        const float   nt_top_p = a.has_top_p ? a.top_p : (pi_ok ? pi.default_top_p       : 1.0f);
+        const int32_t nt_top_k = a.has_top_k ? a.top_k : (pi_ok ? pi.default_top_k       : 50);
+        const uint32_t nt_seed = a.seed ? a.seed : 0xC0DEC1ABu;
+
+        int32_t n_frames = 0;
+        const char * stop_reason = "max_frames";
+        bool ok = run_token_single_cb(ctx, lctx, lmodel, vocab, pi, neutts_prompt_toks,
+                                      off, count, eos_id, max_frames, nt_seed,
+                                      nt_temp, nt_top_p, nt_top_k,
+                                      &n_frames, &stop_reason);
+        llama_free(lctx);
+        llama_model_free(lmodel);
+        llama_backend_free();
+        if (!ok) {
+            // run_token_single_cb prints the concrete cause (mask / prefill /
+            // feedback / contract-violation) to stderr; the ctx last_error may
+            // be stale from the deferred get_prompt_info, so keep this generic.
+            out->error = std::string("NeuTTS AR failed (") + stop_reason
+                       + "); see stderr for the concrete cause";
+            audio_lm_free(ctx);
+            return false;
+        }
+        std::printf("NeuTTS AR done: %d frames, stop=%s\n", n_frames, stop_reason);
+        if (n_frames == 0) {
+            out->error = "NeuTTS: no speech frames generated";
+            audio_lm_free(ctx);
+            return false;
+        }
+        // observe_token accumulated the codes into ctx->codes already — decode
+        // directly (no reset/push; reset would clear the accumulator).
+        audio_lm_audio_output pcm;
+        if (!audio_lm_decode_audio(ctx, &pcm)) {
+            out->error = std::string("NeuTTS: decode_audio failed: ") + audio_lm_last_error(ctx);
+            audio_lm_free(ctx);
+            return false;
+        }
+        fill_result_from_output(pcm, n_frames, stop_reason, out);
+        audio_lm_free(ctx);
+        return true;
     }
 
     // ── Prompt tokenize + prefill ─────────────────────────────────
