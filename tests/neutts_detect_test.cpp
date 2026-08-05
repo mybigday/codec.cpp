@@ -82,25 +82,36 @@ int main() {
     llama_model_free(model);
 
     // ── Negative test (optional) ─────────────────────────────────────────────
+    // Default fixture: a non-NeuTTS LLM backbone that llama.cpp can load.
+    // (moss_audio_nano.gguf has arch 'moss_audio_tokenizer' which is unknown
+    // to llama.cpp — it cannot be loaded at all, even with vocab_only=false.
+    // Use CSM's llama backbone or any other known-arch backbone instead.)
     const char * neg_gguf = std::getenv("NEUTTS_NEG_GGUF");
-    // fall back to default negative model if env not set
-    const char * default_neg = "models/moss_audio_nano/moss_audio_nano.gguf";
+    const char * default_neg = "models/csm/llama_backbone.gguf";
     if (!neg_gguf) neg_gguf = default_neg;
 
     if (!file_exists(neg_gguf)) {
-        std::printf("[neutts_detect_test] SKIP negative case: %s not found\n", neg_gguf);
+        std::printf("[neutts_detect_test] SKIP negative (no neg gguf): %s not found\n", neg_gguf);
     } else {
-        llama_model * neg_model = llama_model_load_from_file(neg_gguf, mparams);
+        // Load WITHOUT vocab_only so that models requiring full init also work.
+        llama_model_params neg_mparams = llama_model_default_params();
+        neg_mparams.vocab_only = false;
+        neg_mparams.n_gpu_layers = 0;
+        llama_model * neg_model = llama_model_load_from_file(neg_gguf, neg_mparams);
         if (!neg_model) {
-            // Can't load — skip negative case rather than fail (model may need
-            // a different backend or be incompatible; positive test still ran).
-            std::printf("[neutts_detect_test] SKIP negative case: could not load %s\n", neg_gguf);
-        } else {
-            const llama_vocab * neg_vocab = llama_model_get_vocab(neg_model);
-            CHECK(!codec_common::detect_neutts(neg_vocab),
-                  "detect_neutts should be false for non-NeuTTS backbone");
-            llama_model_free(neg_model);
+            // Present but unloadable — this is a broken fixture, not a valid skip.
+            std::fprintf(stderr,
+                "[neutts_detect_test] WARN: negative fixture present but failed to load: %s\n"
+                "  (If this is a codec/non-LLM model, it cannot be used as a neg fixture;\n"
+                "   set NEUTTS_NEG_GGUF to a loadable LLM backbone gguf instead.)\n",
+                neg_gguf);
+            return 1;
         }
+        const llama_vocab * neg_vocab = llama_model_get_vocab(neg_model);
+        CHECK(!codec_common::detect_neutts(neg_vocab),
+              "detect_neutts should be false for non-NeuTTS backbone");
+        std::printf("[neutts_detect_test] negative case: detect_neutts=false PASS\n");
+        llama_model_free(neg_model);
     }
 
     if (g_fail) {
