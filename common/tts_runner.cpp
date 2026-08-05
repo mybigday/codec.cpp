@@ -1056,6 +1056,64 @@ void fill_result_from_output(const audio_lm_audio_output & pcm,
     out->stop_reason  = stop;
 }
 
+// ── OuteTTS V2/V3 detection ───────────────────────────────────────────────────
+//
+// Scans the backbone vocab for signature special-token pieces that uniquely
+// identify an OuteTTS family.  Uses O(vocab) linear scan per probe — called
+// once at init so the cost is negligible.
+//
+// Fail-closed: anything not clearly OuteTTS returns false so non-OuteTTS
+// models (Qwen3-TTS, MOSS-TTSD, Chatterbox, …) are never mis-constrained.
+
+static bool vocab_has_piece(const llama_vocab * vocab, const char * piece) {
+    if (!vocab || !piece) return false;
+    const int32_t n = llama_vocab_n_tokens(vocab);
+    for (int32_t id = 0; id < n; ++id) {
+        const char * t = llama_vocab_get_text(vocab, id);
+        if (t && std::strcmp(t, piece) == 0) return true;
+    }
+    return false;
+}
+
+// Identify an OuteTTS backbone from vocab signature tokens.  V3 carries
+// per-word feature/paired-code markers; V2 carries <|space|> + bare code
+// tokens and lacks the V3 markers.  Return false on anything ambiguous so
+// non-OuteTTS models are never mis-constrained.
+[[maybe_unused]]
+static bool detect_outetts_version(const llama_model * lmodel,
+                                   const llama_vocab * vocab,
+                                   codec_common::outetts_version * out) {
+    if (!vocab || !out) return false;
+
+    auto has = [&](const char * piece) -> bool {
+        return vocab_has_piece(vocab, piece);
+    };
+
+    // V3 signature: any of these per-word markers present.
+    const bool v3 = has("<|word_start|>") || has("<|features|>") || has("<|c1_0|>");
+    // V2 signature: space + audio-end tokens, but NOT the V3 markers.
+    const bool v2 = has("<|space|>") && has("<|audio_end|>") && !v3;
+
+    // Corroborate with general.name when available (non-fatal; skip on error).
+    char name[256] = {0};
+    if (lmodel) {
+        llama_model_meta_val_str(lmodel, "general.name", name, sizeof(name));
+    }
+
+    if (v3) {
+        *out = codec_common::outetts_version::V3;
+        std::printf("[tts] OuteTTS detection: V3 (general.name=\"%s\")\n", name);
+        return true;
+    }
+    if (v2) {
+        *out = codec_common::outetts_version::V2;
+        std::printf("[tts] OuteTTS detection: V2 (general.name=\"%s\")\n", name);
+        return true;
+    }
+    std::printf("[tts] OuteTTS detection: negative — not OuteTTS (general.name=\"%s\")\n", name);
+    return false;
+}
+
 }  // namespace
 
 bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out) {
