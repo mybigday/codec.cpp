@@ -352,6 +352,122 @@ def main():
         stop_line="AR done",
     ))
 
+    # ── NeuTTS-nano (report-only CER pass) ────────────────────────────────────
+    # NeuTTS uses phoneme-mode input: both --text and --ref-text must be
+    # pre-phonemized before being passed to tts-cli (espeak is OFF by default
+    # so the binary passes them verbatim to the runner).
+    #
+    # The model is a single-codebook AR (KIND_TOKEN_SINGLE_CB); it uses the
+    # distill_neucodec GGUF for decode (distill shares the FSQ code space and
+    # the decoder with base, so decoded audio is correct even though the
+    # backbone was trained against the base encoder).
+    #
+    # CER is report-only this pass — we want the number before deciding
+    # whether to tighten the gate.
+    _neutts_nano_codec   = REPO / "models" / "distill_neucodec" / "distill_neucodec.gguf"
+    _neutts_nano_bb      = REPO / "models" / "hf" / "neutts_nano" / "neutts-nano-q8_0.gguf"
+    _neutts_nano_refwav  = REPO / "assets" / "refs" / "jfk_en.wav"
+    _neutts_nano_reftxt  = REPO / "assets" / "refs" / "jfk_en.txt"
+
+    _neutts_assets_ok = (
+        _neutts_nano_codec.exists()
+        and _neutts_nano_bb.exists()
+        and _neutts_nano_refwav.exists()
+        and _neutts_nano_reftxt.exists()
+    )
+
+    if not _neutts_assets_ok:
+        missing = [p for p in [_neutts_nano_codec, _neutts_nano_bb,
+                                _neutts_nano_refwav, _neutts_nano_reftxt]
+                   if not p.exists()]
+        print(f"[skip] neutts_nano: missing assets ({', '.join(p.name for p in missing)})")
+        results.append(None)
+    else:
+        _neutts_phon_ok = False
+        try:
+            from phonemizer.backend import EspeakBackend as _EspeakBackend
+            _neutts_phon_ok = True
+        except Exception as _e:
+            print(f"[skip] neutts_nano: phonemizer unavailable ({_e})")
+            results.append(None)
+
+        if _neutts_phon_ok:
+            _g2p = _EspeakBackend(
+                language="en-us",
+                preserve_punctuation=True,
+                with_stress=True,
+                words_mismatch="ignore",
+                language_switch="remove-flags",
+            )
+
+            def _to_phones(text):
+                return " ".join(_g2p.phonemize([text])[0].split())
+
+            _original_text = "The birch canoe slid on the smooth planks."
+            _ref_raw        = _neutts_nano_reftxt.read_text().strip()
+            _phon_text      = _to_phones(_original_text)
+            _phon_ref       = _to_phones(_ref_raw)
+
+            print(f"[info] neutts_nano: original_text = {_original_text!r}")
+            print(f"[info] neutts_nano: phon_text     = {_phon_text!r}")
+            print(f"[info] neutts_nano: phon_ref      = {_phon_ref!r}")
+
+            _out_wav = Path("/tmp") / "ttscli_neutts_nano.wav"
+            if _out_wav.exists():
+                _out_wav.unlink()
+
+            _proc = _run_synth(
+                _neutts_nano_codec,
+                _neutts_nano_bb,
+                _phon_text,
+                _out_wav,
+                extra=[
+                    "--ref-audio", str(_neutts_nano_refwav),
+                    "--ref-text",  _phon_ref,
+                    "--temp",      "1.0",
+                    "--top-k",     "50",
+                    "--seed",      "1",
+                    "--max-frames", "400",
+                ],
+                greedy=False,
+            )
+
+            if _proc.returncode != 0:
+                print(f"[FAIL] neutts_nano: exit {_proc.returncode}")
+                print(_proc.stdout[-1200:])
+                print(_proc.stderr[-800:])
+                results.append(False)
+            else:
+                _stop_lines = [ln for ln in _proc.stdout.splitlines()
+                               if "NeuTTS AR done" in ln]
+                _stop = _stop_lines[0].split("stop=")[-1].strip() if _stop_lines else "?"
+                _frames_str = ""
+                if _stop_lines:
+                    import re as _re
+                    _m = _re.search(r"(\d+) frames", _stop_lines[0])
+                    if _m:
+                        _frames_str = f" frames={_m.group(1)}"
+
+                assert _out_wav.exists(), "neutts_nano: no wav written"
+                _sr, _dur, _rms = _wav_stats(_out_wav)
+
+                # CER: ASR against the plain-English original (not the phonemes).
+                _cer_res = _try_cer(_out_wav, _original_text, "en")
+                _cer_str = ""
+                if _cer_res is not None:
+                    _asr_txt, _cer_val = _cer_res
+                    _cer_str = f" ASR={_asr_txt!r} CER={_cer_val:.3f}"
+
+                # report-only: never fail on CER or audio quality this pass.
+                _ok = True
+                if _proc.returncode != 0:
+                    _ok = False
+                if _rms < 0.005:
+                    print(f"[WARN] neutts_nano: near-silent (rms={_rms:.4f})")
+                print(f"[{'PASS' if _ok else 'FAIL'}] neutts_nano (report-only): "
+                      f"stop={_stop}{_frames_str} dur={_dur:.2f}s rms={_rms:.3f}{_cer_str}")
+                results.append(_ok)
+
     ran = [r for r in results if r is not None]
     if not ran:
         print("no cases ran (all assets missing)")
