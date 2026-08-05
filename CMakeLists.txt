@@ -216,7 +216,14 @@ if(CODEC_BUILD_TTS_CLI)
             message(FATAL_ERROR "CODEC_TTS_ESPEAK=ON but espeak-ng library not found. "
                 "Install libespeak-ng-dev (or libespeak-ng1 on systems without a .so symlink).")
         endif()
+        find_path(ESPEAK_NG_INCLUDE_DIR NAMES espeak-ng/speak_lib.h
+            HINTS /usr/include /usr/local/include)
+        if(NOT ESPEAK_NG_INCLUDE_DIR)
+            message(FATAL_ERROR "CODEC_TTS_ESPEAK=ON but espeak-ng headers not found "
+                "(espeak-ng/speak_lib.h). Install libespeak-ng-dev.")
+        endif()
         target_compile_definitions(tts-cli PRIVATE CODEC_TTS_ESPEAK=1)
+        target_include_directories(tts-cli PRIVATE ${ESPEAK_NG_INCLUDE_DIR})
         target_link_libraries(tts-cli PRIVATE ${ESPEAK_NG_LIB})
     endif()
 endif()

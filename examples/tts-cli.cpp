@@ -35,7 +35,98 @@
 #include <string>
 #include <vector>
 
+// ── Optional espeak-ng phonemization (CODEC_TTS_ESPEAK) ──────────────────────
+//
+// When built with -DCODEC_TTS_ESPEAK=ON, --text and --ref-text are phonemized
+// via espeak-ng (IPA, with stress, language en-us) before being handed to the
+// runner.  This matches the NeuTTS reference phonemizer params (neutts-facts
+// §Step 3: EspeakBackend language='en-us', preserve_punctuation=True,
+// with_stress=True).
+//
+// NOTE: this path is OPT-IN and NOT exercised by the e2e smoke test.  Task 6
+// pre-phonemizes in Python with the phonemizer library; the tts-cli espeak-OFF
+// (default) path passes text through unchanged, which is what the e2e uses.
+//
+// Requires: libespeak-ng-dev (provides <espeak-ng/speak_lib.h>).
+// On this machine (Ubuntu 6.17, 2026-08-06) libespeak-ng-dev is NOT installed;
+// espeak-ON builds will fail with "header not found" until the package is added.
+// The runtime binary (/usr/bin/espeak-ng 1.51) is present but its headers are not.
+#ifdef CODEC_TTS_ESPEAK
+#include <espeak-ng/speak_lib.h>
+#include <sstream>
+#endif
+
 namespace {
+
+// ── espeak-ng phonemization helper ───────────────────────────────────────────
+#ifdef CODEC_TTS_ESPEAK
+// Phonemize a single UTF-8 text string via espeak-ng (IPA output, with stress).
+// Matches the NeuTTS Python reference (neutts-facts §Step 3):
+//   EspeakBackend(language='en-us', preserve_punctuation=True, with_stress=True)
+//
+// espeak-ng C API:
+//   espeak_Initialize(AUDIO_OUTPUT_SYNCH_PLAYBACK, ...)  — no audio device
+//   espeak_SetVoiceByName("en-us")
+//   espeak_TextToPhonemes(&text_ptr, espeakCHARS_UTF8, espeakPHONEMES_IPA)
+//     — advances text_ptr past each clause, returns IPA phoneme string for
+//       that clause (NULL at end-of-input).
+//
+// Returns the IPA string on success, or the original text on failure (with a
+// warning to stderr so the espeak-OFF behavior is preserved).
+static std::string espeak_phonemize(const std::string & text) {
+    if (text.empty()) return text;
+
+    // AUDIO_OUTPUT_SYNCH_PLAYBACK suppresses audio device opening (phoneme-only
+    // mode uses synchronous output; the buffer size 0 means use the default).
+    int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCH_PLAYBACK, /*buflength=*/0,
+                               /*path=*/nullptr, /*options=*/0);
+    if (sr < 0) {
+        std::fprintf(stderr, "[espeak] espeak_Initialize failed (sr=%d); "
+                             "passing text unchanged\n", sr);
+        return text;
+    }
+
+    if (espeak_SetVoiceByName("en-us") != EE_OK) {
+        std::fprintf(stderr, "[espeak] SetVoiceByName('en-us') failed; "
+                             "passing text unchanged\n");
+        espeak_Terminate();
+        return text;
+    }
+
+    // espeak_TextToPhonemes walks the text clause by clause.
+    // text_ptr is advanced by the library; we keep a local copy for the loop.
+    const char * text_ptr = text.c_str();
+    std::string ipa;
+    bool first = true;
+    while (text_ptr && *text_ptr) {
+        // espeakPHONEMES_IPA → IPA with stress markers embedded
+        // espeakCHARS_UTF8  → input is UTF-8
+        const char * clause = espeak_TextToPhonemes(
+            reinterpret_cast<const void **>(&text_ptr),
+            espeakCHARS_UTF8,
+            espeakPHONEMES_IPA);
+        if (!clause) break;
+        if (!first) ipa += ' ';
+        ipa += clause;
+        first = false;
+    }
+
+    espeak_Terminate();
+
+    if (ipa.empty()) {
+        std::fprintf(stderr, "[espeak] phonemization returned empty; "
+                             "passing text unchanged\n");
+        return text;
+    }
+
+    // Mirror NeuTTS _to_phones: split on whitespace, rejoin with single spaces.
+    // This collapses the trailing space that espeak-ng inserts before punctuation.
+    std::istringstream ss(ipa);
+    std::string tok, out;
+    while (ss >> tok) { if (!out.empty()) out += ' '; out += tok; }
+    return out.empty() ? text : out;
+}
+#endif  // CODEC_TTS_ESPEAK
 
 void print_usage(const char * prog) {
     std::fprintf(stderr,
@@ -292,11 +383,29 @@ int write_result_wav(const args & a, const codec_common::tts_runner_result & r) 
     return 0;
 }
 
-int cmd_synthesize(const args & a) {
+int cmd_synthesize(args a) {  // note: args by value so we can mutate text/ref_text in-place
     if (a.output.empty()) {
         std::fprintf(stderr, "synthesize requires --output PATH.wav\n");
         return 1;
     }
+
+#ifdef CODEC_TTS_ESPEAK
+    // Phonemize --text and --ref-text before building rp (NeuTTS phonemes path).
+    // NOTE: this path is opt-in (CODEC_TTS_ESPEAK) and NOT exercised by the e2e
+    // smoke test.  The e2e pre-phonemizes in Python; espeak-OFF (default) passes
+    // text through unchanged.
+    if (!a.text.empty()) {
+        const std::string phones = espeak_phonemize(a.text);
+        std::printf("[espeak] text    → '%s'\n", phones.c_str());
+        a.text = phones;
+    }
+    if (!a.ref_text.empty()) {
+        const std::string phones = espeak_phonemize(a.ref_text);
+        std::printf("[espeak] ref_text → '%s'\n", phones.c_str());
+        a.ref_text = phones;
+    }
+#endif  // CODEC_TTS_ESPEAK
+
     const codec_common::tts_runner_params rp = make_runner_params(a);
     codec_common::tts_runner_result r;
 

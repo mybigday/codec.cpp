@@ -1,0 +1,2 @@
+# Allow WAV reference clips in this directory to be tracked
+!*.wav
