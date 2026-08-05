@@ -1,2 +1,3 @@
-# Allow WAV reference clips in this directory to be tracked
+# Allow WAV reference clips and transcripts in this directory to be tracked
 !*.wav
+!*.txt

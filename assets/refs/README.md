@@ -5,36 +5,34 @@ Each clip must be accompanied by a matching `.txt` transcript (exact words spoke
 
 ---
 
-## gettysburg_espeak_en.wav
+## jfk_en.wav
 
 | Field | Value |
 |-------|-------|
-| License | Public domain / CC0 |
-| Source | Generated with eSpeak-NG 1.51 (`espeak-ng -v en-us -s 150 -p 50`) |
-| Source text | Opening line of the Gettysburg Address (1863, Abraham Lincoln; US government speech, no copyright) |
-| Duration | 5.92 s |
+| License | Public domain (US government work) |
+| Source | https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav |
+| Source content | Natural recording of John F. Kennedy's inaugural address (20 January 1961) |
+| Trim | First 5.5 s of the source clip (trimmed with ffmpeg) |
 | Format | 16-bit PCM WAV, 24000 Hz, mono |
-| File size | ~278 KB |
+| File size | ~258 KB |
 
-**Transcript** (`gettysburg_espeak_en.txt`):
-> Four score and seven years ago our fathers brought forth on this continent a new nation.
+**Transcript** (`jfk_en.txt`):
+> And so, my fellow Americans, ask not what
 
 **Provenance / license statement:**
-The source text (Gettysburg Address, 1863) is a US government work and is in the public domain.
-The synthesized audio was generated entirely by eSpeak-NG, an open-source speech synthesizer
-(Apache-2.0 / GPL). Machine-generated speech has no independent copyright under US law; the file
-is dedicated to the public domain (CC0 1.0 Universal).
+The source recording is a US government work (presidential address delivered at a public ceremony)
+and is in the public domain.  The clip is widely used in TTS and ASR CI under the same status
+(see whisper.cpp samples/ for precedent).
 
 **How the transcript was derived:**
-The text was supplied directly to eSpeak-NG as input. Whisper large-v3-turbo (openai/whisper-large-v3-turbo)
-was run on the output and returned the transcript verbatim, confirming the two match exactly.
+The trimmed wav was transcribed with Whisper large-v3-turbo
+(`openai/whisper-large-v3-turbo` via HuggingFace Transformers).  The transcript is the exact
+text spoken in the 5.5 s clip — the sentence is incomplete because the clip ends mid-utterance.
 
 **How the file was produced:**
 ```bash
-espeak-ng -v en-us -s 150 -p 50 \
-  "Four score and seven years ago our fathers brought forth on this continent a new nation." \
-  -w /tmp/espeak_ref_raw.wav
-ffmpeg -i /tmp/espeak_ref_raw.wav -ar 24000 -ac 1 -c:a pcm_s16le assets/refs/gettysburg_espeak_en.wav
+curl -fsSL -o /tmp/jfk.wav https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav
+ffmpeg -y -i /tmp/jfk.wav -t 5.5 -ar 24000 -ac 1 -c:a pcm_s16le assets/refs/jfk_en.wav
 ```
 
 **Usage:**
@@ -42,8 +40,8 @@ ffmpeg -i /tmp/espeak_ref_raw.wav -ar 24000 -ac 1 -c:a pcm_s16le assets/refs/get
 ./build/tts-cli synthesize \
   --model models/distill_neucodec/distill_neucodec.gguf \
   --backbone models/hf/neutts_nano/neutts-nano-q8_0.gguf \
-  --ref-audio assets/refs/gettysburg_espeak_en.wav \
-  --ref-text "Four score and seven years ago our fathers brought forth on this continent a new nation." \
-  --text "Hello world." \
-  -o /tmp/neutts_asset_smoke.wav
+  --ref-audio assets/refs/jfk_en.wav \
+  --ref-text "And so, my fellow Americans, ask not what" \
+  --text "hello world" \
+  -o /tmp/neutts_jfk_smoke.wav
 ```
