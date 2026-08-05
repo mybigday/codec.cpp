@@ -13,7 +13,7 @@
 - **No NeuTTS metadata on the codec gguf; no large params in any gguf.** NeuTTS specifics are derived from the backbone vocab at runtime (via `audio_lm_set_audio_token_range`).
 - `common/audio_lm.cpp` / `common/codec_common.h` (codec_common) MUST NOT include `llama.h` / `llama_*` — backbone-dependent code lives in `common/tts_runner.cpp`.
 - espeak-ng may be referenced ONLY from `examples/tts-cli.cpp`, guarded by CMake option `CODEC_TTS_ESPEAK` (default OFF). Core `libcodec`/`codec_common` never links espeak.
-- Port prompt format VERBATIM from official `neuphonic/neutts-air` (`neutts/neutts.py`): prompt `user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text} {input_text}<|TEXT_PROMPT_END|>\nassistant:` + ref `<|speech_{i}|>` codes; stop `<|SPEECH_GENERATION_END|>`; code token `<|speech_{i}|>`.
+- Port prompt format VERBATIM from official `neuphonic/neutts-air` (`neutts/neutts.py::_ggml_prompt`), as pinned by Task 0 in `docs/superpowers/notes/neutts-facts.md` §Step 5: prompt `user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text} {input_text}<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>` + ref `<|speech_{i}|>` codes; stop `<|SPEECH_GENERATION_END|>`; code token `<|speech_{i}|>`. (Task 0 correction: `<|SPEECH_GENERATION_START|>` sits between `assistant:` and the ref codes — the earlier draft omitted it.) `ref_text`/`input_text` are phonemized separately then joined with a single space.
 - `cmake --build build -j` is the source of truth; ignore clangd diagnostics (no compile_commands.json).
 - Reference asset must be CC0/public-domain (NOT neuphonic `samples/*.wav`).
 - Memory-size literals use `(size_t)` casts.
@@ -164,7 +164,7 @@ git commit -m "feat(tts): detect NeuTTS + derive audio-token range from backbone
 - Consumes: `runner_params.ref_text` (Task 1), `ref_pcm` load (existing `load_ref_audio`), NeuCodec encode (`codec_encode` / an `audio_lm_encode_ref_codes` helper), `detect_neutts`/`neutts_audio_token_range` (Task 2).
 - Produces: `std::vector<llama_token> build_neutts_prompt(const llama_vocab*, const std::string & ref_text_phonemes, const std::string & input_phonemes, const std::vector<int32_t> & ref_codes)` — the prefill token sequence: template text tokens + `<|speech_{c}|>` tokens for each ref code, per the verbatim format.
 
-- [ ] **Step 1: Write the failing test** — a token-sequence oracle. With the NeuTTS-Air vocab and a tiny synthetic `ref_codes={0,1,2}`, assert `build_neutts_prompt` yields exactly: tokenized `user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref}{ input}<|TEXT_PROMPT_END|>\nassistant:` followed by the ids of `<|speech_0|><|speech_1|><|speech_2|>`. Compare against the ids Task 0 recorded. (SKIP if no NeuTTS gguf.)
+- [ ] **Step 1: Write the failing test** — a token-sequence oracle. With the NeuTTS-Air vocab and a tiny synthetic `ref_codes={0,1,2}`, assert `build_neutts_prompt` yields exactly: tokenized `user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text} {input_text}<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>` followed by the ids of `<|speech_0|><|speech_1|><|speech_2|>` (Task 0 §Step 5: note the `<|SPEECH_GENERATION_START|>` marker before the codes, and the single space joining ref/input phonemes). Compare against the ids Task 0 recorded. (SKIP if no NeuTTS gguf.)
 
 - [ ] **Step 2: Run — expect FAIL.**
 
