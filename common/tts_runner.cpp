@@ -13,12 +13,12 @@
 // tts_runner_result (PCM + stats) instead of writing WAV files.  Built only
 // when CODEC_TTS_BACKBONE=ON.
 
+#include "llama.h"   // must precede tts_runner.h (defines LLAMA_H guard)
+
 #include "tts_runner.h"
 
 #include "codec_common.h"
 #include "utils/wav_io.h"
-
-#include "llama.h"
 #include "common.h"     // common_params_sampling, common_grammar
 #include "sampling.h"   // common_sampler_*
 #include "ggml.h"
@@ -36,6 +36,24 @@
 #include <vector>
 
 namespace codec_common {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flat audio-token logit-bias mask (Type A / direct-audio backbone models).
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::vector<llama_logit_bias> build_flat_audio_mask(int32_t offset, int32_t count,
+                                                    int32_t eos_id, int32_t n_vocab) {
+    std::vector<llama_logit_bias> out;
+    if (offset < 0 || count <= 0 || n_vocab <= 0) return out;
+    const int32_t lo = offset;
+    const int32_t hi = offset + count;                 // exclusive
+    out.reserve((size_t) n_vocab);
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        const bool allowed = (id >= lo && id < hi) || (eos_id >= 0 && id == eos_id);
+        if (!allowed) out.push_back(llama_logit_bias{ id, -INFINITY });
+    }
+    return out;
+}
 
 namespace {
 

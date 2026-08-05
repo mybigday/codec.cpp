@@ -1,11 +1,14 @@
 // Standalone assert test for the model-less TTS constraint logic.
 // Returns 0 on success, non-zero (and prints) on the first failure.
 #include "codec_common.h"
+#include "tts_runner.h"
+#include <cmath>
 #include <cstdio>
 #include <string>
 
 using codec_common::outetts_version;
 using codec_common::outetts_build_grammar;
+using codec_common::build_flat_audio_mask;
 
 static int g_fail = 0;
 #define CHECK_EQ(actual, expected)                                            \
@@ -85,10 +88,30 @@ static void test_escaping_and_non_ascii() {
     }
 }
 
+static void test_flat_audio_mask() {
+    // vocab 10, audio ids [3,7), eos = 9 → allowed {3,4,5,6,9}; mask the rest.
+    auto m = build_flat_audio_mask(/*offset=*/3, /*count=*/4, /*eos=*/9, /*n_vocab=*/10);
+    bool masked[10] = {false,false,false,false,false,false,false,false,false,false};
+    for (const auto & lb : m) {
+        if (lb.token < 0 || lb.token >= 10) {
+            std::printf("FAIL mask oob %d\n", lb.token); g_fail = 1;
+        } else {
+            masked[lb.token] = true;
+            if (lb.bias != -INFINITY) { std::printf("FAIL mask bias\n"); g_fail = 1; }
+        }
+    }
+    // allowed = {3,4,5,6,9}; expected masked = {0,1,2,7,8}.
+    const bool exp[10] = {true,true,true,false,false,false,false,true,true,false};
+    for (int i = 0; i < 10; ++i) if (masked[i] != exp[i]) {
+        std::printf("FAIL mask id %d: got %d want %d\n", i, masked[i], exp[i]); g_fail = 1;
+    }
+}
+
 int main() {
     test_v2_two_ascii_words();
     test_v3_uses_word_alternation_and_features();
     test_escaping_and_non_ascii();
+    test_flat_audio_mask();
     if (g_fail) { std::printf("tts_constraint_test: FAILURES\n"); return 1; }
     std::printf("tts_constraint_test: all passed\n");
     return 0;

@@ -26,7 +26,35 @@
 #include <string>
 #include <vector>
 
+// llama_logit_bias — replicated inline so this header is includable by TUs
+// that do NOT have llama.h on their include path (e.g. tts_runner_flow.cpp,
+// which lives in the always-built codec_common library).  The layout is
+// identical to llama.h's typedef.  Gated on !LLAMA_H so that TUs that
+// already included llama.h (which defines the same struct) don't redeclare it.
+#ifndef LLAMA_H
+typedef struct llama_logit_bias {
+    int32_t token;
+    float   bias;
+} llama_logit_bias;
+#endif  // !LLAMA_H
+
 namespace codec_common {
+
+// ─────────────────────────────────────────────────────────────────────
+// Backbone-sampler constraint.  Exactly one field is populated for a
+// constrained model; both empty = unconstrained.
+//   grammar    — GBNF for structured models (OuteTTS / MOSS-TTSD)
+//   logit_bias — id-level mask for flat direct-audio Type A models
+// ─────────────────────────────────────────────────────────────────────
+struct tts_constraint {
+    std::string                   grammar;
+    std::vector<llama_logit_bias> logit_bias;
+};
+
+// Mask every token OUTSIDE [offset, offset+count) ∪ {eos_id} to -INFINITY.
+// eos_id < 0 = no sentinel.  offset < 0 → returns {} (Type A disabled).
+std::vector<llama_logit_bias> build_flat_audio_mask(int32_t offset, int32_t count,
+                                                    int32_t eos_id, int32_t n_vocab);
 
 // ─────────────────────────────────────────────────────────────────────
 // Params — everything the reference loop needs.  Unset optionals fall
