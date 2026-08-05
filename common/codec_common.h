@@ -504,6 +504,7 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
 // `text` is unused today (MOSS-TTSD's grammar is text-independent) but is
 // threaded through for future prompt-dependent grammars (OuteTTS-style
 // word-sequence constraints).
+
 // OuteTTS interface version — selects the grammar template family.
 enum class outetts_version { V2, V3 };
 

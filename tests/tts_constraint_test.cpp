@@ -107,11 +107,46 @@ static void test_flat_audio_mask() {
     }
 }
 
+static void test_flat_audio_mask_edges() {
+    // Case 1: eos inside range — build_flat_audio_mask(3, 4, 5, 10)
+    // audio range [3,7), eos=5 already in range.
+    // allowed = {3,4,5,6}; masked = {0,1,2,7,8,9}.
+    // eos token 5 must NOT appear in the returned vector (it is allowed, not masked).
+    {
+        auto m = build_flat_audio_mask(/*offset=*/3, /*count=*/4, /*eos=*/5, /*n_vocab=*/10);
+        bool masked[10] = {};
+        for (const auto & lb : m) {
+            if (lb.token < 0 || lb.token >= 10) {
+                std::printf("FAIL edge1 mask oob %d\n", lb.token); g_fail = 1;
+            } else {
+                if (lb.token == 5) {
+                    std::printf("FAIL edge1: eos=5 (inside range) appears in mask\n"); g_fail = 1;
+                }
+                masked[lb.token] = true;
+                if (lb.bias != -INFINITY) { std::printf("FAIL edge1 mask bias\n"); g_fail = 1; }
+            }
+        }
+        const bool exp[10] = {true,true,true,false,false,false,false,true,true,true};
+        for (int i = 0; i < 10; ++i) if (masked[i] != exp[i]) {
+            std::printf("FAIL edge1 mask id %d: got %d want %d\n", i, masked[i], exp[i]); g_fail = 1;
+        }
+    }
+    // Case 2: negative offset → returns empty vector.
+    {
+        auto m = build_flat_audio_mask(/*offset=*/-1, /*count=*/4, /*eos=*/9, /*n_vocab=*/10);
+        if (!m.empty()) {
+            std::printf("FAIL edge2: negative offset should return empty, got %zu entries\n", m.size());
+            g_fail = 1;
+        }
+    }
+}
+
 int main() {
     test_v2_two_ascii_words();
     test_v3_uses_word_alternation_and_features();
     test_escaping_and_non_ascii();
     test_flat_audio_mask();
+    test_flat_audio_mask_edges();
     if (g_fail) { std::printf("tts_constraint_test: FAILURES\n"); return 1; }
     std::printf("tts_constraint_test: all passed\n");
     return 0;

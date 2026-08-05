@@ -17,6 +17,15 @@
 
 #include "tts_runner.h"
 
+#include <type_traits>
+
+// The inline llama_logit_bias fallback in tts_runner.h (for no-llama TUs) is
+// only ABI-safe while this holds.  Assert it in the TU that sees the real type.
+static_assert(sizeof(llama_logit_bias) == 8,
+              "llama_logit_bias layout drift breaks tts_runner.h's fallback typedef");
+static_assert(std::is_same<llama_token, int32_t>::value,
+              "llama_logit_bias::token must be int32_t for the fallback typedef");
+
 #include "codec_common.h"
 #include "utils/wav_io.h"
 #include "common.h"     // common_params_sampling, common_grammar
@@ -736,6 +745,16 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
                      const std::vector<float> & speaker_prefix,
                      const std::string & payload_text,
                      int32_t * out_frames, const char ** out_stop) {
+    // A flat Type A logit-bias mask is only consumed by the cb0-from-backbone
+    // sampler path.  Type A single-cb decode is not wired up yet (no such model
+    // ships), so a non-empty mask here would be silently dropped → unconstrained
+    // audio.  Make that loud rather than silent.
+    if (!constraint.logit_bias.empty() && !pi.cb0_from_backbone) {
+        std::fprintf(stderr,
+            "WARN: flat Type A logit-bias mask (%zu masked tokens) computed but the "
+            "token-single-cb decode path is not wired; audio will be UNCONSTRAINED.\n",
+            constraint.logit_bias.size());
+    }
     audio_lm_set_uses_embed_override(ctx, true, 1);
     int32_t n_past = 0;
 
@@ -1096,7 +1115,7 @@ static bool detect_outetts_version(const llama_model * lmodel,
     // V3 signature: any of these per-word markers present.
     const bool v3 = has("<|word_start|>") || has("<|features|>") || has("<|c1_0|>");
     // V2 signature: space + audio-end tokens, but NOT the V3 markers.
-    const bool v2 = has("<|space|>") && has("<|audio_end|>") && !v3;
+    const bool v2 = !v3 && has("<|space|>") && has("<|audio_end|>");
 
     // Corroborate with general.name when available (non-fatal; skip on error).
     char name[256] = {0};
@@ -1258,9 +1277,9 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         if (a_off >= 0) {
             const int32_t nv = llama_vocab_n_tokens(vocab);
             if (a_off + a_cnt > nv) {
-                std::printf("WARN: audio-token range [%d,%d) exceeds n_vocab=%d "
-                            "(bad codec.audio_token.offset/count?)\n",
-                            a_off, a_off + a_cnt, nv);
+                std::fprintf(stderr, "WARN: audio-token range [%d,%d) exceeds n_vocab=%d "
+                             "(bad codec.audio_token.offset/count?)\n",
+                             a_off, a_off + a_cnt, nv);
             }
             char pf[128] = {0}, pl[128] = {0};
             llama_token_to_piece(vocab, a_off,             pf, sizeof(pf), 0, true);

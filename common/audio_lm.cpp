@@ -1219,6 +1219,7 @@ static std::string word_to_grammar(const std::string & word) {
 std::string outetts_build_grammar(outetts_version v, const std::string & text) {
     std::vector<std::string> wg;
     for (const auto & w : oute_split_ws(text)) wg.push_back(word_to_grammar(w));
+    if (wg.empty()) return "";   // no words → no constraint (avoid malformed GBNF)
 
     auto join = [](const std::vector<std::string> & xs, const std::string & sep) {
         std::string o;
