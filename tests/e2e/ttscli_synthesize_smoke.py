@@ -468,6 +468,123 @@ def main():
                       f"stop={_stop}{_frames_str} dur={_dur:.2f}s rms={_rms:.3f}{_cer_str}")
                 results.append(_ok)
 
+    # ── NeuTTS-air (report-only CER pass) ─────────────────────────────────────
+    # NeuTTS-air (Qwen2 0.5B) is the larger sibling of neutts-nano: same
+    # phoneme-mode ICL protocol, same distill_neucodec codec, same
+    # ref-audio/ref-text convention, same token-id contract.  The backbone
+    # differs (qwen2 arch, 24 layers, hidden=896, vocab=217652) but the
+    # NeuTTS host-loop is arch-agnostic — detection is purely vocab-range.
+    #
+    # Converted via llama.cpp/convert_hf_to_gguf.py --outtype q8_0 (plain
+    # Qwen2ForCausalLM, no tensor-rename needed).  Seed=1 reused from nano
+    # (both are NeuTTS checkpoints; the EOS-at-9-frames bias at seed=42 is
+    # observed on nano; air may or may not share it, but seed=1 is safe).
+    #
+    # CER is report-only this pass.
+    _neutts_air_codec   = REPO / "models" / "distill_neucodec" / "distill_neucodec.gguf"
+    _neutts_air_bb      = REPO / "models" / "hf" / "neutts_air" / "neutts-air-q8_0.gguf"
+    _neutts_air_refwav  = REPO / "assets" / "refs" / "jfk_en.wav"
+    _neutts_air_reftxt  = REPO / "assets" / "refs" / "jfk_en.txt"
+
+    _neutts_air_assets_ok = (
+        _neutts_air_codec.exists()
+        and _neutts_air_bb.exists()
+        and _neutts_air_refwav.exists()
+        and _neutts_air_reftxt.exists()
+    )
+
+    if not _neutts_air_assets_ok:
+        _missing_air = [p for p in [_neutts_air_codec, _neutts_air_bb,
+                                     _neutts_air_refwav, _neutts_air_reftxt]
+                        if not p.exists()]
+        print(f"[skip] neutts_air: missing assets ({', '.join(p.name for p in _missing_air)})")
+        results.append(None)
+    else:
+        _neutts_air_phon_ok = False
+        try:
+            from phonemizer.backend import EspeakBackend as _EspeakBackendAir
+            _neutts_air_phon_ok = True
+        except Exception as _e_air:
+            print(f"[skip] neutts_air: phonemizer unavailable ({_e_air})")
+            results.append(None)
+
+        if _neutts_air_phon_ok:
+            _g2p_air = _EspeakBackendAir(
+                language="en-us",
+                preserve_punctuation=True,
+                with_stress=True,
+                words_mismatch="ignore",
+                language_switch="remove-flags",
+            )
+
+            def _to_phones_air(text):
+                return " ".join(_g2p_air.phonemize([text])[0].split())
+
+            _air_original_text = "The birch canoe slid on the smooth planks."
+            _air_ref_raw       = _neutts_air_reftxt.read_text().strip()
+            _air_phon_text     = _to_phones_air(_air_original_text)
+            _air_phon_ref      = _to_phones_air(_air_ref_raw)
+
+            print(f"[info] neutts_air: original_text = {_air_original_text!r}")
+            print(f"[info] neutts_air: phon_text     = {_air_phon_text!r}")
+            print(f"[info] neutts_air: phon_ref      = {_air_phon_ref!r}")
+
+            _air_out_wav = Path("/tmp") / "ttscli_neutts_air.wav"
+            if _air_out_wav.exists():
+                _air_out_wav.unlink()
+
+            _air_proc = _run_synth(
+                _neutts_air_codec,
+                _neutts_air_bb,
+                _air_phon_text,
+                _air_out_wav,
+                extra=[
+                    "--ref-audio", str(_neutts_air_refwav),
+                    "--ref-text",  _air_phon_ref,
+                    "--temp",      "1.0",
+                    "--top-k",     "50",
+                    "--seed",      "1",
+                    "--max-frames", "400",
+                ],
+                greedy=False,
+            )
+
+            if _air_proc.returncode != 0:
+                print(f"[FAIL] neutts_air: exit {_air_proc.returncode}")
+                print(_air_proc.stdout[-1200:])
+                print(_air_proc.stderr[-800:])
+                results.append(False)
+            else:
+                _air_stop_lines = [ln for ln in _air_proc.stdout.splitlines()
+                                   if "NeuTTS AR done" in ln]
+                _air_stop = (_air_stop_lines[0].split("stop=")[-1].strip()
+                             if _air_stop_lines else "?")
+                _air_frames_str = ""
+                if _air_stop_lines:
+                    import re as _re_air
+                    _m_air = _re_air.search(r"(\d+) frames", _air_stop_lines[0])
+                    if _m_air:
+                        _air_frames_str = f" frames={_m_air.group(1)}"
+
+                assert _air_out_wav.exists(), "neutts_air: no wav written"
+                _air_sr, _air_dur, _air_rms = _wav_stats(_air_out_wav)
+
+                # CER: ASR against the plain-English original (not the phonemes).
+                _air_cer_res = _try_cer(_air_out_wav, _air_original_text, "en")
+                _air_cer_str = ""
+                if _air_cer_res is not None:
+                    _air_asr_txt, _air_cer_val = _air_cer_res
+                    _air_cer_str = f" ASR={_air_asr_txt!r} CER={_air_cer_val:.3f}"
+
+                # report-only: never fail on CER or audio quality this pass.
+                _air_ok = True
+                if _air_rms < 0.005:
+                    print(f"[WARN] neutts_air: near-silent (rms={_air_rms:.4f})")
+                print(f"[{'PASS' if _air_ok else 'FAIL'}] neutts_air (report-only): "
+                      f"stop={_air_stop}{_air_frames_str} dur={_air_dur:.2f}s "
+                      f"rms={_air_rms:.3f}{_air_cer_str}")
+                results.append(_air_ok)
+
     ran = [r for r in results if r is not None]
     if not ran:
         print("no cases ran (all assets missing)")
