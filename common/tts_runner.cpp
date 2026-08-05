@@ -165,6 +165,7 @@ struct BackboneSampler {
     bool build(const llama_model * model, uint32_t seed, float temp,
                int32_t top_k, float top_p, float min_p, float rep_penalty,
                int32_t rep_last_n, const std::string & grammar,
+               const std::vector<llama_logit_bias> & logit_bias,
                std::string * err) {
         common_params_sampling sp;
         sp.seed          = seed;
@@ -189,6 +190,9 @@ struct BackboneSampler {
         };
         if (!grammar.empty()) {
             sp.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
+        }
+        if (!logit_bias.empty()) {
+            sp.logit_bias = logit_bias;
         }
         try {
             smpl = common_sampler_init(model, sp);
@@ -728,7 +732,7 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
                      const std::vector<llama_token> & toks, int32_t hidden, int32_t n_cb,
                      int32_t max_frames, uint32_t seed,
                      float temp, float top_p, int32_t top_k,
-                     const std::string & grammar,
+                     const tts_constraint & constraint,
                      const std::vector<float> & speaker_prefix,
                      const std::string & payload_text,
                      int32_t * out_frames, const char ** out_stop) {
@@ -831,7 +835,8 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
     if (pi.cb0_from_backbone) {
         std::string berr;
         if (!bbsmpl.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
-                          /*rep_penalty=*/1.0f, /*rep_last_n=*/0, grammar, &berr)) {
+                          /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
+                          constraint.grammar, constraint.logit_bias, &berr)) {
             std::fprintf(stderr, "backbone sampler init failed: %s\n", berr.c_str());
             *out_stop = "grammar_error";
             return false;
@@ -1079,7 +1084,6 @@ static bool vocab_has_piece(const llama_vocab * vocab, const char * piece) {
 // per-word feature/paired-code markers; V2 carries <|space|> + bare code
 // tokens and lacks the V3 markers.  Return false on anything ambiguous so
 // non-OuteTTS models are never mis-constrained.
-[[maybe_unused]]
 static bool detect_outetts_version(const llama_model * lmodel,
                                    const llama_vocab * vocab,
                                    codec_common::outetts_version * out) {
@@ -1112,6 +1116,40 @@ static bool detect_outetts_version(const llama_model * lmodel,
     }
     std::printf("[tts] OuteTTS detection: negative — not OuteTTS (general.name=\"%s\")\n", name);
     return false;
+}
+
+// Resolve the full constraint for a backbone synthesis request.
+// Resolution order (first match wins):
+//   1. Explicit user GBNF grammar.
+//   2. OuteTTS V2/V3 structured backbone → prompt-dependent grammar.
+//   3. Codec-metadata GBNF grammar (MOSS-TTSD tts_auto_grammar).
+//   4. Flat audio-token logit-bias mask for Type A direct-audio models.
+// Returns an empty constraint for models with no constraint (CSM / Chatterbox /
+// Qwen3-TTS / LFM2 / Realtime) — identical behaviour to before this change.
+static tts_constraint resolve_constraint(const llama_model * lmodel,
+                                         const llama_vocab * vocab,
+                                         const audio_lm_prompt_info & pi,
+                                         const std::string & user_grammar,
+                                         const std::string & text,
+                                         int32_t n_vocab) {
+    tts_constraint c;
+    // 1) explicit user grammar wins.
+    if (!user_grammar.empty()) { c.grammar = user_grammar; return c; }
+    // 2) structured backbone family (OuteTTS) → prompt-dependent grammar.
+    codec_common::outetts_version ov;
+    if (detect_outetts_version(lmodel, vocab, &ov)) {
+        c.grammar = codec_common::outetts_build_grammar(ov, text);
+        return c;
+    }
+    // 3a) codec-metadata grammar (MOSS-TTSD; unchanged).
+    c.grammar = tts_auto_grammar(pi, text);
+    if (!c.grammar.empty()) return c;
+    // 3b) flat Type A → logit-bias mask.
+    if (pi.audio_tok_offset >= 0) {
+        c.logit_bias = build_flat_audio_mask(pi.audio_tok_offset, pi.audio_tok_count,
+                                             pi.audio_tok_eos, n_vocab);
+    }
+    return c;
 }
 
 }  // namespace
@@ -1209,6 +1247,28 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         return false;
     }
     const llama_vocab * vocab = llama_model_get_vocab(lmodel);
+
+    // ── Type A sanity: surface audio-token range bounds and edge pieces ──
+    // A mis-counted codec.audio_token.offset (added-token order drift in the
+    // converter) produces in-range-but-wrong ids → silent garbage.  Log the
+    // range edges and warn on overflow so converter bugs surface early.
+    {
+        int32_t a_off = -1, a_cnt = 0, a_eos = -1;
+        audio_lm_get_audio_token_range(ctx, &a_off, &a_cnt, &a_eos);
+        if (a_off >= 0) {
+            const int32_t nv = llama_vocab_n_tokens(vocab);
+            if (a_off + a_cnt > nv) {
+                std::printf("WARN: audio-token range [%d,%d) exceeds n_vocab=%d "
+                            "(bad codec.audio_token.offset/count?)\n",
+                            a_off, a_off + a_cnt, nv);
+            }
+            char pf[128] = {0}, pl[128] = {0};
+            llama_token_to_piece(vocab, a_off,             pf, sizeof(pf), 0, true);
+            llama_token_to_piece(vocab, a_off + a_cnt - 1, pl, sizeof(pl), 0, true);
+            std::printf("audio-token range [%d,%d) eos=%d; first=<%s> last=<%s>\n",
+                        a_off, a_off + a_cnt, a_eos, pf, pl);
+        }
+    }
 
     // ── Chatterbox T3 flow (Flow 4) ───────────────────────────────────
     if (is_chatterbox) {
@@ -1322,14 +1382,17 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     const int32_t top_k = a.has_top_k ? a.top_k : pi.default_top_k;
     const uint32_t seed = a.seed ? a.seed : 0xC0DEC1ABu;
 
-    // Grammar for the backbone sampler: an explicit user GBNF wins; else the
-    // model's metadata-derived auto-grammar (empty for models with none).
-    std::string grammar = !a.grammar.empty() ? a.grammar
-                                             : tts_auto_grammar(pi, a.text);
-    if (!grammar.empty()) {
+    // Resolve the backbone constraint (grammar or logit-bias mask).
+    const int32_t n_vocab_bb = llama_vocab_n_tokens(vocab);
+    const tts_constraint constraint =
+        resolve_constraint(lmodel, vocab, pi, a.grammar, a.text, n_vocab_bb);
+    if (!constraint.grammar.empty()) {
         std::printf("grammar: %s (%zu bytes)\n",
                     !a.grammar.empty() ? "user-supplied" : "auto (model-derived)",
-                    grammar.size());
+                    constraint.grammar.size());
+    } else if (!constraint.logit_bias.empty()) {
+        std::printf("logit-bias: flat audio mask (%zu tokens masked)\n",
+                    constraint.logit_bias.size());
     }
 
     const char * stop_reason = "max_frames";
@@ -1369,7 +1432,7 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
                                        &n_frames, &stop_reason);
     } else {
         ar_ok = run_codebook_ar(ctx, lctx, lmodel, vocab, pi, toks, hidden, n_cb,
-                                max_frames, seed, temp, top_p, top_k, grammar,
+                                max_frames, seed, temp, top_p, top_k, constraint,
                                 speaker_prefix, a.text, &n_frames, &stop_reason);
     }
 
