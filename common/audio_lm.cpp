@@ -941,6 +941,15 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
     else if (is_delay)             out->model_kind = audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY;
     else if (is_depth)             out->model_kind = audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR;
 
+    // Mirror the Type A audio-token range into out (see codec_common.h).
+    out->audio_tok_offset = ctx->audio_tok_offset;
+    out->audio_tok_count  = ctx->audio_tok_count;
+    out->audio_tok_eos    = ctx->audio_tok_eos;
+    if (ctx->audio_tok_offset >= 0 &&
+        out->model_kind == audio_lm_prompt_info::KIND_UNKNOWN) {
+        out->model_kind = audio_lm_prompt_info::KIND_TOKEN_SINGLE_CB;
+    }
+
     // ── Per-arch / per-family prompt template ──────────────────────────
     // barbet == BlueMagpie continuous latent CFM.
     if (out->host_arch == "barbet" || ctx->is_continuous) {

@@ -387,6 +387,7 @@ struct audio_lm_prompt_info {
         KIND_RESIDUAL_DEPTH_AR,   // Type C — CSM, Qwen3-TTS, MOSS-TTS-Realtime
         KIND_PARALLEL_HEADS_DELAY,// Type D — MOSS-TTSD
         KIND_CONTINUOUS_CFM,      // BlueMagpie / VoxCPM
+        KIND_TOKEN_SINGLE_CB,     // Type A — OuteTTS / single-codebook token LMs
     } model_kind = KIND_UNKNOWN;
 
     std::string host_arch;        // "llama" / "qwen3" / "barbet"
@@ -467,6 +468,14 @@ struct audio_lm_prompt_info {
     // arbitrary text tokens (babble) mid-utterance.  Both -1 when absent.
     int32_t cb0_speech_range_start = -1;  // codec.lm.cb0_speech_offset
     int32_t cb0_speech_range_end   = -1;  // codec.lm.cb0_speech_range_end (exclusive)
+
+    // Type A (token-based single-cb) audio-token range, mirrored from the
+    // codec_lm context so backbone-side code (tts_runner) can build a flat
+    // logit-bias mask without reaching into the private context.
+    // audio_tok_offset < 0 → not a Type A model.
+    int32_t audio_tok_offset = -1;
+    int32_t audio_tok_count  = 0;
+    int32_t audio_tok_eos    = -1;
 };
 
 // Fill `*out` from the loaded model's metadata.  Returns false + sets
