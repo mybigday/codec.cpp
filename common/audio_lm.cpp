@@ -1161,6 +1161,109 @@ static std::string gbnf_uint_range_rule(int32_t max_inclusive) {
     return out;
 }
 
+// Split on ASCII whitespace (space/tab/newline/CR), dropping empties.
+static std::vector<std::string> oute_split_ws(const std::string & s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        const bool ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                         c == '\f' || c == '\v');
+        if (ws) { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
+        else cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// One word → a GBNF terminal, mirroring the reference word_to_grammar:
+//   all-ASCII  → "word"  (with " and \ escaped — safe hardening)
+//   otherwise  → [unique-codepoints]+  (first-seen order, UTF-8 bytes re-emitted)
+static std::string word_to_grammar(const std::string & word) {
+    bool ascii = true;
+    for (unsigned char c : word) if (c >= 128) { ascii = false; break; }
+    if (ascii) {
+        std::string esc;
+        for (char c : word) { if (c == '"' || c == '\\') esc += '\\'; esc += c; }
+        return "\"" + esc + "\"";
+    }
+    // Decode UTF-8 into codepoint byte-spans; dedupe by codepoint, keep order.
+    std::string cls;
+    std::vector<std::string> seen;   // unique codepoints as their UTF-8 bytes
+    size_t i = 0;
+    while (i < word.size()) {
+        unsigned char b = (unsigned char) word[i];
+        size_t len = 1;
+        if      ((b & 0x80) == 0x00) len = 1;
+        else if ((b & 0xE0) == 0xC0) len = 2;
+        else if ((b & 0xF0) == 0xE0) len = 3;
+        else if ((b & 0xF8) == 0xF0) len = 4;
+        if (i + len > word.size()) len = 1;         // malformed tail — byte-wise
+        std::string cp = word.substr(i, len);
+        bool dup = false;
+        for (const auto & s : seen) if (s == cp) { dup = true; break; }
+        if (!dup) { seen.push_back(cp); cls += cp; }
+        i += len;
+    }
+    return "[" + cls + "]+";
+}
+
+std::string outetts_build_grammar(outetts_version v, const std::string & text) {
+    std::vector<std::string> wg;
+    for (const auto & w : oute_split_ws(text)) wg.push_back(word_to_grammar(w));
+
+    auto join = [](const std::vector<std::string> & xs, const std::string & sep) {
+        std::string o;
+        for (size_t k = 0; k < xs.size(); ++k) { if (k) o += sep; o += xs[k]; }
+        return o;
+    };
+    const std::string word_alt = join(wg, " | ");
+
+    std::string g;
+    if (v == outetts_version::V2) {
+        g += "root       ::= NL? " + join(wg, " audioBlock ") + " audioEnd NL EOS?\n";
+        g += "audioBlock ::= TIME CODE* space NL?\n";
+        g += "TEXT ::= [A-Za-z0-9 .,?!]+\n";
+        g += "EOS      ::= \"<|im_end|>\"\n";
+        g += "emotionStart ::= \"<|emotion_start|>\"\n";
+        g += "emotionEnd ::= \"<|emotion_end|>\"\n";
+        g += "audioEnd   ::= \"<|audio_end|>\"\n";
+        g += "space      ::= \"<|space|>\"\n";
+        g += "WORD       ::= " + word_alt + "\n";
+        g += "NL         ::= [\\n]\n";
+        g += "TIME  ::= \"<|t_\" DECIMAL \"|>\"\n";
+        g += "CODE    ::= \"<|\" DIGITS \"|>\"\n";
+        g += "DIGITS     ::= [0-9]+\n";
+        g += "DECIMAL    ::= [0-9]+ \".\" [0-9]+\n";
+        g += "punch ::= \"<|\" [a-z_]+ \"|>\"\n";
+        return g;
+    }
+    // V3
+    g += "root       ::= leadWord wordBlock* audioEnd NL EOS?\n";
+    g += "leadWord ::= WORD audioBlock\n";
+    g += "wordBlock ::= wordStart WORD audioBlock\n";
+    g += "audioBlock ::= codeBlock wordEnd NL?\n";
+    g += "codeBlock ::= features TIME energy spectralCentroid pitch CODE CODES*\n";
+    g += "TEXT ::= [A-Za-z0-9.,!?]+\n";
+    g += "EOS      ::= \"<|im_end|>\"\n";
+    g += "audioEnd   ::= \"<|audio_end|>\"\n";
+    g += "wordStart ::= \"<|word_start|>\"\n";
+    g += "wordEnd ::= \"<|word_end|>\"\n";
+    g += "features ::= \"<|features|>\"\n";
+    g += "energy ::= \"<|energy_\" DIGITS \"|>\"\n";
+    g += "spectralCentroid ::= \"<|spectral_centroid_\" DIGITS \"|>\"\n";
+    g += "pitch ::= \"<|pitch_\" DIGITS \"|>\"\n";
+    g += "WORD       ::= " + word_alt + "\n";
+    g += "NL         ::= [\\n]\n";
+    g += "TIME       ::= \"<|t_\" DECIMAL \"|>\"\n";
+    g += "CODE       ::= \"<|code|>\"\n";
+    g += "CODES      ::= CODE1 CODE2\n";
+    g += "CODE1      ::= \"<|c1_\" DIGITS \"|>\"\n";
+    g += "CODE2      ::= \"<|c2_\" DIGITS \"|>\"\n";
+    g += "DIGITS     ::= [0-9]+\n";
+    g += "DECIMAL    ::= [0-9]+ \".\" [0-9]+\n";
+    return g;
+}
+
 std::string tts_auto_grammar(const audio_lm_prompt_info & pi,
                              const std::string & text) {
     (void) text;  // reserved for future prompt-dependent grammars

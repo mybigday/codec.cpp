@@ -197,5 +197,9 @@ if(CODEC_BUILD_TTS_CLI)
         target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}")
         set_target_properties(tts-cli PROPERTIES
             BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
+
+        add_executable(tts-constraint-test tests/tts_constraint_test.cpp)
+        target_link_libraries(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
+        target_include_directories(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>)
     endif()
 endif()

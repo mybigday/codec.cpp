@@ -495,6 +495,17 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
 // `text` is unused today (MOSS-TTSD's grammar is text-independent) but is
 // threaded through for future prompt-dependent grammars (OuteTTS-style
 // word-sequence constraints).
+// OuteTTS interface version — selects the grammar template family.
+enum class outetts_version { V2, V3 };
+
+// Build the prompt-dependent GBNF for an OuteTTS backbone. Pure string:
+// splits `text` on ASCII whitespace into words, converts each to a GBNF
+// terminal (ASCII → quoted literal with " and \ escaped; non-ASCII →
+// [unique-codepoints]+), and substitutes them into the V2 or V3 template.
+// No llama dependency — callable from hook hosts (rn-tts) and tests without
+// a backbone. Faithful port of BricksDisplay/OuteTTS-Speaker-Creator app.py.
+std::string outetts_build_grammar(outetts_version v, const std::string & text);
+
 std::string tts_auto_grammar(const audio_lm_prompt_info & pi,
                              const std::string & text);
 
