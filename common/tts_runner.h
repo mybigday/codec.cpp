@@ -66,6 +66,7 @@ struct tts_runner_params {
                                      // self-contained models (Pocket FlowLM)
     std::string text;                // synthesis target (required)
     std::string ref_audio_path;      // optional WAV for voice conditioning
+    std::string ref_text;            // optional transcript of ref_audio (NeuTTS phonemization)
 
     int32_t  n_threads = 0;
     bool     use_gpu   = false;

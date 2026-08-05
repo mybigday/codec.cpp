@@ -45,7 +45,7 @@ void print_usage(const char * prog) {
         "  info       --model PATH\n"
         "  decode     --model PATH --codes PATH.npy --output PATH.wav [--n-threads N]\n"
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
-        "             --output PATH.wav [--ref-audio PATH.wav]\n"
+        "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
         "             [--cfg F] [--timesteps N] [--min-len N]\n"
         "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
@@ -114,6 +114,7 @@ struct args {
     std::string codes;
     std::string text;
     std::string ref_audio;
+    std::string ref_text;
     std::string output;
     std::string backbone;
 
@@ -151,6 +152,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--codes")      { const char * v = need(); if (!v) return false; out->codes = v; i++; }
         else if (a == "--text")       { const char * v = need(); if (!v) return false; out->text = v;  i++; }
         else if (a == "--ref-audio")  { const char * v = need(); if (!v) return false; out->ref_audio = v; i++; }
+        else if (a == "--ref-text")   { const char * v = need(); if (!v) return false; out->ref_text = v; i++; }
         else if (a == "--output")     { const char * v = need(); if (!v) return false; out->output = v; i++; }
         else if (a == "--backbone")   { const char * v = need(); if (!v) return false; out->backbone = v; i++; }
         else if (a == "--n-threads")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
@@ -259,6 +261,7 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.backbone_path = a.backbone;
     rp.text          = a.text;
     rp.ref_audio_path = a.ref_audio;
+    rp.ref_text       = a.ref_text;
     rp.n_threads     = a.n_threads;
     rp.use_gpu       = a.use_gpu;
     rp.seed          = a.seed;
