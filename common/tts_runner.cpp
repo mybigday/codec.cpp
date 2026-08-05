@@ -936,7 +936,7 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
                          const audio_lm_prompt_info & /*pi*/,
                          const std::vector<llama_token> & prompt_toks,
                          int32_t off, int32_t count, int32_t eos_id,
-                         int32_t max_frames, uint32_t seed,
+                         int32_t max_frames, int32_t min_frames, uint32_t seed,
                          float temp, float top_p, int32_t top_k,
                          int32_t * out_frames, const char ** out_stop) {
     // 1) Teach observe_token the speech range + eos BEFORE any observe call so
@@ -966,6 +966,50 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
         return false;
     }
 
+    // 3b) Min-length guard sampler (phase 1).  At temp 1.0 / top-k 50 the
+    //     backbone can sample <|SPEECH_GENERATION_END|> from the very first
+    //     step for unlucky seeds, yielding 0-few frames of near-silent audio
+    //     (measured: some seeds emit eos as the FIRST token).  A pinned seed
+    //     hides this, but users don't control the seed, so it's a real defect.
+    //     Fix: forbid eos until at least `min_frames` audio frames exist.
+    //
+    //     We must GUARANTEE a non-eos token when we suppress eos (rejection-
+    //     resampling can loop when the eos logit dominates), so the guard
+    //     draws from a SECOND sampler whose flat mask FORBIDS eos: passing
+    //     eos_id=-1 to build_flat_audio_mask leaves the allowed set to just
+    //     [off, off+count) (eos gets a -inf bias, since -1 is not a valid id).
+    //
+    //     RNG-DESYNC PITFALL: the two samplers own independent mt19937 streams
+    //     seeded identically.  If we sampled *exclusively* from the guard while
+    //     under min_frames, the primary stream would stay frozen and, at the
+    //     first eos-allowed step, replay its very first variate — the same draw
+    //     that picked eos at step 0 pre-fix — deterministically re-hitting the
+    //     early-eos it was meant to avoid (observed: a seed stopping at EXACTLY
+    //     frame min_frames).  So we ALWAYS draw from the primary sampler first
+    //     (advancing its stream every step); only if it yields eos while under
+    //     min_frames do we substitute a single guard draw for the actual token.
+    //     The primary's accept-of-eos is harmless here (no grammar; penalties
+    //     disabled), and its stream stays decorrelated from the guard's.
+    //
+    //     Default min_frames = 25 (~0.33 s at the NeuCodec 75-frame/s rate) is
+    //     enough to escape the early-eos basin while staying short enough to
+    //     never truncate a genuinely brief utterance; `--min-len` overrides.
+    BackboneSampler bbsmpl_min;
+    const bool use_min_guard = min_frames > 0;
+    if (use_min_guard) {
+        std::vector<llama_logit_bias> mask_noeos =
+            build_flat_audio_mask(off, count, /*eos_id=*/-1, n_vocab);
+        std::string berr_min;
+        if (!bbsmpl_min.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
+                              /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
+                              /*grammar=*/std::string(), mask_noeos, &berr_min)) {
+            std::fprintf(stderr,
+                "run_token_single_cb: min-guard sampler init failed: %s\n", berr_min.c_str());
+            *out_stop = "grammar_error";
+            return false;
+        }
+    }
+
     // 4) Prefill the ICL prompt.
     int32_t n_past = 0;
     if (!decode_tokens(lctx, prompt_toks, n_past, /*all_pos=*/false)) {
@@ -976,7 +1020,16 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
 
     // 5) AR loop — sample → observe → feed back.
     for (int32_t step = 0; step < max_frames; ++step) {
+        // Always draw from the primary sampler first so its RNG stream advances
+        // every step (see the RNG-desync note above).  Under min_frames, if the
+        // primary picked eos, substitute a single eos-forbidden guard draw — the
+        // primary's frozen-first-variate replay is thereby broken, and the guard
+        // GUARANTEES a non-eos token this step.  At/after min_frames, keep the
+        // primary token as-is (eos allowed → OBSERVE_STOP breaks).
         llama_token tok = bbsmpl.sample(lctx, -1);
+        if (use_min_guard && (*out_frames) < min_frames && tok == eos_id) {
+            tok = bbsmpl_min.sample(lctx, -1);
+        }
         observe_action act =
             audio_lm_observe_token(ctx, tok, /*last_hidden=*/nullptr, /*hidden_dim=*/0);
         if (act == OBSERVE_STOP) {
@@ -1691,8 +1744,14 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
 
         int32_t n_frames = 0;
         const char * stop_reason = "max_frames";
+        // Min-length guard: forbid eos until at least `nt_min_frames` audio
+        // frames exist, suppressing the early-eos near-silence failure mode
+        // (some seeds sample eos on the FIRST token at temp 1.0 / top-k 50).
+        // NeuTTS default is 25 frames (~0.35 s at the NeuCodec frame rate);
+        // `--min-len` (a.min_len) overrides.
+        const int32_t nt_min_frames = a.min_len > 0 ? a.min_len : 25;
         bool ok = run_token_single_cb(ctx, lctx, lmodel, vocab, pi, neutts_prompt_toks,
-                                      off, count, eos_id, max_frames, nt_seed,
+                                      off, count, eos_id, max_frames, nt_min_frames, nt_seed,
                                       nt_temp, nt_top_p, nt_top_k,
                                       &n_frames, &stop_reason);
         llama_free(lctx);
