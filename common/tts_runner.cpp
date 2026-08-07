@@ -40,7 +40,9 @@ static_assert(std::is_same<llama_token, int32_t>::value,
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1425,6 +1427,432 @@ std::vector<llama_token> build_neutts_prompt(
         toks.push_back(offset + c);
     }
     return toks;
+}
+
+// ── OuteTTS V3 speaker loader + prompt builder (public API) ──────────────────
+//
+// Speaker JSON schema (outetts 0.4.4, outetts10-facts §Step 3):
+//
+//   {
+//     "text":  "<reference sentence>",
+//     "words": [
+//       { "word": "The", "duration": 0.20,
+//         "c1": [720,...], "c2": [658,...],
+//         "features": {"energy":10, "spectral_centroid":15, "pitch":45} },
+//       ...
+//     ],
+//     "global_features": {"energy":13, "spectral_centroid":20, "pitch":28},
+//     "interface_version": 3
+//   }
+//
+// We parse this with a minimal hand-parser (no external JSON library dependency
+// needed for this fixed schema).
+
+namespace {
+
+// ── Tiny JSON helpers ─────────────────────────────────────────────────────────
+// These operate on the raw file content (one std::string) and implement only
+// what the speaker JSON schema requires: string extraction, key lookup, integer
+// array parsing, and float parsing.  They do NOT handle Unicode escapes, nested
+// objects deeper than 2 levels, or arrays of objects except words[].
+
+// Advance pos past whitespace.
+static void json_skip_ws(const std::string & s, size_t & pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' ||
+                               s[pos] == '\r' || s[pos] == '\n'))
+        ++pos;
+}
+
+// Parse a JSON string starting at s[pos] (which must be '"').
+// Advances pos to after the closing '"'.
+static std::string json_parse_string(const std::string & s, size_t & pos) {
+    if (pos >= s.size() || s[pos] != '"') return "";
+    ++pos;  // skip opening "
+    std::string out;
+    while (pos < s.size() && s[pos] != '"') {
+        if (s[pos] == '\\' && pos + 1 < s.size()) {
+            ++pos;
+            switch (s[pos]) {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case '/':  out += '/';  break;
+                case 'n':  out += '\n'; break;
+                case 't':  out += '\t'; break;
+                case 'r':  out += '\r'; break;
+                default:   out += s[pos]; break;
+            }
+        } else {
+            out += s[pos];
+        }
+        ++pos;
+    }
+    if (pos < s.size()) ++pos;  // skip closing "
+    return out;
+}
+
+// Return the position of the value after key "key" in the JSON object rooted
+// at [obj_start, obj_end).  Returns std::string::npos if not found.
+static size_t json_find_key(const std::string & s, size_t obj_start, size_t obj_end,
+                             const std::string & key) {
+    size_t pos = obj_start;
+    while (pos < obj_end) {
+        json_skip_ws(s, pos);
+        if (pos >= obj_end) break;
+        if (s[pos] != '"') { ++pos; continue; }  // skip non-key chars (commas, etc.)
+        std::string k = json_parse_string(s, pos);
+        // Skip the colon separator after the key.
+        json_skip_ws(s, pos);
+        if (pos < obj_end && s[pos] == ':') ++pos;
+        json_skip_ws(s, pos);
+        if (k == key) {
+            // pos now points at the start of the value — return it.
+            return pos;
+        }
+        // Key doesn't match: skip the value so we advance past it.
+        if (pos >= obj_end) break;
+        char c = s[pos];
+        if (c == '"') {
+            json_parse_string(s, pos);
+        } else if (c == '{' || c == '[') {
+            // Skip matched bracket (handles nested objects/arrays).
+            char open = c, close = (c == '{') ? '}' : ']';
+            int depth = 0;
+            bool in_str = false;
+            while (pos < obj_end) {
+                char ch = s[pos++];
+                if (in_str) { if (ch == '\\') { if (pos < obj_end) ++pos; }
+                              else if (ch == '"') in_str = false; }
+                else { if (ch == '"') in_str = true;
+                       else if (ch == open)  ++depth;
+                       else if (ch == close) { --depth; if (depth == 0) break; } }
+            }
+        } else {
+            // number / bool / null — advance to next comma or closing bracket.
+            while (pos < obj_end && s[pos] != ',' && s[pos] != '}' && s[pos] != ']') ++pos;
+        }
+    }
+    return std::string::npos;
+}
+
+// Parse an integer array [N, N, ...] starting at s[pos] (which must be '[').
+// Advances pos past the closing ']'.
+static std::vector<int32_t> json_parse_int_array(const std::string & s, size_t & pos) {
+    std::vector<int32_t> out;
+    if (pos >= s.size() || s[pos] != '[') return out;
+    ++pos;  // skip '['
+    while (pos < s.size()) {
+        json_skip_ws(s, pos);
+        if (pos >= s.size()) break;
+        if (s[pos] == ']') { ++pos; break; }
+        if (s[pos] == ',') { ++pos; continue; }
+        // parse integer (may be negative)
+        bool neg = (s[pos] == '-');
+        if (neg) ++pos;
+        int32_t v = 0;
+        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+            v = v * 10 + (s[pos++] - '0');
+        }
+        out.push_back(neg ? -v : v);
+    }
+    return out;
+}
+
+// Parse a float at s[pos]; advances pos past the number.
+static float json_parse_float(const std::string & s, size_t & pos) {
+    size_t start = pos;
+    if (pos < s.size() && (s[pos] == '-' || s[pos] == '+')) ++pos;
+    while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
+    if (pos < s.size() && s[pos] == '.') {
+        ++pos;
+        while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
+    }
+    if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
+        ++pos;
+        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
+        while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
+    }
+    return (float) std::stod(s.substr(start, pos - start));
+}
+
+// Parse an integer at s[pos]; advances pos past the number.
+static int32_t json_parse_int(const std::string & s, size_t & pos) {
+    json_skip_ws(s, pos);
+    bool neg = (pos < s.size() && s[pos] == '-');
+    if (neg) ++pos;
+    int32_t v = 0;
+    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') v = v * 10 + (s[pos++] - '0');
+    return neg ? -v : v;
+}
+
+// Find the matching close bracket for the open bracket at s[open_pos].
+// Returns std::string::npos if not found.
+static size_t json_match_bracket(const std::string & s, size_t open_pos) {
+    if (open_pos >= s.size()) return std::string::npos;
+    char open = s[open_pos], close = (open == '{') ? '}' : ']';
+    int depth = 0;
+    bool in_str = false;
+    size_t pos = open_pos;
+    while (pos < s.size()) {
+        char c = s[pos++];
+        if (in_str) { if (c == '\\') { if (pos < s.size()) ++pos; } else if (c == '"') in_str = false; }
+        else { if (c == '"') in_str = true; else if (c == open) ++depth; else if (c == close) { --depth; if (depth == 0) return pos - 1; } }
+    }
+    return std::string::npos;
+}
+
+}  // namespace
+
+// ── load_outetts_speaker ──────────────────────────────────────────────────────
+
+bool load_outetts_speaker(const std::string & json_path, OutettsSpeaker * out) {
+    if (!out) return false;
+
+    // Read entire file.
+    std::ifstream f(json_path);
+    if (!f.is_open()) {
+        std::fprintf(stderr, "[outetts] load_outetts_speaker: cannot open %s\n", json_path.c_str());
+        return false;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    const std::string src = ss.str();
+
+    // Find top-level object boundaries.
+    size_t root = src.find('{');
+    if (root == std::string::npos) {
+        std::fprintf(stderr, "[outetts] load_outetts_speaker: no JSON object in %s\n", json_path.c_str());
+        return false;
+    }
+    size_t root_end = json_match_bracket(src, root);
+    if (root_end == std::string::npos) root_end = src.size();
+
+    // Parse "text" field.
+    {
+        size_t vp = json_find_key(src, root + 1, root_end, "text");
+        if (vp != std::string::npos && vp < src.size() && src[vp] == '"') {
+            out->text = json_parse_string(src, vp);
+        }
+    }
+
+    // Parse "words" array.
+    {
+        size_t vp = json_find_key(src, root + 1, root_end, "words");
+        if (vp == std::string::npos || vp >= src.size() || src[vp] != '[') {
+            std::fprintf(stderr, "[outetts] load_outetts_speaker: 'words' array not found in %s\n",
+                         json_path.c_str());
+            return false;
+        }
+        size_t words_end = json_match_bracket(src, vp);
+        if (words_end == std::string::npos) words_end = src.size();
+        size_t pos = vp + 1;  // skip '['
+
+        while (pos < words_end) {
+            json_skip_ws(src, pos);
+            if (pos >= words_end) break;
+            if (src[pos] == ']') break;
+            if (src[pos] != '{') { ++pos; continue; }
+
+            size_t wobj_end = json_match_bracket(src, pos);
+            if (wobj_end == std::string::npos) wobj_end = words_end;
+            size_t wstart = pos + 1;
+
+            OutettsSpeakerWord w;
+
+            // "word"
+            {
+                size_t kp = json_find_key(src, wstart, wobj_end, "word");
+                if (kp != std::string::npos && src[kp] == '"') {
+                    w.word = json_parse_string(src, kp);
+                }
+            }
+
+            // "duration"
+            {
+                size_t kp = json_find_key(src, wstart, wobj_end, "duration");
+                if (kp != std::string::npos) {
+                    w.duration = json_parse_float(src, kp);
+                }
+            }
+
+            // "c1"
+            {
+                size_t kp = json_find_key(src, wstart, wobj_end, "c1");
+                if (kp != std::string::npos && src[kp] == '[') {
+                    w.c1 = json_parse_int_array(src, kp);
+                }
+            }
+
+            // "c2"
+            {
+                size_t kp = json_find_key(src, wstart, wobj_end, "c2");
+                if (kp != std::string::npos && src[kp] == '[') {
+                    w.c2 = json_parse_int_array(src, kp);
+                }
+            }
+
+            // "features": {"energy": N, "spectral_centroid": N, "pitch": N}
+            {
+                size_t fp = json_find_key(src, wstart, wobj_end, "features");
+                if (fp != std::string::npos && src[fp] == '{') {
+                    size_t fobj_end = json_match_bracket(src, fp);
+                    if (fobj_end == std::string::npos) fobj_end = wobj_end;
+                    size_t fstart = fp + 1;
+
+                    size_t ep = json_find_key(src, fstart, fobj_end, "energy");
+                    if (ep != std::string::npos) w.energy = json_parse_int(src, ep);
+
+                    size_t sp = json_find_key(src, fstart, fobj_end, "spectral_centroid");
+                    if (sp != std::string::npos) w.spectral_centroid = json_parse_int(src, sp);
+
+                    size_t pp = json_find_key(src, fstart, fobj_end, "pitch");
+                    if (pp != std::string::npos) w.pitch = json_parse_int(src, pp);
+                }
+            }
+
+            out->words.push_back(std::move(w));
+            pos = wobj_end + 1;  // advance past '}' of word object
+        }
+    }
+
+    return !out->words.empty();
+}
+
+// ── build_outetts_v3_prompt ───────────────────────────────────────────────────
+//
+// Exact V3 prefill (outetts10-facts §Step 1):
+//
+//   <|im_start|>\n
+//   <|text_start|>SPEAKER_TEXT. TARGET_TEXT<|text_end|>\n
+//   <|audio_start|>\n
+//   {speaker word blocks, each ending with \n}
+//   <|word_start|>
+//
+// Each word block (from create_codes in prompt_processor.py):
+//   <|word_start|>WORD<|features|><|t_D.DD|><|energy_N|><|spectral_centroid_N|><|pitch_N|>
+//   <|code|><|c1_X|><|c2_X|>...<|word_end|>
+//
+// c1_base (0.6B) = 151669, c2_base (0.6B) = 152694 (facts §Step 2).
+// The format specials (<|...|>) are resolved via llama_tokenize(parse_special=true)
+// together with the surrounding text; code tokens are appended as raw ids.
+//
+// Guard: returns empty on null vocab, empty text, or any c1/c2 code out of [0,1024).
+
+std::vector<llama_token> build_outetts_v3_prompt(const llama_vocab    * vocab,
+                                                  const std::string   & text,
+                                                  const OutettsSpeaker& speaker) {
+    if (!vocab || text.empty()) return {};
+
+    // Validate all codes up front before we allocate anything.
+    for (const auto & w : speaker.words) {
+        for (int32_t c : w.c1) {
+            if (c < 0 || c >= 1024) {
+                std::fprintf(stderr,
+                    "[outetts] build_outetts_v3_prompt: c1 code %d out of range [0,1024)\n", c);
+                return {};
+            }
+        }
+        for (int32_t c : w.c2) {
+            if (c < 0 || c >= 1024) {
+                std::fprintf(stderr,
+                    "[outetts] build_outetts_v3_prompt: c2 code %d out of range [0,1024)\n", c);
+                return {};
+            }
+        }
+    }
+
+    // Resolve c1/c2 base ids from the vocab (facts §Step 2: look up <|c1_0|> / <|c2_0|>).
+    const int32_t c1_base = vocab_piece_id(vocab, "<|c1_0|>");
+    const int32_t c2_base = vocab_piece_id(vocab, "<|c2_0|>");
+    if (c1_base < 0 || c2_base < 0) {
+        std::fprintf(stderr,
+            "[outetts] build_outetts_v3_prompt: <|c1_0|> or <|c2_0|> not found in vocab\n");
+        return {};
+    }
+
+    // ── Build the prompt string.
+    // The string contains all special tokens in <|...|> form; llama_tokenize
+    // with parse_special=true will resolve them to their ids.  Code tokens are
+    // NOT embedded in the string — they are appended as raw ids after tokenization
+    // to avoid any piece-merging ambiguity.
+    //
+    // To interleave text and code tokens correctly (the code tokens must appear
+    // at the right position within the word block), we build the prompt in
+    // segments.  Each word produces:
+    //   text_segment: "<|word_start|>WORD<|features|><|t_D.DD|>...<|code|>"
+    //   code_ids:     [c1_base+c1[0], c2_base+c2[0], c1_base+c1[1], ...]
+    //   end_segment:  "<|word_end|>\n"
+    // After all words, we append the trailing "<|word_start|>" primer.
+
+    // Merged text: "SPEAKER_TEXT. TARGET_TEXT"
+    const std::string merged_text = speaker.text + ". " + text;
+
+    // Header segment (fully textual with specials)
+    const std::string header =
+        "<|im_start|>\n"
+        "<|text_start|>" + merged_text + "<|text_end|>\n"
+        "<|audio_start|>\n";
+
+    // We'll accumulate (text_segment, code_tokens) pairs then do one tokenize
+    // per text segment and concatenate everything.
+
+    struct Segment {
+        std::string          text_piece;   // tokenized with parse_special=true
+        std::vector<int32_t> code_ids;     // raw token ids appended after text_piece
+    };
+
+    std::vector<Segment> segments;
+    segments.push_back({header, {}});
+
+    for (const auto & w : speaker.words) {
+        // Per-word text piece (from create_codes in prompt_processor.py):
+        //   "<|word_start|>WORD<|features|><|t_D.DD|><|energy_N|><|spectral_centroid_N|><|pitch_N|><|code|>"
+        char dur_buf[16];
+        std::snprintf(dur_buf, sizeof(dur_buf), "%.2f", (double) w.duration);
+
+        std::string wp = "<|word_start|>" + w.word
+            + "<|features|>"
+            + "<|t_" + dur_buf + "|>"
+            + "<|energy_"            + std::to_string(w.energy)            + "|>"
+            + "<|spectral_centroid_" + std::to_string(w.spectral_centroid) + "|>"
+            + "<|pitch_"             + std::to_string(w.pitch)             + "|>"
+            + "<|code|>";
+
+        // Code token ids: interleaved c1/c2 pairs per frame.
+        std::vector<int32_t> code_ids;
+        const size_t n_frames = std::min(w.c1.size(), w.c2.size());
+        code_ids.reserve(n_frames * 2);
+        for (size_t i = 0; i < n_frames; ++i) {
+            code_ids.push_back(c1_base + w.c1[i]);
+            code_ids.push_back(c2_base + w.c2[i]);
+        }
+
+        // End piece for this word (appended after the code ids).
+        segments.push_back({wp,            std::move(code_ids)});
+        segments.push_back({"<|word_end|>\n", {}});
+    }
+
+    // Trailing <|word_start|> primer (primes generation of first target word).
+    segments.push_back({"<|word_start|>", {}});
+
+    // ── Assemble the full token sequence.
+    std::vector<llama_token> result;
+    for (const auto & seg : segments) {
+        if (!seg.text_piece.empty()) {
+            auto toks = tokenize_str(vocab, seg.text_piece, /*add_bos=*/false, /*parse_special=*/true);
+            if (toks.empty()) {
+                std::fprintf(stderr,
+                    "[outetts] build_outetts_v3_prompt: tokenize failed for segment: \"%s\"\n",
+                    seg.text_piece.substr(0, 80).c_str());
+                return {};
+            }
+            result.insert(result.end(), toks.begin(), toks.end());
+        }
+        for (int32_t id : seg.code_ids) {
+            result.push_back(id);
+        }
+    }
+
+    return result;
 }
 
 bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out) {

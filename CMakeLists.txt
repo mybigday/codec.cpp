@@ -207,6 +207,12 @@ if(CODEC_BUILD_TTS_CLI)
         target_include_directories(neutts-detect-test PRIVATE
             $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>
             ${TTS_BACKBONE_INCLUDE_DIRS})
+
+        add_executable(outetts-prompt-test tests/outetts_prompt_test.cpp)
+        target_link_libraries(outetts-prompt-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
+        target_include_directories(outetts-prompt-test PRIVATE
+            $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>
+            ${TTS_BACKBONE_INCLUDE_DIRS})
     endif()
 
     # Model-less unit test for the multi-codebook Type A observe_token accumulator.
