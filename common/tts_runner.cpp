@@ -1054,9 +1054,13 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
             return false;
         }
         n_past += 1;
-        if (act == OBSERVE_CONSUMED) {
-            (*out_frames)++;
-        }
+        // Count COMPLETE n_q-frames, not individual consumed tokens.  For n_q=1
+        // (NeuTTS) every CONSUMED token completes a frame so this is identical
+        // to the old ++(*out_frames).  For n_q>1 (OuteTTS, n_q=2) the
+        // accumulator only advances its frame count when the full n_q-tuple is
+        // stored, so a single CONSUMED mid-frame leaves the count unchanged
+        // until the last token of the frame arrives — avoiding over-counting.
+        *out_frames = audio_lm_codes_n_frames(ctx);
         // OBSERVE_PASSTHROUGH mid-audio is unexpected under the mask (only
         // speech ∪ eos are reachable); fed back but not counted as a frame.
     }
