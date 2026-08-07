@@ -933,6 +933,21 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
 //     caller runs `audio_lm_decode_audio` directly with NO manual push.
 //   * `build_flat_audio_mask` leaves the eos id UN-biased (allowed set =
 //     [off, off+count) ∪ {eos}), so the model can always reach eos and stop.
+//
+// Two modes, selected by `constrain_audio_mask`:
+//   * true  (NeuTTS, n_q=1): flat audio-only mask + min-length eos-forbidden
+//     guard.  The stream is pure audio, so forbidding everything but the audio
+//     range ∪ eos is correct.  BYTE-IDENTICAL to the original single-mode fn.
+//   * false (OuteTTS, multi-cb Type A): FREE generation.  The output stream
+//     INTERLEAVES structural tokens (<|word_start|>, word text, <|features|>,
+//     <|t_..|>, <|energy_N|>, <|code|>, <|word_end|>, ...) between the c1/c2
+//     codes, so a flat audio-only mask would forbid exactly those and break
+//     generation.  Instead: empty logit_bias (no constraint) + rep-penalty
+//     (OuteTTS mandates a 64-token repetition window) + NO min-length guard
+//     (min_frames ignored → eos never suppressed).  The multi-cb range is
+//     configured by the CALLER via audio_lm_set_audio_token_ranges BEFORE this
+//     call, so free-gen mode MUST NOT touch audio_lm_set_audio_token_range
+//     (singular) — doing so would clobber the multi-cb range.
 bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
                          const llama_model * lmodel, const llama_vocab * vocab,
                          const audio_lm_prompt_info & /*pi*/,
@@ -940,28 +955,39 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
                          int32_t off, int32_t count, int32_t eos_id,
                          int32_t max_frames, int32_t min_frames, uint32_t seed,
                          float temp, float top_p, int32_t top_k,
+                         bool constrain_audio_mask, float rep_penalty,
+                         int32_t rep_last_n,
                          int32_t * out_frames, const char ** out_stop) {
-    // 1) Teach observe_token the speech range + eos BEFORE any observe call so
-    //    <|speech_N|> classifies as OBSERVE_CONSUMED and eos as OBSERVE_STOP.
-    audio_lm_set_audio_token_range(ctx, off, count, eos_id);
-
-    // 2) Flat mask: constrain the backbone to speech ∪ eos.  This is the first
-    //    runnable consumer of the Type A mask.  Empty ⇒ bad range → error.
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    std::vector<llama_logit_bias> mask =
-        build_flat_audio_mask(off, count, eos_id, n_vocab);
-    if (mask.empty()) {
-        std::fprintf(stderr,
-            "run_token_single_cb: flat audio mask empty (off=%d count=%d eos=%d n_vocab=%d)\n",
-            off, count, eos_id, n_vocab);
-        return false;
+
+    // 1) Constrained mode only: teach observe_token the single-cb speech range +
+    //    eos BEFORE any observe call so <|speech_N|> classifies as CONSUMED and
+    //    eos as STOP.  In free-gen (multi-cb) mode the caller has ALREADY set the
+    //    range via audio_lm_set_audio_token_ranges; re-setting the singular range
+    //    here would clobber it, so we skip it entirely.
+    if (constrain_audio_mask) {
+        audio_lm_set_audio_token_range(ctx, off, count, eos_id);
+    }
+
+    // 2) Build the primary sampler's logit_bias.
+    //    * constrained: flat mask (speech ∪ eos).  Empty ⇒ bad range → error.
+    //    * free-gen:    empty mask (no constraint) — structural tokens must pass.
+    std::vector<llama_logit_bias> mask;
+    if (constrain_audio_mask) {
+        mask = build_flat_audio_mask(off, count, eos_id, n_vocab);
+        if (mask.empty()) {
+            std::fprintf(stderr,
+                "run_token_single_cb: flat audio mask empty (off=%d count=%d eos=%d n_vocab=%d)\n",
+                off, count, eos_id, n_vocab);
+            return false;
+        }
     }
 
     // 3) Backbone sampler with the mask attached (no grammar for Type A).
     BackboneSampler bbsmpl;
     std::string berr;
     if (!bbsmpl.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
-                      /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
+                      rep_penalty, rep_last_n,
                       /*grammar=*/std::string(), mask, &berr)) {
         std::fprintf(stderr, "run_token_single_cb: sampler init failed: %s\n", berr.c_str());
         *out_stop = "grammar_error";
@@ -996,8 +1022,12 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
     //     Default min_frames = 25 (~0.33 s at the NeuCodec 75-frame/s rate) is
     //     enough to escape the early-eos basin while staying short enough to
     //     never truncate a genuinely brief utterance; `--min-len` overrides.
+    //     Free-gen mode (constrain_audio_mask=false) DISABLES the guard: the
+    //     eos-forbidden mask [off,off+count) would forbid the interleaved
+    //     structural tokens, and OuteTTS has no early-eos basin to escape (its
+    //     eos is <|audio_end|>, reached only after full word blocks).
     BackboneSampler bbsmpl_min;
-    const bool use_min_guard = min_frames > 0;
+    const bool use_min_guard = constrain_audio_mask && min_frames > 0;
     if (use_min_guard) {
         std::vector<llama_logit_bias> mask_noeos =
             build_flat_audio_mask(off, count, /*eos_id=*/-1, n_vocab);
@@ -1378,6 +1408,34 @@ bool neutts_audio_token_range(const llama_vocab * vocab,
     *offset = off;
     *count  = n;
     *eos_id = eos;
+    return true;
+}
+
+// Derive the multi-codebook audio-token ranges from an OuteTTS V3 backbone
+// vocab.  Resolves everything from vocab pieces so it is robust across the
+// 0.6B (Qwen3) and 1B (Llama) backbones, whose ids differ (facts §Step 2):
+//   offsets[0] = id of <|c1_0|>   (0.6B → 151669, 1B → 128256)
+//   offsets[1] = id of <|c2_0|>   (0.6B → 152694, 1B → 129281)
+//   counts     = {1024, 1024}     (valid DAC code range 0..1023; index 1024 is
+//                                  a padding token never emitted by the codec)
+//   *sentinel  = id of <|code|>   (0.6B → 156730)
+//   *eos       = id of <|audio_end|> (0.6B → 156729)
+// Returns false if any marker token is absent.
+bool outetts_audio_token_ranges(const llama_vocab * vocab,
+                                int32_t offsets[2], int32_t counts[2],
+                                int32_t * sentinel, int32_t * eos) {
+    if (!vocab || !offsets || !counts || !sentinel || !eos) return false;
+    const int32_t c1_base   = vocab_piece_id(vocab, "<|c1_0|>");
+    const int32_t c2_base   = vocab_piece_id(vocab, "<|c2_0|>");
+    const int32_t code_id   = vocab_piece_id(vocab, "<|code|>");
+    const int32_t audio_end = vocab_piece_id(vocab, "<|audio_end|>");
+    if (c1_base < 0 || c2_base < 0 || code_id < 0 || audio_end < 0) return false;
+    offsets[0] = c1_base;
+    offsets[1] = c2_base;
+    counts[0]  = 1024;
+    counts[1]  = 1024;
+    *sentinel  = code_id;
+    *eos       = audio_end;
     return true;
 }
 
@@ -2044,14 +2102,154 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     std::vector<llama_token> neutts_prompt_toks;
     const bool is_neutts = detect_neutts(vocab);
 
-    // If get_prompt_info was deferred (codec-only gguf) but this is NOT a
-    // NeuTTS backbone, the model genuinely lacks a usable codec_lm — abort now
-    // with the original deferred error rather than fall through to the
-    // codec_lm-backed flows (which would dereference an unpopulated `pi`).
-    if (!pi_ok && !is_neutts) {
+    // OuteTTS is ALSO a codec-only backbone (get_prompt_info fails, pi_ok=false)
+    // that drives a 24kHz 2-codebook DAC purely via token ids.  Detect it here
+    // (V3 only for this path) so the deferred-pi abort below skips it too.
+    codec_common::outetts_version ov{};
+    const bool is_outetts =
+        detect_outetts_version(lmodel, vocab, &ov) &&
+        ov == codec_common::outetts_version::V3;
+
+    // If get_prompt_info was deferred (codec-only gguf) but this is NEITHER a
+    // NeuTTS nor an OuteTTS backbone, the model genuinely lacks a usable
+    // codec_lm — abort now with the original deferred error rather than fall
+    // through to the codec_lm-backed flows (which would dereference an
+    // unpopulated `pi`).
+    if (!pi_ok && !is_neutts && !is_outetts) {
         out->error = deferred_pi_err;
         llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
         return false;
+    }
+
+    // ── OuteTTS V3 free-gen multi-cb Type A decode + DAC ────────────────────
+    // OuteTTS (like NeuTTS) is codec-only: the backbone lm_head emits an
+    // INTERLEAVED stream of structural tokens (<|word_start|>, word text,
+    // <|features|>, <|t_..|>, <|energy_N|>, <|code|>, <|c1_N|>, <|c2_N|>,
+    // <|word_end|>, ...) that ends with <|audio_end|>.  We drive it with FREE
+    // generation (no flat audio mask — that would forbid the structural tokens)
+    // + a 64-token repetition window (mandated by the OuteTTS README), then let
+    // the multi-cb observe accumulator strip the non-audio tokens and pack the
+    // c1/c2 pairs into the (T, n_q=2) frame layout for DAC decode.  Grammar OFF.
+    // Self-contained: frees all resources on every early-return and returns.
+    if (is_outetts) {
+        // 1) Load the bundled default V3 speaker.  Resolve the asset relative to
+        //    a few candidate roots (cwd / repo layout), mirroring the tests.
+        static const char * kSpeakerCandidates[] = {
+            "assets/speakers/en-female-1-neutral.json",
+            "../assets/speakers/en-female-1-neutral.json",
+            "docs/superpowers/notes/outetts10-en-female-1-neutral.json",
+        };
+        std::string speaker_path;
+        for (const char * cand : kSpeakerCandidates) {
+            std::ifstream probe(cand);
+            if (probe.good()) { speaker_path = cand; break; }
+        }
+        if (speaker_path.empty()) {
+            out->error =
+                "OuteTTS: bundled default speaker not found "
+                "(assets/speakers/en-female-1-neutral.json); run tts-cli from the repo root.";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        codec_common::OutettsSpeaker speaker;
+        if (!load_outetts_speaker(speaker_path, &speaker)) {
+            out->error = std::string("OuteTTS: failed to parse speaker JSON: ") + speaker_path;
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // 2) Build the V3 prefill (header + speaker word-blocks + <|word_start|>
+        //    primer + interleaved raw c1/c2 code ids).
+        std::vector<llama_token> outetts_prompt_toks =
+            build_outetts_v3_prompt(vocab, a.text, speaker);
+        if (outetts_prompt_toks.empty()) {
+            out->error =
+                "OuteTTS: build_outetts_v3_prompt returned empty "
+                "(empty text, bad vocab, or out-of-range speaker code)";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // 3) Configure the multi-cb Type A range (c1/c2 offsets + counts,
+        //    <|code|> frame sentinel, <|audio_end|> eos) BEFORE any observe.
+        int32_t off2[2] = {-1, -1}, cnt2[2] = {0, 0}, sentinel = -1, eos_id = -1;
+        if (!outetts_audio_token_ranges(vocab, off2, cnt2, &sentinel, &eos_id)) {
+            out->error =
+                "OuteTTS: outetts_audio_token_ranges failed "
+                "(<|c1_0|>/<|c2_0|>/<|code|>/<|audio_end|> missing from vocab)";
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+        audio_lm_set_audio_token_ranges(ctx, off2, cnt2, /*n_q=*/2, sentinel, eos_id);
+        std::printf("[outetts] V3 multi-cb range: c1=[%d,%d) c2=[%d,%d) sentinel=%d eos=%d; "
+                    "%zu prompt tokens\n",
+                    off2[0], off2[0] + cnt2[0], off2[1], off2[1] + cnt2[1],
+                    sentinel, eos_id, outetts_prompt_toks.size());
+
+        // 4) Type A single-cb-driver kind (the decode drives the DAC via codes).
+        pi.model_kind = audio_lm_prompt_info::KIND_TOKEN_SINGLE_CB;
+
+        // Validate prefill fits the backbone context.
+        const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
+        if ((int32_t) outetts_prompt_toks.size() + 1 >= n_ctx) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "OuteTTS: V3 prefill (%zu tokens) does not fit backbone n_ctx=%d; "
+                "raise --max-frames.",
+                outetts_prompt_toks.size(), n_ctx);
+            out->error = buf;
+            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+            return false;
+        }
+
+        // OuteTTS sampling defaults (README): temp 1.0, top-k 50, 64-token
+        // repetition window with penalty 1.1 (overridable via --rep-penalty).
+        const float    ot_temp    = a.has_temp  ? a.temp  : 1.0f;
+        const float    ot_top_p   = a.has_top_p ? a.top_p : 1.0f;
+        const int32_t  ot_top_k   = a.has_top_k ? a.top_k : 50;
+        const uint32_t ot_seed    = a.seed ? a.seed : 0xC0DEC1ABu;
+        const float    ot_rep_pen = a.has_rep_penalty ? a.repetition_penalty : 1.1f;
+        const int32_t  ot_rep_n   = 64;
+
+        // 5) Free-gen multi-cb decode.  constrain_audio_mask=false ⇒ empty mask
+        //    (structural tokens pass), no min-length guard, and NO singular
+        //    range re-set (the multi-cb range above is preserved).  off/count/
+        //    eos_id are unused in free-gen mode but passed for signature parity.
+        int32_t n_frames = 0;
+        const char * stop_reason = "max_frames";
+        bool ok = run_token_single_cb(ctx, lctx, lmodel, vocab, pi, outetts_prompt_toks,
+                                      off2[0], cnt2[0], eos_id, max_frames,
+                                      /*min_frames=*/0, ot_seed,
+                                      ot_temp, ot_top_p, ot_top_k,
+                                      /*constrain_audio_mask=*/false,
+                                      ot_rep_pen, ot_rep_n,
+                                      &n_frames, &stop_reason);
+        llama_free(lctx);
+        llama_model_free(lmodel);
+        llama_backend_free();
+        if (!ok) {
+            out->error = std::string("OuteTTS AR failed (") + stop_reason
+                       + "); see stderr for the concrete cause";
+            audio_lm_free(ctx);
+            return false;
+        }
+        std::printf("OuteTTS AR done: %d frames, stop=%s\n", n_frames, stop_reason);
+        if (n_frames == 0) {
+            out->error = "OuteTTS: no speech frames generated";
+            audio_lm_free(ctx);
+            return false;
+        }
+        // observe_token accumulated the c1/c2 codes into ctx->codes already —
+        // decode directly (DAC n_q=2, codes [1,2,n_frames]).
+        audio_lm_audio_output pcm;
+        if (!audio_lm_decode_audio(ctx, &pcm)) {
+            out->error = std::string("OuteTTS: decode_audio failed: ") + audio_lm_last_error(ctx);
+            audio_lm_free(ctx);
+            return false;
+        }
+        fill_result_from_output(pcm, n_frames, stop_reason, out);
+        audio_lm_free(ctx);
+        return true;
     }
 
     if (is_neutts) {
@@ -2185,6 +2383,8 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         bool ok = run_token_single_cb(ctx, lctx, lmodel, vocab, pi, neutts_prompt_toks,
                                       off, count, eos_id, max_frames, nt_min_frames, nt_seed,
                                       nt_temp, nt_top_p, nt_top_k,
+                                      /*constrain_audio_mask=*/true,
+                                      /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
                                       &n_frames, &stop_reason);
         llama_free(lctx);
         llama_model_free(lmodel);

@@ -125,6 +125,17 @@ bool neutts_audio_token_range(const llama_vocab * vocab,
                               int32_t * count,
                               int32_t * eos_id);
 
+// Derive the multi-codebook audio-token ranges from an OuteTTS V3 backbone
+// vocab.  Resolves from vocab pieces (robust across the 0.6B/1B backbones):
+//   offsets[0] = <|c1_0|>, offsets[1] = <|c2_0|>, counts = {1024, 1024},
+//   *sentinel = <|code|> (per-frame reset), *eos = <|audio_end|>.
+// Returns false if any marker token is absent.
+bool outetts_audio_token_ranges(const llama_vocab * vocab,
+                                int32_t offsets[2],
+                                int32_t counts[2],
+                                int32_t * sentinel,
+                                int32_t * eos);
+
 // Build the full NeuTTS ICL prefill token sequence.
 //
 // Assembles the verbatim prompt string (phonemes mode):
