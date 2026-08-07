@@ -91,6 +91,18 @@ struct audio_lm_context {
     int32_t  audio_tok_count  = 0;
     int32_t  audio_tok_eos    = -1;
 
+    // Multi-codebook Type A range (OuteTTS 1.0, n_q >= 1).
+    // When cb_offsets is non-empty, observe_token uses the multi-cb path
+    // instead of the single-cb [audio_tok_offset, audio_tok_offset+count) path.
+    // cb_offsets[q] / cb_counts[q]: per-codebook range [offset, offset+count).
+    // frame_sentinel_id: token that signals the start of a new frame (resets
+    //   cb_cursor to 0, returns PASSTHROUGH).  -1 = no sentinel.
+    // cb_cursor: which codebook we are currently waiting for (0..n_cb-1).
+    std::vector<int32_t> cb_offsets;   // per-codebook token range start
+    std::vector<int32_t> cb_counts;    // per-codebook token range size
+    int32_t frame_sentinel_id = -1;    // frame-start sentinel (-1 = none)
+    int32_t cb_cursor         = 0;     // current codebook index within a frame
+
     // Type B embed-override toggle.  When true, observe_token composes
     // the next backbone-input embed via `codec_lm_compose_next_embd`
     // and returns OBSERVE_CONSUMED_EMBED.  `ar_step` is the position
@@ -348,10 +360,38 @@ void audio_lm_free(audio_lm_context * ctx) {
     delete ctx;
 }
 
+// Bare-context allocation for unit-test / model-less use.
+// The context is zeroed (all pointers null); only the accumulator +
+// Type A range state are functional.
+audio_lm_context * audio_lm_alloc_bare() {
+    return new (std::nothrow) audio_lm_context();
+}
+
+void audio_lm_free_bare(audio_lm_context * ctx) {
+    // Model / state pointers are all null in a bare context — safe to delete.
+    delete ctx;
+}
+
+int32_t audio_lm_codes_n_frames(const audio_lm_context * ctx) {
+    return ctx ? ctx->codes_n_frames : 0;
+}
+
+const int32_t * audio_lm_debug_codes(const audio_lm_context * ctx,
+                                      int32_t * out_n_q,
+                                      int32_t * out_n_frames) {
+    if (out_n_q)      *out_n_q      = 0;
+    if (out_n_frames) *out_n_frames = 0;
+    if (ctx == nullptr || ctx->codes.empty()) return nullptr;
+    if (out_n_q)      *out_n_q      = ctx->n_cb > 0 ? ctx->n_cb : 1;
+    if (out_n_frames) *out_n_frames = ctx->codes_n_frames;
+    return ctx->codes.data();
+}
+
 void audio_lm_reset(audio_lm_context * ctx) {
     if (ctx == nullptr) return;
     ctx->codes.clear();
     ctx->codes_n_frames = 0;
+    ctx->cb_cursor = 0;
     ctx->next_embed_buf.clear();
     ctx->next_embed_dim = 0;
     ctx->ar_step = ctx->ar_step_start;
@@ -560,6 +600,31 @@ void audio_lm_set_audio_token_range(audio_lm_context * ctx,
     ctx->audio_tok_eos    = eos_id;
 }
 
+void audio_lm_set_audio_token_ranges(audio_lm_context * ctx,
+                                      const int32_t * offsets,
+                                      const int32_t * counts,
+                                      int32_t         n_q,
+                                      int32_t         frame_sentinel_id,
+                                      int32_t         eos_id) {
+    if (ctx == nullptr || offsets == nullptr || counts == nullptr || n_q <= 0) return;
+    ctx->cb_offsets.assign(offsets, offsets + (size_t) n_q);
+    ctx->cb_counts.assign(counts,   counts  + (size_t) n_q);
+    ctx->frame_sentinel_id = frame_sentinel_id;
+    ctx->audio_tok_eos     = eos_id;
+    // Lock in n_cb so decode_audio's layout logic sees the right value.
+    ctx->n_cb              = n_q;
+    // Reset accumulator state for fresh start.
+    ctx->codes.clear();
+    ctx->codes_n_frames = 0;
+    ctx->cb_cursor      = 0;
+    // Pre-allocate codes buffer in [q*n_frames + t] layout — initially empty;
+    // resized per-frame during observe_token.
+    // Disable the legacy single-cb path by clearing audio_tok_offset so
+    // observe_token doesn't double-route.
+    ctx->audio_tok_offset = -1;
+    ctx->audio_tok_count  = 0;
+}
+
 void audio_lm_get_audio_token_range(const audio_lm_context * ctx,
                                      int32_t * out_offset, int32_t * out_count,
                                      int32_t * out_eos_id) {
@@ -598,9 +663,11 @@ bool audio_lm_get_uses_embed_override(const audio_lm_context * ctx) {
 
 // ─── Per-step observe ───────────────────────────────────────────────
 //
-// Type A path implemented (single-codebook contiguous audio range +
-// optional EOS sentinel).  Type B/C/D paths land in steps 4–5 and
-// will inspect the `last_hidden` argument; for now Type A ignores it.
+// Two dispatch paths:
+//   Multi-cb Type A (cb_offsets non-empty): OuteTTS 1.0 — sentinel +
+//     per-codebook ranges; accumulates full frames into codes[].
+//   Single-cb Type A/B (audio_tok_offset >= 0): NeuTTS / legacy single-
+//     codebook path; unchanged from earlier implementation.
 
 observe_action audio_lm_observe_token(
         audio_lm_context * ctx,
@@ -609,36 +676,89 @@ observe_action audio_lm_observe_token(
         int32_t            /*hidden_dim*/) {
     if (ctx == nullptr) return OBSERVE_STOP;
 
-    // EOS sentinel — explicit end-of-audio token.  Checked BEFORE the
-    // audio range in case the converter put eos_id inside [offset,
-    // offset+count) (unusual but legal).
+    // EOS sentinel — checked first regardless of dispatch path, so that
+    // eos_id can overlap with any audio range.
     if (ctx->audio_tok_eos >= 0 && tok == ctx->audio_tok_eos) {
         return OBSERVE_STOP;
     }
 
-    // Type A/B audio-range detection.  Disabled when offset < 0.
+    // ── Multi-cb Type A (n_q >= 1 with explicit per-cb ranges) ──────────
+    // Active when `audio_lm_set_audio_token_ranges` has been called
+    // (cb_offsets is non-empty).  The frame stream looks like:
+    //   <sentinel> c0 c1 … c{n_q-1}  <sentinel> c0 c1 …
+    if (!ctx->cb_offsets.empty()) {
+        const int32_t n_q = (int32_t) ctx->cb_offsets.size();
+
+        // Frame-start sentinel: reset cursor, surface to host.
+        if (ctx->frame_sentinel_id >= 0 && tok == ctx->frame_sentinel_id) {
+            ctx->cb_cursor = 0;
+            return OBSERVE_PASSTHROUGH;
+        }
+
+        // Find which codebook this token belongs to.
+        // We check the current expected codebook first (fast path), then
+        // scan all in case the stream doesn't strictly follow cursor order.
+        int32_t matched_q = -1;
+        // Prefer cursor-ordered check (OuteTTS emits c0, c1, … in order).
+        {
+            const int32_t q = ctx->cb_cursor;
+            if (q < n_q &&
+                tok >= ctx->cb_offsets[(size_t) q] &&
+                tok <  ctx->cb_offsets[(size_t) q] + ctx->cb_counts[(size_t) q]) {
+                matched_q = q;
+            }
+        }
+        // Fallback: scan all codebooks (tolerant of out-of-order arrival).
+        if (matched_q < 0) {
+            for (int32_t q = 0; q < n_q; ++q) {
+                if (tok >= ctx->cb_offsets[(size_t) q] &&
+                    tok <  ctx->cb_offsets[(size_t) q] + ctx->cb_counts[(size_t) q]) {
+                    matched_q = q;
+                    break;
+                }
+            }
+        }
+
+        if (matched_q < 0) {
+            // Not a sentinel and not in any codebook range → text/BOS/etc.
+            return OBSERVE_PASSTHROUGH;
+        }
+
+        // Store code into the current frame at the matched codebook slot.
+        // Layout: frame-major (T, n_cb): codes[t * n_q + q].
+        // We pre-extend the codes array to hold the current frame on first
+        // code of each frame.
+        const int32_t code = tok - ctx->cb_offsets[(size_t) matched_q];
+        const int32_t t    = ctx->codes_n_frames;   // frame being assembled
+
+        // Extend codes array to hold at least (t+1)*n_q entries.
+        const size_t need = (size_t)(t + 1) * (size_t) n_q;
+        if (ctx->codes.size() < need) {
+            ctx->codes.resize(need, 0);
+        }
+        ctx->codes[(size_t) t * (size_t) n_q + (size_t) matched_q] = code;
+
+        // Advance cursor.  When the last codebook is filled, the frame is done.
+        ctx->cb_cursor = matched_q + 1;
+        if (ctx->cb_cursor >= n_q) {
+            ctx->codes_n_frames += 1;
+            ctx->cb_cursor = 0;
+        }
+
+        return OBSERVE_CONSUMED;
+    }
+
+    // ── Single-cb Type A/B (legacy path; NeuTTS, Orpheus, etc.) ─────────
+    // Disabled when audio_tok_offset < 0.
     if (ctx->audio_tok_offset >= 0 && ctx->audio_tok_count > 0 &&
         tok >= ctx->audio_tok_offset &&
         tok <  ctx->audio_tok_offset + ctx->audio_tok_count) {
         const int32_t code = tok - ctx->audio_tok_offset;
-        // Append (single-cb frame).  Future multi-cb Type A variants
-        // (e.g. Orpheus-style delay over N codebooks) will need a more
-        // structured stride here; n_q==1 is the only shape we surface
-        // today.
-        const int32_t this_n_q = ctx->n_cb > 0 ? ctx->n_cb : 1;
-        if (this_n_q != 1) {
-            // Multi-cb Type A/B isn't part of step 3/4.  Fall through to
-            // PASSTHROUGH rather than silently corrupt the accumulator.
-            return OBSERVE_PASSTHROUGH;
-        }
         if (ctx->n_cb == 0) ctx->n_cb = 1;
         ctx->codes.push_back(code);
         ctx->codes_n_frames += 1;
 
         // Type B: compose the next backbone-input embed via codec_lm.
-        // Requires a codec_lm (single-cb here, so codes is just [code])
-        // and surfaces OBSERVE_CONSUMED_EMBED so the host knows to feed
-        // `get_next_embed`'s buffer into its inputs_embeds decode path.
         if (ctx->uses_embed_override && ctx->lm != nullptr && ctx->hidden > 0) {
             ctx->next_embed_buf.assign((size_t) ctx->hidden, 0.0f);
             const int32_t codes_single[1] = { code };

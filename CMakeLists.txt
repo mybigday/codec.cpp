@@ -209,6 +209,14 @@ if(CODEC_BUILD_TTS_CLI)
             ${TTS_BACKBONE_INCLUDE_DIRS})
     endif()
 
+    # Model-less unit test for the multi-codebook Type A observe_token accumulator.
+    # Depends only on codec_common (no backbone, no GGUF required).
+    add_executable(outetts-observe-test tests/outetts_observe_test.cpp)
+    target_link_libraries(outetts-observe-test PRIVATE codec_common)
+    target_include_directories(outetts-observe-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
     option(CODEC_TTS_ESPEAK "Link espeak-ng into tts-cli for NeuTTS phonemization" OFF)
     if(CODEC_TTS_ESPEAK)
         find_library(ESPEAK_NG_LIB NAMES espeak-ng libespeak-ng.so.1)

@@ -200,11 +200,59 @@ void audio_lm_set_audio_token_range(
         int32_t            count,
         int32_t            eos_id);
 
+// Multi-codebook Type A range config (OuteTTS 1.0, n_q >= 1).
+//
+// Each codebook q has its own contiguous token range:
+//   tok ∈ [offsets[q], offsets[q] + counts[q])  → code = tok - offsets[q]
+//
+// frame_sentinel_id: token emitted before each frame's code sequence
+//   (OuteTTS <|code|>); resets the per-frame cursor, returns PASSTHROUGH.
+//   Pass -1 when the model has no sentinel.
+// eos_id: end-of-audio sentinel; returns OBSERVE_STOP.
+//
+// This replaces the per-sequence range state on the context.  The
+// existing single-cb `audio_lm_set_audio_token_range` remains and is
+// equivalent to calling this with n_q=1 and frame_sentinel_id=-1.
+//
+// Codes are accumulated in frame-major (T, n_q) layout:
+//   codes[t * n_q + q]  (matches codec_token_buffer convention).
+void audio_lm_set_audio_token_ranges(
+        audio_lm_context * ctx,
+        const int32_t *    offsets,
+        const int32_t *    counts,
+        int32_t            n_q,
+        int32_t            frame_sentinel_id,
+        int32_t            eos_id);
+
 void audio_lm_get_audio_token_range(
         const audio_lm_context * ctx,
         int32_t * out_offset,
         int32_t * out_count,
         int32_t * out_eos_id);
+
+// Number of complete audio frames accumulated so far (valid during or
+// after observe_token / observe_codes calls; incremented when the last
+// codebook of each frame is filled).
+int32_t audio_lm_codes_n_frames(const audio_lm_context * ctx);
+
+// ─────────────────────────────────────────────────────────────────────
+// Bare-context allocation (unit-test / model-less use)
+//
+// Allocates a zeroed audio_lm_context without loading any model.
+// Only the accumulator and Type A range state are functional; all
+// model-dependent paths (observe_codes, decode_audio, etc.) will fail
+// gracefully.  Free with audio_lm_free_bare (NOT audio_lm_free).
+// ─────────────────────────────────────────────────────────────────────
+audio_lm_context * audio_lm_alloc_bare();
+void               audio_lm_free_bare(audio_lm_context * ctx);
+
+// Debug accessor: returns a pointer to the raw accumulated codes vector
+// and writes the number of codebooks + frames into *out_n_q / *out_n_frames.
+// Valid until the next mutating call (observe_token, reset, free).
+// Returns nullptr when ctx is null or no codes have been accumulated.
+const int32_t * audio_lm_debug_codes(const audio_lm_context * ctx,
+                                      int32_t * out_n_q,
+                                      int32_t * out_n_frames);
 
 // ─────────────────────────────────────────────────────────────────────
 // codec_lm end-of-audio metadata (codebook-AR kinds).
