@@ -600,6 +600,92 @@ def main():
                       f"rms={_air_rms:.3f}{_air_cer_str}")
                 results.append(_air_ok)
 
+    # ── OuteTTS 1.0-0.6B (CER report-only) ───────────────────────────────────
+    # OuteTTS uses RAW text input — NO phonemization.  The bundled default
+    # speaker (assets/speakers/en-female-1-neutral.json) is auto-loaded by
+    # the runner.  Detection is vocabulary-based (V3 signature tokens) and
+    # the auto-grammar is attached automatically.
+    #
+    # Sampling regime mirrors the OuteTTS reference: temp=1.0, top-k=50,
+    # seed=1, rep-penalty=1.1.  CER is REPORT-ONLY for this first pass;
+    # a threshold will be enforced once the round-trip quality is baselined.
+    _outetts_codec  = REPO / "models" / "output" / "ibm-research--DAC.speech-F32.gguf"
+    _outetts_bb     = REPO / "models" / "hf" / "outetts_1_0" / "OuteTTS-1.0-0.6B-Q8_0.gguf"
+    _outetts_spk    = REPO / "assets" / "speakers" / "en-female-1-neutral.json"
+
+    _outetts_assets_ok = (
+        _outetts_codec.exists()
+        and _outetts_bb.exists()
+        and _outetts_spk.exists()
+    )
+
+    if not _outetts_assets_ok:
+        _missing_oe = [p for p in [_outetts_codec, _outetts_bb, _outetts_spk]
+                       if not p.exists()]
+        print(f"[skip] outetts_1_0: missing assets ({', '.join(p.name for p in _missing_oe)})")
+        results.append(None)
+    else:
+        _outetts_text = "The birch canoe slid on the smooth planks."
+        _outetts_out  = Path("/tmp") / "ttscli_outetts_1_0.wav"
+        if _outetts_out.exists():
+            _outetts_out.unlink()
+
+        print(f"[info] outetts_1_0: text = {_outetts_text!r}")
+
+        _outetts_proc = _run_synth(
+            _outetts_codec,
+            _outetts_bb,
+            _outetts_text,
+            _outetts_out,
+            extra=[
+                "--temp",        "1.0",
+                "--top-k",       "50",
+                "--seed",        "1",
+                "--rep-penalty", "1.1",
+                "--max-frames",  "600",
+            ],
+            greedy=False,
+        )
+
+        if _outetts_proc.returncode != 0:
+            print(f"[FAIL] outetts_1_0: exit {_outetts_proc.returncode}")
+            print(_outetts_proc.stdout[-1200:])
+            print(_outetts_proc.stderr[-800:])
+            results.append(False)
+        else:
+            _oe_stop_lines = [ln for ln in _outetts_proc.stdout.splitlines()
+                              if "OuteTTS AR done" in ln]
+            _oe_stop = (_oe_stop_lines[0].split("stop=")[-1].strip()
+                        if _oe_stop_lines else "?")
+            _oe_frames_str = ""
+            if _oe_stop_lines:
+                import re as _re_oe
+                _m_oe = _re_oe.search(r"(\d+) frames", _oe_stop_lines[0])
+                if _m_oe:
+                    _oe_frames_str = f" frames={_m_oe.group(1)}"
+
+            assert _outetts_out.exists(), "outetts_1_0: no wav written"
+            _oe_sr, _oe_dur, _oe_rms = _wav_stats(_outetts_out)
+
+            # CER: ASR against the raw English text (no phoneme indirection).
+            _oe_cer_res = _try_cer(_outetts_out, _outetts_text, "en")
+            _oe_cer_str = ""
+            _oe_ok = True
+            if _oe_rms < 0.005:
+                print(f"[FAIL] outetts_1_0: near-silent (rms={_oe_rms:.4f})")
+                _oe_ok = False
+            if not (0.3 <= _oe_dur <= 30.0):
+                print(f"[FAIL] outetts_1_0: duration {_oe_dur:.2f}s out of bounds")
+                _oe_ok = False
+            if _oe_cer_res is not None:
+                _oe_asr_txt, _oe_cer_val = _oe_cer_res
+                _oe_cer_str = f" ASR={_oe_asr_txt!r} CER={_oe_cer_val:.3f}"
+                # CER is report-only for this first pass — no threshold enforced.
+            print(f"[{'PASS' if _oe_ok else 'FAIL'}] outetts_1_0: "
+                  f"stop={_oe_stop}{_oe_frames_str} dur={_oe_dur:.2f}s "
+                  f"rms={_oe_rms:.3f}{_oe_cer_str}")
+            results.append(_oe_ok)
+
     ran = [r for r in results if r is not None]
     if not ran:
         print("no cases ran (all assets missing)")
