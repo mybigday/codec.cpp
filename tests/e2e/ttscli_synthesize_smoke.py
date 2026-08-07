@@ -600,15 +600,19 @@ def main():
                       f"rms={_air_rms:.3f}{_air_cer_str}")
                 results.append(_air_ok)
 
-    # ── OuteTTS 1.0-0.6B (CER report-only) ───────────────────────────────────
+    # ── OuteTTS 1.0-0.6B (enforced CER ≤ 0.10) ──────────────────────────────
     # OuteTTS uses RAW text input — NO phonemization.  The bundled default
     # speaker (assets/speakers/en-female-1-neutral.json) is auto-loaded by
     # the runner.  Detection is vocabulary-based (V3 signature tokens) and
     # the auto-grammar is attached automatically.
     #
     # Sampling regime mirrors the OuteTTS reference: temp=1.0, top-k=50,
-    # seed=1, rep-penalty=1.1.  CER is REPORT-ONLY for this first pass;
-    # a threshold will be enforced once the round-trip quality is baselined.
+    # seed=1, rep-penalty=1.1.
+    #
+    # seed=1 is pinned (clean eos, CER 0.000); OuteTTS 0.6B is content-robust
+    # across seeds (CER ~0.0–0.05) but eos-emission is seed-sensitive (other
+    # seeds produce correct audio yet may stop=max_frames) — see the status
+    # note in CLAUDE.md.  CER threshold 0.10 gives headroom over measured 0.000.
     _outetts_codec  = REPO / "models" / "output" / "ibm-research--DAC.speech-F32.gguf"
     _outetts_bb     = REPO / "models" / "hf" / "outetts_1_0" / "OuteTTS-1.0-0.6B-Q8_0.gguf"
     _outetts_spk    = REPO / "assets" / "speakers" / "en-female-1-neutral.json"
@@ -680,7 +684,11 @@ def main():
             if _oe_cer_res is not None:
                 _oe_asr_txt, _oe_cer_val = _oe_cer_res
                 _oe_cer_str = f" ASR={_oe_asr_txt!r} CER={_oe_cer_val:.3f}"
-                # CER is report-only for this first pass — no threshold enforced.
+                # Enforced: CER ≤ 0.10 (measured 0.000 @ seed=1; headroom
+                # covers minor Whisper transcription drift).
+                if _oe_cer_val > 0.10:
+                    print(f"[FAIL] outetts_1_0: CER {_oe_cer_val:.3f} > 0.10")
+                    _oe_ok = False
             print(f"[{'PASS' if _oe_ok else 'FAIL'}] outetts_1_0: "
                   f"stop={_oe_stop}{_oe_frames_str} dur={_oe_dur:.2f}s "
                   f"rms={_oe_rms:.3f}{_oe_cer_str}")

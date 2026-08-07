@@ -213,3 +213,13 @@ If you need to add/replace an op:
 - Codec: uses `models/distill_neucodec` (NOT base). codec.cpp's BASE NeuCodec ENCODER is unimplemented; distill shares the FSQ code space AND decoder, so ref-encode works and decoded output is correct. Canonical base `models/neucodec/neucodec.gguf` fails at ref-encode with a loud actionable error. (Implementing the base encoder is a possible follow-up but not needed for round-trip.)
 - Known limitation: nano is seed-fragile — ~2/6 seeds collapse to near-silence (the forced non-eos tokens are varied but decode to silence: a model-level anti-collapse issue, not the length guard). air is robust. Pin a known-good seed for nano.
 - espeak phonemization inside tts-cli is opt-in (`CODEC_TTS_ESPEAK`, default OFF; needs libespeak-ng-dev). The validated path pre-phonemizes in python.
+
+## OuteTTS-1.0 Status
+
+- Type A **multi-codebook** token LM: the backbone (OuteTTS-1.0-0.6B = plain qwen3, standard 1D RoPE, NO MRoPE; also Llama-1B) emits a word-aligned stream of ordinary vocab tokens — per frame `<|code|><|c1_N|><|c2_N|>` (2 DAC codebooks) interleaved with `<|word_start|>`/word text/`<|features|>`/`<|t_|>`/energy/pitch/`<|word_end|>`. Decoded by the shared DAC codec.
+- Reuses the shared Type A path EXTENDED to n_q≥1: `audio_lm_set_audio_token_ranges` (per-codebook ranges + sentinel) + the multi-cb `observe_token` accumulator (frame-major `[t*n_cb+q]`) + `run_token_single_cb` in **free-generation mode** (`constrain_audio_mask=false`: empty logit-bias so the interleaved structural tokens pass; NeuTTS n_q=1 keeps the flat mask, byte-identical). rep-penalty 1.1 / window 64.
+- Detection `detect_outetts_version → V3`; range derived from vocab (`<|c1_0|>`=151669, `<|c2_0|>`=152694, `<|code|>`=156730, `<|audio_end|>`=156729 for 0.6B). Raw text, NO phonemization. Bundled default speaker `assets/speakers/en-female-1-neutral.json` (Apache-2.0) is the ICL prefix; no runtime encode/aligner (voice-cloning is a follow-up).
+- Codec: `models/output/ibm-research--DAC.speech-F32.gguf` (24 kHz, hop=320, n_q=2, cb=1024; decode `[1,2,n_frames]`) — parity MATCH, no new gguf.
+- E2E round-trip (tests/e2e/ttscli_synthesize_smoke.py, raw text): **OuteTTS-1.0-0.6B CER 0.000 @ seed=1** (bit-exact), stop=eos.
+- Known minor: eos-emission is seed-sensitive — content is robust across seeds (CER ~0.0–0.05) but non-seed-1 runs may not emit a clean `<|audio_end|>` and stop=max_frames (correct audio, wasted compute). Pin a good seed. Follow-ups: investigate eos robustness (grammar / lower default max-frames), a `--speaker` override flag, and Llama-OuteTTS-1.0-1B.
+- Contract pinned in `docs/superpowers/notes/outetts10-facts.md`.
