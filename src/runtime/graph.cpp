@@ -62,6 +62,23 @@ void codec_graph_release(codec_context * ctx) {
     if (ctx == nullptr) {
         return;
     }
+
+    // The scheduler retains pointers into an allocated graph, so release its
+    // graph state while the eval context is still alive. A scheduler reset is
+    // sufficient for most graphs, but Metal can retain stale allocations for
+    // Chatterbox S3G's large decode graph and return zeroes on the next decode.
+    // Recreate that scheduler when codec_sched_ensure_capacity is called again.
+    if (ctx->sched != nullptr && ctx->eval_graph_allocated) {
+        if (ctx->eval_entry != nullptr &&
+            ctx->eval_entry->key.kind == CODEC_GRAPH_CHATTERBOX_S3G_DECODE) {
+            ggml_backend_sched_free(ctx->sched);
+            ctx->sched = nullptr;
+            ctx->sched_reserved_graph_size = 0;
+        } else {
+            ggml_backend_sched_reset(ctx->sched);
+        }
+    }
+
     if (ctx->eval_ctx != nullptr) {
         ggml_free(ctx->eval_ctx);
         ctx->eval_ctx = nullptr;
