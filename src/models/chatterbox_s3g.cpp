@@ -55,6 +55,8 @@ constexpr int32_t kFlowEncoderUpLayers = 4;
 
 // Tunable params for flow decode (matches CFM_PARAMS in chatterbox/s3gen/configs.py).
 constexpr int32_t kFlowDefaultNTimesteps = 10;
+constexpr int32_t kFlowMeanflowNTimesteps = 2;
+constexpr int32_t kFlowMaxNTimesteps = 64;
 constexpr float   kFlowCfgRate = 0.7f;
 constexpr float   kFlowTSchedulerCosineHalfPi = 0.5f * 3.14159265358979323846f;
 
@@ -533,6 +535,7 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
         return false;
     }
     const codec_model * model = p->model;
+    const codec_chatterbox_s3g & s3g = *static_cast<const codec_chatterbox_s3g *>(model->impl);
     auto W = [&](const std::string & n) -> ggml_tensor * { return codec_graph_weight(ctx_eval, model, n); };
 
     const int32_t T = p->t_in;
@@ -657,7 +660,9 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     ggml_tensor * cond = ggml_concat(ctx_eval, pf_tc, zero_tail, /*dim=*/0);  // [T_total, 80]
     ggml_set_name(cond, "s3g.flow.cond");
 
-    // ---- CFM ODE unrolled: 10 Euler steps, each with CFG cond/uncond passes.
+    // CFM ODE unrolled: n_timesteps cosine-scheduled Euler steps with CFG
+    // (default 10 steps, cfg 0.7), both from GGUF metadata.
+    // cfg_rate == 0 drops the uncond pass entirely (half the estimator calls).
     // The noise z is fed as a graph input (ggml lacks a portable cross-backend
     // RNG), then x is updated by chained ggml_add nodes; nothing escapes to CPU.
     ggml_tensor * t_z = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, T_total, kCfmOutChannels);
@@ -666,9 +671,11 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     ggml_tensor * spks_zero = ggml_scale(ctx_eval, spks, 0.0f);
     ggml_tensor * cond_zero = ggml_scale(ctx_eval, cond, 0.0f);
     ggml_tensor * x = t_z;
-    for (int32_t i = 0; i < kFlowDefaultNTimesteps; ++i) {
-        const float lin_t = (float) i / (float) kFlowDefaultNTimesteps;
-        const float lin_r = (float) (i + 1) / (float) kFlowDefaultNTimesteps;
+    const int32_t n_steps = s3g.n_timesteps;
+    const float cfg_rate = s3g.cfg_rate;
+    for (int32_t i = 0; i < n_steps; ++i) {
+        const float lin_t = (float) i / (float) n_steps;
+        const float lin_r = (float) (i + 1) / (float) n_steps;
         const float t_v = 1.0f - std::cos(lin_t * kFlowTSchedulerCosineHalfPi);
         const float r_v = 1.0f - std::cos(lin_r * kFlowTSchedulerCosineHalfPi);
         const float dt = r_v - t_v;
@@ -676,14 +683,19 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
         ggml_tensor * t_emb = codec_s3g_cfm_time_emb(ctx_eval, t_v, model);
         if (t_emb == nullptr) return false;
 
-        ggml_tensor * dxdt_cond   = codec_s3g_cfm_estimator_forward(ctx_eval, x, mu_tc,   spks,      cond,      t_emb, model);
+        ggml_tensor * dxdt_cond = codec_s3g_cfm_estimator_forward(ctx_eval, x, mu_tc, spks, cond, t_emb, model);
+        if (dxdt_cond == nullptr) return false;
+        if (cfg_rate == 0.0f) {
+            x = ggml_add(ctx_eval, x, ggml_scale(ctx_eval, dxdt_cond, dt));
+            continue;
+        }
         ggml_tensor * dxdt_uncond = codec_s3g_cfm_estimator_forward(ctx_eval, x, mu_zero, spks_zero, cond_zero, t_emb, model);
-        if (dxdt_cond == nullptr || dxdt_uncond == nullptr) return false;
+        if (dxdt_uncond == nullptr) return false;
 
         // (1+cfg) * dxdt_cond - cfg * dxdt_uncond → cfg-corrected velocity.
         ggml_tensor * sub = ggml_sub(ctx_eval,
-            ggml_scale(ctx_eval, dxdt_cond,   1.0f + kFlowCfgRate),
-            ggml_scale(ctx_eval, dxdt_uncond, kFlowCfgRate));
+            ggml_scale(ctx_eval, dxdt_cond,   1.0f + cfg_rate),
+            ggml_scale(ctx_eval, dxdt_uncond, cfg_rate));
         x = ggml_add(ctx_eval, x, ggml_scale(ctx_eval, sub, dt));
     }
 
@@ -867,6 +879,9 @@ enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
     s3g.n_q = codec_read_i32_kv(model->gguf, "codec.n_q", s3g.n_q);
     s3g.codebook_size = codec_read_i32_kv(model->gguf, "codec.codebook_size", s3g.codebook_size);
     s3g.meanflow = codec_read_bool_kv(model->gguf, "chatterbox_s3g.meanflow", s3g.meanflow);
+    s3g.n_timesteps = codec_read_i32_kv(model->gguf, "chatterbox_s3g.flow.n_timesteps",
+        s3g.meanflow ? kFlowMeanflowNTimesteps : kFlowDefaultNTimesteps);
+    s3g.cfg_rate = codec_read_f32_kv(model->gguf, "chatterbox_s3g.flow.cfg_rate", kFlowCfgRate);
     s3g.has_builtin_conditioning = codec_read_bool_kv(
         model->gguf, "chatterbox_s3g.has_builtin_conditioning", s3g.has_builtin_conditioning);
     s3g.builtin_prompt_token_len = codec_read_i32_kv(
@@ -894,6 +909,9 @@ enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
     model->latent_dim = -1;
 
     if (s3g.n_q != 1 || s3g.codebook_size != kFlowVocabSize || s3g.sample_rate <= 0 || s3g.hop_size <= 0) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    if (s3g.n_timesteps < 1 || s3g.n_timesteps > kFlowMaxNTimesteps || !(s3g.cfg_rate >= 0.0f)) {
         return CODEC_STATUS_INVALID_ARG;
     }
     if (s3g.meanflow) {

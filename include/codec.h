@@ -58,6 +58,27 @@ struct codec_model_params {
     int32_t n_threads;
 };
 
+// GGUF metadata override applied at load time, mirroring llama.cpp's
+// llama_model_kv_override. Lets published GGUFs that predate a metadata key
+// opt into it without re-conversion (e.g. chatterbox_s3g.flow.n_timesteps).
+enum codec_model_kv_override_type {
+    CODEC_KV_OVERRIDE_TYPE_INT,
+    CODEC_KV_OVERRIDE_TYPE_FLOAT,
+    CODEC_KV_OVERRIDE_TYPE_BOOL,
+    CODEC_KV_OVERRIDE_TYPE_STR,
+};
+
+struct codec_model_kv_override {
+    enum codec_model_kv_override_type tag;
+    char key[128];
+    union {
+        int64_t val_i64;
+        double  val_f64;
+        bool    val_bool;
+        char    val_str[128];
+    };
+};
+
 struct codec_context_params {
     int32_t seed;
 };
@@ -150,6 +171,11 @@ struct codec_encode_params codec_encode_default_params(void);
 struct codec_decode_params codec_decode_default_params(void);
 
 struct codec_model * codec_model_load_from_file(const char * path_model, struct codec_model_params params);
+// kv_overrides: NULL, or an array terminated by an entry with key[0] == 0.
+struct codec_model * codec_model_load_from_file_ext(
+    const char * path_model,
+    struct codec_model_params params,
+    const struct codec_model_kv_override * kv_overrides);
 void codec_model_free(struct codec_model * model);
 
 struct codec_context * codec_init_from_model(struct codec_model * model, struct codec_context_params params);

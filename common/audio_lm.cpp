@@ -299,6 +299,45 @@ static void init_decode_transform(audio_lm_context * ctx) {
 // Lifecycle
 // =====================================================================
 
+bool parse_kv_override(const char * spec, codec_model_kv_override * out) {
+    if (spec == nullptr || out == nullptr) return false;
+    const char * eq = std::strchr(spec, '=');
+    if (eq == nullptr || eq == spec || (size_t) (eq - spec) >= sizeof(out->key)) return false;
+    codec_model_kv_override ov{};
+    std::memcpy(ov.key, spec, (size_t) (eq - spec));
+    const char * v = eq + 1;
+    char * end = nullptr;
+    if (std::strncmp(v, "int:", 4) == 0) {
+        ov.tag = CODEC_KV_OVERRIDE_TYPE_INT;
+        ov.val_i64 = std::strtoll(v + 4, &end, 10);
+        if (end == v + 4 || *end != '\0') return false;
+    } else if (std::strncmp(v, "float:", 6) == 0) {
+        ov.tag = CODEC_KV_OVERRIDE_TYPE_FLOAT;
+        ov.val_f64 = std::strtod(v + 6, &end);
+        if (end == v + 6 || *end != '\0') return false;
+    } else if (std::strncmp(v, "bool:", 5) == 0) {
+        ov.tag = CODEC_KV_OVERRIDE_TYPE_BOOL;
+        if (std::strcmp(v + 5, "true") == 0) ov.val_bool = true;
+        else if (std::strcmp(v + 5, "false") == 0) ov.val_bool = false;
+        else return false;
+    } else if (std::strncmp(v, "str:", 4) == 0) {
+        ov.tag = CODEC_KV_OVERRIDE_TYPE_STR;
+        if (std::strlen(v + 4) >= sizeof(ov.val_str)) return false;
+        std::strcpy(ov.val_str, v + 4);
+    } else {
+        return false;
+    }
+    *out = ov;
+    return true;
+}
+
+codec_model * load_codec_model(const std::string & path, codec_model_params mp,
+                               const std::vector<codec_model_kv_override> & overrides) {
+    std::vector<codec_model_kv_override> ov = overrides;
+    ov.emplace_back();  // zero key terminates the list
+    return codec_model_load_from_file_ext(path.c_str(), mp, ov.data());
+}
+
 audio_lm_context * audio_lm_init(const audio_lm_params & p, std::string * err) {
     if (p.codec_path.empty()) {
         if (err) *err = "audio_lm_init: codec_path is empty";
@@ -313,7 +352,7 @@ audio_lm_context * audio_lm_init(const audio_lm_params & p, std::string * err) {
     auto mp = codec_model_default_params();
     mp.use_gpu   = p.use_gpu;
     if (p.n_threads > 0) mp.n_threads = p.n_threads;
-    ctx->model = codec_model_load_from_file(p.codec_path.c_str(), mp);
+    ctx->model = load_codec_model(p.codec_path, mp, p.kv_overrides);
     if (ctx->model == nullptr) {
         if (err) *err = "audio_lm_init: codec_model_load_from_file failed for " + p.codec_path;
         delete ctx;

@@ -47,7 +47,15 @@ struct audio_lm_params {
     std::string codec_path;             // codec / codec_lm GGUF path
     bool        use_gpu      = false;
     int32_t     n_threads    = 0;       // 0 → codec.cpp default
+    std::vector<codec_model_kv_override> kv_overrides;  // GGUF metadata overrides (no terminator)
 };
+
+// Parses llama.cpp-style "KEY=TYPE:VALUE" (TYPE ∈ int|float|bool|str).
+bool parse_kv_override(const char * spec, codec_model_kv_override * out);
+
+// Loads a codec model applying `overrides` (terminator appended internally).
+codec_model * load_codec_model(const std::string & path, codec_model_params mp,
+                               const std::vector<codec_model_kv_override> & overrides);
 
 // Generic input descriptor.  Fill the fields the caller has; the model
 // uses what its modality + speaker_info declare.  Unknown / unused

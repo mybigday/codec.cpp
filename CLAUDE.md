@@ -203,6 +203,8 @@ If you need to add/replace an op:
 - Decode path is a single graph: tokens → encoder → unrolled CFM ODE (10 steps × CFG cond/uncond) → mel → f0_predictor → in-graph NSF source → STFT → main HiFT → in-graph iSTFT → PCM. Builtin-conds path only (no ref_wav embedding yet).
 - Reusable building blocks landed in `src/ops/ggml_ops` (`codec_op_basic_transformer_block_tc`, `codec_op_cfm_causal_resnet_block_tc`, `codec_op_causal_block1d_tc`, `codec_op_hifigan_resblock_branch_ct`, `codec_op_sinusoidal_time_emb`, `codec_op_espnet_rel_pos_emb`) and `src/ops/lm_attn` (`codec_op_lm_attn_rel_pos_dth`, `codec_op_rel_shift_espnet`).
 - meanflow checkpoints convert and load metadata but `init` rejects them — the meanflow ODE schedule + `time_embed_mixer` aren't wired into the unrolled graph.
+- CFM schedule is GGUF metadata: `chatterbox_s3g.flow.n_timesteps` (default 10) and `chatterbox_s3g.flow.cfg_rate` (default 0.7; `0` drops the uncond pass). Published GGUFs without these keys keep the defaults bit-exactly; override at load via `codec_model_load_from_file_ext` KV overrides (`tts-cli --override-kv chatterbox_s3g.flow.n_timesteps=int:4`).
+- Step sweep (English, builtin voice, CPU): ≥2 steps all Whisper CER 0; 4 steps / cfg 0.7 is 2.3× faster with VoiceEncoder cosine 0.991 vs 10 steps; 1 step collapses (cos 0.71). cfg 0 costs ~0.03 speaker cosine at any step count.
 
 ## NeuTTS-Air / Nano Status
 

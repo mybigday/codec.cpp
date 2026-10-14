@@ -147,7 +147,11 @@ void print_usage(const char * prog) {
         "             Full host AR loop: a llama.cpp backbone (--backbone) drives\n"
         "             the codec_common per-step hooks end-to-end.  Flow is chosen\n"
         "             from the model's GGUF metadata.  Self-contained models\n"
-        "             (Pocket-TTS FlowLM) need no backbone.  --temp 0 = greedy.\n",
+        "             (Pocket-TTS FlowLM) need no backbone.  --temp 0 = greedy.\n"
+        "\n"
+        "  all subcommands: [--override-kv KEY=int|float|bool|str:VALUE] (repeatable)\n"
+        "             overrides codec GGUF metadata at load, e.g.\n"
+        "             --override-kv chatterbox_s3g.flow.n_timesteps=int:4\n",
         prog);
 }
 
@@ -228,6 +232,8 @@ struct args {
     bool has_rep_penalty = false; float repetition_penalty = 0.0f;
 
     std::string grammar;   // GBNF for the backbone sampler (FILE contents or literal)
+
+    std::vector<codec_model_kv_override> kv_overrides;  // --override-kv (codec GGUF)
 };
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -259,6 +265,15 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--cfg-weight") { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cfg_weight)) return false; out->has_cfg_weight = true; i++; }
         else if (a == "--min-p")      { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->min_p)) return false; out->has_min_p = true; i++; }
         else if (a == "--rep-penalty"){ const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->repetition_penalty)) return false; out->has_rep_penalty = true; i++; }
+        else if (a == "--override-kv"){
+            const char * v = need(); if (!v) return false;
+            codec_model_kv_override ov;
+            if (!codec_common::parse_kv_override(v, &ov)) {
+                std::fprintf(stderr, "invalid --override-kv '%s' (want KEY=int|float|bool|str:VALUE)\n", v);
+                return false;
+            }
+            out->kv_overrides.push_back(ov); i++;
+        }
         else if (a == "--grammar")    { const char * v = need(); if (!v) return false; out->grammar = load_grammar_arg(v); i++; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
@@ -269,6 +284,7 @@ bool parse_args(int argc, char ** argv, args * out) {
 int cmd_info(const args & a) {
     codec_common::audio_lm_params p;
     p.codec_path = a.model;
+    p.kv_overrides = a.kv_overrides;
     p.use_gpu    = a.use_gpu;
     p.n_threads  = a.n_threads;
 
@@ -297,6 +313,7 @@ int cmd_decode(const args & a) {
     }
     codec_common::audio_lm_params p;
     p.codec_path = a.model;
+    p.kv_overrides = a.kv_overrides;
     p.use_gpu    = a.use_gpu;
     p.n_threads  = a.n_threads;
     std::string err;
@@ -349,6 +366,7 @@ int cmd_decode(const args & a) {
 codec_common::tts_runner_params make_runner_params(const args & a) {
     codec_common::tts_runner_params rp;
     rp.codec_path    = a.model;
+    rp.kv_overrides  = a.kv_overrides;
     rp.backbone_path = a.backbone;
     rp.text          = a.text;
     rp.ref_audio_path = a.ref_audio;

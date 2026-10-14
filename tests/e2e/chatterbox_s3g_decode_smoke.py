@@ -4,6 +4,10 @@
 Loads the model with GPU offload and calls codec_decode twice on the same
 context. This catches scheduler allocations retained across eval-graph releases,
 which caused the second Metal decode to return silent PCM.
+
+Also loads the same (flow-metadata-free) GGUF through
+codec_model_load_from_file_ext with chatterbox_s3g.flow.* KV overrides, the
+path published GGUFs use to pick a cheaper CFM schedule without re-conversion.
 """
 
 from __future__ import annotations
@@ -28,6 +32,36 @@ class codec_model_params(ctypes.Structure):
 
 class codec_context_params(ctypes.Structure):
     _fields_ = [("seed", ctypes.c_int32)]
+
+
+CODEC_KV_OVERRIDE_TYPE_INT = 0
+CODEC_KV_OVERRIDE_TYPE_FLOAT = 1
+
+
+class _kv_override_value(ctypes.Union):
+    _fields_ = [
+        ("val_i64", ctypes.c_int64),
+        ("val_f64", ctypes.c_double),
+        ("val_bool", ctypes.c_bool),
+        ("val_str", ctypes.c_char * 128),
+    ]
+
+
+class codec_model_kv_override(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [("tag", ctypes.c_int), ("key", ctypes.c_char * 128), ("value", _kv_override_value)]
+
+
+def kv_overrides(items: list[tuple[str, int, float]]) -> ctypes.Array:
+    arr = (codec_model_kv_override * (len(items) + 1))()
+    for slot, (key, tag, value) in zip(arr, items):
+        slot.tag = tag
+        slot.key = key.encode()
+        if tag == CODEC_KV_OVERRIDE_TYPE_INT:
+            slot.val_i64 = int(value)
+        else:
+            slot.val_f64 = float(value)
+    return arr
 
 
 class codec_decode_params(ctypes.Structure):
@@ -74,6 +108,10 @@ def bind(lib_path: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(lib_path))
     lib.codec_model_load_from_file.argtypes = [ctypes.c_char_p, codec_model_params]
     lib.codec_model_load_from_file.restype = ctypes.c_void_p
+    lib.codec_model_load_from_file_ext.argtypes = [
+        ctypes.c_char_p, codec_model_params, ctypes.POINTER(codec_model_kv_override)
+    ]
+    lib.codec_model_load_from_file_ext.restype = ctypes.c_void_p
     lib.codec_model_free.argtypes = [ctypes.c_void_p]
     lib.codec_init_from_model.argtypes = [ctypes.c_void_p, codec_context_params]
     lib.codec_init_from_model.restype = ctypes.c_void_p
@@ -152,6 +190,31 @@ def main() -> int:
             lib.codec_free(ctx)
             lib.codec_model_free(model)
 
+        # Bad schedules must be rejected at load, not at decode.
+        bad = kv_overrides([("chatterbox_s3g.flow.n_timesteps", CODEC_KV_OVERRIDE_TYPE_INT, 0)])
+        if lib.codec_model_load_from_file_ext(str(gguf).encode(), codec_model_params(True, 4), bad):
+            print("FAIL: n_timesteps=0 override was accepted")
+            return 1
+
+        fast = kv_overrides([
+            ("chatterbox_s3g.flow.n_timesteps", CODEC_KV_OVERRIDE_TYPE_INT, 2),
+            ("chatterbox_s3g.flow.cfg_rate", CODEC_KV_OVERRIDE_TYPE_FLOAT, 0.0),
+        ])
+        model = lib.codec_model_load_from_file_ext(str(gguf).encode(), codec_model_params(True, 4), fast)
+        if not model:
+            print("FAIL: model load with flow overrides")
+            return 1
+        ctx = lib.codec_init_from_model(model, codec_context_params(0))
+        if not ctx:
+            lib.codec_model_free(model)
+            print("FAIL: context init with flow overrides")
+            return 1
+        try:
+            fast_pcm, _ = decode(lib, ctx, tokens)
+        finally:
+            lib.codec_free(ctx)
+            lib.codec_model_free(model)
+
     for index, (pcm, sample_rate) in enumerate(results, start=1):
         rms = float(np.sqrt(np.mean(pcm**2)))
         peak = float(np.max(np.abs(pcm)))
@@ -174,6 +237,14 @@ def main() -> int:
         return 1
     if not np.allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-6):
         print("FAIL: repeated same-context decodes differ")
+        return 1
+    fast_rms = float(np.sqrt(np.mean(fast_pcm**2)))
+    print(f"  override n_timesteps=2 cfg_rate=0: {fast_pcm.size} samples; rms={fast_rms:.6f}")
+    if fast_pcm.shape != results[0][0].shape or not np.all(np.isfinite(fast_pcm)) or fast_rms < 1e-4:
+        print("FAIL: overridden flow schedule produced bad PCM")
+        return 1
+    if np.allclose(fast_pcm, results[0][0], rtol=1e-5, atol=1e-6):
+        print("FAIL: flow KV overrides had no effect")
         return 1
     print("chatterbox S3G decode end-to-end smoke test passed")
     return 0

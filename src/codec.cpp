@@ -300,7 +300,53 @@ struct codec_decode_params codec_decode_default_params(void) {
     return result;
 }
 
+// Rewrites gguf KV entries in place so every codec_read_*_kv sees the override.
+// Integer overrides keep an existing key's integer width (u32 vs i32) so readers
+// that only accept one of them still match.
+static bool codec_apply_kv_overrides(struct gguf_context * gf, const struct codec_model_kv_override * ov) {
+    for (; ov != nullptr && ov->key[0] != '\0'; ++ov) {
+        const int key_id = gguf_find_key(gf, ov->key);
+        const enum gguf_type cur = key_id >= 0 ? gguf_get_kv_type(gf, key_id) : GGUF_TYPE_COUNT;
+        switch (ov->tag) {
+            case CODEC_KV_OVERRIDE_TYPE_INT:
+                if (cur == GGUF_TYPE_UINT32) {
+                    if (ov->val_i64 < 0 || ov->val_i64 > (int64_t) UINT32_MAX) return false;
+                    gguf_set_val_u32(gf, ov->key, (uint32_t) ov->val_i64);
+                } else if (cur == GGUF_TYPE_INT64) {
+                    gguf_set_val_i64(gf, ov->key, ov->val_i64);
+                } else {
+                    if (ov->val_i64 < INT32_MIN || ov->val_i64 > INT32_MAX) return false;
+                    gguf_set_val_i32(gf, ov->key, (int32_t) ov->val_i64);
+                }
+                break;
+            case CODEC_KV_OVERRIDE_TYPE_FLOAT:
+                if (cur == GGUF_TYPE_FLOAT64) {
+                    gguf_set_val_f64(gf, ov->key, ov->val_f64);
+                } else {
+                    gguf_set_val_f32(gf, ov->key, (float) ov->val_f64);
+                }
+                break;
+            case CODEC_KV_OVERRIDE_TYPE_BOOL:
+                gguf_set_val_bool(gf, ov->key, ov->val_bool);
+                break;
+            case CODEC_KV_OVERRIDE_TYPE_STR:
+                gguf_set_val_str(gf, ov->key, ov->val_str);
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 struct codec_model * codec_model_load_from_file(const char * path_model, struct codec_model_params params) {
+    return codec_model_load_from_file_ext(path_model, params, nullptr);
+}
+
+struct codec_model * codec_model_load_from_file_ext(
+        const char * path_model,
+        struct codec_model_params params,
+        const struct codec_model_kv_override * kv_overrides) {
     if (path_model == nullptr) {
         return nullptr;
     }
@@ -313,6 +359,11 @@ struct codec_model * codec_model_load_from_file(const char * path_model, struct 
 
     struct gguf_context * gf = gguf_init_from_file(path_model, gguf_params);
     if (gf == nullptr) {
+        return nullptr;
+    }
+    if (!codec_apply_kv_overrides(gf, kv_overrides)) {
+        gguf_free(gf);
+        ggml_free(weights);
         return nullptr;
     }
 

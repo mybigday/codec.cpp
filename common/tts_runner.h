@@ -22,6 +22,8 @@
 // OFF, tts-cli falls back to the self-contained (no-backbone) FlowLM path
 // exposed by `tts_runner_synthesize_selfcontained`.
 
+#include "codec.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -159,6 +161,7 @@ std::vector<llama_token> build_neutts_prompt(
 // ─────────────────────────────────────────────────────────────────────
 struct tts_runner_params {
     std::string codec_path;          // codec / codec_lm GGUF (required)
+    std::vector<codec_model_kv_override> kv_overrides;  // codec GGUF metadata overrides
     std::string backbone_path;       // llama.cpp backbone GGUF; empty for
                                      // self-contained models (Pocket FlowLM)
     std::string text;                // synthesis target (required)

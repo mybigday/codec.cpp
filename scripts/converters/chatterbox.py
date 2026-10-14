@@ -600,6 +600,13 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         self._reset_quant_stats()
         self._write_common_metadata(writer, self.config)
         writer.add_bool("chatterbox_s3g.meanflow", meanflow)
+        # Flow solver schedule; runtime defaults are 10 steps / cfg 0.7 (CFM) or 2 (MeanFlow).
+        n_timesteps = self.config.get("n_timesteps")
+        if n_timesteps is not None:
+            writer.add_uint32("chatterbox_s3g.flow.n_timesteps", int(n_timesteps))
+        cfg_rate = self.config.get("cfg_rate")
+        if cfg_rate is not None:
+            writer.add_float32("chatterbox_s3g.flow.cfg_rate", float(cfg_rate))
 
         if self.conds is not None:
             gen_conds = self.conds.get("gen")

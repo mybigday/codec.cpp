@@ -1932,6 +1932,7 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
 
     audio_lm_params p;
     p.codec_path = a.codec_path;
+    p.kv_overrides = a.kv_overrides;
     p.use_gpu    = a.use_gpu;
     p.n_threads  = a.n_threads;
     std::string err;
@@ -2282,7 +2283,7 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         codec_model_params cmp = codec_model_default_params();
         cmp.use_gpu   = a.use_gpu;
         cmp.n_threads = a.n_threads > 0 ? a.n_threads : 1;
-        codec_model * cmodel = codec_model_load_from_file(a.codec_path.c_str(), cmp);
+        codec_model * cmodel = load_codec_model(a.codec_path, cmp, a.kv_overrides);
         if (!cmodel) {
             out->error = std::string("NeuTTS: failed to load NeuCodec model from ") + a.codec_path;
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
