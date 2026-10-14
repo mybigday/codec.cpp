@@ -297,6 +297,27 @@ struct SamplerChain {
         llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
     }
 
+    // HF LogitsProcessorList order used by Chatterbox Turbo
+    // (t3.py::inference_turbo): temp → top_k → top_p → repetition penalty
+    // → dist(seed).  Penalties run on the already-truncated candidates, so
+    // the kept set is chosen before the penalty, as in the reference.
+    void init_sampled_penalty_last(uint32_t seed, float temp, int32_t top_k, float top_p,
+                                   float rep_penalty) {
+        reset();
+        llama_sampler_chain_params sp = llama_sampler_chain_default_params();
+        sp.no_perf = true;
+        chain = llama_sampler_chain_init(sp);
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+        if (top_k > 0) llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+        if (top_p > 0.0f && top_p < 1.0f)
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+        if (rep_penalty != 1.0f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(-1, rep_penalty, 0.0f, 0.0f));
+            has_penalties = true;
+        }
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+    }
+
     void reset() {
         if (chain) { llama_sampler_free(chain); chain = nullptr; }
         has_penalties = false;
@@ -1105,22 +1126,56 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
                     const tts_runner_params & a, int32_t hidden, int32_t max_frames,
                     std::vector<int32_t> * out_codes,
                     int32_t * out_frames, const char ** out_stop) {
-    const float cfg_weight = a.has_cfg_weight ? a.cfg_weight : 0.5f;
-    const float temperature = a.has_temp ? a.temp : 0.8f;
-    const float top_p = a.has_top_p ? a.top_p : 1.0f;
-    const float min_p = a.has_min_p ? a.min_p : 0.05f;
-    const float rep_pen = a.has_rep_penalty ? a.repetition_penalty : 1.2f;
+    // CLI flags win, then the GGUF's reference sampling defaults
+    // (`codec.lm.chatterbox.sampling.*`, < 0 = unset), then the Llama-T3
+    // regime.  Turbo has no CFG lane at all.
+    const bool turbo = ci->is_turbo != 0;
+    auto pick = [](bool has, float cli, float meta, float fallback) {
+        return has ? cli : (meta >= 0.0f ? meta : fallback);
+    };
+    const float cfg_weight = turbo ? 0.0f : pick(a.has_cfg_weight, a.cfg_weight, ci->cfg_weight, 0.5f);
+    const float temperature = pick(a.has_temp, a.temp, ci->temperature, 0.8f);
+    const float top_p = pick(a.has_top_p, a.top_p, ci->top_p, 1.0f);
+    const float min_p = pick(a.has_min_p, a.min_p, ci->min_p, 0.05f);
+    const float rep_pen = pick(a.has_rep_penalty, a.repetition_penalty, ci->repetition_penalty, 1.2f);
+    const int32_t top_k = a.has_top_k ? a.top_k : (ci->top_k >= 0 ? ci->top_k : 0);
 
-    std::vector<int32_t> text_ids(a.text.size() + 64);
-    int32_t n_text = 0;
-    if (codec_lm_chatterbox_tokenize(lm, a.text.c_str(), text_ids.data(),
-                                     (int32_t) text_ids.size(), &n_text) != CODEC_STATUS_SUCCESS) {
-        std::fprintf(stderr, "chatterbox tokenize failed: %s\n", codec_lm_get_last_error(lm));
-        return false;
+    std::vector<int32_t> text_ids;
+    if (ci->backbone_tokenizer) {
+        // Turbo: punc_norm on the codec side, then the backbone's GPT-2 BPE
+        // (paralinguistic tags such as "[laugh]" are added tokens).
+        std::vector<char> normed(a.text.size() * 2 + 64);
+        if (codec_lm_chatterbox_normalize_text(lm, a.text.c_str(), normed.data(),
+                                               (int32_t) normed.size()) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "chatterbox normalize failed: %s\n", codec_lm_get_last_error(lm));
+            return false;
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(lctx));
+        const int32_t n_chars = (int32_t) std::strlen(normed.data());
+        text_ids.resize((size_t) n_chars + 16);
+        int32_t n = llama_tokenize(vocab, normed.data(), n_chars, text_ids.data(),
+                                   (int32_t) text_ids.size(), /*add_special=*/false,
+                                   /*parse_special=*/true);
+        if (n < 0) {
+            text_ids.resize((size_t) -n);
+            n = llama_tokenize(vocab, normed.data(), n_chars, text_ids.data(),
+                               (int32_t) text_ids.size(), false, true);
+        }
+        if (n < 0) { std::fprintf(stderr, "chatterbox backbone tokenize failed\n"); return false; }
+        text_ids.resize((size_t) n);
+    } else {
+        text_ids.resize(a.text.size() + 64);
+        int32_t n_text = 0;
+        if (codec_lm_chatterbox_tokenize(lm, a.text.c_str(), text_ids.data(),
+                                         (int32_t) text_ids.size(), &n_text) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "chatterbox tokenize failed: %s\n", codec_lm_get_last_error(lm));
+            return false;
+        }
+        text_ids.resize(n_text);
     }
-    text_ids.resize(n_text);
-    std::printf("chatterbox: %d text tokens, cfg_weight=%.2f temp=%.2f min_p=%.2f top_p=%.2f rep=%.2f\n",
-                n_text, cfg_weight, temperature, min_p, top_p, rep_pen);
+    const int32_t n_text = (int32_t) text_ids.size();
+    std::printf("chatterbox%s: %d text tokens, cfg_weight=%.2f temp=%.2f top_k=%d min_p=%.2f top_p=%.2f rep=%.2f\n",
+                turbo ? " turbo" : "", n_text, cfg_weight, temperature, top_k, min_p, top_p, rep_pen);
 
     std::vector<float> ref_pcm;
     const float * ref_pcm_ptr = nullptr;
@@ -1149,7 +1204,7 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
     }
 
     const int32_t cond_rows = ci->cond_rows;
-    const int32_t seq_len_cap = cond_rows + (n_text + 2) + 2;
+    const int32_t seq_len_cap = cond_rows + (n_text + 2) + 2;  // also bounds Turbo's single-BOS layout
     const int32_t n_seq_cap = (cfg_weight > 0.0f) ? 2 : 1;
     std::vector<float> prompt((size_t) seq_len_cap * n_seq_cap * hidden);
     int32_t seq_len = 0, n_seq = 0;
@@ -1191,9 +1246,15 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
     // T3-faithful chain: penalties(full history) → temp → min_p → top_p →
     // dist(seed).  Seed the penalty ring buffer with start_speech_token, as
     // the old sample_t3 pre-loaded `generated` with it before step 0.
+    // Turbo uses the HF warper order instead and its history is only the
+    // generated tokens (inference_turbo's input_ids exclude the BOS after
+    // step 0).
     SamplerChain smpl;
     if (temperature <= 0.0f) smpl.init_greedy();
-    else {
+    else if (turbo) {
+        smpl.init_sampled_penalty_last(a.seed ? a.seed : 0xC0DEC1ABu, temperature, top_k,
+                                       top_p, rep_pen);
+    } else {
         smpl.init_sampled(a.seed ? a.seed : 0xC0DEC1ABu, temperature, /*top_k=*/0,
                           top_p, min_p, rep_pen, /*rep_last_n=*/-1);
         if (smpl.has_penalties) llama_sampler_accept(smpl.chain, ci->start_speech_token);
@@ -1250,6 +1311,10 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
             std::fprintf(stderr, "chatterbox step decode failed\n"); return false;
         }
         ++n_past;
+    }
+    // Turbo appends S3GEN_SIL × 3 before S3Gen (tts_turbo.py::generate).
+    if (ci->silence_token >= 0) {
+        for (int32_t i = 0; i < ci->n_trailing_silence; ++i) out_codes->push_back(ci->silence_token);
     }
     return true;
 }
@@ -2012,7 +2077,8 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     const codec_lm_chatterbox_info * cbx =
         lm_handle ? codec_lm_chatterbox_get_info(lm_handle) : nullptr;
     const bool is_chatterbox = (cbx != nullptr);
-    const float cbx_cfg = a.has_cfg_weight ? a.cfg_weight : 0.5f;
+    const float cbx_cfg = !is_chatterbox || cbx->is_turbo ? 0.0f
+        : a.has_cfg_weight ? a.cfg_weight : (cbx->cfg_weight >= 0.0f ? cbx->cfg_weight : 0.5f);
     const int32_t cbx_n_seq = (is_chatterbox && cbx_cfg > 0.0f) ? 2 : 1;
 
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : 512;

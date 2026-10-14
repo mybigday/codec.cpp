@@ -714,13 +714,24 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         self._add_tensor(writer, "speaker.voice_encoder.mel_basis", mel_basis, st_dtype="F32")
         self._add_tensor(writer, "speaker.voice_encoder.window",    window,    st_dtype="F32")
 
-        # Metadata block — read by codec_lm at create time.
+        # Metadata block — read by codec_lm at create time.  Turbo has no
+        # perceiver/emotion: cond rows = spkr_enc (1) + raw speech_emb of the
+        # cond prompt (375 tokens for the builtin voice).
+        turbo = self.lm_source is not None and \
+            (Path(str(self.lm_source)) / "t3_turbo_v1.safetensors").is_file()
+        n_rows = 34
+        if turbo:
+            t3 = self.conds.get("t3") if isinstance(self.conds, dict) else None
+            toks = t3.get("cond_prompt_speech_tokens") if isinstance(t3, dict) else None
+            if toks is None:
+                raise ValueError("Turbo speaker section needs conds.pt t3.cond_prompt_speech_tokens")
+            n_rows = 1 + int(np.asarray(toks).reshape(-1).shape[0])
         writer.add_bool   ("codec.speaker.has_encoder", True)
-        writer.add_uint32 ("codec.speaker.n_rows", 34)
+        writer.add_uint32 ("codec.speaker.n_rows", n_rows)
         writer.add_uint32 ("codec.speaker.hidden_dim", 1024)
         writer.add_bool   ("codec.speaker.needs_ref_pcm", True)
         writer.add_bool   ("codec.speaker.needs_ref_speech_tokens", True)
-        writer.add_bool   ("codec.speaker.needs_emotion_scalar", True)
+        writer.add_bool   ("codec.speaker.needs_emotion_scalar", not turbo)
         writer.add_uint32 ("codec.speaker.ref_sample_rate", VE_SAMPLE_RATE)
         writer.add_uint32 ("codec.speaker.speaker_emb_dim", VE_SPEAKER_EMBED)
         writer.add_float32("codec.speaker.emotion_default", 0.5)
@@ -743,5 +754,5 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
 
         self.log(
             f"Speaker section: voice_encoder (3-layer LSTM, hidden={VE_HIDDEN_SIZE}, "
-            f"embed={VE_SPEAKER_EMBED}) + cond_enc (from LM adaptor) -> 34 × 1024"
+            f"embed={VE_SPEAKER_EMBED}) + cond_enc (from LM adaptor) -> {n_rows} × 1024"
         )

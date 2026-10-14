@@ -71,6 +71,12 @@ struct cbx_impl {
     int32_t n_rows        = 34;
     int32_t speaker_embed_dim = 256;
 
+    // cond_enc layout.  Turbo drops the perceiver (raw speech_emb rows of the
+    // cond prompt), the emotion row and the learned speech PE.
+    bool use_perceiver   = true;
+    bool has_emotion     = true;
+    bool learned_pos_emb = true;
+
     // Mel basis + window (F32 host buffers, dequantised at init).
     std::vector<float> mel_basis;   // (n_freq * n_mels)
     std::vector<float> window;      // (n_fft)
@@ -215,11 +221,27 @@ bool chatterbox_speaker_init(codec_lm * lm) {
     // bundled by the LM adaptor section, so this is only ever called for
     // GGUFs that also have the LM adaptor; the speaker section is
     // gated on `lm_source` at convert time).
+    impl->use_perceiver   = codec_read_bool_kv(gf, "codec.lm.chatterbox.use_perceiver", true);
+    impl->has_emotion     = codec_read_bool_kv(gf, "codec.lm.chatterbox.has_emotion_cond", true);
+    impl->learned_pos_emb = codec_read_bool_kv(gf, "codec.lm.chatterbox.learned_pos_emb", true);
     impl->spkr_enc_W      = find_required(lm, "lm.chatterbox.cond.spkr_enc.weight");
     impl->spkr_enc_b      = find_required(lm, "lm.chatterbox.cond.spkr_enc.bias");
-    impl->emotion_adv_W   = find_required(lm, "lm.chatterbox.cond.emotion_adv_fc.weight");
     impl->speech_emb      = find_required(lm, "lm.audio_embd_0.weight");
-    impl->speech_pos_emb  = find_required(lm, "lm.chatterbox.speech_pos_emb.weight");
+    if (!impl->spkr_enc_W || !impl->spkr_enc_b || !impl->speech_emb) {
+        delete impl; return false;
+    }
+    if (impl->has_emotion) {
+        impl->emotion_adv_W = find_required(lm, "lm.chatterbox.cond.emotion_adv_fc.weight");
+        if (!impl->emotion_adv_W) { delete impl; return false; }
+    }
+    if (impl->learned_pos_emb) {
+        impl->speech_pos_emb = find_required(lm, "lm.chatterbox.speech_pos_emb.weight");
+        if (!impl->speech_pos_emb) { delete impl; return false; }
+    }
+    if (!impl->use_perceiver) {
+        lm->speaker_impl = impl;
+        return true;
+    }
     impl->perceiver_q     = find_required(lm, "lm.chatterbox.cond.perceiver.queries");
     impl->perc_norm_W     = find_required(lm, "lm.chatterbox.cond.perceiver.norm.weight");
     impl->perc_norm_b     = find_required(lm, "lm.chatterbox.cond.perceiver.norm.bias");
@@ -231,8 +253,7 @@ bool chatterbox_speaker_init(codec_lm * lm) {
     impl->perc_to_v_b     = find_required(lm, "lm.chatterbox.cond.perceiver.to_v.bias");
     impl->perc_proj_out_W = find_required(lm, "lm.chatterbox.cond.perceiver.proj_out.weight");
     impl->perc_proj_out_b = find_required(lm, "lm.chatterbox.cond.perceiver.proj_out.bias");
-    if (!impl->spkr_enc_W || !impl->spkr_enc_b || !impl->emotion_adv_W ||
-        !impl->speech_emb || !impl->speech_pos_emb || !impl->perceiver_q ||
+    if (!impl->perceiver_q ||
         !impl->perc_norm_W || !impl->perc_norm_b ||
         !impl->perc_to_q_W || !impl->perc_to_q_b ||
         !impl->perc_to_k_W || !impl->perc_to_k_b ||
@@ -475,8 +496,6 @@ bool build_cond_graph(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     ggml_set_name(t_spk, "spk.in.spkr_emb");
     ggml_tensor * t_tokens  = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, T_speech);
     ggml_set_name(t_tokens, "spk.in.tokens");
-    ggml_tensor * t_emotion = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
-    ggml_set_name(t_emotion, "spk.in.emotion");
 
     // ---- cond_spkr = spkr_enc(spk_emb_raw) ----------------------
     //   spkr_enc.weight is (256, 1024) — ggml ne[0]=256, ne[1]=1024.
@@ -487,24 +506,33 @@ bool build_cond_graph(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     spk_y = ggml_add(ctx_eval, spk_y, spk_b);
     ggml_tensor * cond_spkr = ggml_reshape_2d(ctx_eval, spk_y, H, 1);   // (H, 1)
 
+    // ---- speech_emb lookup (+ speech_pos_emb) → seq (H, T_speech) ----
+    ggml_tensor * emb_rows = ggml_get_rows(ctx_eval, impl->speech_emb, t_tokens);   // (H, T_speech)
+    ggml_tensor * seq = codec_graph_cast_f32(ctx_eval, emb_rows);
+    if (impl->learned_pos_emb) {
+        // pos_ids = [0, 1, ..., T_speech-1]
+        ggml_tensor * pos_ids = ggml_arange(ctx_eval, 0.0f, (float) T_speech, 1.0f);
+        pos_ids = ggml_cast(ctx_eval, pos_ids, GGML_TYPE_I32);
+        ggml_tensor * pos_rows = ggml_get_rows(ctx_eval, impl->speech_pos_emb, pos_ids);
+        seq = ggml_add(ctx_eval, seq, codec_graph_cast_f32(ctx_eval, pos_rows));
+    }
+
+    if (!impl->use_perceiver) {
+        // Turbo: [cond_spkr (1) | seq (T_speech)] (no emotion row).
+        ggml_tensor * cond = ggml_concat(ctx_eval, cond_spkr, seq, 1);
+        ggml_set_name(cond, "spk.out.cond_emb");
+        *out = cond;
+        return true;
+    }
+
     // ---- cond_emotion = emotion_adv_fc(emotion) --------------------
     //   emotion_adv_fc.weight is (1, 1024) — ggml ne[0]=1, ne[1]=1024.
     //   y = W @ scalar : ggml_mul_mat(W_2d, scalar_1d).  Result (1024,).
+    ggml_tensor * t_emotion = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
+    ggml_set_name(t_emotion, "spk.in.emotion");
     ggml_tensor * emo_W = codec_graph_mat_lhs(ctx_eval, impl->emotion_adv_W);
     ggml_tensor * emo_y = ggml_mul_mat(ctx_eval, emo_W, t_emotion);   // (1024,)
     ggml_tensor * cond_emotion = ggml_reshape_2d(ctx_eval, emo_y, H, 1);
-
-    // ---- speech_emb lookup + speech_pos_emb add → seq (H, T_speech) -
-    ggml_tensor * emb_rows = ggml_get_rows(ctx_eval, impl->speech_emb, t_tokens);   // (H, T_speech)
-    emb_rows = codec_graph_cast_f32(ctx_eval, emb_rows);
-
-    // pos_ids = [0, 1, ..., T_speech-1]
-    ggml_tensor * pos_ids = ggml_arange(ctx_eval, 0.0f, (float) T_speech, 1.0f);
-    pos_ids = ggml_cast(ctx_eval, pos_ids, GGML_TYPE_I32);
-    ggml_tensor * pos_rows = ggml_get_rows(ctx_eval, impl->speech_pos_emb, pos_ids);
-    pos_rows = codec_graph_cast_f32(ctx_eval, pos_rows);
-
-    ggml_tensor * seq = ggml_add(ctx_eval, emb_rows, pos_rows);     // (H, T_speech)
 
     // ---- Perceiver: 32 learned queries cross-attend over seq, then self-attend.
     // perceiver_q stored as (1, 32, H) — flatten to (H, 32).
@@ -692,9 +720,10 @@ enum codec_status chatterbox_speaker_encode_from_emb(
     }
     ggml_tensor * t_spk     = codec_graph_get_tensor(impl->cond_ctx, entry, "spk.in.spkr_emb");
     ggml_tensor * t_tokens  = codec_graph_get_tensor(impl->cond_ctx, entry, "spk.in.tokens");
-    ggml_tensor * t_emotion = codec_graph_get_tensor(impl->cond_ctx, entry, "spk.in.emotion");
+    ggml_tensor * t_emotion = impl->use_perceiver
+        ? codec_graph_get_tensor(impl->cond_ctx, entry, "spk.in.emotion") : nullptr;
     ggml_tensor * t_out     = codec_graph_get_tensor(impl->cond_ctx, entry, "spk.out.cond_emb");
-    if (!t_spk || !t_tokens || !t_emotion || !t_out) {
+    if (!t_spk || !t_tokens || (impl->use_perceiver && !t_emotion) || !t_out) {
         lm->last_error = "chatterbox speaker_encode: cond graph missing tensors";
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -706,7 +735,7 @@ enum codec_status chatterbox_speaker_encode_from_emb(
                                     (size_t) impl->speaker_embed_dim * sizeof(float), &err) ||
         !codec_runtime_write_tensor(t_tokens, ref_speech_tokens,
                                     (size_t) n_ref_speech_tokens * sizeof(int32_t), &err) ||
-        !codec_runtime_write_tensor(t_emotion, &emotion, sizeof(float), &err)) {
+        (t_emotion && !codec_runtime_write_tensor(t_emotion, &emotion, sizeof(float), &err))) {
         lm->last_error = "chatterbox speaker_encode: " + err;
         return CODEC_STATUS_INTERNAL_ERROR;
     }
@@ -715,7 +744,8 @@ enum codec_status chatterbox_speaker_encode_from_emb(
         lm->last_error = "chatterbox speaker_encode: " + err;
         return CODEC_STATUS_INTERNAL_ERROR;
     }
-    const int32_t need = impl->n_rows * impl->hidden_dim;
+    const int32_t rows = impl->use_perceiver ? impl->n_rows : 1 + n_ref_speech_tokens;
+    const int32_t need = rows * impl->hidden_dim;
     if (out_n_elems < need) {
         lm->last_error = "chatterbox speaker_encode: out buffer too small";
         return CODEC_STATUS_INVALID_ARG;

@@ -614,6 +614,21 @@ struct codec_lm_chatterbox_info {
     int32_t has_tokenizer;          // 1 if BPE tokenizer baked into GGUF
     int32_t has_builtin_conds;      // 1 if builtin speaker conditioning baked
     int32_t is_multilingual;        // 1 for the 2454-vocab variants
+    // Turbo (GPT-2 T3, `codec.lm.chatterbox.variant = "turbo"`) — fields
+    // appended so older callers keep their layout.
+    int32_t is_turbo;               // 1 for Chatterbox Turbo
+    int32_t backbone_tokenizer;     // 1: tokenize text with the backbone vocab
+                                    //    (after codec_lm_chatterbox_normalize_text)
+    int32_t silence_token;          // S3Gen silence code appended after AR (-1 = none)
+    int32_t n_trailing_silence;     // how many silence codes to append (Turbo: 3)
+    // Reference sampling defaults (`codec.lm.chatterbox.sampling.*`); a
+    // value < 0 means "not specified" and the host picks its own default.
+    float   temperature;
+    int32_t top_k;
+    float   top_p;
+    float   min_p;
+    float   repetition_penalty;
+    float   cfg_weight;
 };
 
 // Returns the chatterbox info, or NULL if the model is not a T3 adaptor.
@@ -632,8 +647,19 @@ enum codec_status codec_lm_chatterbox_tokenize(
     int32_t           cap,
     int32_t *         n_out);
 
+// Apply the variant's punc_norm text cleanup (tts.py / tts_turbo.py) into
+// `out` (capacity `cap` bytes incl. NUL).  Hosts with backbone_tokenizer=1
+// call this, then tokenize with the backbone vocab.
+enum codec_status codec_lm_chatterbox_normalize_text(
+    struct codec_lm * lm,
+    const char *      text,
+    char *            out,
+    int32_t           cap);
+
 // Build the full backbone-input embed prefix for T3 inference:
 //   [ cond_emb (cond_rows) | text_emb+text_pos_emb (n_text_wrapped) | BOS ]
+// Turbo: [ cond_emb (1 + n_cond_tokens) | text_emb (n_text) | BOS ] — no
+// start/stop text tokens, no learned PEs, one BOS row, never a CFG lane.
 // The caller passes RAW text ids (without start/stop text tokens); this
 // helper prepends start_text_token, appends stop_text_token, adds
 // text_pos_emb, then appends the speech BOS

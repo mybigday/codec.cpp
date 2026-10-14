@@ -352,19 +352,71 @@ CHATTERBOX_T3_LLAMA_CFG = {
 }
 
 
+CHATTERBOX_T3_CHECKPOINTS = (
+    "t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
+    "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors",
+    "t3_turbo_v1.safetensors",
+)
+
+# Turbo swaps the Llama-520M tfmr for GPT-2 medium (learned wpe, LayerNorm,
+# fused c_attn).  Mirror of `llama_configs.py::GPT2_MEDIUM_CONFIG` with the
+# real Turbo text vocab: its `wte` rows line up 1:1 with the shipped GPT-2
+# tokenizer (50257 BPE + 19 paralinguistic tags such as `[laugh]`), so the
+# backbone GGUF carries the actual text tokenizer and the runtime tokenizes
+# with llama_tokenize.  Inference still feeds embeddings, never token ids.
+CHATTERBOX_T3_TURBO_GPT2_CFG = {
+    "architectures":      ["GPT2LMHeadModel"],
+    "model_type":         "gpt2",
+    "activation_function": "gelu_new",
+    "vocab_size":         50276,
+    "n_ctx":              8196,
+    "n_positions":        8196,
+    "n_embd":             1024,
+    "n_head":             16,
+    "n_layer":            24,
+    "n_inner":            None,
+    "layer_norm_epsilon": 1e-05,
+    "bos_token_id":       50256,
+    "eos_token_id":       50256,
+    "tie_word_embeddings": True,
+    "torch_dtype":        "float32",
+}
+
+
+def prep_chatterbox_t3_turbo(src: Path, t3_path: Path, dst: Path) -> list[tuple[str, str]]:
+    """Unwrap Chatterbox Turbo's GPT-2 medium tfmr (`tfmr.h.*`, `tfmr.ln_f`,
+    `tfmr.wpe`, `tfmr.wte`) into a GPT2LMHeadModel dir + its tokenizer.
+    The T3 adaptor side (text/speech embeds, speech head with bias,
+    spkr_enc) goes through `scripts/converters/lm_adaptor/chatterbox.py`."""
+    sd = load_file(str(t3_path))
+    out_sd: Dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if k.startswith("tfmr."):
+            out_sd[k[len("tfmr."):]] = v
+    for need in ("wte.weight", "wpe.weight", "ln_f.weight", "h.0.attn.c_attn.weight"):
+        if need not in out_sd:
+            raise SystemExit(f"missing tfmr.{need} in {t3_path}")
+    if out_sd["wte.weight"].shape[0] != CHATTERBOX_T3_TURBO_GPT2_CFG["vocab_size"]:
+        raise SystemExit(f"unexpected Turbo wte shape {tuple(out_sd['wte.weight'].shape)}")
+    (dst / "config.json").write_text(json.dumps(CHATTERBOX_T3_TURBO_GPT2_CFG, indent=2))
+    _save_state_dict(out_sd, dst)
+    _write_generation_config(dst, 50256, 50256)
+    _copy_tokenizer(src, dst)
+    return []
+
+
 def _chatterbox_find_t3_safetensors(src: Path) -> Path:
     """Find the T3 LM checkpoint inside a Chatterbox-format directory.
     Supports English (`t3_cfg.safetensors`) + multilingual variants
     (`t3_23lang.safetensors`, `t3_mtl23ls_v2.safetensors`,
     `t3_mtl23ls_v3.safetensors`)."""
-    for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
-               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
+    for fn in CHATTERBOX_T3_CHECKPOINTS:
         p = src / fn
         if p.is_file():
             return p
     raise SystemExit(
         f"no Chatterbox T3 checkpoint in {src}; expected one of "
-        f"t3_cfg / t3_mtl23ls_v2 / t3_mtl23ls_v3 / t3_23lang .safetensors")
+        f"{' / '.join(CHATTERBOX_T3_CHECKPOINTS)}")
 
 
 def prep_chatterbox_t3(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
@@ -378,6 +430,8 @@ def prep_chatterbox_t3(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]
     is handled separately by `scripts/converters/lm_adaptor/chatterbox.py`.
     """
     t3_path = _chatterbox_find_t3_safetensors(src)
+    if t3_path.name == "t3_turbo_v1.safetensors":
+        return prep_chatterbox_t3_turbo(src, t3_path, dst)
     sd = load_file(str(t3_path))
 
     out_sd: Dict[str, torch.Tensor] = {}
@@ -684,11 +738,7 @@ def chatterbox_layout_detected(src: Path) -> bool:
     looking for the bundled T3 checkpoint filename(s)."""
     if not src.is_dir():
         return False
-    for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
-               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
-        if (src / fn).is_file():
-            return True
-    return False
+    return any((src / fn).is_file() for fn in CHATTERBOX_T3_CHECKPOINTS)
 
 
 # ---------------------------------------------------------------------
@@ -711,6 +761,10 @@ def run_llama_cpp_converter(
         raise SystemExit(f"missing {conv}; pass --llama-cpp /path/to/llama.cpp")
 
     saved_argv = sys.argv
+    saved_path = list(sys.path)
+    # Newer llama.cpp splits the converter into a `conversion/` package next
+    # to convert_hf_to_gguf.py; exec() doesn't add the script dir itself.
+    sys.path[:0] = [str(llama_cpp.resolve()), str((llama_cpp / "gguf-py").resolve())]
     sys.argv = [
         "convert_hf_to_gguf.py", str(hf_dir),
         "--outfile", str(output),
@@ -727,6 +781,7 @@ def run_llama_cpp_converter(
              {"__name__": "__main__", "__file__": str(conv)})
     finally:
         sys.argv = saved_argv
+        sys.path[:] = saved_path
 
 
 def load_config(src: Path) -> dict:

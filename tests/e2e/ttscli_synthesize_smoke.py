@@ -197,6 +197,21 @@ def main():
         greedy=False, stop_line="chatterbox AR done",
     ))
 
+    # Chatterbox Turbo — GPT-2 medium T3 (single lane, no CFG; GPT-2 BPE
+    # text tokenizer carried by the backbone GGUF), sampled with the GGUF's
+    # reference regime (temp 0.8 / top-k 1000 / top-p 0.95 / rep 1.2, HF
+    # warper order), 3 trailing S3GEN_SIL codes, decoded by the MeanFlow
+    # S3Gen (2 steps, no CFG).  Greedy T3 matches PyTorch token-for-token.
+    results.append(_case(
+        "chatterbox_turbo",
+        REPO / "models" / "chatterbox_turbo" / "chatterbox_turbo.gguf",
+        REPO / "models" / "chatterbox_turbo" / "gpt2_backbone.gguf",
+        "Hello, this is a test of the emergency broadcast system.",
+        "en", want_stop="eos_code_c0", cer_max=0.1,
+        extra=["--seed", "42", "--max-frames", "1000"],
+        greedy=False, stop_line="chatterbox AR done",
+    ))
+
     # BlueMagpie — continuous CFM, stops via the diffusion stop head.
     bm_bb = Path.home() / "Projects" / "llama.rn" / ".scratch" / "gguf" / "BlueMagpie-Barbet-1B-f16.gguf"
     results.append(_case(

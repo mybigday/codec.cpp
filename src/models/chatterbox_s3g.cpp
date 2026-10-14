@@ -536,6 +536,7 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     }
     const codec_model * model = p->model;
     const codec_chatterbox_s3g & s3g = *static_cast<const codec_chatterbox_s3g *>(model->impl);
+    const bool meanflow = s3g.meanflow;
     auto W = [&](const std::string & n) -> ggml_tensor * { return codec_graph_weight(ctx_eval, model, n); };
 
     const int32_t T = p->t_in;
@@ -653,15 +654,12 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     // View prompt_feat as [80, mel_len1] (drop trailing dim 1) → transpose to [mel_len1, 80].
     ggml_tensor * pf_2d = ggml_reshape_2d(ctx_eval, pf, kCfmOutChannels, mel_len1);
     ggml_tensor * pf_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, pf_2d));  // [mel_len1, 80]
-    // Zero tail [T_total - mel_len1, 80].
     const int32_t tail = T_total - mel_len1;
-    ggml_tensor * zero_tail = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, tail, kCfmOutChannels);
-    zero_tail = ggml_scale(ctx_eval, zero_tail, 0.0f);
-    ggml_tensor * cond = ggml_concat(ctx_eval, pf_tc, zero_tail, /*dim=*/0);  // [T_total, 80]
+    ggml_tensor * cond = ggml_pad(ctx_eval, pf_tc, tail, 0, 0, 0);
     ggml_set_name(cond, "s3g.flow.cond");
 
-    // CFM ODE unrolled: n_timesteps cosine-scheduled Euler steps with CFG
-    // (default 10 steps, cfg 0.7), both from GGUF metadata.
+    // CFM uses n_timesteps cosine steps with CFG (default 10, cfg 0.7); MeanFlow
+    // uses linear steps without CFG (default 2). Both come from GGUF metadata.
     // cfg_rate == 0 drops the uncond pass entirely (half the estimator calls).
     // The noise z is fed as a graph input (ggml lacks a portable cross-backend
     // RNG), then x is updated by chained ggml_add nodes; nothing escapes to CPU.
@@ -676,12 +674,24 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     for (int32_t i = 0; i < n_steps; ++i) {
         const float lin_t = (float) i / (float) n_steps;
         const float lin_r = (float) (i + 1) / (float) n_steps;
-        const float t_v = 1.0f - std::cos(lin_t * kFlowTSchedulerCosineHalfPi);
-        const float r_v = 1.0f - std::cos(lin_r * kFlowTSchedulerCosineHalfPi);
+        const float t_v = meanflow ? lin_t : 1.0f - std::cos(lin_t * kFlowTSchedulerCosineHalfPi);
+        const float r_v = meanflow ? lin_r : 1.0f - std::cos(lin_r * kFlowTSchedulerCosineHalfPi);
         const float dt = r_v - t_v;
 
         ggml_tensor * t_emb = codec_s3g_cfm_time_emb(ctx_eval, t_v, model);
         if (t_emb == nullptr) return false;
+
+        if (meanflow) {
+            ggml_tensor * r_emb = codec_s3g_cfm_time_emb(ctx_eval, r_v, model);
+            ggml_tensor * mixer = W("s3g.cfm.t_mix.w");
+            if (r_emb == nullptr || mixer == nullptr) return false;
+            auto * pair = ggml_concat(ctx_eval, t_emb, r_emb, 0);
+            t_emb = ggml_mul_mat(ctx_eval, mixer, pair);
+            auto * velocity = codec_s3g_cfm_estimator_forward(ctx_eval, x, mu_tc, spks, cond, t_emb, model);
+            if (velocity == nullptr) return false;
+            x = ggml_add(ctx_eval, x, ggml_scale(ctx_eval, velocity, dt));
+            continue;
+        }
 
         ggml_tensor * dxdt_cond = codec_s3g_cfm_estimator_forward(ctx_eval, x, mu_tc, spks, cond, t_emb, model);
         if (dxdt_cond == nullptr) return false;
@@ -915,8 +925,11 @@ enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
         return CODEC_STATUS_INVALID_ARG;
     }
     if (s3g.meanflow) {
-        // Meanflow inference path is not implemented yet; flag explicitly.
-        return CODEC_STATUS_NOT_SUPPORTED;
+        auto * mixer = ggml_get_tensor(model->weights, "s3g.cfm.t_mix.w");
+        if (mixer == nullptr || mixer->ne[0] != 2 * kCfmTimeEmbedDim ||
+                mixer->ne[1] != kCfmTimeEmbedDim || mixer->ne[2] != 1 || mixer->ne[3] != 1) {
+            return CODEC_STATUS_INVALID_ARG;
+        }
     }
 
     if (s3g.has_builtin_conditioning) {
@@ -972,10 +985,6 @@ enum codec_status codec_chatterbox_s3g_decode(
     }
     if (!s3g->has_builtin_conditioning) {
         codec_context_set_error(ctx, "Chatterbox-S3G decode requires builtin conditioning (no ref_wav path yet)");
-        return CODEC_STATUS_NOT_SUPPORTED;
-    }
-    if (s3g->meanflow) {
-        codec_context_set_error(ctx, "Chatterbox-S3G meanflow path not implemented");
         return CODEC_STATUS_NOT_SUPPORTED;
     }
 

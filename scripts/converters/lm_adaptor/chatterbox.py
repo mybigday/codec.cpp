@@ -6,8 +6,11 @@ Covers ResembleAI's Chatterbox family:
   - Multilingual `t3_23lang.safetensors`         (text_dict = 2454)
   - Multilingual `t3_mtl23ls_v2.safetensors`     (text_dict = 2454)
   - Multilingual `t3_mtl23ls_v3.safetensors`     (text_dict = 2454)
+  - Turbo        `t3_turbo_v1.safetensors`       (text_dict = 50276) — see
+    `dump_turbo`: GPT-2 medium backbone, no perceiver / emotion / learned
+    PEs, speech head with bias, GPT-2 text tokenizer in the backbone GGUF.
 
-All four share the same Llama-520M backbone (extracted separately by
+The first four share the same Llama-520M backbone (extracted separately by
 `scripts/convert-backbone-to-gguf.py prep_chatterbox_t3`) + the same
 adaptor shape; only the text embed table width and tokenizer differ.
 
@@ -114,6 +117,10 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
          *, verbose: bool = False) -> None:
     """Write codec.lm.* metadata + lm.* tensors for a Chatterbox T3
     checkpoint into the supplied GGUFWriter."""
+
+    if str(cfg.get("chatterbox_t3_checkpoint", "")).startswith("t3_turbo"):
+        dump_turbo(writer, sd, cfg, verbose=verbose)
+        return
 
     text_vocab = int(cfg.get("chatterbox_text_vocab_size") or 0)
     if text_vocab == 0:
@@ -227,6 +234,84 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
               f"n_codebook=1 hidden={HIDDEN_DIM} "
               f"text_vocab={text_vocab} (multilingual={is_multilingual}) "
               f"speech_vocab={SPEECH_VOCAB_SIZE}")
+
+
+# Turbo (tts_turbo.py::ChatterboxTurboTTS.from_local + t3.inference_turbo).
+TURBO_SPEECH_VOCAB_SIZE = 6563   # 6561 codes + start/stop speech tokens
+TURBO_SILENCE_TOKEN     = 4299   # s3gen/const.py S3GEN_SIL
+TURBO_N_TRAILING_SIL    = 3
+
+
+def dump_turbo(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
+               *, verbose: bool = False) -> None:
+    """Chatterbox Turbo T3 adaptor.
+
+    Prompt = [spkr_enc(ve_emb) | speech_emb(cond_prompt_tokens) | text_emb(text)
+    | speech_emb(start_speech)] with no perceiver, emotion row, learned PEs or
+    start/stop text tokens (GPT-2 adds its own wpe).  Sampling is single-lane
+    (no CFG) with temp → top_k → top_p → repetition penalty, and three
+    S3GEN_SIL tokens are appended before S3Gen (MeanFlow) decode.
+    """
+    text_vocab = int(_require(sd, "text_emb.weight").shape[0])
+    speech_vocab = int(_require(sd, "speech_emb.weight").shape[0])
+    if speech_vocab != TURBO_SPEECH_VOCAB_SIZE:
+        raise RuntimeError(f"unexpected Turbo speech vocab {speech_vocab}")
+
+    writer.add_bool   ("codec.lm.has_adaptor",     True)
+    writer.add_string ("codec.lm.kind",            "parallel_heads_delay")
+    writer.add_string ("codec.lm.host_arch",       "gpt2")
+    writer.add_uint32 ("codec.lm.hidden_dim",      HIDDEN_DIM)
+    writer.add_uint32 ("codec.lm.audio_embed_dim", HIDDEN_DIM)
+    writer.add_uint32 ("codec.lm.n_codebook",      1)
+    writer.add_array  ("codec.lm.codebook_sizes",  [speech_vocab])
+    writer.add_array  ("codec.lm.delay_pattern",   [0])
+    writer.add_bool   ("codec.lm.parallel.tied_heads_to_embd", False)
+    writer.add_int32  ("codec.lm.eos_code_c0",     STOP_SPEECH_TOKEN)
+    writer.add_int32  ("codec.lm.eos_min_step",    0)
+    writer.add_int32  ("codec.lm.bos_code_c0",     START_SPEECH_TOKEN)
+
+    writer.add_string ("codec.lm.chatterbox.variant",            "turbo")
+    writer.add_uint32 ("codec.lm.chatterbox.text_vocab_size",    text_vocab)
+    writer.add_uint32 ("codec.lm.chatterbox.start_speech_token", START_SPEECH_TOKEN)
+    writer.add_uint32 ("codec.lm.chatterbox.stop_speech_token",  STOP_SPEECH_TOKEN)
+    writer.add_uint32 ("codec.lm.chatterbox.max_speech_tokens",  1000)
+    writer.add_bool   ("codec.lm.chatterbox.is_multilingual",    False)
+    writer.add_bool   ("codec.lm.chatterbox.has_emotion_cond",   False)
+    writer.add_bool   ("codec.lm.chatterbox.use_perceiver",      False)
+    writer.add_bool   ("codec.lm.chatterbox.learned_pos_emb",    False)
+    writer.add_bool   ("codec.lm.chatterbox.wrap_text_tokens",   False)
+    writer.add_uint32 ("codec.lm.chatterbox.n_speech_bos",       1)
+    writer.add_bool   ("codec.lm.chatterbox.backbone_tokenizer", True)
+    writer.add_uint32 ("codec.lm.chatterbox.speaker_embed_dim",  SPEAKER_EMBED_DIM)
+    writer.add_uint32 ("codec.lm.chatterbox.silence_token",      TURBO_SILENCE_TOKEN)
+    writer.add_uint32 ("codec.lm.chatterbox.n_trailing_silence", TURBO_N_TRAILING_SIL)
+    # Reference sampling regime (tts_turbo.py::generate defaults).
+    writer.add_float32("codec.lm.chatterbox.sampling.temperature", 0.8)
+    writer.add_int32  ("codec.lm.chatterbox.sampling.top_k",       1000)
+    writer.add_float32("codec.lm.chatterbox.sampling.top_p",       0.95)
+    writer.add_float32("codec.lm.chatterbox.sampling.min_p",       0.0)
+    writer.add_float32("codec.lm.chatterbox.sampling.repetition_penalty", 1.2)
+    writer.add_float32("codec.lm.chatterbox.sampling.cfg_weight",  0.0)
+
+    _emit(writer, "lm.audio_embd_0.weight", _require(sd, "speech_emb.weight"),
+          shape=(speech_vocab, HIDDEN_DIM))
+    _emit(writer, "lm.heads_0.weight", _require(sd, "speech_head.weight"),
+          shape=(speech_vocab, HIDDEN_DIM))
+    _emit(writer, "lm.heads_0.bias", _require(sd, "speech_head.bias"),
+          shape=(speech_vocab,))
+    _emit(writer, "lm.chatterbox.text_emb.weight", _require(sd, "text_emb.weight"),
+          shape=(text_vocab, HIDDEN_DIM))
+    _emit(writer, "lm.chatterbox.cond.spkr_enc.weight", _require(sd, "cond_enc.spkr_enc.weight"),
+          shape=(HIDDEN_DIM, SPEAKER_EMBED_DIM))
+    _emit(writer, "lm.chatterbox.cond.spkr_enc.bias", _require(sd, "cond_enc.spkr_enc.bias"),
+          shape=(HIDDEN_DIM,))
+
+    src_dir = cfg.get("chatterbox_source_dir")
+    if src_dir:
+        _dump_builtin_conds(writer, Path(src_dir), verbose=verbose)
+    if verbose:
+        print(f"[lm_adaptor:chatterbox] turbo: text_vocab={text_vocab} "
+              f"speech_vocab={speech_vocab}")
 
 
 def _dump_tokenizer(writer, src_dir: Path, *, verbose: bool = False) -> None:

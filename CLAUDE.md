@@ -202,9 +202,18 @@ If you need to add/replace an op:
 
 - Decode path is a single graph: tokens → encoder → unrolled CFM ODE (10 steps × CFG cond/uncond) → mel → f0_predictor → in-graph NSF source → STFT → main HiFT → in-graph iSTFT → PCM. Builtin-conds path only (no ref_wav embedding yet).
 - Reusable building blocks landed in `src/ops/ggml_ops` (`codec_op_basic_transformer_block_tc`, `codec_op_cfm_causal_resnet_block_tc`, `codec_op_causal_block1d_tc`, `codec_op_hifigan_resblock_branch_ct`, `codec_op_sinusoidal_time_emb`, `codec_op_espnet_rel_pos_emb`) and `src/ops/lm_attn` (`codec_op_lm_attn_rel_pos_dth`, `codec_op_rel_shift_espnet`).
-- meanflow checkpoints convert and load metadata but `init` rejects them — the meanflow ODE schedule + `time_embed_mixer` aren't wired into the unrolled graph.
+- MeanFlow (Turbo `s3gen_meanflow.safetensors`) is wired: linear schedule, default 2 steps, no CFG, `t_mix.w` mixes the (t, r) time embeddings. `flow.n_timesteps` applies to it too.
 - CFM schedule is GGUF metadata: `chatterbox_s3g.flow.n_timesteps` (default 10) and `chatterbox_s3g.flow.cfg_rate` (default 0.7; `0` drops the uncond pass). Published GGUFs without these keys keep the defaults bit-exactly; override at load via `codec_model_load_from_file_ext` KV overrides (`tts-cli --override-kv chatterbox_s3g.flow.n_timesteps=int:4`).
 - Step sweep (English, builtin voice, CPU): ≥2 steps all Whisper CER 0; 4 steps / cfg 0.7 is 2.3× faster with VoiceEncoder cosine 0.991 vs 10 steps; 1 step collapses (cos 0.71). cfg 0 costs ~0.03 speaker cosine at any step count.
+
+## Chatterbox Turbo Status
+
+- `models/chatterbox_turbo/`: `chatterbox_turbo.gguf` (MeanFlow S3G + T3 adaptor + VoiceEncoder; `convert-to-gguf.py --checkpoint-path models/chatterbox_turbo --model-type chatterbox_s3g --lm-source models/chatterbox_turbo`) and `gpt2_backbone.gguf` (`convert-backbone-to-gguf.py --model-id models/chatterbox_turbo --llama-cpp common/third-party/llama.cpp`).
+- T3 is GPT-2 medium (native llama.cpp `gpt2` arch, learned wpe). Its `wte` rows match the shipped GPT-2 tokenizer (50257 BPE + 19 paralinguistic tags like `[laugh]`), so the backbone GGUF carries the real text tokenizer: the runner does codec-side `punc_norm` (`codec_lm_chatterbox_normalize_text`) then `llama_tokenize(parse_special=true)`. Token ids match HF.
+- Adaptor layout flags (`codec.lm.chatterbox.*`, defaults = Llama T3): `variant=turbo`, `use_perceiver=false`, `has_emotion_cond=false`, `learned_pos_emb=false`, `wrap_text_tokens=false`, `n_speech_bos=1`, `backbone_tokenizer=true`; speech head has `lm.heads_0.bias`. Cond rows = spkr_enc + 375 raw `speech_emb` rows (376); prompt = cond | text | BOS.
+- Sampling defaults live in GGUF (`codec.lm.chatterbox.sampling.*`): single lane, temp 0.8 → top-k 1000 → top-p 0.95 → rep 1.2 (HF warper order, penalty last, history excludes BOS). Three `S3GEN_SIL`(4299) codes are appended before S3G.
+- Parity: greedy T3 token sequence identical to PyTorch; e2e Whisper CER 0 on 8/9 (3 sentences × 3 seeds, one 0.078 sampling miss), VoiceEncoder cosine to the builtin voice 0.93–0.96. ~3.4× faster end-to-end than Llama Chatterbox on CPU (3–4 s vs 11–14 s per sentence, 16 threads).
+- Builtin voice only for the full path (S3G has no ref_wav path; ref audio only swaps the VE speaker row, as for the Llama T3).
 
 ## NeuTTS-Air / Nano Status
 

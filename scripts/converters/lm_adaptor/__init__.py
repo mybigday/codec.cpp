@@ -126,7 +126,8 @@ def _load_chatterbox_lm_source_if_present(
     checkpoint file), return its (state_dict, synth_config) tuple;
     otherwise return (None, None)."""
     for fn in ("t3_cfg.safetensors", "t3_mtl23ls_v3.safetensors",
-               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors"):
+               "t3_mtl23ls_v2.safetensors", "t3_23lang.safetensors",
+               "t3_turbo_v1.safetensors"):
         t3_path = local / fn
         if t3_path.is_file():
             try:
