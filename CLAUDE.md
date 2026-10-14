@@ -1,6 +1,6 @@
 # codec.cpp
 
-This repository is a C/C++ library + CLI that runs several neural audio codecs (currently WavTokenizer-Large, DAC, Mimi, Soprano, NeuCodec, NeMo Nano, Qwen3-TTS-Tokenizer, Chatterbox-S3T, Chatterbox-S3G, XCodec2, SNAC) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.).
+This repository is a C/C++ library + CLI that runs neural audio codecs (and the codec side of several TTS models) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.). Per-model implementation status lives in `docs/model_status.md`.
 
 The intended architecture is **llama.cpp-style**:
 - Build model forward passes as **ggml graphs (ops)**.
@@ -171,66 +171,3 @@ If you need to understand a model forward:
 
 If you need to add/replace an op:
 - `src/ops/ggml_ops.cpp` (+ possibly ggml upstream)
-
----
-
-## Mimi Encoder Migration Status
-
-- Mimi encode path is consolidated into one canonical graph kind: `CODEC_GRAPH_MIMI_ENCODE`.
-- The unified graph builder is the only Mimi encode graph path (`frontend -> transformer -> downsample -> unrolled RVQ`).
-- Split/legacy graph kinds for Mimi encode stages are removed from runtime graph enums.
-- Mimi encode weight writing now targets only the canonical encode graph path.
-
-## SNAC Status
-
-- Single-graph encode + decode for hubertsiuzdak/snac_24khz (BigVGAN-style depthwise SNAC, no LocalMHA, 3-level Residual VQ at strides [4, 2, 1]).
-- Encode 100% bit-exact against the HF reference on the full e2e clip; decode bit-perfect (corr 0.99999963).  Roundtrip audio corr 0.9993.
-- Codes packed as `codec_token_buffer` (n_q=3, n_frames=T/512): row 0 = level-0 ×4, row 1 = level-1 ×2, row 2 = level-2 raw.  The decode entry sub-samples each row at its native stride to recover the (T/2048, T/1024, T/512) compact triple.
-- `NoiseBlock` is run as identity for deterministic parity; the e2e test monkey-patches `snac.layers.NoiseBlock.forward` to match.
-- `codec_op_snake` cannot be used directly (it clamps alpha to be positive); SNAC's trained alphas include negative values, so `snac.cpp` ships a local snake helper using `(alpha + 1e-9).reciprocal()` (sign-preserving).
-
-## XCodec2 Status
-
-- Full encode + decode wired up: PCM → CPU mel-fbank → 16 conformer layers (relative-key Shaw attention) + SemanticEncoder + BigCodec acoustic stack → fc_prior → FSQ encode → indices; decoder mirrors NeuCodec (FSQ → fc_post_a → Vocos backbone with 12 RoFormer layers → ISTFT head).
-- Decoder bit-perfect (corr 0.99999981); encoder ≥99.6% codes match HF reference. The drift is FSQ rounding near bucket boundaries — single-feature flips, not systematic bias.
-- Mel-fbank feature extractor lives CPU-side in `audio_dsp.cpp` (`codec_runtime_w2v_bert_features`) — matches `SeamlessM4TFeatureExtractor` (Kaldi-2^15 scale, per-frame remove-DC, 0.97 preemphasis, Povey window, log-mel + per-bin ddof=1 normalize, stride-2 stack).
-- New shareable graph ops landed: `codec_op_alias_free_snake_beta_tc` (BigVGAN/alias-free SnakeBeta with 12-tap Kaiser FIR) and `codec_op_lm_attn_rel_key_dth` (Shaw rel-key attention via per-t_q batched matmul).
-- Encode graph for ≥7s audio fits in CPU RAM; the e2e test caps input at 5s via `max_input_seconds` to keep the runner under iGPU/RAM pressure.
-- Quantizer's `act.beta` mismatch (HF reference loads with `strict=False` and silently uses `bias=0`) is matched at convert time by baking `inv_beta = 1/(1+1e-9)` for every Activation1d.
-
-## Chatterbox-S3G Status
-
-- Decode path is a single graph: tokens → encoder → unrolled CFM ODE (10 steps × CFG cond/uncond) → mel → f0_predictor → in-graph NSF source → STFT → main HiFT → in-graph iSTFT → PCM. Builtin-conds path only (no ref_wav embedding yet).
-- Reusable building blocks landed in `src/ops/ggml_ops` (`codec_op_basic_transformer_block_tc`, `codec_op_cfm_causal_resnet_block_tc`, `codec_op_causal_block1d_tc`, `codec_op_hifigan_resblock_branch_ct`, `codec_op_sinusoidal_time_emb`, `codec_op_espnet_rel_pos_emb`) and `src/ops/lm_attn` (`codec_op_lm_attn_rel_pos_dth`, `codec_op_rel_shift_espnet`).
-- MeanFlow (Turbo `s3gen_meanflow.safetensors`) is wired: linear schedule, default 2 steps, no CFG, `t_mix.w` mixes the (t, r) time embeddings. `flow.n_timesteps` applies to it too.
-- CFM schedule is GGUF metadata: `chatterbox_s3g.flow.n_timesteps` (default 10) and `chatterbox_s3g.flow.cfg_rate` (default 0.7; `0` drops the uncond pass). Published GGUFs without these keys keep the defaults bit-exactly; override at load via `codec_model_load_from_file_ext` KV overrides (`tts-cli --override-kv chatterbox_s3g.flow.n_timesteps=int:4`).
-- Step sweep (English, builtin voice, CPU): ≥2 steps all Whisper CER 0; 4 steps / cfg 0.7 is 2.3× faster with VoiceEncoder cosine 0.991 vs 10 steps; 1 step collapses (cos 0.71). cfg 0 costs ~0.03 speaker cosine at any step count.
-
-## Chatterbox Turbo Status
-
-- `models/chatterbox_turbo/`: `chatterbox_turbo.gguf` (MeanFlow S3G + T3 adaptor + VoiceEncoder; `convert-to-gguf.py --checkpoint-path models/chatterbox_turbo --model-type chatterbox_s3g --lm-source models/chatterbox_turbo`) and `gpt2_backbone.gguf` (`convert-backbone-to-gguf.py --model-id models/chatterbox_turbo --llama-cpp common/third-party/llama.cpp`).
-- T3 is GPT-2 medium (native llama.cpp `gpt2` arch, learned wpe). Its `wte` rows match the shipped GPT-2 tokenizer (50257 BPE + 19 paralinguistic tags like `[laugh]`), so the backbone GGUF carries the real text tokenizer: the runner does codec-side `punc_norm` (`codec_lm_chatterbox_normalize_text`) then `llama_tokenize(parse_special=true)`. Token ids match HF.
-- Adaptor layout flags (`codec.lm.chatterbox.*`, defaults = Llama T3): `variant=turbo`, `use_perceiver=false`, `has_emotion_cond=false`, `learned_pos_emb=false`, `wrap_text_tokens=false`, `n_speech_bos=1`, `backbone_tokenizer=true`; speech head has `lm.heads_0.bias`. Cond rows = spkr_enc + 375 raw `speech_emb` rows (376); prompt = cond | text | BOS.
-- Sampling defaults live in GGUF (`codec.lm.chatterbox.sampling.*`): single lane, temp 0.8 → top-k 1000 → top-p 0.95 → rep 1.2 (HF warper order, penalty last, history excludes BOS). Three `S3GEN_SIL`(4299) codes are appended before S3G.
-- Parity: greedy T3 token sequence identical to PyTorch; e2e Whisper CER 0 on 8/9 (3 sentences × 3 seeds, one 0.078 sampling miss), VoiceEncoder cosine to the builtin voice 0.93–0.96. ~3.4× faster end-to-end than Llama Chatterbox on CPU (3–4 s vs 11–14 s per sentence, 16 threads).
-- Builtin voice only for the full path (S3G has no ref_wav path; ref audio only swaps the VE speaker row, as for the Llama T3).
-
-## NeuTTS-Air / Nano Status
-
-- Type A single-codebook TOKEN LM: the llama.cpp backbone emits `<|speech_N|>` tokens directly (NeuCodec FSQ code space, 65536 codes); NeuCodec decodes them. NeuTTS is detected + the audio-token range derived from the backbone vocab at runtime (`detect_neutts` / `neutts_audio_token_range` in tts_runner.cpp) — NO codec-gguf metadata.
-- ICL prompt (verbatim from `neutts/neutts.py::_ggml_prompt`, pinned in docs/superpowers/notes/neutts-facts.md): `user: Convert the text to speech:<|TEXT_PROMPT_START|>{ph(ref)} {ph(input)}<|TEXT_PROMPT_END|>\nassistant:<|SPEECH_GENERATION_START|>` + ref `<|speech_N|>` codes (NeuCodec-encoded ref audio); stop `<|SPEECH_GENERATION_END|>`. ref_text/input phonemized separately (espeak-ng en-us, preserve_punctuation, with_stress), joined by one space.
-- Decode: `run_token_single_cb` (KIND_TOKEN_SINGLE_CB) — prefill + constrained AR (flat mask = speech ∪ eos) + a min-length guard (default 25 frames, `--min-len` overrides) that forbids eos early to prevent early-eos near-silence.
-- E2E round-trip (tests/e2e/ttscli_synthesize_smoke.py; input phonemized in python, espeak OFF): **neutts-air CER 0.000** (verbatim, robust across seeds); **neutts-nano CER 0.147 @ seed=1** (verbatim + a Whisper tail-hallucination).
-- Codec: uses `models/distill_neucodec` (NOT base). codec.cpp's BASE NeuCodec ENCODER is unimplemented; distill shares the FSQ code space AND decoder, so ref-encode works and decoded output is correct. Canonical base `models/neucodec/neucodec.gguf` fails at ref-encode with a loud actionable error. (Implementing the base encoder is a possible follow-up but not needed for round-trip.)
-- Known limitation: nano is seed-fragile — ~2/6 seeds collapse to near-silence (the forced non-eos tokens are varied but decode to silence: a model-level anti-collapse issue, not the length guard). air is robust. Pin a known-good seed for nano.
-- espeak phonemization inside tts-cli is opt-in (`CODEC_TTS_ESPEAK`, default OFF; needs libespeak-ng-dev). The validated path pre-phonemizes in python.
-
-## OuteTTS-1.0 Status
-
-- Type A **multi-codebook** token LM: the backbone (OuteTTS-1.0-0.6B = plain qwen3, standard 1D RoPE, NO MRoPE; also Llama-1B) emits a word-aligned stream of ordinary vocab tokens — per frame `<|code|><|c1_N|><|c2_N|>` (2 DAC codebooks) interleaved with `<|word_start|>`/word text/`<|features|>`/`<|t_|>`/energy/pitch/`<|word_end|>`. Decoded by the shared DAC codec.
-- Reuses the shared Type A path EXTENDED to n_q≥1: `audio_lm_set_audio_token_ranges` (per-codebook ranges + sentinel) + the multi-cb `observe_token` accumulator (frame-major `[t*n_cb+q]`) + `run_token_single_cb` in **free-generation mode** (`constrain_audio_mask=false`: empty logit-bias so the interleaved structural tokens pass; NeuTTS n_q=1 keeps the flat mask, byte-identical). rep-penalty 1.1 / window 64.
-- Detection `detect_outetts_version → V3`; range derived from vocab (`<|c1_0|>`=151669, `<|c2_0|>`=152694, `<|code|>`=156730, `<|audio_end|>`=156729 for 0.6B). Raw text, NO phonemization. Bundled default speaker `assets/speakers/en-female-1-neutral.json` (Apache-2.0) is the ICL prefix; no runtime encode/aligner (voice-cloning is a follow-up).
-- Codec: `models/output/ibm-research--DAC.speech-F32.gguf` (24 kHz, hop=320, n_q=2, cb=1024; decode `[1,2,n_frames]`) — parity MATCH, no new gguf.
-- E2E round-trip (tests/e2e/ttscli_synthesize_smoke.py, raw text): **OuteTTS-1.0-0.6B CER 0.000 @ seed=1** (bit-exact), stop=eos.
-- Known minor: eos-emission is seed-sensitive — content is robust across seeds (CER ~0.0–0.05) but non-seed-1 runs may not emit a clean `<|audio_end|>` and stop=max_frames (correct audio, wasted compute). Pin a good seed. Follow-ups: investigate eos robustness (grammar / lower default max-frames), a `--speaker` override flag, and Llama-OuteTTS-1.0-1B.
-- Contract pinned in `docs/superpowers/notes/outetts10-facts.md`.
