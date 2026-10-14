@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
+
+#define POCKETFFT_NO_MULTITHREADING
+#include "../third_party/pocketfft/pocketfft_hdronly.h"
 
 bool codec_runtime_istft_from_head(
     const std::vector<float> & head,
@@ -46,37 +50,40 @@ bool codec_runtime_istft_from_head(
     const int32_t out_size = (n_frames - 1) * hop + n_fft;
     std::vector<float> y((size_t) out_size, 0.0f);
     std::vector<float> env((size_t) out_size, 0.0f);
-    std::vector<float> frame((size_t) n_fft, 0.0f);
-
-    for (int32_t ti = 0; ti < n_frames; ++ti) {
-        for (int32_t n = 0; n < n_fft; ++n) {
-            float sum = 0.0f;
-            if (!skip_dc_nyquist) {
-                float mag0 = std::exp(head[(size_t) 0 + (size_t) out_dim * (size_t) ti]);
-                if (mag0 > 1e2f) mag0 = 1e2f;
-                const float re0 = mag0 * std::cos(head[(size_t) n_bins + (size_t) out_dim * (size_t) ti]);
-                sum += re0;
-                float magn = std::exp(head[(size_t) (n_bins - 1) + (size_t) out_dim * (size_t) ti]);
-                if (magn > 1e2f) magn = 1e2f;
-                const float ren = magn * std::cos(head[(size_t) (2 * n_bins - 1) + (size_t) out_dim * (size_t) ti]);
-                sum += ren * ((n & 1) ? -1.0f : 1.0f);
-            }
-            for (int32_t k = 1; k < n_bins - 1; ++k) {
-                float mag = std::exp(head[(size_t) k + (size_t) out_dim * (size_t) ti]);
+    // Per frame: inverse real FFT of the (mag, phase) spectrum, then window and
+    // overlap-add. The plan (twiddle factors) is built once per call.
+    try {
+        const pocketfft::detail::pocketfft_r<float> plan((size_t) n_fft);
+        std::vector<float> frame((size_t) n_fft);
+        for (int32_t ti = 0; ti < n_frames; ++ti) {
+            const float * h = head.data() + (size_t) out_dim * (size_t) ti;
+            // FFTPACK halfcomplex layout: [r0, r1, i1, ..., r_{N/2-1}, i_{N/2-1}, r_{N/2}].
+            // DC / Nyquist imaginary parts are dropped (real output).
+            for (int32_t k = 0; k < n_bins; ++k) {
+                float mag = std::exp(h[k]);
                 if (mag > 1e2f) mag = 1e2f;
-                const float ph = head[(size_t) (n_bins + k) + (size_t) out_dim * (size_t) ti];
-                const float re = mag * std::cos(ph);
-                const float im = mag * std::sin(ph);
-                const float ang = 2.0f * pi * (float) k * (float) n / (float) n_fft;
-                sum += 2.0f * (re * std::cos(ang) - im * std::sin(ang));
+                const float re = mag * std::cos(h[n_bins + k]);
+                if (k == 0) {
+                    frame[0] = skip_dc_nyquist ? 0.0f : re;
+                } else if (k == n_bins - 1) {
+                    frame[(size_t) (n_fft - 1)] = skip_dc_nyquist ? 0.0f : re;
+                } else {
+                    frame[(size_t) (2 * k - 1)] = re;
+                    frame[(size_t) (2 * k)] = mag * std::sin(h[n_bins + k]);
+                }
             }
-            frame[(size_t) n] = (sum / (float) n_fft) * win[(size_t) n];
+            plan.exec(frame.data(), 1.0f / (float) n_fft, /*fwd=*/false);
+            const int32_t off = ti * hop;
+            for (int32_t n = 0; n < n_fft; ++n) {
+                y[(size_t) (off + n)] += frame[(size_t) n] * win[(size_t) n];
+                env[(size_t) (off + n)] += win[(size_t) n] * win[(size_t) n];
+            }
         }
-        const int32_t off = ti * hop;
-        for (int32_t n = 0; n < n_fft; ++n) {
-            y[(size_t) (off + n)] += frame[(size_t) n];
-            env[(size_t) (off + n)] += win[(size_t) n] * win[(size_t) n];
+    } catch (const std::exception & e) {
+        if (err != nullptr) {
+            *err = std::string("ISTFT failed: ") + e.what();
         }
+        return false;
     }
 
     const int32_t out_begin = std::max(0, pad);
