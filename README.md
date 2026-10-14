@@ -119,6 +119,10 @@ cmake --build build -j
 
 MIT
 
+Third-party code bundled in this repository:
+
+- [pocketfft](https://github.com/mreineck/pocketfft) (header-only FFT, used by the host ISTFT) — BSD-3-Clause, see `src/third_party/pocketfft/LICENSE.md`. Binary distributions must reproduce its copyright notice and disclaimer.
+
 ---
 
 <p align="center">
