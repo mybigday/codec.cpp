@@ -203,6 +203,13 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
         return false;
     }
 
+    // |round(x_comp)| <= levels // 2 = scale.
+    std::vector<float> scale_v;
+    if (!codec_tensor_as_vec_f32(codec_model_get_tensor(p->model, nemo_fsq_name("scale")), &scale_v) || scale_v.empty()) {
+        return false;
+    }
+    const int32_t round_max = (int32_t) *std::max_element(scale_v.begin(), scale_v.end());
+
     ggml_tensor * tokens = nullptr;
     const int32_t t = (int32_t) x->ne[0];
     for (int32_t g = 0; g < p->n_q; ++g) {
@@ -213,7 +220,7 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
         ggml_tensor * x_tanh = ggml_tanh(ctx_eval, x_add);
         ggml_tensor * x_mul = ggml_mul(ctx_eval, x_tanh, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_out_scale, 1, p->codebook_dim), x_g));
         ggml_tensor * x_comp = ggml_sub(ctx_eval, x_mul, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_out_offset, 1, p->codebook_dim), x_g));
-        ggml_tensor * x_round = ggml_round(ctx_eval, x_comp);
+        ggml_tensor * x_round = codec_op_round_bounded(ctx_eval, x_comp, round_max);
         ggml_tensor * x_norm = ggml_div(ctx_eval, x_round, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_scale, 1, p->codebook_dim), x_g));
 
         ggml_tensor * x_nonneg = ggml_add(ctx_eval, ggml_mul(ctx_eval, x_norm, ggml_repeat(ctx_eval, ggml_reshape_2d(ctx_eval, t_scale, 1, p->codebook_dim), x_g)),

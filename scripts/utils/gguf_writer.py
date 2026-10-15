@@ -36,6 +36,7 @@ TENSOR_TYPE_MAP = {
     "Q5_K": 13,   # Q5_K_M uses this
     "Q5_K_M": 13, # Alias for Q5_K (5-bit K-quants variant)
     "Q6_K": 14,
+    "I32": 26,
 }
 
 
@@ -150,6 +151,8 @@ class GGUFWriter:
                 st_dtype = "F32"
             elif dtype_name == "float16":
                 st_dtype = "F16"
+            elif dtype_name == "int32":
+                st_dtype = "I32"
             else:
                 raise ValueError(f"Unsupported dtype: {arr.dtype} ({name})")
 
@@ -163,6 +166,8 @@ class GGUFWriter:
             if st_dtype == "F16" and arr.dtype != np.float16:
                 arr = arr.astype(np.float16)
             data = arr.tobytes(order="C")
+        elif st_dtype == "I32":
+            data = arr.astype(np.int32).tobytes(order="C")
         else:
             # Import here to avoid circular dependency
             from .quantization import (

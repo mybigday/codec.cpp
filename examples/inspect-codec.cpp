@@ -40,6 +40,18 @@ int main(int argc, char ** argv) {
     print_optional_i32("n_mels", codec_model_n_mels(model));
     print_optional_i32("latent_dim", codec_model_latent_dim(model));
 
+    const int32_t n_spk = codec_model_n_speakers(model);
+    if (n_spk > 0) {
+        const struct codec_speaker * def = codec_get_speaker(model, nullptr);
+        std::printf("speakers (%d):", n_spk);
+        for (int32_t i = 0; i < n_spk; ++i) {
+            const char * name = codec_model_speaker_name(model, i);
+            const bool is_def = def != nullptr && codec_get_speaker(model, name) == def;
+            std::printf(" %s%s", name, is_def ? "*" : "");
+        }
+        std::printf("\n");
+    }
+
     const struct codec_gguf_metadata * meta = codec_model_metadata(model);
     if (meta != nullptr) {
         std::printf("metadata:\n");

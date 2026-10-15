@@ -1,5 +1,7 @@
 #include "codec_internal.h"
 
+#include <cstdio>
+
 #include "runtime/perf_log.h"
 #include "batch/batch.h"
 #include "models/dac.h"
@@ -295,6 +297,7 @@ struct codec_decode_params codec_decode_default_params(void) {
     struct codec_decode_params result = {
         /*.n_threads =*/ 0,
         /*.n_q =*/ 0,
+        /*.speaker =*/ nullptr,
     };
 
     return result;
@@ -469,6 +472,7 @@ struct codec_model * codec_model_load_from_file_ext(
         const char * arch = gguf_get_val_str(gf, arch_id);
         if (arch != nullptr) {
             model->arch = codec_arch_from_string(arch);
+            model->arch_name = arch;
         }
     }
 
@@ -494,6 +498,15 @@ struct codec_model * codec_model_load_from_file_ext(
     if (init_st != CODEC_STATUS_SUCCESS) {
         codec_model_free(model);
         return nullptr;
+    }
+
+    {
+        std::string spk_err;
+        if (!codec_model_load_speakers(model, &spk_err)) {
+            std::fprintf(stderr, "codec_model_load: %s\n", spk_err.c_str());
+            codec_model_free(model);
+            return nullptr;
+        }
     }
 
     return model;
@@ -656,6 +669,19 @@ enum codec_status codec_decode(
 
     if (params.n_threads <= 0) {
         params.n_threads = ctx->model->n_threads;
+    }
+
+    if (params.speaker != nullptr) {
+        const codec_model * model = ctx->model;
+        if (model->vtable == nullptr || model->vtable->speaker_validate == nullptr) {
+            codec_context_set_error(ctx, "model architecture takes no speaker");
+            return CODEC_STATUS_NOT_SUPPORTED;
+        }
+        if (params.speaker->arch != model->arch_name ||
+            params.speaker->encoder_hash != model->speaker_encoder_hash) {
+            codec_context_set_error(ctx, "speaker was produced by a different model architecture or encoder");
+            return CODEC_STATUS_INVALID_ARG;
+        }
     }
 
     return codec_dispatch_decode(ctx, tokens, out_pcm, params);

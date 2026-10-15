@@ -42,6 +42,7 @@ set(CODEC_SOURCES
     src/runtime/graph.cpp
     src/runtime/graph_exec.cpp
     src/runtime/perf_log.cpp
+    src/runtime/speaker.cpp
     src/ops/safe_math.cpp
     src/ops/ggml_ops.cpp
     src/ops/lm_attn.cpp
@@ -51,6 +52,12 @@ set(CODEC_SOURCES
     src/ops/convtr1d.cpp
     src/ops/pool1d.cpp
     src/ops/local_attn.cpp
+    src/ops/audio_frontend.cpp
+    src/blocks/s3_tokenizer.cpp
+    src/blocks/campplus.cpp
+    src/blocks/xvector_sincnet.cpp
+    src/blocks/chatterbox_voice_encoder.cpp
+    src/blocks/ecapa_tdnn.cpp
     src/batch/batch.cpp
     src/models/wavtokenizer.cpp
     src/models/dac.cpp
@@ -129,6 +136,7 @@ target_include_directories(codec-example-utils
 # builds; the full backbone-driven runner lives in codec_tts_runner.
 add_library(codec_common STATIC
     common/audio_lm.cpp
+    common/kitten_text.cpp
     common/tts_runner_flow.cpp
 )
 target_include_directories(codec_common

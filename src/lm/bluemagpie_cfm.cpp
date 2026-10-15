@@ -208,7 +208,7 @@ ggml_tensor * bm_fsq(ggml_context * ctx, const codec_model * model, ggml_tensor 
     auto W  = [&](const char * s) { return codec_graph_weight(ctx, model, s); };
     auto WM = [&](const char * s) { return codec_graph_weight_mat(ctx, model, s); };
     ggml_tensor * q = ggml_tanh(ctx, lin(ctx, WM("lm.fsq.in_proj.w"), a, W("lm.fsq.in_proj.b")));
-    q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) fsq_scale)), 1.0f / (float) fsq_scale);
+    q = ggml_scale(ctx, codec_op_round_bounded(ctx, ggml_scale(ctx, q, (float) fsq_scale), fsq_scale), 1.0f / (float) fsq_scale);
     return lin(ctx, WM("lm.fsq.out_proj.w"), q, W("lm.fsq.out_proj.b"));   // (h_vox,T)
 }
 
@@ -492,7 +492,7 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
         }
         // ---- FSQ: round(tanh(in_proj(a))*s)/s then out_proj ----
         ggml_tensor * q = ggml_tanh(ctx, linW("lm.fsq.in_proj.w", a, "lm.fsq.in_proj.b"));
-        q = ggml_scale(ctx, ggml_round(ctx, ggml_scale(ctx, q, (float) I.fsq_scale)), 1.0f / (float) I.fsq_scale);
+        q = ggml_scale(ctx, codec_op_round_bounded(ctx, ggml_scale(ctx, q, (float) I.fsq_scale), I.fsq_scale), 1.0f / (float) I.fsq_scale);
         lm_hidden = linW("lm.fsq.out_proj.w", q, "lm.fsq.out_proj.b");   // (h_vox,1)
 
         // ---- RALM input = fusion_concat_proj([lm_hidden ; prev_feedback_lm]) ----

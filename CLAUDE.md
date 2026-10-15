@@ -24,6 +24,11 @@ The intended architecture is **llama.cpp-style**:
 - `src/ops/` — small wrappers around ggml ops + a few custom compositions
   - `ggml_ops.*` — layernorm/groupnorm/linear/unary/snake/pad/crop helpers
   - `conv1d.*`, `convtr1d.*` — conv wrappers (keep only if ggml lacks needed variant)
+  - `audio_frontend.*` — in-graph resampling, STFT/mel, Kaldi fbank
+- `src/blocks/` — reusable network blocks (S3TokenizerV2, CAMPPlus,
+  XVectorSincNet, Chatterbox VoiceEncoder, ECAPA-TDNN): `tensor → tensor`
+  subgraph builders that a model's or codec_lm's graph composes, never
+  standalone graphs
 - `src/batch/` — sequence-level batch container + decode loop (MVP)
 - `examples/` — demo/inspection binaries (e.g. batch decode)
 - `ggml/` — ggml submodule/subproject
@@ -81,6 +86,8 @@ Flow:
 
 Important constraints:
 - When switching to a different graph allocation, scheduler reset may be required to avoid dangling allocations (see comments in `codec_graph_prepare_io`).
+- Lookup tables a builder needs (DFT bases, resampler kernels) are graph constants: `codec_graph_const*` inside the build_fn; `codec_graph_prepare_io` writes them. Blocks stay self-contained, callers don't fill tables by hand.
+- `codec_graph_cpu_scope` pins the ops built inside it to the CPU backend while the rest of the graph offloads. Use it for precision-critical front-ends only (see the Vulkan matmul lesson below); end the scope on a non-view tensor.
 
 ---
 
@@ -95,6 +102,11 @@ Prefer directly using ggml ops when available.
 If a needed op is missing in ggml:
 1. First try composing from existing ops.
 2. If impossible/perf critical, add a custom op (CPU SIMD first) and keep a path to backend support later.
+
+**Pick ops every target backend runs — Metal and Vulkan, not just CPU.** An unsupported op does not fail: the scheduler silently moves it to CPU, splitting the graph (and a view crossing that boundary can crash). Check `ggml_metal_device_supports_op` (`ggml/src/ggml-metal/ggml-metal-device.m`) and `ggml_backend_vk_device_supports_op` before choosing an op, including their dtype/contiguity conditions. Known gaps and the replacements in `src/ops`:
+- Metal: no `ROUND`/`FLOOR` unary (`codec_op_round_bounded`: STEP-based, bit-exact with `ggml_round` incl. ties, for FSQ-style bounded inputs), `PAD` only pads at the end (`codec_op_pad_1d` prepends a zero constant), binary ops need an F32 src0 with contiguous rows.
+- Vulkan: no `PAD_REFLECT_1D` (`codec_op_pad_reflect_tc`).
+- Both: `ggml_clamp` is in-place (`codec_op_clamp_min`).
 
 ---
 
@@ -143,6 +155,7 @@ These recur often enough that they're worth checking *before* you debug a parity
 - **`codec_op_snake` clamps alpha to positive — wrong for SNAC**.  The shared helper does `clamp(alpha, eps, FLT_MAX)` (BigVGAN convention), which flips negative-alpha channels into a near-singular `1/eps` factor.  SNAC's reference formula is `(alpha + 1e-9).reciprocal()` and the trained checkpoints have negative alphas.  Use a local Snake variant that preserves sign (multiply-then-add-eps in the denominator) instead of reaching for `codec_op_snake`.
 - **codec_token_buffer uses (T, Q) interleaved layout**, not (Q, T).  `codec_example_load_npy_i32_2d_tq` transposes a (n_q, n_frames) NPY into `data[t*n_q + q]`, and the save helper expects the same.  When implementing a multi-codebook model, mirror NeuCodec/XCodec2's `tokens->data[t*n_q + q]` access pattern — `data[q*n_frames + t]` reads garbage.
 - **strict=False state-dict loads can hide silent default-init**. The HKUSTAudio/xcodec2 checkpoint stores `act.beta` (per BigVGAN) but the upstream `SnakeBeta` was renamed to `act.bias`; HF's `load_state_dict(strict=False)` silently drops the unmatched key and runs the activation with `bias=0` → effective `inv_beta = 1`. If you bake the trained beta into your converter, you'll diverge from the reference. Always cross-check `load_state_dict` reports for unexpected keys, especially when the upstream code does the load with `strict=False`.
+- **Offloaded F32 matmuls are not F32-exact**. ggml-vulkan's `matmul_f32_f32` stages tiles in fp16 shared memory whenever the device has fp16 (`GGML_PREC_F32` does not change it): ~2.5e-4 relative error. Networks shrug it off, but framed DFTs / filterbanks on raw audio don't — quiet bins come from cancelling large terms, and the following log/InstanceNorm amplifies them (speaker mel max |Δ| 0.1 → 4e-5 once pinned to CPU). Put such front-ends in a `codec_graph_cpu_scope`.
 - **clangd noise is NOT real**. The codebase shows constant `Adding 'string' to a string does not append` and `lambda has no matching call` diagnostics from clangd because there's no compile_commands.json wired up. **Trust `cmake --build`** — if cmake compiles, the code is fine.
 - **Fixed-size positional-embedding tables ⇒ the model chunks long inputs**. A `sinusoids(max_pos, d)` buffer sliced as `pos_emb[:tgt_len]` (XY-Tokenizer, Whisper-style encoders) only has `max_pos` rows; feed it a sequence longer than that and `ggml_view_2d(pos, ne0, t, …)` overruns the source and trips `GGML_ASSERT(data_size + view_offs <= ggml_nbytes(view_src))` at *graph-build* time (not compute). Before assuming a resource-sizing bug, check the reference's `forward`: if it does `pos[:tgt_len] if tgt_len < pos.shape[0] else pos`, the model is *designed* to never exceed the table — it chunks. XY-Tokenizer decode caps at `chunk_code_length = chunk_len_s·enc_sr/enc_downsample = 375` codes and HF `decode(overlap_seconds=10)` walks overlapping windows (stride `duration_code_length = 250`, keep leading `250·1920` samples per window, final trim to `total·1920`). Mirror that CPU-side loop — each window is one full decode graph — rather than growing the table (which would desync from the reference numerics). Parity check: the chunk seam has *zero* diff when the stitch is correct.
 

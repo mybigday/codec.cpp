@@ -712,7 +712,7 @@ static bool codec_x2_build_encode(ggml_context * ctx_eval, void * user_data, ggm
     };
     z = fsq_bound(z);
     z = fsq_bound(z);
-    ggml_tensor * zq = ggml_scale(ctx_eval, ggml_round(ctx_eval, z), 1.0f / half_width);
+    ggml_tensor * zq = ggml_scale(ctx_eval, codec_op_round_bounded(ctx_eval, z, 2), 1.0f / half_width);   // z in (-2.0015, 1.0015)
 
     // Codebook indices: sum over feature axis (ne[1]) of zq_scaled * basis[k].
     // basis[k] = product(levels[:k]) = (1, 4, 16, 64, 256, 1024, 4096, 16384) for levels=[4]^8.

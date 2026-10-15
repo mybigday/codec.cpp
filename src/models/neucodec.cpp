@@ -1194,7 +1194,7 @@ static bool codec_neu_build_encode(ggml_context * ctx_eval, void * user_data, gg
     z_bound = ggml_scale_bias(ctx_eval, z_bound, half_l, -offset);
     z_bound = ggml_tanh(ctx_eval, ggml_scale_bias(ctx_eval, z_bound, 1.0f, shift));
     z_bound = ggml_scale_bias(ctx_eval, z_bound, half_l, -offset);
-    ggml_tensor * zq = ggml_scale(ctx_eval, ggml_round(ctx_eval, z_bound), 1.0f / half_width);
+    ggml_tensor * zq = ggml_scale(ctx_eval, codec_op_round_bounded(ctx_eval, z_bound, 2), 1.0f / half_width);   // z in (-2.0015, 1.0015)
 
     // indices
     ggml_tensor * basis = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->codebook_dim);

@@ -134,9 +134,14 @@ void print_usage(const char * prog) {
         "\n"
         "subcommands:\n"
         "  info       --model PATH\n"
+        "  voices     --model CODEC.gguf [--speaker-file PATH.gguf]\n"
+        "             List the codec's builtin speakers (or those in a speaker\n"
+        "             file); * marks the default.\n"
         "  decode     --model PATH --codes PATH.npy --output PATH.wav [--n-threads N]\n"
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
+        "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
+        "             [--preset NAME]\n"
         "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
         "             [--cfg F] [--timesteps N] [--min-len N]\n"
         "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
@@ -148,6 +153,10 @@ void print_usage(const char * prog) {
         "             the codec_common per-step hooks end-to-end.  Flow is chosen\n"
         "             from the model's GGUF metadata.  Self-contained models\n"
         "             (Pocket-TTS FlowLM) need no backbone.  --temp 0 = greedy.\n"
+        "             Decoder speaker: --speaker-file > --ref-audio (when the codec\n"
+        "             bundles speaker encoders) > --voice (builtin) > model default;\n"
+        "             with --speaker-file, --voice picks a speaker inside the file.\n"
+        "             --save-speaker writes the one in use for reuse.\n"
         "\n"
         "  all subcommands: [--override-kv KEY=int|float|bool|str:VALUE] (repeatable)\n"
         "             overrides codec GGUF metadata at load, e.g.\n"
@@ -210,6 +219,10 @@ struct args {
     std::string text;
     std::string ref_audio;
     std::string ref_text;
+    std::string voice;
+    std::string speaker_file;
+    std::string save_speaker;
+    std::string preset;
     std::string output;
     std::string backbone;
 
@@ -250,6 +263,10 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--text")       { const char * v = need(); if (!v) return false; out->text = v;  i++; }
         else if (a == "--ref-audio")  { const char * v = need(); if (!v) return false; out->ref_audio = v; i++; }
         else if (a == "--ref-text")   { const char * v = need(); if (!v) return false; out->ref_text = v; i++; }
+        else if (a == "--voice")      { const char * v = need(); if (!v) return false; out->voice = v; i++; }
+        else if (a == "--speaker-file") { const char * v = need(); if (!v) return false; out->speaker_file = v; i++; }
+        else if (a == "--save-speaker") { const char * v = need(); if (!v) return false; out->save_speaker = v; i++; }
+        else if (a == "--preset")     { const char * v = need(); if (!v) return false; out->preset = v; i++; }
         else if (a == "--output")     { const char * v = need(); if (!v) return false; out->output = v; i++; }
         else if (a == "--backbone")   { const char * v = need(); if (!v) return false; out->backbone = v; i++; }
         else if (a == "--n-threads")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
@@ -300,6 +317,54 @@ int cmd_info(const args & a) {
     std::printf("hidden_dim:      %d\n",  codec_common::audio_lm_hidden_dim(ctx));
     std::printf("has_speaker_enc: %s\n",  codec_common::audio_lm_has_speaker_enc(ctx) ? "true" : "false");
 
+    codec_common::audio_lm_free(ctx);
+    return 0;
+}
+
+// ─── Subcommand: voices ──────────────────────────────────────────
+int cmd_voices(const args & a) {
+    codec_common::audio_lm_params p;
+    p.codec_path   = a.model;
+    p.kv_overrides = a.kv_overrides;
+    p.use_gpu      = false;
+    p.n_threads    = a.n_threads;
+
+    std::string err;
+    auto * ctx = codec_common::audio_lm_init(p, &err);
+    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
+
+    std::vector<codec_common::audio_lm_speaker_entry> list;
+    const char * source = a.model.c_str();
+    if (!a.speaker_file.empty()) {
+        source = a.speaker_file.c_str();
+        if (!codec_common::audio_lm_list_speaker_file(ctx, source, &list)) {
+            std::fprintf(stderr, "%s\n", codec_common::audio_lm_last_error(ctx));
+            codec_common::audio_lm_free(ctx);
+            return 6;
+        }
+    } else {
+        list = codec_common::audio_lm_list_codec_speakers(ctx);
+    }
+    std::printf("%s: %zu speaker(s)", source, list.size());
+    if (a.speaker_file.empty()) {
+        std::printf(", from audio: %s",
+                    codec_common::audio_lm_codec_can_speaker_from_audio(ctx) ? "yes" : "no");
+    }
+    std::printf("\n");
+    for (const auto & e : list) {
+        std::printf("  %s%s", e.name.c_str(), e.is_default ? " *" : "");
+        if (!e.ref_text.empty()) {
+            // Keep one line per speaker: cut long transcripts on a UTF-8 boundary.
+            std::string rt = e.ref_text;
+            if (rt.size() > 60) {
+                size_t cut = 60;
+                while (cut > 0 && (static_cast<unsigned char>(rt[cut]) & 0xC0) == 0x80) --cut;
+                rt = rt.substr(0, cut) + "...";
+            }
+            std::printf("  \"%s\"", rt.c_str());
+        }
+        std::printf("\n");
+    }
     codec_common::audio_lm_free(ctx);
     return 0;
 }
@@ -371,6 +436,10 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.text          = a.text;
     rp.ref_audio_path = a.ref_audio;
     rp.ref_text       = a.ref_text;
+    rp.voice          = a.voice;
+    rp.speaker_file   = a.speaker_file;
+    rp.save_speaker   = a.save_speaker;
+    rp.preset         = a.preset;
     rp.n_threads     = a.n_threads;
     rp.use_gpu       = a.use_gpu;
     rp.seed          = a.seed;
@@ -460,6 +529,7 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
 
     if (a.sub == "info")       return cmd_info(a);
+    if (a.sub == "voices")     return cmd_voices(a);
     if (a.sub == "decode")     return cmd_decode(a);
     if (a.sub == "synthesize") return cmd_synthesize(a);
 

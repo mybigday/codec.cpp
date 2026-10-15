@@ -164,6 +164,40 @@ int32_t      audio_lm_n_codebook     (const audio_lm_context * ctx);
 int32_t      audio_lm_hidden_dim     (const audio_lm_context * ctx);
 const char * audio_lm_last_error     (const audio_lm_context * ctx);
 
+// ─────────────────────────────────────────────────────────────────────
+// Decoder speaker (codec_speaker) used by audio_lm_decode_audio.
+// Default: the codec model's default speaker.  Precedence the runner applies:
+// speaker file > reference audio (when the codec can derive one) > --voice.
+// ─────────────────────────────────────────────────────────────────────
+bool audio_lm_codec_has_speakers         (const audio_lm_context * ctx);
+bool audio_lm_codec_can_speaker_from_audio(const audio_lm_context * ctx);
+bool audio_lm_set_decode_speaker         (audio_lm_context * ctx, const char * name);
+// `name` = NULL loads the file's default speaker.
+bool audio_lm_load_decode_speaker        (audio_lm_context * ctx, const char * path,
+                                          const char * name = nullptr);
+// `ref_text` (optional) is the transcript of the clip, kept on the speaker.
+bool audio_lm_decode_speaker_from_audio  (audio_lm_context * ctx, const float * pcm,
+                                          int32_t n_samples, int32_t sample_rate,
+                                          const char * ref_text = nullptr);
+bool audio_lm_save_decode_speaker        (audio_lm_context * ctx, const char * path, const char * name);
+// The speaker decode will use (the model default when none was selected;
+// NULL when the codec has no speakers), e.g. to read model-specific slots.
+const codec_speaker * audio_lm_decode_speaker(const audio_lm_context * ctx);
+
+struct audio_lm_speaker_entry {
+    std::string name;
+    std::string ref_text;
+    bool        is_default = false;
+};
+// Builtin speakers of the codec model.
+std::vector<audio_lm_speaker_entry> audio_lm_list_codec_speakers(const audio_lm_context * ctx);
+// Speakers in a speaker file (checked against the codec model like a load).
+bool audio_lm_list_speaker_file(audio_lm_context * ctx, const char * path,
+                                std::vector<audio_lm_speaker_entry> * out);
+
+// Raw codec GGUF metadata value (stringified), or NULL when absent.
+const char * audio_lm_meta_str(const audio_lm_context * ctx, const char * key);
+
 // Borrowed handle to the underlying codec_lm (NULL when none loaded).
 // Lets a host reach model-specific helpers not wrapped by codec_common
 // (e.g. the Chatterbox T3 `codec_lm_chatterbox_*` prompt/tokenizer API).

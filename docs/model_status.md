@@ -19,7 +19,7 @@
 | BlueMagpie AudioVAE | ✅ | |
 | Soprano (Vocos decoder) | ✅ | Decoder only (by design) |
 | Chatterbox-S3T | ✅ | Encoder only (by design) |
-| Chatterbox-S3G | 🟡 | Builtin conds only; no ref_wav embedding |
+| Chatterbox-S3G | ✅ | Speakers: builtin (`spk.*`), saved files, or derived from reference audio when the GGUF bundles the encoders |
 | NeuCodec | 🟡 | Base encoder unimplemented — use `distill_neucodec` for encode (same code space + decoder) |
 
 ## TTS (`tts-cli synthesize`)
@@ -32,7 +32,8 @@
 | MOSS-TTS-Realtime | ✅ | |
 | Qwen3-TTS | ✅ | Base model requires reference audio |
 | LFM2-Audio | ✅ | Must sample (greedy degenerates, as in reference) |
-| Chatterbox Turbo | 🟡 | Builtin voice only (ref audio swaps only the VE speaker row); GPU untested |
+| Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); GPU untested |
+| KittenTTS 2 | 🟡 | 47 builtin voices + voice clone; English text normalizer not ported (pass spoken text) |
 | MOSS-TTSD | 🟡 | Requires BF16 backbone (F16/Q8 → babble) |
 | NeuTTS-Air | 🟡 | Input must be pre-phonemized (in-CLI espeak is opt-in); ref encode needs `distill_neucodec` |
 | NeuTTS-Nano | 🟡 | Same as Air; seed-fragile (~1/3 seeds collapse to silence) |

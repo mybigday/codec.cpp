@@ -1650,65 +1650,72 @@ enum codec_status compose_audio_embd(codec_lm * lm, const int32_t * codes, float
     return CODEC_STATUS_SUCCESS;
 }
 
-// Host-side text-projection for the Qwen3-TTS talker prompt:
+// Qwen3-TTS talker text projection as a cached graph:
 //   out[H_out] = fc2(silu(fc1(text_embd[text_token])))
-// fc weights are stored (in, out) as ggml ne[0]=in, ne[1]=out, so
-//   y[o] = sum_i x[i] * W[i + o*in] + b[o].
-// A few tokens per prompt → cheap enough to run on the CPU directly
-// without a graph (deterministic, no per-step cost).
-static bool rda_project_text_token(rda_impl * impl, int32_t text_token,
-                                   float * out, int32_t out_cap,
-                                   std::string * err) {
-    if (!impl || !impl->tp_text_embd || !impl->tp_fc1_w || !impl->tp_fc2_w) {
-        if (err) *err = "text projection tensors not loaded";
+struct rda_text_proj_build {
+    rda_impl * impl;
+};
+
+static bool rda_build_text_proj(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
+    const auto * b = static_cast<const rda_text_proj_build *>(ud);
+    if (ctx_eval == nullptr || b == nullptr || out == nullptr) return false;
+    rda_impl * impl = b->impl;
+    ggml_tensor * tok = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, 1);
+    ggml_set_name(tok, "lm.text_proj.token");
+    ggml_tensor * x = codec_graph_cast_f32(ctx_eval, ggml_get_rows(ctx_eval, impl->tp_text_embd, tok));   // [H_text, 1]
+    x = ggml_mul_mat(ctx_eval, impl->tp_fc1_w, x);
+    if (impl->tp_fc1_b) x = ggml_add(ctx_eval, x, codec_graph_cast_f32(ctx_eval, impl->tp_fc1_b));
+    x = ggml_mul_mat(ctx_eval, impl->tp_fc2_w, ggml_silu(ctx_eval, x));
+    if (impl->tp_fc2_b) x = ggml_add(ctx_eval, x, codec_graph_cast_f32(ctx_eval, impl->tp_fc2_b));
+    ggml_set_name(x, "lm.text_proj.out");
+    *out = x;
+    return true;
+}
+
+static bool rda_project_text_token(codec_lm * lm, rda_impl * impl, int32_t text_token,
+                                   float * out, int32_t out_cap, std::string * err) {
+    if (!impl->tp_text_embd || !impl->tp_fc1_w || !impl->tp_fc2_w) {
+        *err = "text projection tensors not loaded";
         return false;
     }
     if (out_cap < impl->tp_out_dim) {
-        if (err) *err = "text projection output buffer too small";
+        *err = "text projection output buffer too small";
         return false;
     }
-    const int32_t H_in  = impl->tp_text_dim;
-    const int32_t H_mid = impl->tp_mid_dim;
-    const int32_t H_out = impl->tp_out_dim;
-
-    std::vector<float> x((size_t) H_in);
-    if (!rda_copy_embd_row(impl->tp_text_embd, text_token, H_in,
-                           x.data(), "lm.text_embd", err)) {
+    if (text_token < 0 || text_token >= impl->tp_text_embd->ne[1]) {
+        *err = "text token out of range";
         return false;
     }
-
-    // fc1: (H_in) -> (H_mid), then SiLU.
-    std::vector<float> w1((size_t) H_in * H_mid);
-    if (!codec_tensor_as_vec_f32(impl->tp_fc1_w, &w1)) {
-        if (err) *err = "failed to read text_projection.fc1.weight";
+    if (impl->compose_ctx == nullptr) {
+        codec_context * cctx = new (std::nothrow) codec_context();
+        if (!cctx) return false;
+        cctx->model   = lm->codec;
+        cctx->backend = lm->codec->backend;
+        cctx->params  = codec_context_default_params();
+        if (!codec_runtime_init(cctx, err)) {
+            delete cctx;
+            return false;
+        }
+        impl->compose_ctx = cctx;
+    }
+    rda_text_proj_build build = { impl };
+    codec_graph_eval_guard guard(impl->compose_ctx);
+    codec_graph_cache_entry * entry = nullptr;
+    codec_graph_cache_key key = {};
+    key.kind = (int32_t) CODEC_GRAPH_LM_RDA_TEXT_PROJ;
+    key.n_in = impl->tp_out_dim;
+    if (!codec_graph_cache_get_or_build(impl->compose_ctx, key, rda_build_text_proj, &build, sizeof(build),
+                                        &entry, err)) {
         return false;
     }
-    std::vector<float> b1;
-    if (impl->tp_fc1_b) { codec_tensor_as_vec_f32(impl->tp_fc1_b, &b1); }
-    std::vector<float> mid((size_t) H_mid);
-    for (int32_t o = 0; o < H_mid; ++o) {
-        double acc = b1.empty() ? 0.0 : b1[o];
-        const float * wcol = w1.data() + (size_t) o * H_in;
-        for (int32_t i = 0; i < H_in; ++i) acc += (double) x[i] * wcol[i];
-        const double v = acc;
-        mid[o] = (float) (v / (1.0 + std::exp(-v)));   // SiLU
-    }
-
-    // fc2: (H_mid) -> (H_out).
-    std::vector<float> w2((size_t) H_mid * H_out);
-    if (!codec_tensor_as_vec_f32(impl->tp_fc2_w, &w2)) {
-        if (err) *err = "failed to read text_projection.fc2.weight";
-        return false;
-    }
-    std::vector<float> b2;
-    if (impl->tp_fc2_b) { codec_tensor_as_vec_f32(impl->tp_fc2_b, &b2); }
-    for (int32_t o = 0; o < H_out; ++o) {
-        double acc = b2.empty() ? 0.0 : b2[o];
-        const float * wcol = w2.data() + (size_t) o * H_mid;
-        for (int32_t i = 0; i < H_mid; ++i) acc += (double) mid[i] * wcol[i];
-        out[o] = (float) acc;
-    }
-    return true;
+    ggml_tensor * t_tok = codec_graph_get_tensor(impl->compose_ctx, entry, "lm.text_proj.token");
+    ggml_tensor * t_out = codec_graph_get_tensor(impl->compose_ctx, entry, "lm.text_proj.out");
+    const int32_t nt = lm->codec->n_threads > 0 ? lm->codec->n_threads : 1;
+    return t_tok != nullptr && t_out != nullptr &&
+           codec_graph_prepare_io(impl->compose_ctx, entry, err) &&
+           codec_runtime_write_tensor(t_tok, &text_token, sizeof(int32_t), err) &&
+           codec_graph_compute(impl->compose_ctx, entry, nt, err) &&
+           codec_runtime_read_tensor(t_out, out, (size_t) impl->tp_out_dim * sizeof(float), err);
 }
 
 }  // namespace
@@ -1722,7 +1729,7 @@ bool codec_lm_project_text(struct codec_lm * lm, int32_t text_token,
     if (lm->kind != CODEC_LM_KIND_RESIDUAL_DEPTH_AR) return false;
     rda_impl * impl = static_cast<rda_impl *>(lm->impl);
     std::string err;
-    bool ok = rda_project_text_token(impl, text_token, out, out_cap, &err);
+    bool ok = rda_project_text_token(lm, impl, text_token, out, out_cap, &err);
     if (!ok) lm->last_error = err;
     return ok;
 }

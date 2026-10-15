@@ -11,12 +11,11 @@ struct codec_chatterbox_s3g {
     bool meanflow = false;
     int32_t n_timesteps = 10;  // chatterbox_s3g.flow.n_timesteps (MeanFlow default 2)
     float cfg_rate = 0.7f;     // chatterbox_s3g.flow.cfg_rate (ignored by MeanFlow)
-    bool has_builtin_conditioning = false;
-    int32_t builtin_prompt_token_len = 0;
-    int32_t builtin_prompt_feat_frames = 0;
-    int32_t builtin_prompt_feat_dim = 0;
-    int32_t builtin_embedding_dim = 0;
-    std::vector<int32_t> builtin_prompt_token;
+    bool has_speaker_encoder = false;
+    // LM-side speaker encoder bundled with the decoder (KittenTTS 2):
+    // "xvector_sincnet" adds slots lm_cond [lm_cond_dim] and ref_tokens.
+    std::string lm_encoder;
+    int32_t lm_cond_dim = 0;  // chatterbox_s3g.spk.has_encoder: s3t.* + s3g.cp.* + s3g.spk.mel_fb
     bool has_encoder = false;
     bool has_decoder = true;
 };

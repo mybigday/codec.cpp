@@ -16,6 +16,8 @@ except ImportError:
     snapshot_download = None
 
 from .base import BaseConverter
+from .campplus import write_campplus
+from .speaker import encoder_hash, write_speaker, write_speaker_meta
 from utils.gguf_writer import GGUFWriter
 
 
@@ -86,6 +88,56 @@ def _find_voice_encoder_checkpoint(checkpoint_dir: Path) -> Path | None:
     speaker-conditioning side (e.g. S3G-only test fixtures)."""
     candidate = checkpoint_dir / "ve.safetensors"
     return candidate if candidate.is_file() else None
+
+
+def _s3t_tensor_map(state: Dict[str, np.ndarray], n_layers: int) -> list[tuple[str, str]]:
+    """(gguf name, state key) pairs for the S3TokenizerV2 encoder under `tokenizer.`."""
+    pairs = [("s3t.mel_filters", "tokenizer._mel_filters")]
+    if "tokenizer.window" in state:
+        pairs.append(("s3t.window", "tokenizer.window"))
+    pairs += [
+        ("s3t.enc.conv1.w", "tokenizer.encoder.conv1.weight"),
+        ("s3t.enc.conv1.b", "tokenizer.encoder.conv1.bias"),
+        ("s3t.enc.conv2.w", "tokenizer.encoder.conv2.weight"),
+        ("s3t.enc.conv2.b", "tokenizer.encoder.conv2.bias"),
+    ]
+    for li in range(n_layers):
+        p = f"tokenizer.encoder.blocks.{li}"
+        d = f"s3t.enc.blk.{li}"
+        pairs += [
+            (f"{d}.attn_ln.w", f"{p}.attn_ln.weight"),
+            (f"{d}.attn_ln.b", f"{p}.attn_ln.bias"),
+            (f"{d}.attn.q.w", f"{p}.attn.query.weight"),
+            (f"{d}.attn.q.b", f"{p}.attn.query.bias"),
+            (f"{d}.attn.k.w", f"{p}.attn.key.weight"),
+            (f"{d}.attn.v.w", f"{p}.attn.value.weight"),
+            (f"{d}.attn.v.b", f"{p}.attn.value.bias"),
+            (f"{d}.attn.o.w", f"{p}.attn.out.weight"),
+            (f"{d}.attn.o.b", f"{p}.attn.out.bias"),
+            (f"{d}.attn.fsmn.w", f"{p}.attn.fsmn_block.weight"),
+            (f"{d}.mlp_ln.w", f"{p}.mlp_ln.weight"),
+            (f"{d}.mlp_ln.b", f"{p}.mlp_ln.bias"),
+            (f"{d}.mlp.fc1.w", f"{p}.mlp.0.weight"),
+            (f"{d}.mlp.fc1.b", f"{p}.mlp.0.bias"),
+            (f"{d}.mlp.fc2.w", f"{p}.mlp.2.weight"),
+            (f"{d}.mlp.fc2.b", f"{p}.mlp.2.bias"),
+        ]
+    pairs += [
+        ("s3t.q.proj.w", "tokenizer.quantizer._codebook.project_down.weight"),
+        ("s3t.q.proj.b", "tokenizer.quantizer._codebook.project_down.bias"),
+    ]
+    missing = [k for _, k in pairs if k not in state]
+    if missing:
+        raise KeyError(f"missing tokenizer tensors: {missing[:3]}")
+    return pairs
+
+
+# Reference-audio preprocessing that feeds the S3G speaker slots (S3Gen.embed_ref).
+S3T_N_LAYERS = 6
+S3G_SPEAKER_PARAMS = (
+    "chatterbox_s3g.spk.v1;resample=torchaudio_sinc_hann(width=6,rolloff=0.99);max_seconds=10;prompt_feat=mel24k(n_fft=1920,hop=480,win=1920,n_mels=80,fmin=0,fmax=8000,log_clamp=1e-5);"
+    "embedding=campplus(fbank16k,n_mels=80);prompt_token=s3tokenizer_v2(16k)"
+)
 
 
 def _load_voice_encoder_state(path: Path) -> Dict[str, np.ndarray]:
@@ -483,42 +535,8 @@ class ChatterboxS3TConverter(_BaseChatterboxConverter):
         writer.add_uint32("chatterbox_s3t.fsmn_kernel_size", int(self.config["fsmn_kernel_size"]))
         writer.add_float32("chatterbox_s3t.rope_theta", float(self.config["rope_theta"]))
 
-        def add(name: str, key: str) -> None:
-            if key not in self.state_dict:
-                raise KeyError(f"missing tokenizer tensor: {key}")
+        for name, key in _s3t_tensor_map(self.state_dict, int(self.config["audio_layer"])):
             self._add_tensor(writer, name, self.state_dict[key])
-
-        add("s3t.mel_filters", "tokenizer._mel_filters")
-        if "tokenizer.window" in self.state_dict:
-            add("s3t.window", "tokenizer.window")
-        add("s3t.enc.conv1.w", "tokenizer.encoder.conv1.weight")
-        add("s3t.enc.conv1.b", "tokenizer.encoder.conv1.bias")
-        add("s3t.enc.conv2.w", "tokenizer.encoder.conv2.weight")
-        add("s3t.enc.conv2.b", "tokenizer.encoder.conv2.bias")
-
-        n_layers = int(self.config["audio_layer"])
-        for li in range(n_layers):
-            p = f"tokenizer.encoder.blocks.{li}"
-            d = f"s3t.enc.blk.{li}"
-            add(f"{d}.attn_ln.w", f"{p}.attn_ln.weight")
-            add(f"{d}.attn_ln.b", f"{p}.attn_ln.bias")
-            add(f"{d}.attn.q.w", f"{p}.attn.query.weight")
-            add(f"{d}.attn.q.b", f"{p}.attn.query.bias")
-            add(f"{d}.attn.k.w", f"{p}.attn.key.weight")
-            add(f"{d}.attn.v.w", f"{p}.attn.value.weight")
-            add(f"{d}.attn.v.b", f"{p}.attn.value.bias")
-            add(f"{d}.attn.o.w", f"{p}.attn.out.weight")
-            add(f"{d}.attn.o.b", f"{p}.attn.out.bias")
-            add(f"{d}.attn.fsmn.w", f"{p}.attn.fsmn_block.weight")
-            add(f"{d}.mlp_ln.w", f"{p}.mlp_ln.weight")
-            add(f"{d}.mlp_ln.b", f"{p}.mlp_ln.bias")
-            add(f"{d}.mlp.fc1.w", f"{p}.mlp.0.weight")
-            add(f"{d}.mlp.fc1.b", f"{p}.mlp.0.bias")
-            add(f"{d}.mlp.fc2.w", f"{p}.mlp.2.weight")
-            add(f"{d}.mlp.fc2.b", f"{p}.mlp.2.bias")
-
-        add("s3t.q.proj.w", "tokenizer.quantizer._codebook.project_down.weight")
-        add("s3t.q.proj.b", "tokenizer.quantizer._codebook.project_down.bias")
 
         writer.write()
         self._warn_if_no_quantized()
@@ -591,6 +609,21 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         )
         self.load_from_checkpoint(ckpt_dir)
 
+    # Hooks for converters that reuse the S3G decoder with their own voices and
+    # extra speaker encoders (e.g. KittenTTS 2).
+    def _extra_speaker_encoder_tensors(self) -> list[tuple[str, np.ndarray]]:
+        return []
+
+    def _speaker_params(self) -> str:
+        return S3G_SPEAKER_PARAMS
+
+    def _write_builtin_speakers(self, writer: GGUFWriter, enc_hash: str) -> bool:
+        """Write builtin speakers + spk metadata; False = use conds.pt (default)."""
+        return False
+
+    def _write_extra_encoders(self, writer: GGUFWriter) -> None:
+        pass
+
     def convert_and_save(self, output_path: Path) -> None:
         if self.state_dict is None or self.config is None:
             raise RuntimeError("No model loaded. Call load_from_checkpoint/load_from_huggingface first.")
@@ -608,7 +641,19 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         if cfg_rate is not None:
             writer.add_float32("chatterbox_s3g.flow.cfg_rate", float(cfg_rate))
 
-        if self.conds is not None:
+        # Speakers: hash the reference-audio encoders (S3 tokenizer + CAMPPlus,
+        # plus the voice encoder when bundled) so speaker files made by a
+        # different encoder are rejected at load.
+        enc_tensors = [(k, np.asarray(v)) for k, v in self.state_dict.items()
+                       if k.startswith("tokenizer.") or k.startswith("speaker_encoder.")]
+        if self.ve_state is not None:
+            enc_tensors += [("ve." + k, v) for k, v in self.ve_state.items()]
+        enc_tensors += self._extra_speaker_encoder_tensors()
+        enc_hash = encoder_hash(enc_tensors, self._speaker_params())
+
+        if self._write_builtin_speakers(writer, enc_hash):
+            pass
+        elif self.conds is not None:
             gen_conds = self.conds.get("gen")
             if not isinstance(gen_conds, dict):
                 raise ValueError("conds.pt missing dict entry 'gen'")
@@ -626,21 +671,34 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
             if int(prompt_token_len[0]) > prompt_token.size:
                 raise ValueError("S3G builtin prompt_token_len exceeds prompt_token size")
 
-            writer.add_bool("chatterbox_s3g.has_builtin_conditioning", True)
-            writer.add_uint32("chatterbox_s3g.cond.prompt_token_len", int(prompt_token_len[0]))
-            writer.add_uint32("chatterbox_s3g.cond.prompt_feat_frames", int(prompt_feat.shape[1]))
-            writer.add_uint32("chatterbox_s3g.cond.prompt_feat_dim", int(prompt_feat.shape[2]))
-            writer.add_uint32("chatterbox_s3g.cond.embedding_dim", int(embedding.shape[1]))
-            writer.add_array("chatterbox_s3g.cond.prompt_token", prompt_token.tolist())
-            self._add_tensor(writer, "s3g.cond.prompt_feat", prompt_feat, st_dtype="F32")
-            self._add_tensor(writer, "s3g.cond.embedding", embedding, st_dtype="F32")
+            write_speaker(writer, self.architecture, "default", {
+                "prompt_token": prompt_token[: int(prompt_token_len[0])],
+                "prompt_feat": prompt_feat[0],   # [F, 80] -> ggml [80, F]
+                "embedding": embedding[0],
+            })
+            write_speaker_meta(writer, self.architecture, default="default", enc_hash=enc_hash)
         else:
-            writer.add_bool("chatterbox_s3g.has_builtin_conditioning", False)
+            writer.add_string(f"{self.architecture}.spk.encoder_hash", enc_hash)
 
         flat = _materialize_state_dict(self.state_dict)
         emit = _build_s3g_tensor_map(flat, meanflow=meanflow)
         for gguf_name, arr in emit:
             self._add_tensor(writer, gguf_name, arr)
+
+        # Reference-audio speaker encoders (codec_speaker_from_audio): S3
+        # tokenizer for prompt_token, CAMPPlus for the x-vector, and the
+        # Matcha mel filterbank for prompt_feat.
+        if any(k.startswith("tokenizer.") for k in self.state_dict) and \
+                any(k.startswith("speaker_encoder.") for k in self.state_dict):
+            for name, key in _s3t_tensor_map(self.state_dict, S3T_N_LAYERS):
+                self._add_tensor(writer, name, self.state_dict[key])
+            write_campplus(lambda n, a: self._add_tensor(writer, n, a, st_dtype="F32"),
+                           self.state_dict, "speaker_encoder.", "s3g.cp")
+            from librosa.filters import mel as librosa_mel
+            mel_fb = librosa_mel(sr=24000, n_fft=1920, n_mels=80, fmin=0, fmax=8000).astype(np.float32)
+            self._add_tensor(writer, "s3g.spk.mel_fb", mel_fb, st_dtype="F32")
+            writer.add_bool("chatterbox_s3g.spk.has_encoder", True)
+        self._write_extra_encoders(writer)
 
         if self.lm_source is not None:
             from .lm_adaptor import dump_lm_into

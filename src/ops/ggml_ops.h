@@ -21,8 +21,22 @@ ggml_tensor * codec_op_linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
 ggml_tensor * codec_op_linear_tc(ggml_context * ctx, ggml_tensor * x_tc, ggml_tensor * w, ggml_tensor * b);
 ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha, float eps);
 ggml_tensor * codec_op_snake_beta(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha, ggml_tensor * inv_beta, float eps);
+// Zero padding along ne[0]. Left padding prepends a zero constant (Metal's PAD
+// only pads at the end), so call it from a graph build_fn.
 ggml_tensor * codec_op_pad_1d(ggml_context * ctx, ggml_tensor * x, int32_t pad_left, int32_t pad_right);
 ggml_tensor * codec_op_pad_1d_replicate(ggml_context * ctx, ggml_tensor * x, int32_t pad_left, int32_t pad_right);
+// Reflect padding of x [t, c] along t (torch "reflect": the edge sample is
+// not repeated) as a gather, so it also runs on backends without
+// PAD_REFLECT_1D (Vulkan). Call from a graph build_fn (index constant).
+ggml_tensor * codec_op_pad_reflect_tc(ggml_context * ctx, ggml_tensor * x_tc, int32_t pad_left, int32_t pad_right);
+// max(x, lo). Unlike ggml_clamp (an in-place view of x), safe on a tensor
+// that lives on another backend.
+ggml_tensor * codec_op_clamp_min(ggml_context * ctx, ggml_tensor * x, float lo);
+// round(x) for inputs with |round(x)| <= max_abs (FSQ after a tanh bound),
+// built from STEP since Metal has no ROUND: counts the half-integer
+// thresholds x reaches on each side. Matches ggml_round / roundf exactly,
+// ties included (away from zero; FSQ outputs do land on ties).
+ggml_tensor * codec_op_round_bounded(ggml_context * ctx, ggml_tensor * x, int32_t max_abs);
 ggml_tensor * codec_op_causal_crop_1d(ggml_context * ctx, ggml_tensor * x, int32_t target_t);
 ggml_tensor * codec_op_crop_1d(ggml_context * ctx, ggml_tensor * x, int32_t crop_left, int32_t crop_right);
 ggml_tensor * codec_op_channel_scale(ggml_context * ctx, ggml_tensor * x, ggml_tensor * scale);

@@ -304,6 +304,11 @@ bool codec_graph_prepare_io(
     }
 
     ggml_backend_sched_reset(ctx->sched);
+    if (ctx->cpu_backend != nullptr && !codec_backend_is_cpu(ctx->backend)) {
+        for (ggml_tensor * node : ctx->eval_cpu_nodes) {
+            ggml_backend_sched_set_tensor_backend(ctx->sched, node, ctx->cpu_backend);
+        }
+    }
     if (!ggml_backend_sched_alloc_graph(ctx->sched, ctx->eval_graph)) {
         if (error != nullptr) {
             *error = "failed to allocate graph in scheduler";
@@ -311,6 +316,10 @@ bool codec_graph_prepare_io(
         return false;
     }
     ctx->eval_graph_allocated = true;
+
+    for (const codec_graph_const_input & c : ctx->eval_consts) {
+        ggml_backend_tensor_set(c.tensor, c.data.data(), 0, c.data.size());
+    }
 
     {
         char det[80];

@@ -37,7 +37,7 @@ class codec_context_params(ctypes.Structure):
 
 
 class codec_decode_params(ctypes.Structure):
-    _fields_ = [("n_threads", ctypes.c_int32), ("n_q", ctypes.c_int32)]
+    _fields_ = [("n_threads", ctypes.c_int32), ("n_q", ctypes.c_int32), ("speaker", ctypes.c_void_p)]
 
 
 class codec_pcm_buffer(ctypes.Structure):

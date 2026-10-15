@@ -3,11 +3,14 @@
 #include "conv1d.h"
 #include "lm_attn.h"
 #include "rope.h"
+#include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <string>
+#include <vector>
 
 ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op op) {
     if (ctx == nullptr || x == nullptr) {
@@ -192,7 +195,72 @@ ggml_tensor * codec_op_pad_1d(ggml_context * ctx, ggml_tensor * x, int32_t pad_l
     if (ctx == nullptr || x == nullptr || pad_left < 0 || pad_right < 0) {
         return nullptr;
     }
-    return ggml_pad_ext(ctx, x, pad_left, pad_right, 0, 0, 0, 0, 0, 0);
+    if (pad_left == 0) {
+        return pad_right > 0 ? ggml_pad(ctx, x, pad_right, 0, 0, 0) : x;
+    }
+    // Metal's PAD only pads at the end: prepend a zero constant instead.
+    const int64_t ne[4] = {pad_left, x->ne[1], x->ne[2], x->ne[3]};
+    const std::string name = std::string("lut.zeros.") + ggml_type_name(x->type) + "." + std::to_string(ne[0]) +
+                             "x" + std::to_string(ne[1]) + "x" + std::to_string(ne[2]) + "x" + std::to_string(ne[3]);
+    std::vector<uint8_t> zeros((size_t) (ggml_row_size(x->type, ne[0]) * ne[1] * ne[2] * ne[3]), 0);
+    ggml_tensor * z = codec_graph_const(ctx, name.c_str(), x->type, 4, ne, zeros.data());
+    if (z == nullptr) {
+        // Not inside a graph build: fall back to the native op.
+        return ggml_pad_ext(ctx, x, pad_left, pad_right, 0, 0, 0, 0, 0, 0);
+    }
+    ggml_tensor * y = ggml_concat(ctx, z, x, 0);
+    return pad_right > 0 ? ggml_pad(ctx, y, pad_right, 0, 0, 0) : y;
+}
+
+ggml_tensor * codec_op_pad_reflect_tc(ggml_context * ctx, ggml_tensor * x_tc, int32_t pad_left, int32_t pad_right) {
+    if (ctx == nullptr || x_tc == nullptr || pad_left < 0 || pad_right < 0) {
+        return nullptr;
+    }
+    const int64_t t = x_tc->ne[0];
+    if (pad_left == 0 && pad_right == 0) {
+        return x_tc;
+    }
+    if (pad_left >= t || pad_right >= t) {
+        return nullptr;
+    }
+    std::vector<int32_t> idx((size_t) (t + pad_left + pad_right));
+    for (int64_t i = 0; i < (int64_t) idx.size(); ++i) {
+        int64_t j = i - pad_left;
+        if (j < 0) j = -j;
+        if (j >= t) j = 2 * (t - 1) - j;
+        idx[(size_t) i] = (int32_t) j;
+    }
+    const std::string name = "lut.reflect." + std::to_string(t) + "." + std::to_string(pad_left) + "." +
+                             std::to_string(pad_right);
+    const int64_t ne[1] = {(int64_t) idx.size()};
+    ggml_tensor * rows = codec_graph_const(ctx, name.c_str(), GGML_TYPE_I32, 1, ne, idx.data());
+    if (rows == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, x_tc));               // [c, t]: rows are time steps
+    return ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx, x_ct, rows)));    // [t + pads, c]
+}
+
+ggml_tensor * codec_op_clamp_min(ggml_context * ctx, ggml_tensor * x, float lo) {
+    if (ctx == nullptr || x == nullptr) {
+        return nullptr;
+    }
+    return ggml_scale_bias(ctx, ggml_relu(ctx, ggml_scale_bias(ctx, x, 1.0f, -lo)), 1.0f, lo);
+}
+
+ggml_tensor * codec_op_round_bounded(ggml_context * ctx, ggml_tensor * x, int32_t max_abs) {
+    if (ctx == nullptr || x == nullptr || max_abs <= 0) {
+        return nullptr;
+    }
+    ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+    const int64_t n = ggml_nelements(xc);
+    // [max_abs, n]: every element against thresholds t = 0.5, 1.5, ...
+    // round(x) = #{t : x >= t} - #{t : -x >= t} = sum_t step(x + t) - step(t - x).
+    ggml_tensor * xr = ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, xc, 1, n), max_abs, n, 1, 1);
+    ggml_tensor * thr = ggml_arange(ctx, 0.5f, (float) max_abs, 1.0f);
+    ggml_tensor * up = ggml_sum_rows(ctx, ggml_step(ctx, ggml_add(ctx, xr, thr)));
+    ggml_tensor * dn = ggml_sum_rows(ctx, ggml_step(ctx, ggml_add(ctx, ggml_scale(ctx, xr, -1.0f), thr)));
+    return ggml_reshape(ctx, ggml_sub(ctx, up, dn), xc);
 }
 
 ggml_tensor * codec_op_pad_1d_replicate(ggml_context * ctx, ggml_tensor * x, int32_t pad_left, int32_t pad_right) {

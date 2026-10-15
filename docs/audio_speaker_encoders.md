@@ -8,6 +8,9 @@ the runtime dispatches on a `codec.speaker.encoder_arch` GGUF metadata
 string to the per-arch implementation.
 
 This document tracks which models have which level of support.
+Decoder-side voice conditioning (Chatterbox-S3G prompt mel / x-vector,
+KittenTTS 2) uses the separate `codec_speaker` API: see
+[codec_speaker.md](codec_speaker.md).
 
 ## Boundary
 
@@ -57,9 +60,11 @@ codec_status codec_lm_speaker_encode_from_embedding(
   resampler (32 learned queries cross-attend over `speech_emb +
   speech_pos_emb` of `cond_speech_tokens`).
 - **Output**: `(34, 1024)` = `[spkr_proj | perceiver_resampled (32) | emotion_proj]`.
-- **Runtime**: `src/lm/speaker_chatterbox.cpp`.  Hybrid CPU (mel + LSTM,
-  ~5.5 MB weights, runs once per ref audio) + ggml graph (cond_enc +
-  perceiver, cached by `n_ref_speech_tokens`).
+- **Runtime**: `src/lm/speaker_chatterbox.cpp`.  One cached ggml graph per
+  call: the VoiceEncoder block (`src/blocks/chatterbox_voice_encoder`: power
+  mel → overlapping partials → LSTM unrolled over 160 steps × 3 layers,
+  batched over partials) feeds cond_enc + perceiver. The `from_embedding`
+  entry builds the same graph without the VoiceEncoder.
 - **Parity**: `tests/e2e/chatterbox_speaker_smoke.py` — 34 rows corr =
   1.000000 vs `VoiceEncoder.embeds_from_wavs` + `T3CondEnc.forward`.
 - **Application example**: `examples/tts-cli synthesize --model
@@ -77,10 +82,9 @@ codec_status codec_lm_speaker_encode_from_embedding(
   `talker_input_embed` between `tts_pad_embed` placeholders and the
   `tts_bos_embed`.
 - **Output**: `(1, 1024)`.
-- **Runtime**: `src/lm/speaker_qwen3_tts.cpp`.  Pure CPU forward
-  (~5 GFLOPs once per ref clip; no big matmul, ggml graph would add
-  complexity without perf wins).  Reflect-pad reflection helper handles
-  TDNN k=5 / k=3 with arbitrary dilation.
+- **Runtime**: `src/lm/speaker_qwen3_tts.cpp`.  One cached ggml graph
+  (`src/blocks/ecapa_tdnn`); reflect "same" padding is a gather
+  (`codec_op_pad_reflect_tc`) so the convs stay on GPU backends.
 - **Parity**: `tests/e2e/qwen3_tts_speaker_smoke.py` — corr=1.000000,
   max_abs_diff < 1e-3 vs HF reference.
 - **Notes**: `codec_lm_speaker_encode_from_embedding` is a memcpy
@@ -130,7 +134,8 @@ For an audio encoder X that returns `(n_rows, hidden_dim)`:
 4. Write the runtime (`src/lm/speaker_<arch>.cpp`):
    - `<arch>_speaker_init` / `_free` / `_encode` / (optional)
      `_encode_from_emb`.
-   - One cached ggml graph for the audio-encoder forward.
+   - One cached ggml graph for the whole call (front-end + encoder +
+     conditioning); put a reusable encoder network in `src/blocks/`.
 5. Wire dispatch (`src/lm/lm.cpp`):
    - Add the new `encoder_arch` string in `codec_lm_populate_info`.
    - Add a case in each of `speaker_arch_init`, `speaker_arch_free`,

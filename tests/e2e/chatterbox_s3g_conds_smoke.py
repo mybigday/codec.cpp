@@ -77,9 +77,9 @@ def main() -> int:
 
         out = run([str(INSPECT), str(gguf)])
         assert_contains(out, "arch:       Chatterbox-S3G")
-        assert_contains(out, "chatterbox_s3g.has_builtin_conditioning = true")
-        assert_contains(out, "chatterbox_s3g.cond.prompt_feat_dim = 80")
-        assert_contains(out, "chatterbox_s3g.cond.embedding_dim = 192")
+        assert_contains(out, "speakers (1): default*")
+        assert_contains(out, "chatterbox_s3g.spk.default = default")
+        assert_contains(out, "chatterbox_s3g.spk.encoder_hash = ")
 
     print("chatterbox S3G builtin-conditioning smoke test passed")
     return 0

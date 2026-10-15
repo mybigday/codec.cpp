@@ -212,6 +212,46 @@ def main():
         greedy=False, stop_line="chatterbox AR done",
     ))
 
+    # Chatterbox Turbo voice clone: --ref-audio swaps both the T3 VoiceEncoder
+    # row and the S3G decoder speaker (codec_speaker_from_audio: S3 tokens +
+    # 24 kHz mel + CAMPPlus, derived in-library).
+    results.append(_case(
+        "chatterbox_turbo_ref",
+        REPO / "models" / "chatterbox_turbo" / "chatterbox_turbo.gguf",
+        REPO / "models" / "chatterbox_turbo" / "gpt2_backbone.gguf",
+        "Hello, this is a test of the emergency broadcast system.",
+        "en", want_stop="eos_code_c0", cer_max=0.1,
+        extra=["--seed", "42", "--max-frames", "1000",
+               "--ref-audio", str(REPO / "input_audio" / "10_2_24k.wav")],
+        greedy=False, stop_line="chatterbox AR done",
+    ))
+
+    # KittenTTS 2 — Qwen3-1.7B speech LM (ternary weights, lossless Q4_0
+    # repack) emitting S3 tokens as vocab rows, decoded by the MeanFlow S3Gen.
+    # Built-in voice: position-0 speaker row + in-context reference (voice's
+    # transcript + S3 tokens), kittenml sampling (stable preset, run/repetition
+    # penalties).  Greedy tokens match PyTorch fp32 for the bf16 backbone.
+    kt = REPO / "models" / "kitten_tts_2"
+    kt_text = "One day, a little girl named Lily found a needle in her room."
+    results.append(_case(
+        "kitten_tts2",
+        kt / "kitten_tts2.gguf", kt / "kitten_tts2_backbone-q4_0.gguf",
+        kt_text, "en", want_stop="eos", cer_max=0.1,
+        extra=["--seed", "42", "--voice", "bruno"],
+        greedy=False, stop_line="KittenTTS AR done",
+    ))
+    # Voice clone: --ref-audio derives every speaker slot in-library (S3G conds,
+    # x-vector → spk_proj row, reference S3 tokens); --ref-text enables the
+    # in-context reference prompt.
+    results.append(_case(
+        "kitten_tts2_clone",
+        kt / "kitten_tts2.gguf", kt / "kitten_tts2_backbone-q4_0.gguf",
+        kt_text, "en", want_stop="eos", cer_max=0.1,
+        extra=["--seed", "42", "--ref-audio", str(REPO / "input_audio" / "10_2_24k.wav"),
+               "--ref-text", "这恶魔甩着头发喷着口沫张牙舞爪地扑在老妇人的镜子上扼住她的脆弱的喉管"],
+        greedy=False, stop_line="KittenTTS AR done",
+    ))
+
     # BlueMagpie — continuous CFM, stops via the diffusion stop head.
     bm_bb = Path.home() / "Projects" / "llama.rn" / ".scratch" / "gguf" / "BlueMagpie-Barbet-1B-f16.gguf"
     results.append(_case(

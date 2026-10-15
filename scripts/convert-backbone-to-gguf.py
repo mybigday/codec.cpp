@@ -706,6 +706,23 @@ def prep_moshi(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
     )]
 
 
+# ---- KittenTTS 2 (Qwen3-1.7B speech LM) ----------------------------------
+
+def prep_kitten_tts2(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
+    """KittenTTS 2 keeps a plain Qwen3ForCausalLM under `lm/`, plus a
+    `spk_proj.*` speaker head that is not part of the backbone (it lives in
+    the codec GGUF, see scripts/converters/kitten_tts2.py) and is dropped.
+    Audio tokens are ordinary vocab rows; `<|speech_end|>` is the eos."""
+    lm = src / cfg.get("lm_dir", "lm")
+    sd = {k: v for k, v in load_state_dict(lm).items() if not k.startswith("spk_proj.")}
+    _save_state_dict(sd, dst)
+    shutil.copy(lm / "config.json", dst / "config.json")
+    _copy_tokenizer(lm, dst)
+    tm = cfg["token_map"]
+    _write_generation_config(dst, bos=151643, eos=int(tm["speech_end_id"]))
+    return []
+
+
 # ---------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------
@@ -719,6 +736,7 @@ PREPARERS: Dict[str, Callable[[Path, Path, dict], list[tuple[str, str]]]] = {
     "Lfm2AudioForConditionalGeneration": prep_lfm2_audio,
     "MoshiForConditionalGeneration":  prep_moshi,
     "ChatterboxT3":                   prep_chatterbox_t3,
+    "KittenTTS2":                     prep_kitten_tts2,
 }
 
 
@@ -810,6 +828,8 @@ def main() -> int:
         cfg = {"architectures": ["ChatterboxT3"]}
     else:
         cfg = load_config(src)
+        if cfg.get("type") == "KITTEN2":   # kittenml repo layout: LM under lm/
+            cfg["architectures"] = ["KittenTTS2"]
     arch = detect_arch(cfg)
     print(f"[bb] arch: {arch}", flush=True)
 

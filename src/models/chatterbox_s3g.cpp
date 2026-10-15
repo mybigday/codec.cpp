@@ -1,5 +1,9 @@
 #include "chatterbox_s3g.h"
 
+#include "../blocks/campplus.h"
+#include "../blocks/s3_tokenizer.h"
+#include "../blocks/xvector_sincnet.h"
+#include "../ops/audio_frontend.h"
 #include "../ops/conv1d.h"
 #include "../ops/convtr1d.h"
 #include "../ops/ggml_ops.h"
@@ -64,6 +68,11 @@ constexpr float   kFlowTSchedulerCosineHalfPi = 0.5f * 3.14159265358979323846f;
 // chatterbox/s3gen/decoder.py / matcha/decoder.py / matcha/transformer.py.
 constexpr int32_t kCfmInChannels = 320;        // packed [x, mu, spks, cond] = 80*4
 constexpr int32_t kCfmOutChannels = 80;
+constexpr int32_t kS3gSampleRate = 24000;   // S3GEN_SR
+constexpr int32_t kS3SampleRate = 16000;    // S3_SR (tokenizer + CAMPPlus)
+constexpr int32_t kSpkRefMaxSeconds = 10;   // DEC_COND_LEN
+constexpr int32_t kSpkMelNFft = 1920;
+constexpr int32_t kSpkMelHop = 480;
 constexpr int32_t kCfmChannels = 256;          // channels[0]
 constexpr int32_t kCfmTimeEmbedDim = kCfmChannels * 4;  // 1024
 constexpr int32_t kCfmNumMidBlocks = 12;
@@ -524,7 +533,7 @@ static ggml_tensor * codec_s3g_flow_conformer_block(
 
 struct codec_s3g_flow_build {
     int32_t t_in = 0;        // total token sequence length (prompt + speech)
-    int32_t mel_len1 = 0;    // builtin prompt_feat frame count (== 2 * prompt_token_len)
+    int32_t mel_len1 = 0;    // speaker prompt_feat frame count (2 * prompt_token_len, +1 when unpadded)
     int32_t sample_rate = 0; // S3GenSR (24000) for NSF harmonic frequencies
     const codec_model * model = nullptr;
 };
@@ -631,10 +640,11 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     ggml_set_name(mu_tc, "s3g.flow.mu");
 
     // Speaker embedding: F.normalize(embedding, dim=1) then spk_aff Linear(192, 80).
-    ggml_tensor * sp_emb = W("s3g.cond.embedding");           // ne[0]=192, ne[1]=1
+    ggml_tensor * sp_emb = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, kFlowSpkEmbedDim, 1);
+    ggml_set_name(sp_emb, "s3g.flow.spk_embedding");
     ggml_tensor * sa_w = W("s3g.flow.spk_aff.w");
     ggml_tensor * sa_b = W("s3g.flow.spk_aff.b");
-    if (sp_emb == nullptr || sa_w == nullptr || sa_b == nullptr) return false;
+    if (sa_w == nullptr || sa_b == nullptr) return false;
     // L2 normalise along the embedding dim. ggml_norm divides by RMS(x), so
     // multiply by sqrt(N) afterwards to recover the actual L2-norm-scaled vector.
     // ggml_rms_norm computes x / sqrt(mean(x^2) + eps); F.normalize divides by
@@ -649,10 +659,8 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
 
     // Cond [T_total, 80]: prepend prompt_feat (mel_len1 frames), then zeros.
     // prompt_feat ggml shape: ne[0]=80=feat_dim, ne[1]=mel_len1, ne[2]=1.
-    ggml_tensor * pf = W("s3g.cond.prompt_feat");
-    if (pf == nullptr) return false;
-    // View prompt_feat as [80, mel_len1] (drop trailing dim 1) → transpose to [mel_len1, 80].
-    ggml_tensor * pf_2d = ggml_reshape_2d(ctx_eval, pf, kCfmOutChannels, mel_len1);
+    ggml_tensor * pf_2d = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, kCfmOutChannels, mel_len1);
+    ggml_set_name(pf_2d, "s3g.flow.prompt_feat");
     ggml_tensor * pf_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, pf_2d));  // [mel_len1, 80]
     const int32_t tail = T_total - mel_len1;
     ggml_tensor * cond = ggml_pad(ctx_eval, pf_tc, tail, 0, 0, 0);
@@ -876,6 +884,252 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
     return true;
 }
 
+// ---------------- speakers ---------------------
+// Slots: prompt_token I32 [T], prompt_feat F32 [80, F] (24 kHz log-mel,
+// F = 2T or 2T+1), embedding F32 [192] (CAMPPlus x-vector).
+
+static bool codec_s3g_speaker_validate(
+        const codec_model * model, const codec_speaker * spk, std::string * err) {
+    const auto & s3g = *static_cast<const codec_chatterbox_s3g *>(model->impl);
+    const codec_speaker_slot * tok = spk->slot("prompt_token");
+    const codec_speaker_slot * feat = spk->slot("prompt_feat");
+    const codec_speaker_slot * emb = spk->slot("embedding");
+    if (tok == nullptr || feat == nullptr || emb == nullptr) {
+        *err = "Chatterbox-S3G speaker needs prompt_token, prompt_feat and embedding slots";
+        return false;
+    }
+    if (tok->type != GGML_TYPE_I32 || tok->ne[0] <= 0 || tok->nelements() != tok->ne[0]) {
+        *err = "prompt_token must be a non-empty I32 vector";
+        return false;
+    }
+    if (feat->type != GGML_TYPE_F32 || feat->ne[0] != kCfmOutChannels || feat->ne[1] <= 0 ||
+            feat->nelements() != feat->ne[0] * feat->ne[1]) {
+        *err = "prompt_feat must be F32 [80, frames]";
+        return false;
+    }
+    if (feat->ne[1] > 2 * tok->ne[0] + 1) {
+        *err = "prompt_feat has more frames than 2 * prompt_token + 1";
+        return false;
+    }
+    if (emb->type != GGML_TYPE_F32 || emb->nelements() != kFlowSpkEmbedDim) {
+        *err = "embedding must be F32 [192]";
+        return false;
+    }
+    auto tokens_in_range = [](const codec_speaker_slot * t) {
+        const auto * v = reinterpret_cast<const int32_t *>(t->data.data());
+        for (int64_t i = 0; i < t->nelements(); ++i) {
+            if (v[i] < 0 || v[i] >= kFlowVocabSize) return false;
+        }
+        return true;
+    };
+    if (!tokens_in_range(tok)) {
+        *err = "prompt_token id out of range";
+        return false;
+    }
+    if (!s3g.lm_encoder.empty()) {
+        const codec_speaker_slot * lm = spk->slot("lm_cond");
+        if (lm == nullptr || lm->type != GGML_TYPE_F32 || lm->nelements() != s3g.lm_cond_dim) {
+            *err = "speaker needs an F32 lm_cond slot of " + std::to_string(s3g.lm_cond_dim) + " values";
+            return false;
+        }
+        const codec_speaker_slot * ref = spk->slot("ref_tokens");
+        if (ref != nullptr && (ref->type != GGML_TYPE_I32 || !tokens_in_range(ref))) {
+            *err = "ref_tokens must be I32 S3 token ids";
+            return false;
+        }
+    }
+    return true;
+}
+
+// S3Gen.embed_ref as one graph: reference PCM (any rate) → resample to 24 kHz
+// and truncate to the 10 s S3Gen conditions on → matcha log-mel (prompt_feat)
+// and, at 16 kHz, S3 tokens (prompt_token) + CAMPPlus (embedding). Models with
+// `spk.lm_encoder = xvector_sincnet` (KittenTTS 2) add the LM conditioning
+// from the whole clip at 16 kHz: spk_proj(normalize(x-vector)) and the S3
+// tokens of the in-context reference.
+struct codec_s3g_speaker_build {
+    int32_t n_samples = 0;
+    int32_t sample_rate = 0;
+    int32_t with_lm = 0;
+    const codec_model * model = nullptr;
+};
+
+struct codec_s3g_speaker_lengths {
+    int64_t n24 = 0;    // 24 kHz samples after truncation
+    int64_t n16 = 0;    // 16 kHz samples of the truncated clip
+    int64_t full16 = 0; // 16 kHz samples of the whole clip (LM conditioning)
+};
+
+static codec_s3g_speaker_lengths codec_s3g_speaker_lengths_for(int64_t n, int32_t sample_rate) {
+    codec_s3g_speaker_lengths l;
+    l.n24 = std::min<int64_t>(codec_resample_out_len(n, sample_rate, kS3gSampleRate),
+                              (int64_t) kSpkRefMaxSeconds * kS3gSampleRate);
+    l.n16 = codec_resample_out_len(l.n24, kS3gSampleRate, kS3SampleRate);
+    l.full16 = codec_resample_out_len(n, sample_rate, kS3SampleRate);
+    return l;
+}
+
+static bool codec_s3g_build_speaker(ggml_context * ctx, void * user_data, ggml_tensor ** out) {
+    const auto * p = static_cast<const codec_s3g_speaker_build *>(user_data);
+    if (ctx == nullptr || p == nullptr || p->model == nullptr || out == nullptr || p->n_samples <= 0) {
+        return false;
+    }
+    const codec_s3g_speaker_lengths len = codec_s3g_speaker_lengths_for(p->n_samples, p->sample_rate);
+    const codec_s3_tokenizer_params s3t;
+
+    ggml_tensor * pcm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, p->n_samples);
+    ggml_set_name(pcm, "s3g.spk.pcm");
+
+    ggml_tensor * wav24 = codec_op_resample_sinc_hann(ctx, pcm, p->sample_rate, kS3gSampleRate);
+    if (wav24 == nullptr) return false;
+    if (ggml_nelements(wav24) > len.n24) {
+        wav24 = ggml_cont(ctx, ggml_view_1d(ctx, wav24, len.n24, 0));
+    }
+    ggml_tensor * wav16 = codec_op_resample_sinc_hann(ctx, wav24, kS3gSampleRate, kS3SampleRate);
+    ggml_tensor * mel_fb = codec_graph_weight(ctx, p->model, "s3g.spk.mel_fb");
+    if (wav16 == nullptr || mel_fb == nullptr) return false;
+
+    ggml_tensor * feat = codec_op_matcha_log_mel(ctx, wav24, mel_fb, kSpkMelNFft, kSpkMelHop);   // [80, F]
+    ggml_tensor * tokens = codec_block_s3_tokenizer(ctx, p->model, s3t, wav16);
+    ggml_tensor * emb = codec_block_campplus(ctx, p->model, "s3g.cp", wav16);
+    if (feat == nullptr || tokens == nullptr || emb == nullptr) return false;
+    ggml_set_name(feat, "s3g.spk.prompt_feat");
+    ggml_set_name(tokens, "s3g.spk.prompt_token");
+    ggml_set_name(emb, "s3g.spk.embedding");
+    ggml_set_output(feat);
+    ggml_set_output(tokens);
+
+    if (p->with_lm) {
+        ggml_tensor * full16 = codec_op_resample_sinc_hann(ctx, pcm, p->sample_rate, kS3SampleRate);
+        if (full16 == nullptr) return false;
+        ggml_tensor * lm_cond = codec_block_xvector_sincnet(ctx, p->model, "kt.xv", "kt.spk_proj", full16);
+        ggml_tensor * ref_tokens = codec_block_s3_tokenizer(ctx, p->model, s3t, full16);
+        if (lm_cond == nullptr || ref_tokens == nullptr) return false;
+        ggml_set_name(lm_cond, "s3g.spk.lm_cond");
+        ggml_set_name(ref_tokens, "s3g.spk.ref_tokens");
+        ggml_set_output(lm_cond);
+        ggml_set_output(ref_tokens);
+    }
+    *out = emb;
+    return true;
+}
+
+static enum codec_status codec_s3g_speaker_from_audio(
+        codec_context * ctx, const std::vector<float> & pcm, int32_t sample_rate, codec_speaker * out) {
+    const auto & s3g = *static_cast<const codec_chatterbox_s3g *>(ctx->model->impl);
+    if (pcm.empty() || sample_rate <= 0 || pcm.size() > (size_t) INT32_MAX) {
+        codec_context_set_error(ctx, "invalid reference audio");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const bool with_lm = s3g.lm_encoder == "xvector_sincnet";
+    const codec_s3g_speaker_lengths len = codec_s3g_speaker_lengths_for((int64_t) pcm.size(), sample_rate);
+    if (len.n24 <= (kSpkMelNFft - kSpkMelHop) / 2 || !codec_campplus_accepts(len.n16) ||
+        (with_lm && !codec_xvector_sincnet_accepts(len.full16))) {
+        codec_context_set_error(ctx, "reference audio too short for the speaker encoders");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+
+    codec_s3g_speaker_build build;
+    build.n_samples = (int32_t) pcm.size();
+    build.sample_rate = sample_rate;
+    build.with_lm = with_lm ? 1 : 0;
+    build.model = ctx->model;
+
+    std::string err;
+    codec_graph_eval_guard guard(ctx);
+    codec_graph_cache_entry * entry = nullptr;
+    if (!codec_graph_cache_get_or_build(
+            ctx, {CODEC_GRAPH_CHATTERBOX_S3G_SPEAKER, build.n_samples, build.with_lm, sample_rate, 0, 0},
+            codec_s3g_build_speaker, &build, sizeof(build), &entry, &err)) {
+        codec_context_set_error(ctx, "speaker graph: " + err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    ggml_tensor * t_pcm = codec_graph_get_tensor(ctx, entry, "s3g.spk.pcm");
+    ggml_tensor * t_tok = codec_graph_get_tensor(ctx, entry, "s3g.spk.prompt_token");
+    ggml_tensor * t_feat = codec_graph_get_tensor(ctx, entry, "s3g.spk.prompt_feat");
+    ggml_tensor * t_emb = codec_graph_get_tensor(ctx, entry, "s3g.spk.embedding");
+    ggml_tensor * t_lm = with_lm ? codec_graph_get_tensor(ctx, entry, "s3g.spk.lm_cond") : nullptr;
+    ggml_tensor * t_ref = with_lm ? codec_graph_get_tensor(ctx, entry, "s3g.spk.ref_tokens") : nullptr;
+    if (t_pcm == nullptr || t_tok == nullptr || t_feat == nullptr || t_emb == nullptr ||
+        (with_lm && (t_lm == nullptr || t_ref == nullptr))) {
+        codec_context_set_error(ctx, "invalid speaker graph IO");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    if (!codec_graph_prepare_io(ctx, entry, &err) ||
+        !codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err) ||
+        !codec_graph_compute(ctx, entry, std::max(1, ctx->model->n_threads), &err)) {
+        codec_context_set_error(ctx, "speaker graph: " + err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+
+    std::vector<int32_t> tokens((size_t) ggml_nelements(t_tok));
+    std::vector<float> feat((size_t) ggml_nelements(t_feat));
+    std::vector<float> embedding((size_t) ggml_nelements(t_emb));
+    std::vector<float> lm_cond(t_lm ? (size_t) ggml_nelements(t_lm) : 0);
+    std::vector<int32_t> ref_tokens(t_ref ? (size_t) ggml_nelements(t_ref) : 0);
+    if (!codec_runtime_read_tensor(t_tok, tokens.data(), tokens.size() * sizeof(int32_t), &err) ||
+        !codec_runtime_read_tensor(t_feat, feat.data(), feat.size() * sizeof(float), &err) ||
+        !codec_runtime_read_tensor(t_emb, embedding.data(), embedding.size() * sizeof(float), &err) ||
+        (t_lm && !codec_runtime_read_tensor(t_lm, lm_cond.data(), lm_cond.size() * sizeof(float), &err)) ||
+        (t_ref && !codec_runtime_read_tensor(t_ref, ref_tokens.data(), ref_tokens.size() * sizeof(int32_t), &err))) {
+        codec_context_set_error(ctx, "speaker graph: " + err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    // embed_ref keeps mel_len == 2 * token_len by dropping trailing tokens.
+    const int64_t n_feat = t_feat->ne[1];
+    tokens.resize((size_t) std::min<int64_t>((int64_t) tokens.size(), n_feat / 2));
+
+    const int64_t ne_tok[1] = {(int64_t) tokens.size()};
+    const int64_t ne_feat[2] = {kCfmOutChannels, n_feat};
+    const int64_t ne_emb[1] = {kFlowSpkEmbedDim};
+    codec_speaker_add_slot(out, "prompt_token", GGML_TYPE_I32, ne_tok, 1, tokens.data());
+    codec_speaker_add_slot(out, "prompt_feat", GGML_TYPE_F32, ne_feat, 2, feat.data());
+    codec_speaker_add_slot(out, "embedding", GGML_TYPE_F32, ne_emb, 1, embedding.data());
+    if (with_lm) {
+        const int64_t ne_lm[1] = {(int64_t) lm_cond.size()};
+        const int64_t ne_ref[1] = {(int64_t) ref_tokens.size()};
+        codec_speaker_add_slot(out, "lm_cond", GGML_TYPE_F32, ne_lm, 1, lm_cond.data());
+        codec_speaker_add_slot(out, "ref_tokens", GGML_TYPE_I32, ne_ref, 1, ref_tokens.data());
+    }
+    return CODEC_STATUS_SUCCESS;
+}
+
+// GGUFs converted before the speaker format carry one builtin voice as
+// `chatterbox_s3g.cond.*` metadata + `s3g.cond.*` tensors; expose it as the
+// speaker "default" so they keep decoding unchanged.
+static bool codec_s3g_add_legacy_speaker(codec_model * model) {
+    if (!codec_read_bool_kv(model->gguf, "chatterbox_s3g.has_builtin_conditioning", false)) {
+        return true;
+    }
+    std::vector<int32_t> prompt_token;
+    codec_read_i32_array_kv_vec(model->gguf, "chatterbox_s3g.cond.prompt_token", &prompt_token);
+    const int32_t tok_len = codec_read_i32_kv(model->gguf, "chatterbox_s3g.cond.prompt_token_len", 0);
+    if (tok_len <= 0 || tok_len > (int32_t) prompt_token.size()) return false;
+    prompt_token.resize((size_t) tok_len);
+
+    ggml_tensor * feat = ggml_get_tensor(model->weights, "s3g.cond.prompt_feat");
+    ggml_tensor * emb = ggml_get_tensor(model->weights, "s3g.cond.embedding");
+    if (feat == nullptr || emb == nullptr || feat->type != GGML_TYPE_F32 || emb->type != GGML_TYPE_F32 ||
+            feat->ne[0] != kCfmOutChannels || ggml_nelements(emb) != kFlowSpkEmbedDim) {
+        return false;
+    }
+    std::vector<float> feat_data((size_t) ggml_nelements(feat));
+    std::vector<float> emb_data((size_t) ggml_nelements(emb));
+    ggml_backend_tensor_get(feat, feat_data.data(), 0, ggml_nbytes(feat));
+    ggml_backend_tensor_get(emb, emb_data.data(), 0, ggml_nbytes(emb));
+
+    codec_speaker spk;
+    spk.name = "default";
+    const int64_t ne_tok[1] = {tok_len};
+    const int64_t ne_feat[2] = {kCfmOutChannels, ggml_nelements(feat) / kCfmOutChannels};
+    const int64_t ne_emb[1] = {kFlowSpkEmbedDim};
+    codec_speaker_add_slot(&spk, "prompt_token", GGML_TYPE_I32, ne_tok, 1, prompt_token.data());
+    codec_speaker_add_slot(&spk, "prompt_feat", GGML_TYPE_F32, ne_feat, 2, feat_data.data());
+    codec_speaker_add_slot(&spk, "embedding", GGML_TYPE_F32, ne_emb, 1, emb_data.data());
+    model->speakers.push_back(std::move(spk));
+    return true;
+}
+
 // ---------------- model lifecycle / vtable ---------------------
 
 enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
@@ -892,18 +1146,14 @@ enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
     s3g.n_timesteps = codec_read_i32_kv(model->gguf, "chatterbox_s3g.flow.n_timesteps",
         s3g.meanflow ? kFlowMeanflowNTimesteps : kFlowDefaultNTimesteps);
     s3g.cfg_rate = codec_read_f32_kv(model->gguf, "chatterbox_s3g.flow.cfg_rate", kFlowCfgRate);
-    s3g.has_builtin_conditioning = codec_read_bool_kv(
-        model->gguf, "chatterbox_s3g.has_builtin_conditioning", s3g.has_builtin_conditioning);
-    s3g.builtin_prompt_token_len = codec_read_i32_kv(
-        model->gguf, "chatterbox_s3g.cond.prompt_token_len", s3g.builtin_prompt_token_len);
-    s3g.builtin_prompt_feat_frames = codec_read_i32_kv(
-        model->gguf, "chatterbox_s3g.cond.prompt_feat_frames", s3g.builtin_prompt_feat_frames);
-    s3g.builtin_prompt_feat_dim = codec_read_i32_kv(
-        model->gguf, "chatterbox_s3g.cond.prompt_feat_dim", s3g.builtin_prompt_feat_dim);
-    s3g.builtin_embedding_dim = codec_read_i32_kv(
-        model->gguf, "chatterbox_s3g.cond.embedding_dim", s3g.builtin_embedding_dim);
-    codec_read_i32_array_kv_vec(model->gguf, "chatterbox_s3g.cond.prompt_token", &s3g.builtin_prompt_token);
     s3g.has_encoder = codec_read_bool_kv(model->gguf, "codec.has_encoder", s3g.has_encoder);
+    s3g.has_speaker_encoder = codec_read_bool_kv(model->gguf, "chatterbox_s3g.spk.has_encoder", false);
+    model->can_speaker_from_audio = s3g.has_speaker_encoder;
+    s3g.lm_encoder = codec_read_str_kv(model->gguf, "chatterbox_s3g.spk.lm_encoder", "");
+    s3g.lm_cond_dim = codec_read_i32_kv(model->gguf, "chatterbox_s3g.spk.lm_cond_dim", 0);
+    if (!s3g.lm_encoder.empty() && (s3g.lm_encoder != "xvector_sincnet" || s3g.lm_cond_dim <= 0)) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
     s3g.has_decoder = codec_read_bool_kv(model->gguf, "codec.has_decoder", s3g.has_decoder);
 
     model->sample_rate = s3g.sample_rate;
@@ -932,31 +1182,8 @@ enum codec_status codec_chatterbox_s3g_init(struct codec_model * model) {
         }
     }
 
-    if (s3g.has_builtin_conditioning) {
-        if (s3g.builtin_prompt_token_len <= 0 ||
-            s3g.builtin_prompt_feat_frames <= 0 ||
-            s3g.builtin_prompt_feat_dim <= 0 ||
-            s3g.builtin_embedding_dim <= 0 ||
-            s3g.builtin_prompt_token.empty() ||
-            s3g.builtin_prompt_token_len > (int32_t) s3g.builtin_prompt_token.size()) {
-            return CODEC_STATUS_INVALID_ARG;
-        }
-
-        ggml_tensor * prompt_feat = ggml_get_tensor(model->weights, "s3g.cond.prompt_feat");
-        ggml_tensor * embedding = ggml_get_tensor(model->weights, "s3g.cond.embedding");
-        if (prompt_feat == nullptr || embedding == nullptr) {
-            return CODEC_STATUS_INVALID_ARG;
-        }
-        if (prompt_feat->type != GGML_TYPE_F32 || embedding->type != GGML_TYPE_F32) {
-            return CODEC_STATUS_INVALID_ARG;
-        }
-        if (prompt_feat->ne[0] != s3g.builtin_prompt_feat_dim ||
-            prompt_feat->ne[1] != s3g.builtin_prompt_feat_frames ||
-            prompt_feat->ne[2] != 1 ||
-            embedding->ne[0] != s3g.builtin_embedding_dim ||
-            embedding->ne[1] != 1) {
-            return CODEC_STATUS_INVALID_ARG;
-        }
+    if (!codec_s3g_add_legacy_speaker(model)) {
+        return CODEC_STATUS_INVALID_ARG;
     }
 
     return CODEC_STATUS_SUCCESS;
@@ -983,19 +1210,28 @@ enum codec_status codec_chatterbox_s3g_decode(
         codec_context_set_error(ctx, "model metadata indicates no decoder");
         return CODEC_STATUS_INVALID_STATE;
     }
-    if (!s3g->has_builtin_conditioning) {
-        codec_context_set_error(ctx, "Chatterbox-S3G decode requires builtin conditioning (no ref_wav path yet)");
-        return CODEC_STATUS_NOT_SUPPORTED;
+    const codec_speaker * spk = params.speaker != nullptr
+        ? params.speaker
+        : codec_get_speaker(ctx->model, nullptr);
+    if (spk == nullptr) {
+        codec_context_set_error(ctx, "Chatterbox-S3G decode needs a speaker (model has no default speaker)");
+        return CODEC_STATUS_INVALID_ARG;
     }
-
     std::string err;
-
-    // Build the full token list: prompt_token (builtin) + speech_token (filtered).
-    std::vector<int32_t> tok_seq;
-    tok_seq.reserve(s3g->builtin_prompt_token_len + tokens->n_tokens);
-    for (int32_t i = 0; i < s3g->builtin_prompt_token_len; ++i) {
-        tok_seq.push_back(s3g->builtin_prompt_token[(size_t) i]);
+    if (params.speaker != nullptr && !codec_s3g_speaker_validate(ctx->model, spk, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INVALID_ARG;
     }
+    const codec_speaker_slot * spk_tok = spk->slot("prompt_token");
+    const codec_speaker_slot * spk_feat = spk->slot("prompt_feat");
+    const codec_speaker_slot * spk_emb = spk->slot("embedding");
+
+    // Build the full token list: prompt_token (speaker) + speech_token (filtered).
+    std::vector<int32_t> tok_seq;
+    const int32_t n_prompt = (int32_t) spk_tok->ne[0];
+    const auto * prompt = reinterpret_cast<const int32_t *>(spk_tok->data.data());
+    tok_seq.reserve((size_t) n_prompt + (size_t) tokens->n_tokens);
+    tok_seq.insert(tok_seq.end(), prompt, prompt + n_prompt);
     for (int32_t i = 0; i < tokens->n_tokens; ++i) {
         const int32_t v = tokens->data[i];
         if (v >= 0 && v < s3g->codebook_size) tok_seq.push_back(v);
@@ -1005,7 +1241,7 @@ enum codec_status codec_chatterbox_s3g_decode(
         codec_context_set_error(ctx, "empty token sequence");
         return CODEC_STATUS_INVALID_ARG;
     }
-    const int32_t mel_len1 = s3g->builtin_prompt_feat_frames;
+    const int32_t mel_len1 = (int32_t) spk_feat->ne[1];
     const int32_t T_total = T_tok * 2;
     if (mel_len1 > T_total) {
         codec_context_set_error(ctx, "prompt_feat_frames exceeds encoder output length");
@@ -1048,7 +1284,9 @@ enum codec_status codec_chatterbox_s3g_decode(
     ggml_tensor * t_hann = codec_graph_get_tensor(ctx, entry, "s3g.hift.hann");
     ggml_tensor * t_ola_w = codec_graph_get_tensor(ctx, entry, "s3g.hift.ola_w");
     ggml_tensor * t_pcm = codec_graph_get_tensor(ctx, entry, "s3g.flow.pcm");
-    if (t_tok == nullptr || t_z == nullptr ||
+    ggml_tensor * t_spk_emb = codec_graph_get_tensor(ctx, entry, "s3g.flow.spk_embedding");
+    ggml_tensor * t_prompt_feat = codec_graph_get_tensor(ctx, entry, "s3g.flow.prompt_feat");
+    if (t_tok == nullptr || t_z == nullptr || t_spk_emb == nullptr || t_prompt_feat == nullptr ||
         t_phase == nullptr || t_nsf_noise == nullptr ||
         t_basis_re_k == nullptr || t_basis_im_k == nullptr ||
         t_istft_re == nullptr || t_istft_im == nullptr ||
@@ -1083,6 +1321,8 @@ enum codec_status codec_chatterbox_s3g_decode(
     }
 
     if (!codec_runtime_write_tensor(t_tok, tok_seq.data(), tok_seq.size() * sizeof(int32_t), &err) ||
+        !codec_runtime_write_tensor(t_spk_emb, spk_emb->data.data(), spk_emb->data.size(), &err) ||
+        !codec_runtime_write_tensor(t_prompt_feat, spk_feat->data.data(), spk_feat->data.size(), &err) ||
         !codec_runtime_write_tensor(t_z, noise_z.data(), noise_z.size() * sizeof(float), &err) ||
         !codec_runtime_write_tensor(t_phase, nsf_phase.data(), nsf_phase.size() * sizeof(float), &err) ||
         !codec_runtime_write_tensor(t_nsf_noise, nsf_noise.data(), nsf_noise.size() * sizeof(float), &err) ||
@@ -1156,6 +1396,8 @@ const struct codec_model_vtable * codec_chatterbox_s3g_vtable() {
         nullptr,
         codec_chatterbox_s3g_decode,
         nullptr,
+        codec_s3g_speaker_validate,
+        codec_s3g_speaker_from_audio,
     };
     return &vtable;
 }
