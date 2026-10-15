@@ -712,6 +712,66 @@ enum codec_status codec_lm_chatterbox_compose_speech_embd(
     float *           out,
     int32_t           out_cap);
 
+// ─── CosyVoice host-orchestration helpers ───────────────────────────
+// CosyVoice (v1 300M / BreezyVoice, CosyVoice2, CosyVoice3) runs its AR
+// backbone in llama.cpp (Qwen2, or the `cosyvoice` arch for v1).  The speech
+// head + speech embedding are the generic parallel_heads_delay pair
+// (n_codebook = 1); these helpers supply the CosyVoice prompt rows.  All
+// return CODEC_STATUS_NOT_SUPPORTED (or NULL) when the model is not a
+// CosyVoice adaptor (no `codec.lm.cosyvoice.*` metadata).
+//
+// Prompt (llm.py inference):
+//   v1:    [sos] [spk row + text-encoder rows (codec_lm_cosyvoice_text_rows)] [task_id] [speech rows]
+//   v2/v3: [sos] [backbone token embeds of prompt_text ++ text]               [task_id] [speech rows]
+// The host samples from the speech-head logits and stops on any id in
+// [stop_begin, stop_end).
+struct codec_lm_cosyvoice_info {
+    int32_t version;                 // 1, 2, 3
+    int32_t hidden_dim;              // backbone hidden (1024 v1, 896 v2/v3)
+    int32_t speech_token_size;       // 4096 / 6561 (codec tokens are [0, speech_token_size))
+    int32_t n_vocab;                 // speech-head size (4097 / 6564 / 6761)
+    int32_t special_in_speech_table; // 1: sos / task_id are speech-table rows (v3)
+    int32_t sos;
+    int32_t task_id;
+    int32_t stop_begin;              // ids in [stop_begin, stop_end) end generation
+    int32_t stop_end;
+    int32_t ignore_eos_id;           // masked to -inf while step < min_len (reference quirk)
+    int32_t text_in_backbone;        // 1: tokenize + embed text with the backbone vocab
+    int32_t has_text_encoder;        // 1: v1 text side via codec_lm_cosyvoice_text_rows
+    int32_t ras_sampling;            // 1: repetition-aware sampling, 0: plain top-k
+    int32_t top_k;
+    float   top_p;
+    int32_t win_size;
+    float   tau_r;
+    float   min_token_text_ratio;    // min_len = text_len * ratio (target text only)
+    float   max_token_text_ratio;
+    int32_t n_silent_tokens;         // v3: runs > max_silent_run of these are dropped before the flow
+    const int32_t * silent_tokens;
+    int32_t max_silent_run;
+    const char * prompt_prefix;      // v3 system prompt ("" when none)
+    int32_t bopomofo_frontend;       // BreezyVoice: text expects 注音 annotations (g2pw, external)
+};
+
+const struct codec_lm_cosyvoice_info * codec_lm_cosyvoice_get_info(struct codec_lm * lm);
+
+// which = 0: sos row, 1: task_id row.  Writes hidden_dim floats.
+enum codec_status codec_lm_cosyvoice_special_embd(
+    struct codec_lm * lm, int32_t which, float * out, int32_t out_cap);
+
+// Speech-embedding rows for `codes` (prompt speech tokens, or the token
+// sampled at each step), row-major [n × hidden_dim].
+enum codec_status codec_lm_cosyvoice_speech_embd(
+    struct codec_lm * lm, const int32_t * codes, int32_t n, float * out, int32_t out_cap_rows);
+
+// v1 text side: [spk_aff(F.normalize(xvec))] ++ text_encoder_affine(
+// text_encoder(text_embedding[ids])) as row-major [rows × hidden_dim].
+// `xvec` (192-d CAMPPlus embedding) is optional; `text_ids` must be the
+// whole prompt_text ++ text sequence (the encoder is bidirectional).
+enum codec_status codec_lm_cosyvoice_text_rows(
+    struct codec_lm * lm, const int32_t * text_ids, int32_t n_text,
+    const float * xvec, int32_t xvec_dim,
+    float * out, int32_t out_cap_rows, int32_t * out_rows);
+
 // ─── Pocket-TTS FlowLM host-orchestration helpers (CODEC_LM_KIND_FLOW_LM) ───
 // FlowLM is self-contained: the AR transformer, text LUT, LSD flow head and EOS
 // head all live in the codec GGUF, so there is no llama.cpp backbone.  The host

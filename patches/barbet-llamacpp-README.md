@@ -17,16 +17,17 @@ plumbing the patch may stop applying, at which point re-pin to a newer commit.
 
 The patch is applied **by CMake**, not by hand: configuring codec.cpp with the
 `tts-cli` example enabled (`CODEC_BUILD_TTS_CLI=ON`, the default) runs
-`cmake/SetupBarbetLlama.cmake`, which applies `barbet-llamacpp.patch` to the
-submodule idempotently and fails the configure if upstream has drifted so the
-patch no longer applies. You only need to check out the submodule once:
+`cmake/SetupLlamaPatches.cmake`, which applies `barbet-llamacpp.patch` (and the
+patches stacked on it, e.g. `cosyvoice-llamacpp.patch`) to the submodule
+idempotently and fails the configure if upstream has drifted so a patch no
+longer applies. You only need to check out the submodule once:
 
 ```bash
 git submodule update --init common/third-party/llama.cpp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # applies the patch
 ```
 
-Pass `-DCODEC_BARBET_PATCH=OFF` to skip the patch step, or
+Pass `-DCODEC_LLAMA_PATCHES=OFF` to skip the patch step, or
 `-DCODEC_BUILD_TTS_CLI=OFF` to drop the TTS path (and its Barbet setup) entirely.
 
 Check how far the pin has drifted from upstream master:

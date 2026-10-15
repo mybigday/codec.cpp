@@ -25,8 +25,9 @@ The intended architecture is **llama.cpp-style**:
   - `ggml_ops.*` — layernorm/groupnorm/linear/unary/snake/pad/crop helpers
   - `conv1d.*`, `convtr1d.*` — conv wrappers (keep only if ggml lacks needed variant)
   - `audio_frontend.*` — in-graph resampling, STFT/mel, Kaldi fbank
-- `src/blocks/` — reusable network blocks (S3TokenizerV2, CAMPPlus,
-  XVectorSincNet, Chatterbox VoiceEncoder, ECAPA-TDNN): `tensor → tensor`
+- `src/blocks/` — reusable network blocks (S3 tokenizer v1/v2, CAMPPlus,
+  XVectorSincNet, Chatterbox VoiceEncoder, ECAPA-TDNN, HiFT vocoder, CFM
+  U-Net + Euler/CFG solver, DiT estimator, WeNet Conformer): `tensor → tensor`
   subgraph builders that a model's or codec_lm's graph composes, never
   standalone graphs
 - `src/batch/` — sequence-level batch container + decode loop (MVP)
@@ -137,6 +138,15 @@ CPU computation that *looks* like a loop but is really feedforward (NSF source g
 - **STFT** → `ggml_conv_1d` against a `[k=n_fft, in=1, out=n_bins]` cos/-sin basis kernel (window pre-baked).
 - **iSTFT OLA** → matmul against `[n_bins, n_fft]` synthesis basis, then `ggml_conv_transpose_1d` with an identity `[k, out=1, in=n_fft]` kernel and `stride=hop` to scatter-accumulate frames; divide by an envelope reconstructed by the same convtranspose on a constant `window^2` matrix.
 - **Cumsum + nearest-upsample + step-mask** are all ggml primitives; `ggml_arange + sin/cos + concat` builds sinusoidal/rel-pos PE in-graph.
+
+### Backbone vs codec.cpp boundary (llama.cpp ↔ codec_lm)
+
+Classify every transformer in a new TTS / audio-LM model before writing code:
+
+- **Backbone = the main AR generator's transformer stack** (the model that emits audio tokens / latents step by step from text). It **always runs in llama.cpp** — even when its arch is non-stock (relative-position attention, cross-attention, custom norms). Missing arch → add a llama.cpp patch under `patches/<model>-llamacpp/`; never build a parallel AR runtime for it in codec.cpp. llama.cpp runs it embd-in / hidden-out (`docs/codec_lm.md`).
+- **codec_lm (codec.cpp)** = the adaptor between backbone and codec: audio embedding tables / compose, logit heads, and small transformers **downstream of the backbone** — per-step depth decoders (CSM / Qwen3-TTS / Moshi), flow/CFM heads, etc. Not generators in their own right.
+- **Run-once encoders upstream of the backbone** (speaker encoders, `cond_enc`, ViT-style prompt encoders) live in codec.cpp and hand the backbone prefill embeddings, as llama.cpp's MTMD does for vision encoders.
+- Self-contained exceptions (Pocket-TTS FlowLM) predate this rule; don't cite them as precedent.
 
 ### Lessons from prior model integrations
 

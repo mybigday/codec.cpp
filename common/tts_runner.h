@@ -170,6 +170,7 @@ struct tts_runner_params {
     std::string voice;               // builtin codec speaker name (codec_get_speaker)
     std::string speaker_file;        // speaker GGUF from codec_speaker_save
     std::string save_speaker;        // write the decoder speaker in use to this path
+    std::string instruct;            // CosyVoice instruct text (instruct2 mode)
     std::string preset;              // sampling preset name (KittenTTS: stable / expressive)
 
     int32_t  n_threads = 0;

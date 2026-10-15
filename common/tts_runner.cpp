@@ -43,6 +43,7 @@ static_assert(std::is_same<llama_token, int32_t>::value,
 #include <exception>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1334,6 +1335,259 @@ bool run_chatterbox(audio_lm_context * ctx, llama_context * lctx,
     return true;
 }
 
+// ── CosyVoice (v1 300M / BreezyVoice, CosyVoice2, CosyVoice3) ──────────
+//
+// Prompt (cosyvoice/llm/llm.py inference):
+//   v1:    [sos] [spk row] [text_encoder(prompt_text ++ text)] [task_id] [speech_emb(prompt tokens)]
+//   v2/v3: [sos] [backbone embed(prompt_text ++ text)]          [task_id] [speech_emb(prompt tokens)]
+// Modes follow CosyVoiceFrontEnd: zero-shot when the speaker carries prompt
+// tokens and a transcript (--ref-text), cross-lingual when it has prompt
+// tokens but no transcript (the LLM sees neither), instruct when --instruct
+// is given (instruct text replaces the prompt text, no prompt tokens), SFT
+// for x-vector-only speakers.  Sampling is the reference's ras_sampling
+// (nucleus top_p/top_k, then a full-distribution redraw when the pick
+// repeats inside the last win_size tokens) or BreezyVoice's plain top-k with
+// eos redraw; no temperature.
+
+namespace {
+
+struct CosyVoiceSampler {
+    std::mt19937 rng;
+    explicit CosyVoiceSampler(uint32_t seed) : rng(seed) {}
+
+    static void softmax(const std::vector<float> & x, std::vector<double> * p) {
+        double mx = -INFINITY;
+        for (float v : x) mx = std::max(mx, (double) v);
+        p->resize(x.size());
+        double s = 0.0;
+        for (size_t i = 0; i < x.size(); ++i) { (*p)[i] = std::isinf(x[i]) && x[i] < 0 ? 0.0 : std::exp(x[i] - mx); s += (*p)[i]; }
+        for (double & v : *p) v /= s;
+    }
+    int32_t draw(const std::vector<double> & w, const std::vector<int32_t> & ids) {
+        std::discrete_distribution<int32_t> d(w.begin(), w.end());
+        return ids[(size_t) d(rng)];
+    }
+    // nucleus_sampling: sorted probs, keep while cum < top_p and count < top_k.
+    int32_t nucleus(const std::vector<double> & p, float top_p, int32_t top_k) {
+        std::vector<int32_t> order(p.size());
+        for (size_t i = 0; i < p.size(); ++i) order[i] = (int32_t) i;
+        const size_t k = std::min<size_t>((size_t) std::max(top_k, 1), order.size());
+        std::partial_sort(order.begin(), order.begin() + (long) k, order.end(),
+                          [&](int32_t a, int32_t b) { return p[(size_t) a] > p[(size_t) b] || (p[(size_t) a] == p[(size_t) b] && a < b); });
+        std::vector<double> w;
+        std::vector<int32_t> ids;
+        double cum = 0.0;
+        for (size_t i = 0; i < k && cum < top_p; ++i) {
+            cum += p[(size_t) order[i]];
+            w.push_back(p[(size_t) order[i]]);
+            ids.push_back(order[i]);
+        }
+        return draw(w, ids);
+    }
+    int32_t full(const std::vector<double> & p) {
+        std::vector<int32_t> ids(p.size());
+        for (size_t i = 0; i < p.size(); ++i) ids[i] = (int32_t) i;
+        return draw(p, ids);
+    }
+};
+
+}  // namespace
+
+bool run_cosyvoice(audio_lm_context * ctx, llama_context * lctx, codec_lm * lm,
+                   const codec_lm_cosyvoice_info * ci, const tts_runner_params & a,
+                   int32_t hidden, int32_t max_frames, std::vector<int32_t> * out_codes,
+                   int32_t * out_frames, const char ** out_stop) {
+    const codec_speaker * spk = audio_lm_decode_speaker(ctx);
+    if (spk == nullptr) {
+        std::fprintf(stderr, "cosyvoice: no speaker (pass --ref-audio, --voice or --speaker-file)\n");
+        return false;
+    }
+    std::vector<int32_t> prompt_tokens;
+    std::vector<float> xvec;
+    {
+        enum codec_speaker_slot_type ty;
+        int64_t ne[4];
+        const void * d = nullptr;
+        if (codec_speaker_get_slot(spk, "prompt_token", &ty, ne, &d) && ty == CODEC_SPEAKER_SLOT_I32) {
+            const auto * v = static_cast<const int32_t *>(d);
+            prompt_tokens.assign(v, v + ne[0]);
+        }
+        if (codec_speaker_get_slot(spk, "embedding", &ty, ne, &d) && ty == CODEC_SPEAKER_SLOT_F32) {
+            const auto * v = static_cast<const float *>(d);
+            xvec.assign(v, v + ne[0] * ne[1]);
+        }
+    }
+    std::string ref_text = a.ref_text;
+    if (ref_text.empty() && codec_speaker_ref_text(spk) != nullptr) ref_text = codec_speaker_ref_text(spk);
+    const std::string prefix = ci->prompt_prefix != nullptr ? ci->prompt_prefix : "";
+
+    // Mode → (LLM prompt text, LLM prompt speech tokens, target text).
+    std::string prompt_text, tts_text = a.text;
+    std::vector<int32_t> llm_prompt_tokens;
+    bool llm_xvec = true;   // v1: x-vector row in the LLM prompt
+    const char * mode = "sft";
+    if (!a.instruct.empty()) {
+        // v1 frontend_instruct: instruct text as prompt text, no x-vector in
+        // the LLM ("information leakage"); v2/v3 frontend_instruct2: instruct
+        // text as prompt text, no prompt speech tokens.  The instruct text
+        // ends with <|endofprompt|> (v3 also starts with the system prompt).
+        mode = "instruct";
+        prompt_text = a.instruct;
+        llm_xvec = false;
+        if (ci->version != 1 && prompt_text.find("<|endofprompt|>") == std::string::npos) {
+            if (!prefix.empty()) prompt_text = prefix.substr(0, prefix.find("<|endofprompt|>")) + " " + prompt_text;
+            prompt_text += "<|endofprompt|>";
+        }
+    } else if (!prompt_tokens.empty() && !ref_text.empty()) {
+        mode = "zero_shot";
+        prompt_text = prefix + ref_text;
+        llm_prompt_tokens = prompt_tokens;
+    } else if (!prompt_tokens.empty()) {
+        mode = "cross_lingual";
+        tts_text = prefix + tts_text;
+    } else if (!prefix.empty()) {
+        tts_text = prefix + tts_text;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(lctx));
+    auto tokenize = [&](const std::string & s) {
+        std::vector<llama_token> t(s.size() + 16);
+        int32_t n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(), t.data(), (int32_t) t.size(), false, true);
+        if (n < 0) { t.resize((size_t) -n); n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(), t.data(), (int32_t) t.size(), false, true); }
+        t.resize((size_t) std::max(n, 0));
+        return t;
+    };
+    const std::vector<llama_token> ptxt = prompt_text.empty() ? std::vector<llama_token>() : tokenize(prompt_text);
+    const std::vector<llama_token> ttxt = tokenize(tts_text);
+    if (ttxt.empty()) { std::fprintf(stderr, "cosyvoice: empty text\n"); return false; }
+    std::vector<llama_token> all_txt(ptxt);
+    all_txt.insert(all_txt.end(), ttxt.begin(), ttxt.end());
+
+    const int32_t text_len = (int32_t) ttxt.size();
+    const int32_t min_len = (int32_t) (text_len * ci->min_token_text_ratio);
+    int32_t max_len = (int32_t) (text_len * ci->max_token_text_ratio);
+    if (max_frames > 0) max_len = std::min(max_len, max_frames);
+    std::printf("cosyvoice v%d (%s): %zu prompt-text + %d text tokens, %zu prompt speech tokens, min_len=%d max_len=%d, %s\n",
+                ci->version, mode, ptxt.size(), text_len, llm_prompt_tokens.size(), min_len, max_len,
+                ci->ras_sampling ? "ras" : "top_k");
+
+    // ---- prefill ----
+    const int32_t H = hidden;
+    std::vector<float> row((size_t) H);
+    int32_t n_past = 0;
+    if (codec_lm_cosyvoice_special_embd(lm, 0, row.data(), H) != CODEC_STATUS_SUCCESS) return false;
+    std::vector<float> head(row);   // sos [+ v1 spk row + text rows]
+    int32_t n_head = 1;
+    if (ci->text_in_backbone) {
+        if (!decode_embed_block(lctx, head.data(), H, 1, n_past)) return false;
+        n_past += 1;
+        if (!decode_tokens(lctx, all_txt, n_past, false)) return false;
+        n_past += (int32_t) all_txt.size();
+    } else {
+        std::vector<int32_t> ids(all_txt.begin(), all_txt.end());
+        const int32_t cap = (int32_t) ids.size() + 1;
+        std::vector<float> rows((size_t) cap * H);
+        int32_t n_rows = 0;
+        const bool use_xvec = llm_xvec && !xvec.empty();
+        if (codec_lm_cosyvoice_text_rows(lm, ids.data(), (int32_t) ids.size(),
+                                         use_xvec ? xvec.data() : nullptr, use_xvec ? (int32_t) xvec.size() : 0,
+                                         rows.data(), cap, &n_rows) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "cosyvoice text rows failed: %s\n", codec_lm_get_last_error(lm));
+            return false;
+        }
+        head.insert(head.end(), rows.begin(), rows.begin() + (long) n_rows * H);
+        n_head += n_rows;
+        if (!decode_embed_block(lctx, head.data(), H, n_head, n_past)) return false;
+        n_past += n_head;
+    }
+    std::vector<float> tail((size_t) (1 + llm_prompt_tokens.size()) * H);
+    if (codec_lm_cosyvoice_special_embd(lm, 1, tail.data(), H) != CODEC_STATUS_SUCCESS ||
+        codec_lm_cosyvoice_speech_embd(lm, llm_prompt_tokens.data(), (int32_t) llm_prompt_tokens.size(),
+                                       tail.data() + H, (int32_t) llm_prompt_tokens.size()) != CODEC_STATUS_SUCCESS) {
+        std::fprintf(stderr, "cosyvoice prompt rows failed: %s\n", codec_lm_get_last_error(lm));
+        return false;
+    }
+    if (!decode_embed_block(lctx, tail.data(), H, 1 + (int32_t) llm_prompt_tokens.size(), n_past)) return false;
+    n_past += 1 + (int32_t) llm_prompt_tokens.size();
+
+    // ---- AR loop ----
+    const bool greedy = a.has_temp && a.temp <= 0.0f;
+    const int32_t top_k = a.has_top_k ? a.top_k : ci->top_k;
+    const float top_p = a.has_top_p ? a.top_p : ci->top_p;
+    CosyVoiceSampler smp(a.seed);
+    std::vector<int32_t> decoded;
+    std::vector<double> prob;
+    *out_stop = "max_len";
+    for (int32_t step = 0; step < max_len; ++step) {
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (h == nullptr || !audio_lm_step_begin(ctx, h, H)) return false;
+        int32_t cb = 0, nlog = 0;
+        const float * lg = audio_lm_step_logits(ctx, &cb, &nlog);
+        if (lg == nullptr || nlog <= 0) return false;
+        std::vector<float> logits(lg, lg + nlog);
+        audio_lm_step_push_code(ctx, 0);
+        int32_t dummy = 0;
+        audio_lm_step_finish(ctx, &dummy, 1);
+
+        const bool ignore_eos = step < min_len;
+        int32_t id = 0;
+        if (greedy) {
+            if (ignore_eos) logits[(size_t) ci->ignore_eos_id] = -INFINITY;
+            id = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        } else if (ci->ras_sampling) {
+            if (ignore_eos) logits[(size_t) ci->ignore_eos_id] = -INFINITY;
+            CosyVoiceSampler::softmax(logits, &prob);
+            id = smp.nucleus(prob, top_p, top_k);
+            const int32_t win = ci->win_size;
+            int32_t rep = 0;
+            for (size_t i = decoded.size() > (size_t) win ? decoded.size() - (size_t) win : 0; i < decoded.size(); ++i) {
+                rep += decoded[i] == id;
+            }
+            if ((float) rep >= (float) win * ci->tau_r) {
+                logits[(size_t) id] = -INFINITY;
+                CosyVoiceSampler::softmax(logits, &prob);
+                id = smp.full(prob);
+            }
+        } else {
+            // TransformerLM.sampling_ids: top-k multinomial, redraw while eos is ignored.
+            CosyVoiceSampler::softmax(logits, &prob);
+            std::vector<int32_t> order(prob.size());
+            for (size_t i = 0; i < prob.size(); ++i) order[i] = (int32_t) i;
+            const size_t k = std::min<size_t>((size_t) std::max(top_k, 1), order.size());
+            std::partial_sort(order.begin(), order.begin() + (long) k, order.end(),
+                              [&](int32_t x, int32_t y) { return prob[(size_t) x] > prob[(size_t) y]; });
+            std::vector<int32_t> ids(order.begin(), order.begin() + (long) k);
+            std::vector<double> w;
+            for (int32_t i : ids) w.push_back(prob[(size_t) i]);
+            for (int32_t tries = 0; tries < 100; ++tries) {
+                id = smp.draw(w, ids);
+                if (!ignore_eos || id != ci->ignore_eos_id) break;
+            }
+        }
+        if (id >= ci->stop_begin && id < ci->stop_end) { *out_stop = "eos"; break; }
+        decoded.push_back(id);
+        (*out_frames)++;
+        if (codec_lm_cosyvoice_speech_embd(lm, &id, 1, row.data(), 1) != CODEC_STATUS_SUCCESS ||
+            !decode_embed(lctx, row.data(), H, n_past)) {
+            std::fprintf(stderr, "cosyvoice step %d decode failed\n", step);
+            return false;
+        }
+        ++n_past;
+    }
+
+    // v3 llm_job: after more than max_silent_run consecutive silent/breath
+    // tokens, further ones are dropped from the flow input (they were fed back).
+    int32_t run = 0;
+    for (int32_t id : decoded) {
+        bool silent = false;
+        for (int32_t i = 0; i < ci->n_silent_tokens; ++i) silent = silent || ci->silent_tokens[i] == id;
+        run = silent ? run + 1 : 0;
+        if (silent && ci->max_silent_run > 0 && run > ci->max_silent_run) continue;
+        if (id >= 0 && id < ci->speech_token_size) out_codes->push_back(id);
+    }
+    return true;
+}
+
 // Marshal a codec_common audio_lm_audio_output into the runner result.
 void fill_result_from_output(const audio_lm_audio_output & pcm,
                              int32_t n_frames, const char * stop,
@@ -2411,6 +2665,9 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
     cp.n_seq_max    = (uint32_t) cbx_n_seq;
     cp.embeddings   = true;
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    // CosyVoice v1's relative-position term is a KQ bias, which the
+    // flash-attention path does not take.
+    if (pi_ok && pi.host_arch == "cosyvoice") cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if (a.n_threads > 0) { cp.n_threads = a.n_threads; cp.n_threads_batch = a.n_threads; }
     llama_context * lctx = llama_init_from_model(lmodel, cp);
     if (!lctx) {
@@ -2474,6 +2731,36 @@ bool tts_runner_synthesize(const tts_runner_params & a, tts_runner_result * out)
         audio_lm_audio_output pcm;
         if (!audio_lm_decode_audio(ctx, &pcm)) {
             out->error = std::string("decode_audio failed: ") + audio_lm_last_error(ctx);
+            audio_lm_free(ctx);
+            return false;
+        }
+        fill_result_from_output(pcm, n_frames, stop_reason, out);
+        audio_lm_free(ctx);
+        return true;
+    }
+
+    // ── CosyVoice ────────────────────────────────────────────────────────
+    if (const codec_lm_cosyvoice_info * cvi = lm_handle ? codec_lm_cosyvoice_get_info(lm_handle) : nullptr) {
+        std::vector<int32_t> speech_codes;
+        int32_t n_frames = 0;
+        const char * stop_reason = "max_len";
+        bool ok = run_cosyvoice(ctx, lctx, lm_handle, cvi, a, hidden, a.max_frames, &speech_codes,
+                                &n_frames, &stop_reason);
+        llama_free(lctx);
+        llama_model_free(lmodel);
+        llama_backend_free();
+        if (!ok || speech_codes.empty()) {
+            out->error = ok ? "no speech codes generated" : std::string("cosyvoice AR failed: ") + audio_lm_last_error(ctx);
+            audio_lm_free(ctx);
+            return false;
+        }
+        std::printf("cosyvoice AR done: %d tokens (%zu to the flow), stop=%s\n",
+                    n_frames, speech_codes.size(), stop_reason);
+        audio_lm_reset(ctx);
+        audio_lm_audio_output pcm;
+        if (!audio_lm_push_codes(ctx, speech_codes.data(), (int32_t) speech_codes.size(), 1) ||
+            !audio_lm_decode_audio(ctx, &pcm)) {
+            out->error = std::string("decode failed: ") + audio_lm_last_error(ctx);
             audio_lm_free(ctx);
             return false;
         }

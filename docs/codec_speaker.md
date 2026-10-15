@@ -73,6 +73,18 @@ one FSQ boundary flip in 248 with the default F16 S3T), prompt_feat max |Δ|
 | `lm_cond` | F32 [2048] | pyannote XVectorSincNet → L2 norm → `spk_proj` (Linear + LayerNorm), full clip at 16 kHz |
 | `ref_tokens` | I32 [N] (optional) | S3 tokens of the full clip (in-context reference prompt) |
 
+## CosyVoice slots
+
+| Slot | Shape | From audio (`CosyVoiceFrontEnd`) |
+|---|---|---|
+| `prompt_token` | I32 [T] | S3 tokenizer v1 / v2 / v3 at 16 kHz (`s3t.*` bundled) |
+| `prompt_feat` | F32 [80, F] | Matcha log-mel of the 16 kHz clip resampled to 22.05 / 24 kHz (`cv.spk.mel_fb`); 24 kHz models keep F = 2T |
+| `embedding` | F32 [192] | CAMPPlus on Kaldi fbank (`cv.cp.*`, from `campplus.onnx`) |
+
+SFT voices (`spk2info.pt`) carry only `embedding` (BreezyVoice also ships
+`prompt_token` / `prompt_feat`). The transcript (`ref_text`) selects zero-shot
+over cross-lingual prompting in the LM; see [cosyvoice.md](cosyvoice.md).
+
 ## tts-cli
 
 Decoder speaker precedence: `--speaker-file` > `--ref-audio` (when the codec

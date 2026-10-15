@@ -55,6 +55,10 @@ set(CODEC_SOURCES
     src/ops/audio_frontend.cpp
     src/blocks/s3_tokenizer.cpp
     src/blocks/campplus.cpp
+    src/blocks/hift.cpp
+    src/blocks/cfm.cpp
+    src/blocks/conformer.cpp
+    src/blocks/dit.cpp
     src/blocks/xvector_sincnet.cpp
     src/blocks/chatterbox_voice_encoder.cpp
     src/blocks/ecapa_tdnn.cpp
@@ -65,6 +69,7 @@ set(CODEC_SOURCES
     src/models/qwen3_tts_tokenizer.cpp
     src/models/chatterbox_s3t.cpp
     src/models/chatterbox_s3g.cpp
+    src/models/cosyvoice.cpp
     src/models/soprano.cpp
     src/models/nemo_nano_codec.cpp
     src/models/neucodec.cpp
@@ -82,6 +87,7 @@ set(CODEC_SOURCES
     src/lm/parallel_heads_delay.cpp
     src/lm/residual_depth_ar.cpp
     src/lm/chatterbox_t3.cpp
+    src/lm/cosyvoice_lm.cpp
     src/lm/speaker_chatterbox.cpp
     src/lm/speaker_qwen3_tts.cpp
 )
@@ -174,9 +180,10 @@ target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml 
 
 option(CODEC_BUILD_TTS_CLI "Build the tts-cli example" ON)
 if(CODEC_BUILD_TTS_CLI)
-    # The TTS path uses the Barbet semantic LM in the pinned llama.cpp submodule;
-    # apply its arch patch (idempotent, skips when the submodule isn't checked out).
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupBarbetLlama.cmake)
+    # The TTS path uses backbone archs added to the pinned llama.cpp submodule
+    # (Barbet, CosyVoice v1); apply their patches (idempotent, in order, skips
+    # when the submodule isn't checked out).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupLlamaPatches.cmake)
 
     add_executable(tts-cli
         examples/tts-cli.cpp

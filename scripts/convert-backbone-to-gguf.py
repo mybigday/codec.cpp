@@ -53,6 +53,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Dict
 
+import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -723,6 +724,188 @@ def prep_kitten_tts2(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
     return []
 
 
+# ---- CosyVoice2 / CosyVoice3 (Qwen2-0.5B inside llm.pt) -------------------
+
+def _cosyvoice_special_tokens(version: int) -> list[str]:
+    """CosyVoice{2,3}Tokenizer.add_special_tokens lists (cosyvoice/tokenizer/tokenizer.py).
+    The order fixes the added-token ids (<|endofprompt|> = 151646)."""
+    import importlib.util
+    root = Path(__file__).resolve().parents[1] / ".model-src" / "cosyvoice" / "cosyvoice" / "tokenizer" / "tokenizer.py"
+    if root.is_file():
+        import ast
+        tree = ast.parse(root.read_text())
+        cls = {2: "CosyVoice2Tokenizer", 3: "CosyVoice3Tokenizer"}[version]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == cls:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Dict):
+                        keys = [k.value for k in sub.keys if isinstance(k, ast.Constant)]
+                        if "additional_special_tokens" in keys:
+                            lst = sub.values[keys.index("additional_special_tokens")]
+                            return [e.value for e in lst.elts]
+    raise SystemExit("CosyVoice special-token list not found: clone FunAudioLLM/CosyVoice into .model-src/cosyvoice")
+
+
+def prep_cosyvoice(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
+    """CosyVoice2/3 `llm.pt` wraps a Qwen2ForCausalLM under `llm.model.`; the
+    speech embedding / head (`speech_embedding`, `llm_decoder`, `llm_embedding`)
+    belong to the codec GGUF's LM adaptor. Text is tokenized by the backbone
+    vocab, so the CosyVoice special tokens are added before conversion."""
+    from transformers import AutoTokenizer
+    version = int(cfg["cosyvoice_version"])
+    sd = torch.load(src / "llm.pt", map_location="cpu", weights_only=True)
+    # lm_head is never used (the speech head is llm_decoder) and the config ties it.
+    bb = {k[len("llm.model."):]: v for k, v in sd.items()
+          if k.startswith("llm.model.") and k != "llm.model.lm_head.weight"}
+    _save_state_dict(bb, dst)
+    blank = src / "CosyVoice-BlankEN"
+    shutil.copy(blank / "config.json", dst / "config.json")
+    tok = AutoTokenizer.from_pretrained(str(blank))
+    tok.add_special_tokens({"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
+                            "additional_special_tokens": _cosyvoice_special_tokens(version)})
+    assert tok.convert_tokens_to_ids("<|endofprompt|>") == 151646
+    tok.save_pretrained(str(dst))
+    _write_generation_config(dst, bos=151643, eos=151643)
+    # The added CosyVoice specials change llama.cpp's tokenizer fingerprint;
+    # the pre-tokenizer is still Qwen2's (text IS tokenized by the backbone).
+    return [(
+        'raise NotImplementedError("BPE pre-tokenizer was not recognized - update get_vocab_base_pre()")',
+        'res = "qwen2"  # cosyvoice: Qwen2 tokenizer + CosyVoice special tokens',
+    ), (
+        # The byte-level decoder mangles non-ASCII added tokens ("[iāng]" ->
+        # "[i\x01ng]"), which then collide; keep the added tokens verbatim.
+        'token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))',
+        'pass  # cosyvoice: added tokens are stored verbatim',
+    )]
+
+
+# ---- CosyVoice v1 (CosyVoice-300M / BreezyVoice): llama.cpp `cosyvoice` arch ----
+
+def _whisper_vocab() -> tuple[list[str], list[int], list[str]]:
+    """Whisper multilingual tiktoken (num_languages=100, 51866 ids) as a GPT-2
+    byte-level BPE vocab: tokens, token types and merges (rebuilt from ranks,
+    as convert_hf_to_gguf.py does for tiktoken vocabs)."""
+    import whisper.tokenizer as wt
+    enc = wt.get_encoding("multilingual", num_languages=100)
+    ranks = enc._mergeable_ranks
+
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    byte_encoder = dict(zip(bs, map(chr, cs)))
+
+    def to_str(b: bytes) -> str:
+        return "".join(byte_encoder[x] for x in b)
+
+    def bpe(token: bytes, max_rank: int) -> list[bytes]:
+        parts = [bytes([b]) for b in token]
+        while True:
+            best = None
+            for i, pair in enumerate(zip(parts[:-1], parts[1:])):
+                r = ranks.get(pair[0] + pair[1])
+                if r is not None and (best is None or r < best[1]):
+                    best = (i, r)
+            if best is None or best[1] >= max_rank:
+                break
+            i = best[0]
+            parts = parts[:i] + [parts[i] + parts[i + 1]] + parts[i + 2:]
+        return parts
+
+    tokens = [""] * enc.n_vocab
+    types = [1] * enc.n_vocab               # NORMAL
+    merges = []
+    for tok, rank in ranks.items():
+        tokens[rank] = to_str(tok)
+        if len(tok) > 1:
+            m = bpe(tok, rank)
+            assert len(m) == 2
+            merges.append(" ".join(map(to_str, m)))
+    for tok, rank in enc._special_tokens.items():
+        tokens[rank] = tok
+        types[rank] = 3                     # CONTROL
+    return tokens, types, merges
+
+
+def write_cosyvoice1_backbone(src: Path, output: Path, outtype: str) -> None:
+    """CosyVoice v1 `llm.pt` `llm.*` (WeNet TransformerEncoder, rel-pos attention)
+    → GGUF arch `cosyvoice` (patches/cosyvoice-llamacpp.patch).  The text
+    encoder, speech embedding and speech head belong to the codec GGUF."""
+    import gguf
+    sd = {k[len("llm."):]: v.float().numpy() for k, v in
+          torch.load(src / "llm.pt", map_location="cpu", weights_only=True).items() if k.startswith("llm.")}
+    readme = (src / "README.md").read_text(errors="ignore") if (src / "README.md").is_file() else ""
+    breezy = "BreezyVoice" in readme
+    n_layer = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("encoders."))
+    n_embd = sd["embed.out.0.weight"].shape[0]
+    n_head = sd["encoders.0.self_attn.pos_bias_u"].shape[0]
+    head_dim = n_embd // n_head
+    n_ff = sd["encoders.0.feed_forward.w_1.weight"].shape[0]
+    ftype = {"f32": gguf.GGMLQuantizationType.F32, "f16": gguf.GGMLQuantizationType.F16}[outtype]
+
+    w = gguf.GGUFWriter(str(output), "cosyvoice")
+    w.add_name("BreezyVoice LM" if breezy else "CosyVoice-300M LM")
+    w.add_context_length(8192)
+    w.add_embedding_length(n_embd)
+    w.add_block_count(n_layer)
+    w.add_feed_forward_length(n_ff)
+    w.add_head_count(n_head)
+    w.add_head_count_kv(n_head)
+    # BreezyVoice's fork builds encoder layers with LayerNorm eps 1e-5; upstream WeNet uses 1e-12.
+    w.add_layer_norm_eps(1e-5 if breezy else 1e-12)
+    w.add_file_type(gguf.LlamaFileType.MOSTLY_F16 if outtype == "f16" else gguf.LlamaFileType.ALL_F32)
+    tokens, types, merges = _whisper_vocab()
+    w.add_tokenizer_model("gpt2")
+    w.add_tokenizer_pre("gpt-2")
+    w.add_token_list(tokens)
+    w.add_token_types(types)
+    w.add_token_merges(merges)
+    w.add_bos_token_id(50257)
+    w.add_eos_token_id(50257)
+    w.add_add_bos_token(False)
+
+    def add(name: str, arr, keep_f32: bool = False):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if ftype == gguf.GGMLQuantizationType.F16 and arr.ndim >= 2 and not keep_f32:
+            w.add_tensor(name, arr.astype(np.float16), raw_dtype=gguf.GGMLQuantizationType.F16)
+        else:
+            w.add_tensor(name, arr)
+
+    add("inp_proj.weight", sd["embed.out.0.weight"])
+    add("inp_proj.bias", sd["embed.out.0.bias"])
+    add("inp_norm.weight", sd["embed.out.1.weight"])
+    add("inp_norm.bias", sd["embed.out.1.bias"])
+    add("output_norm.weight", sd["after_norm.weight"])
+    add("output_norm.bias", sd["after_norm.bias"])
+    for i in range(n_layer):
+        p, d = f"encoders.{i}.", f"blk.{i}."
+        a, f = p + "self_attn.", p + "feed_forward."
+        add(d + "attn_norm.weight", sd[p + "norm1.weight"])
+        add(d + "attn_norm.bias", sd[p + "norm1.bias"])
+        for dd, ss in (("attn_q", "linear_q"), ("attn_k", "linear_k"), ("attn_v", "linear_v"), ("attn_output", "linear_out")):
+            add(d + dd + ".weight", sd[a + ss + ".weight"])
+            add(d + dd + ".bias", sd[a + ss + ".bias"])
+        # linear_pos rows of each head, laid out [head, n_embd(in), head_dim] (ggml [d, in, head]).
+        wp = sd[a + "linear_pos.weight"].reshape(n_head, head_dim, n_embd).transpose(0, 2, 1)
+        add(d + "attn_pos.weight", wp, keep_f32=True)
+        add(d + "attn_pos_bias_u.weight", sd[a + "pos_bias_u"], keep_f32=True)   # added to F32 q
+        add(d + "attn_pos_bias_v.weight", sd[a + "pos_bias_v"], keep_f32=True)
+        add(d + "ffn_norm.weight", sd[p + "norm2.weight"])
+        add(d + "ffn_norm.bias", sd[p + "norm2.bias"])
+        add(d + "ffn_up.weight", sd[f + "w_1.weight"])
+        add(d + "ffn_up.bias", sd[f + "w_1.bias"])
+        add(d + "ffn_down.weight", sd[f + "w_2.weight"])
+        add(d + "ffn_down.bias", sd[f + "w_2.bias"])
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 # ---------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------
@@ -737,6 +920,7 @@ PREPARERS: Dict[str, Callable[[Path, Path, dict], list[tuple[str, str]]]] = {
     "MoshiForConditionalGeneration":  prep_moshi,
     "ChatterboxT3":                   prep_chatterbox_t3,
     "KittenTTS2":                     prep_kitten_tts2,
+    "CosyVoice":                      prep_cosyvoice,
 }
 
 
@@ -824,8 +1008,16 @@ def main() -> int:
     # Chatterbox doesn't ship a config.json (its T3 weights live in
     # `t3_cfg.safetensors`); autodetect the layout and synthesise a
     # config dict for the dispatch.
+    if (src / "cosyvoice.yaml").is_file():   # CosyVoice v1: custom arch, written directly
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        write_cosyvoice1_backbone(src, args.output, args.outtype)
+        print(f"[bb] wrote {args.output}", flush=True)
+        return 0
     if chatterbox_layout_detected(src):
         cfg = {"architectures": ["ChatterboxT3"]}
+    elif (src / "cosyvoice2.yaml").is_file() or (src / "cosyvoice3.yaml").is_file():
+        cfg = {"architectures": ["CosyVoice"],
+               "cosyvoice_version": 3 if (src / "cosyvoice3.yaml").is_file() else 2}
     else:
         cfg = load_config(src)
         if cfg.get("type") == "KITTEN2":   # kittenml repo layout: LM under lm/

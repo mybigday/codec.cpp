@@ -368,7 +368,9 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
         elif input_path.is_dir():
             # Directory - try to find config.json
             config_path = input_path / "config.json"
-            if config_path.exists():
+            if any((input_path / n).is_file() for n in ("cosyvoice.yaml", "cosyvoice2.yaml", "cosyvoice3.yaml")):
+                model_type = "cosyvoice"
+            elif config_path.exists():
                 if _is_lm_source_config(config_path):
                     import json
                     with open(config_path) as f:

@@ -207,6 +207,9 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
 
     ggml_tensor * scores = ggml_add(ctx, mat_ac, mat_bd);
     scores = ggml_scale(ctx, scores, scale);
+    if (params != nullptr && params->causal) {
+        scores = ggml_diag_mask_inf(ctx, scores, 0);
+    }
     ggml_tensor * attn_w = ggml_soft_max(ctx, scores);
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));

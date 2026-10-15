@@ -62,7 +62,8 @@ bool codec_campplus_accepts(int64_t n_samples) {
 }
 
 ggml_tensor * codec_block_campplus(
-        ggml_context * ctx, const codec_model * model, const char * prefix, ggml_tensor * pcm16k) {
+        ggml_context * ctx, const codec_model * model, const char * prefix, ggml_tensor * pcm16k,
+        bool onnx_seg_pooling) {
     if (ctx == nullptr || model == nullptr || prefix == nullptr || pcm16k == nullptr ||
         !codec_campplus_accepts(ggml_nelements(pcm16k))) {
         return nullptr;
@@ -85,7 +86,7 @@ ggml_tensor * codec_block_campplus(
     const int32_t t2 = campplus_tdnn_frames(n_frames);
     const int32_t n_seg = campplus_n_segments(t2);
     std::vector<float> inv_cnt((size_t) n_seg, 1.0f / (float) kSegLen);
-    inv_cnt.back() = 1.0f / (float) (t2 - (n_seg - 1) * kSegLen);
+    if (!onnx_seg_pooling) inv_cnt.back() = 1.0f / (float) (t2 - (n_seg - 1) * kSegLen);
     const std::string seg_name = "lut." + std::string(prefix) + ".seg_inv_cnt";
     ggml_tensor * seg_inv_cnt = codec_graph_const_f32(ctx, seg_name.c_str(), inv_cnt, 1, n_seg, 1);
     if (seg_inv_cnt == nullptr) return nullptr;

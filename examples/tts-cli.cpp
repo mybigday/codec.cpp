@@ -141,7 +141,7 @@ void print_usage(const char * prog) {
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
-        "             [--preset NAME]\n"
+        "             [--preset NAME] [--instruct STR]\n"
         "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
         "             [--cfg F] [--timesteps N] [--min-len N]\n"
         "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
@@ -223,6 +223,7 @@ struct args {
     std::string speaker_file;
     std::string save_speaker;
     std::string preset;
+    std::string instruct;
     std::string output;
     std::string backbone;
 
@@ -267,6 +268,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--speaker-file") { const char * v = need(); if (!v) return false; out->speaker_file = v; i++; }
         else if (a == "--save-speaker") { const char * v = need(); if (!v) return false; out->save_speaker = v; i++; }
         else if (a == "--preset")     { const char * v = need(); if (!v) return false; out->preset = v; i++; }
+        else if (a == "--instruct")   { const char * v = need(); if (!v) return false; out->instruct = v; i++; }
         else if (a == "--output")     { const char * v = need(); if (!v) return false; out->output = v; i++; }
         else if (a == "--backbone")   { const char * v = need(); if (!v) return false; out->backbone = v; i++; }
         else if (a == "--n-threads")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
@@ -440,6 +442,7 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.speaker_file   = a.speaker_file;
     rp.save_speaker   = a.save_speaker;
     rp.preset         = a.preset;
+    rp.instruct       = a.instruct;
     rp.n_threads     = a.n_threads;
     rp.use_gpu       = a.use_gpu;
     rp.seed          = a.seed;

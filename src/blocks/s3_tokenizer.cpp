@@ -101,8 +101,20 @@ bool s3t_window(const codec_model * model, int32_t n_fft, std::vector<float> * o
 
 }  // namespace
 
-int32_t codec_s3_tokenizer_n_tokens(int64_t n_samples) {
-    return (int32_t) ((n_samples + kTokenHop - 1) / kTokenHop);
+namespace {
+
+int32_t conv_s2(int32_t t) { return (t + 2 - 3) / 2 + 1; }   // Conv1d(k3, s2, p1)
+
+}  // namespace
+
+int32_t codec_s3_tokenizer_n_tokens(int64_t n_samples, int32_t pad_multiple) {
+    const int32_t n_mel = codec_whisper_log_mel_frames(n_samples, kHop, pad_multiple);
+    return n_mel <= 0 ? 0 : conv_s2(conv_s2(n_mel));
+}
+
+int32_t codec_s3_tokenizer_v1_n_tokens(int64_t n_samples) {
+    const int32_t n_mel = codec_whisper_log_mel_frames(n_samples, kHop, 1);
+    return n_mel <= 0 ? 0 : conv_s2(n_mel);
 }
 
 ggml_tensor * codec_block_s3_tokenizer(
@@ -111,13 +123,13 @@ ggml_tensor * codec_block_s3_tokenizer(
         p.fsmn_kernel <= 0 || (p.fsmn_kernel % 2) == 0) {
         return nullptr;
     }
-    const int32_t t_tok = codec_s3_tokenizer_n_tokens(ggml_nelements(pcm16k));
+    const int32_t t_tok = codec_s3_tokenizer_n_tokens(ggml_nelements(pcm16k), p.pad_multiple);
     std::vector<float> window;
     ggml_tensor * mel_fb = codec_graph_weight(ctx, model, "s3t.mel_filters");
     if (t_tok <= 0 || mel_fb == nullptr || mel_fb->ne[1] != p.n_mels || !s3t_window(model, p.n_fft, &window)) {
         return nullptr;
     }
-    ggml_tensor * mel = codec_op_whisper_log_mel(ctx, pcm16k, mel_fb, window, p.n_fft, kHop, kTokenHop, "lut.s3t_stft");
+    ggml_tensor * mel = codec_op_whisper_log_mel(ctx, pcm16k, mel_fb, window, p.n_fft, kHop, p.pad_multiple, "lut.s3t_stft");
     if (mel == nullptr) return nullptr;                                              // [t_mel, n_mels]
 
     auto W = [&](const char * n) { return codec_graph_weight(ctx, model, n); };
@@ -142,4 +154,45 @@ ggml_tensor * codec_block_s3_tokenizer(
     if (pw == nullptr) return nullptr;
     ggml_tensor * idx = ggml_sum_rows(ctx, ggml_mul(ctx, q_ct, ggml_reshape_2d(ctx, pw, 8, 1)));
     return ggml_cast(ctx, ggml_reshape_1d(ctx, idx, t_tok), GGML_TYPE_I32);
+}
+
+ggml_tensor * codec_block_s3_tokenizer_v1(
+        ggml_context * ctx, const codec_model * model, int32_t n_layers, ggml_tensor * pcm16k) {
+    constexpr int32_t kNFft = 400;
+    constexpr int32_t kHeads = 20;
+    if (ctx == nullptr || model == nullptr || pcm16k == nullptr) return nullptr;
+    const int32_t t_tok = codec_s3_tokenizer_v1_n_tokens(ggml_nelements(pcm16k));
+    std::vector<float> window;
+    ggml_tensor * mel_fb = codec_graph_weight(ctx, model, "s3t.mel_filters");
+    if (t_tok <= 0 || mel_fb == nullptr || !s3t_window(model, kNFft, &window)) return nullptr;
+    ggml_tensor * mel = codec_op_whisper_log_mel(ctx, pcm16k, mel_fb, window, kNFft, kHop, 1, "lut.s3t_stft");
+    if (mel == nullptr) return nullptr;                                              // [t_mel, 128]
+
+    auto W = [&](const std::string & n) { return codec_graph_weight(ctx, model, n); };
+    ggml_tensor * x = codec_conv1d(ctx, mel, W("s3t.enc.conv1.w"), W("s3t.enc.conv1.b"), 1, 1, 1);
+    if (x == nullptr) return nullptr;
+    x = codec_conv1d(ctx, ggml_gelu_erf(ctx, x), W("s3t.enc.conv2.w"), W("s3t.enc.conv2.b"), 2, 1, 1);
+    if (x == nullptr) return nullptr;
+    x = codec_op_add_sliced_pos_emb_tc(ctx, ggml_gelu_erf(ctx, x), W("s3t.enc.pos"));   // [t, 1280]
+    if (x == nullptr) return nullptr;
+    const int32_t hidden = (int32_t) x->ne[1];
+    for (int32_t li = 0; li < n_layers && x != nullptr; ++li) {
+        const std::string b = "s3t.enc.blk." + std::to_string(li) + ".";
+        x = codec_op_whisper_encoder_layer_tc(ctx, x,
+            W(b + "attn_ln.w"), W(b + "attn_ln.b"),
+            W(b + "attn.q.w"), W(b + "attn.q.b"), W(b + "attn.k.w"),
+            W(b + "attn.v.w"), W(b + "attn.v.b"), W(b + "attn.o.w"), W(b + "attn.o.b"),
+            W(b + "mlp_ln.w"), W(b + "mlp_ln.b"),
+            W(b + "mlp.fc1.w"), W(b + "mlp.fc1.b"), W(b + "mlp.fc2.w"), W(b + "mlp.fc2.b"),
+            hidden / kHeads, kHeads, 0);
+    }
+    if (x == nullptr) return nullptr;
+    // Nearest codeword of the L2-normalised frame: argmax_k (2 e_k . x - |e_k|^2).
+    ggml_tensor * xn = ggml_cont(ctx, ggml_transpose(ctx, codec_op_l2_normalize_tc(ctx, x, 1e-12f)));  // [1280, t]
+    ggml_tensor * embed = W("s3t.q.embed");
+    ggml_tensor * embed_sq = W("s3t.q.embed_sq");
+    if (embed == nullptr || embed_sq == nullptr) return nullptr;
+    ggml_tensor * score = ggml_mul_mat(ctx, embed, xn);                                // [4096, t]
+    score = ggml_sub(ctx, ggml_scale(ctx, score, 2.0f), ggml_reshape_2d(ctx, embed_sq, embed_sq->ne[0], 1));
+    return ggml_argmax(ctx, score);                                                   // I32 [t]
 }

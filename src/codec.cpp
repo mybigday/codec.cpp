@@ -8,6 +8,7 @@
 #include "models/mimi.h"
 #include "models/qwen3_tts_tokenizer.h"
 #include "models/chatterbox_s3g.h"
+#include "models/cosyvoice.h"
 #include "models/chatterbox_s3t.h"
 #include "models/soprano.h"
 #include "models/nemo_nano_codec.h"
@@ -148,6 +149,9 @@ enum codec_arch codec_arch_from_string(const std::string & arch) {
     if (arch == "pocket_mimi" || arch == "pocket-mimi" || arch == "pocket_tts") {
         return CODEC_ARCH_POCKET_MIMI;
     }
+    if (arch == "cosyvoice") {
+        return CODEC_ARCH_COSYVOICE;
+    }
 
     return CODEC_ARCH_UNKNOWN;
 }
@@ -186,6 +190,8 @@ static const codec_model_vtable * codec_model_vtable_for_arch(enum codec_arch ar
             return codec_bluemagpie_audiovae_vtable();
         case CODEC_ARCH_POCKET_MIMI:
             return codec_pocket_mimi_vtable();
+        case CODEC_ARCH_COSYVOICE:
+            return codec_cosyvoice_vtable();
         case CODEC_ARCH_UNKNOWN:
         default:
             return nullptr;
@@ -210,6 +216,7 @@ const char * codec_arch_name(enum codec_arch arch) {
         case CODEC_ARCH_XY_TOKENIZER:       return "XY-Tokenizer";
         case CODEC_ARCH_BLUEMAGPIE_AUDIOVAE:return "BlueMagpie-AudioVAE";
         case CODEC_ARCH_POCKET_MIMI:        return "Pocket-TTS-Mimi";
+        case CODEC_ARCH_COSYVOICE:          return "CosyVoice";
         case CODEC_ARCH_UNKNOWN:
         default:                            return "unknown";
     }

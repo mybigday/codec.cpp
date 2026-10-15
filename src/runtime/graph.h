@@ -37,6 +37,7 @@ enum codec_graph_kind {
     CODEC_GRAPH_LM_RDA_COMPOSE        = 30,
     CODEC_GRAPH_LM_RDA_DEPTH_STEP_KV  = 31,  // incremental, llama.cpp-style KV cache
     CODEC_GRAPH_LM_RDA_TEXT_PROJ      = 34,  // Qwen3-TTS talker text_projection MLP
+    CODEC_GRAPH_LM_COSYVOICE_TEXT     = 35,  // CosyVoice v1 text encoder + speaker affine rows
 
     CODEC_GRAPH_LM_SPEAKER_CHATTERBOX = 32,  // [VoiceEncoder +] cond_enc + perceiver
     CODEC_GRAPH_LM_SPEAKER_QWEN3_TTS  = 33,  // ECAPA-TDNN x-vector
@@ -54,7 +55,9 @@ enum codec_graph_kind {
     CODEC_GRAPH_FLOW_LM_STEP    = 63,  // Pocket-TTS FlowLM: one AR frame (transformer + LSD flow + EOS)
     CODEC_GRAPH_FLOW_LM_SPKPROJ = 64,  // Pocket-TTS FlowLM: mu [ldim,T] → speaker_proj rows
 
-    CODEC_GRAPH_CHATTERBOX_S3G_SPEAKER = 65,  // reference PCM → S3G speaker slots (S3T + mel + CAMPPlus [+ x-vector])
+    CODEC_GRAPH_CHATTERBOX_S3G_SPEAKER = 65,
+    CODEC_GRAPH_COSYVOICE_DECODE = 66,   // CosyVoice tokens → flow → HiFT PCM
+    CODEC_GRAPH_COSYVOICE_SPEAKER = 67,  // reference PCM → CosyVoice speaker slots  // reference PCM → S3G speaker slots (S3T + mel + CAMPPlus [+ x-vector])
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

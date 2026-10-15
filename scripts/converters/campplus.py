@@ -98,6 +98,72 @@ def campplus_tensors(state: Mapping[str, np.ndarray], src: str) -> list[tuple[st
     return out
 
 
+def campplus_tensors_from_onnx(path) -> list[tuple[str, np.ndarray]]:
+    """Folded CAMPPlus tensors from the CosyVoice `campplus.onnx` export.
+
+    The export already folded every conv→BN pair (anonymous `onnx::Conv_*`
+    initializers, in module order: 12 FCM-head convs, the TDNN, one `linear1`
+    per CAM layer, then transit3's conv with `out_nonlinear`'s BN folded in);
+    the pre-activation BNs, CAM convs, transits 1-2 and `dense` keep names.
+    """
+    from utils.onnx_reader import read_onnx
+
+    inits, nodes = read_onnx(path)
+    S = {k: v for k, v in inits.items() if not k.startswith("onnx::")}
+    folded = [(n.inputs[1], n.inputs[2]) for n in nodes
+              if n.op_type == "Conv" and n.inputs[1].startswith("onnx::")]
+    n_layers = sum(BLOCK_LAYERS)
+    if len(folded) != 12 + 1 + n_layers + 1:
+        raise ValueError(f"unexpected campplus.onnx layout: {len(folded)} folded convs")
+    it = iter(folded)
+    out: list[tuple[str, np.ndarray]] = []
+
+    def take(dst: str) -> None:
+        w, b = next(it)
+        out.append((dst + ".w", inits[w].astype(np.float32)))
+        out.append((dst + ".b", inits[b].astype(np.float32)))
+
+    def bn_st(dst: str, bn: str) -> None:
+        s, t = _bn(S, bn)
+        out.append((dst + ".s", s.astype(np.float32)))
+        out.append((dst + ".t", t.astype(np.float32)))
+
+    take("head.conv1")
+    for li in (1, 2):
+        for bi in (0, 1):
+            d = f"head.l{li}.{bi}"
+            take(d + ".conv1")
+            take(d + ".conv2")
+            if bi == 0:
+                take(d + ".sc")
+    take("head.conv2")
+    take("tdnn")
+    for bi, n in enumerate(BLOCK_LAYERS, start=1):
+        for li in range(n):
+            p = f"xvector.block{bi}.tdnnd{li + 1}"
+            d = f"b{bi}.{li}"
+            bn_st(d + ".bn", p + ".nonlinear1.batchnorm")
+            take(d + ".lin1")
+            out.append((d + ".local.w", S[p + ".cam_layer.linear_local.weight"].astype(np.float32)))
+            for c in (1, 2):
+                out.append((d + f".cl{c}.w", S[p + f".cam_layer.linear{c}.weight"].astype(np.float32)))
+                out.append((d + f".cl{c}.b", S[p + f".cam_layer.linear{c}.bias"].astype(np.float32)))
+        p = f"xvector.transit{bi}"
+        bn_st(f"tr{bi}.bn", p + ".nonlinear.batchnorm")
+        if bi < len(BLOCK_LAYERS):
+            out.append((f"tr{bi}.w", S[p + ".linear.weight"].astype(np.float32)))
+    # transit3 conv carries out_nonlinear's BN: out_bn becomes identity scale + that bias.
+    w3, b3 = next(it)
+    out.append(("tr3.w", inits[w3].astype(np.float32)))
+    out.append(("out_bn.s", np.ones_like(inits[b3], dtype=np.float32)))
+    out.append(("out_bn.t", inits[b3].astype(np.float32)))
+    w, b = _fold(S["xvector.dense.linear.weight"], *_bn(S, "xvector.dense.nonlinear.batchnorm", affine=False))
+    out.append(("dense.w", w))
+    out.append(("dense.b", b))
+    out.append(("fbank_mel", kaldi_fbank_mel()))
+    return out
+
+
 def write_campplus(add: Callable[[str, np.ndarray], None], state: Mapping[str, np.ndarray],
                    src: str, prefix: str) -> None:
     for name, arr in campplus_tensors(state, src):

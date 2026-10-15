@@ -20,6 +20,7 @@
 | Soprano (Vocos decoder) | ✅ | Decoder only (by design) |
 | Chatterbox-S3T | ✅ | Encoder only (by design) |
 | Chatterbox-S3G | ✅ | Speakers: builtin (`spk.*`), saved files, or derived from reference audio when the GGUF bundles the encoders |
+| CosyVoice (v1 / v2 / v3 token2wav) | ✅ | Speakers: builtin (`spk2info`), saved files, or derived from reference audio |
 | NeuCodec | 🟡 | Base encoder unimplemented — use `distill_neucodec` for encode (same code space + decoder) |
 
 ## TTS (`tts-cli synthesize`)
@@ -33,6 +34,9 @@
 | Qwen3-TTS | ✅ | Base model requires reference audio |
 | LFM2-Audio | ✅ | Must sample (greedy degenerates, as in reference) |
 | Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); GPU untested |
+| CosyVoice-300M (base / SFT / Instruct) | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see docs/cosyvoice.md |
+| CosyVoice2 / CosyVoice3 | 🟡 | Same as CosyVoice-300M |
+| BreezyVoice | 🟡 | Same as CosyVoice-300M; g2pw 注音 annotation is external |
 | KittenTTS 2 | 🟡 | 47 builtin voices + voice clone; English text normalizer not ported (pass spoken text) |
 | MOSS-TTSD | 🟡 | Requires BF16 backbone (F16/Q8 → babble) |
 | NeuTTS-Air | 🟡 | Input must be pre-phonemized (in-CLI espeak is opt-in); ref encode needs `distill_neucodec` |

@@ -20,6 +20,7 @@ from .moshi import MoshiConverter
 from .bluemagpie import BlueMagpieConverter
 from .pocket_tts import PocketTTSConverter
 from .kitten_tts2 import KittenTTS2Converter
+from .cosyvoice import CosyVoiceConverter
 
 # Registry of supported models
 _CONVERTER_REGISTRY = {
@@ -43,6 +44,7 @@ _CONVERTER_REGISTRY = {
     'bluemagpie': BlueMagpieConverter,
     'pocket_tts': PocketTTSConverter,
     'kitten_tts2': KittenTTS2Converter,
+    'cosyvoice': CosyVoiceConverter,
 }
 
 
