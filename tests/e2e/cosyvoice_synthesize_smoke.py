@@ -4,8 +4,9 @@
 Cases (each skipped when its GGUFs are missing under models/cosyvoice/):
   * zero-shot voice cloning (--ref-audio + --ref-text) for CosyVoice-300M,
     BreezyVoice, CosyVoice2 and CosyVoice3,
-  * an SFT builtin voice (--voice) for CosyVoice-300M-SFT,
-  * cross-lingual (--ref-audio without --ref-text) for CosyVoice3.
+  * builtin voices (--voice): CosyVoice-300M-SFT (x-vector only) and
+    BreezyVoice (prompt tokens / mel without a transcript),
+  * cross-lingual (--ref-audio without --ref-text) for CosyVoice-300M and CosyVoice3.
 Each must stop on the speech EOS, produce non-silent audio, and (when Whisper
 is available) transcribe with CER below the threshold.
 
@@ -67,7 +68,10 @@ def main() -> int:
         for name in ("cosyvoice-300m", "breezyvoice", "cosyvoice2", "cosyvoice3"):
             ok &= case(f"{name}-zero-shot", name, ZH_TEXT, "zh", ref, 0.3, tmp)
         ok &= case("cosyvoice-300m-sft-voice", "cosyvoice-300m-sft", ZH_TEXT, "zh", ["--voice", "zh_female"], 0.3, tmp)
-        ok &= case("cosyvoice3-cross-lingual", "cosyvoice3", EN_TEXT, "en", ["--ref-audio", str(REF_WAV)], 0.3, tmp)
+        # BreezyVoice voices carry prompt tokens / mel but no transcript: cross-lingual prompting.
+        ok &= case("breezyvoice-voice", "breezyvoice", ZH_TEXT, "zh", ["--voice", "zh_female"], 0.3, tmp)
+        for name in ("cosyvoice-300m", "cosyvoice3"):
+            ok &= case(f"{name}-cross-lingual", name, EN_TEXT, "en", ["--ref-audio", str(REF_WAV)], 0.3, tmp)
     print("cosyvoice synthesize smoke test " + ("passed" if ok else "FAILED"))
     return 0 if ok else 1
 

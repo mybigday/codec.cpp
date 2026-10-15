@@ -1510,7 +1510,8 @@ bool run_cosyvoice(audio_lm_context * ctx, llama_context * lctx, codec_lm * lm,
     if (!decode_embed_block(lctx, tail.data(), H, 1 + (int32_t) llm_prompt_tokens.size(), n_past)) return false;
     n_past += 1 + (int32_t) llm_prompt_tokens.size();
 
-    // ---- AR loop ----
+    // ---- AR loop ---- (bounded by the backbone context: a 30 s v1 prompt is 1500 rows)
+    max_len = std::min(max_len, (int32_t) llama_n_ctx(lctx) - n_past - 1);
     const bool greedy = a.has_temp && a.temp <= 0.0f;
     const int32_t top_k = a.has_top_k ? a.top_k : ci->top_k;
     const float top_p = a.has_top_p ? a.top_p : ci->top_p;
