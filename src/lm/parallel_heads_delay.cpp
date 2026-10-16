@@ -115,7 +115,7 @@ bool phd_build_logits(ggml_context * ctx_eval, void * user_data, ggml_tensor ** 
         // that runs every step (Chatterbox / WavTokenizer etc. hit this
         // path per AR step × n_codebook heads).
         ggml_tensor * head_in_ctx = codec_graph_mat_lhs(ctx_eval, head);
-        ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_in_ctx, t_h);
+        ggml_tensor * logits = codec_mul_mat(ctx_eval, head_in_ctx, t_h);
         if (ggml_tensor * bias = impl->head_biases[(size_t) i]) {
             logits = ggml_add(ctx_eval, logits, codec_graph_cast_f32(ctx_eval, bias));
         }

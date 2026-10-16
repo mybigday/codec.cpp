@@ -246,7 +246,7 @@ ggml_tensor * perceiver_attn_block(
     // mul_mat src[0] convention.
     auto linear_HH = [&](ggml_tensor * W, ggml_tensor * b, ggml_tensor * x_2d) {
         ggml_tensor * W_lhs = codec_graph_mat_lhs(ctx, W);
-        ggml_tensor * y = ggml_mul_mat(ctx, W_lhs, x_2d);   // (H_out, T)
+        ggml_tensor * y = codec_mul_mat(ctx, W_lhs, x_2d);   // (H_out, T)
         ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
         ggml_tensor * b_2d  = ggml_reshape_2d(ctx, b_f32, H, 1);
         y = ggml_add(ctx, y, ggml_repeat(ctx, b_2d, y));
@@ -268,7 +268,7 @@ ggml_tensor * perceiver_attn_block(
 
     // sim = k_p^T @ q_p : ggml_mul_mat(a=k_p, b=q_p) contracts on ne[0]=head_dim
     //   → (T_k, T_q, n_heads)
-    ggml_tensor * sim = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_tensor * sim = codec_mul_mat(ctx, k_p, q_p);
     sim = ggml_scale(ctx, sim, scale);
     ggml_tensor * attn = ggml_soft_max(ctx, sim);              // softmax over ne[0]=T_k
 
@@ -277,7 +277,7 @@ ggml_tensor * perceiver_attn_block(
     // ggml_mul_mat needs ne[0]s to match — permute v_p to (T_k, head_dim, n_heads)
     // so contraction is on T_k, result (head_dim, T_q, n_heads).
     ggml_tensor * v_pT = ggml_cont(ctx, ggml_permute(ctx, v_p, 1, 0, 2, 3));
-    ggml_tensor * out  = ggml_mul_mat(ctx, v_pT, attn);          // (head_dim, T_q, n_heads)
+    ggml_tensor * out  = codec_mul_mat(ctx, v_pT, attn);          // (head_dim, T_q, n_heads)
 
     // Merge heads: (head_dim, T_q, n_heads) → (head_dim, n_heads, T_q) → (H, T_q).
     ggml_tensor * out_merged = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
@@ -313,7 +313,7 @@ bool build_cond_graph(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     //   spkr_enc.weight is (256, 1024) — ggml ne[0]=256, ne[1]=1024.
     //   y = W^T @ x : ggml_mul_mat(W, x_256) gives (1024,) (contracts on ne[0]).
     ggml_tensor * spk_W = codec_graph_mat_lhs(ctx_eval, impl->spkr_enc_W);
-    ggml_tensor * spk_y = ggml_mul_mat(ctx_eval, spk_W, t_spk);   // (1024,)
+    ggml_tensor * spk_y = codec_mul_mat(ctx_eval, spk_W, t_spk);   // (1024,)
     ggml_tensor * spk_b = codec_graph_cast_f32(ctx_eval, impl->spkr_enc_b);
     spk_y = ggml_add(ctx_eval, spk_y, spk_b);
     ggml_tensor * cond_spkr = ggml_reshape_2d(ctx_eval, spk_y, H, 1);   // (H, 1)
@@ -343,7 +343,7 @@ bool build_cond_graph(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     ggml_tensor * t_emotion = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, 1);
     ggml_set_name(t_emotion, "spk.in.emotion");
     ggml_tensor * emo_W = codec_graph_mat_lhs(ctx_eval, impl->emotion_adv_W);
-    ggml_tensor * emo_y = ggml_mul_mat(ctx_eval, emo_W, t_emotion);   // (1024,)
+    ggml_tensor * emo_y = codec_mul_mat(ctx_eval, emo_W, t_emotion);   // (1024,)
     ggml_tensor * cond_emotion = ggml_reshape_2d(ctx_eval, emo_y, H, 1);
 
     // ---- Perceiver: 32 learned queries cross-attend over seq, then self-attend.

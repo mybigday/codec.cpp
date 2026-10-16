@@ -51,7 +51,7 @@ ggml_tensor * hift_f0(ggml_context * ctx, const codec_model * model, const char 
     ggml_tensor * cls_b = W("f0.cls.b");
     if (cls_w == nullptr || cls_b == nullptr) return nullptr;
     ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, x));
-    ggml_tensor * f0 = ggml_add(ctx, ggml_mul_mat(ctx, cls_w, x_ct), cls_b);
+    ggml_tensor * f0 = ggml_add(ctx, codec_mul_mat(ctx, cls_w, x_ct), cls_b);
     return ggml_reshape_1d(ctx, ggml_abs(ctx, f0), x->ne[0]);
 }
 

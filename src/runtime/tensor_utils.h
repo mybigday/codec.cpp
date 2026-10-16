@@ -49,4 +49,12 @@ ggml_tensor * codec_graph_mat_lhs(ggml_context * ctx_eval, ggml_tensor * t);
 ggml_tensor * codec_graph_weight_mat(ggml_context * ctx_eval, const codec_model * model, const char * name);
 ggml_tensor * codec_graph_weight_mat(ggml_context * ctx_eval, const codec_model * model, const std::string & name);
 
+// ggml_mul_mat that drops a weight dequant on src[0]: when `a` is (a reshape of)
+// the F16/BF16 -> F32 ggml_cast codec_graph_weight put on a stored weight, the
+// stored weight feeds the matmul directly instead of being re-cast every eval.
+// Activations and F32 / quantized weights pass through unchanged.
+// The F16 matmul also rounds `b` to F16: keep plain ggml_mul_mat + F32 for
+// codebook nearest-neighbour searches (mul_mat -> argmax), where that flips codes.
+ggml_tensor * codec_mul_mat(ggml_context * ctx_eval, ggml_tensor * a, ggml_tensor * b);
+
 #endif

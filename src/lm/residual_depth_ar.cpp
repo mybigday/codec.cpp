@@ -342,7 +342,7 @@ bool rda_build_c0(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     ggml_set_name(t_h, "lm.c0.h_in");
 
     ggml_tensor * head = codec_graph_mat_lhs(ctx_eval, b->impl->c0_head);
-    ggml_tensor * logits = ggml_mul_mat(ctx_eval, head, t_h);
+    ggml_tensor * logits = codec_mul_mat(ctx_eval, head, t_h);
     ggml_set_name(logits, "lm.c0.logits");
     *out = logits;
     return true;
@@ -444,7 +444,7 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
                 w_f32->nb[1], w_f32->nb[2], 0);
             ggml_tensor * h_3d   = ggml_reshape_3d(
                 ctx_eval, t_h_in, impl->hidden_dim, 1, 1);
-            ggml_tensor * proj_3d = ggml_mul_mat(ctx_eval, h_3d, w_sl);
+            ggml_tensor * proj_3d = codec_mul_mat(ctx_eval, h_3d, w_sl);
             ggml_tensor * proj    = ggml_reshape_2d(
                 ctx_eval, proj_3d, impl->depth_hidden, T);
 
@@ -524,7 +524,7 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
         head_w = codec_graph_mat_lhs(ctx_eval, impl->depth_heads[(size_t) head_idx]);
     }
 
-    ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_w, x_last);
+    ggml_tensor * logits = codec_mul_mat(ctx_eval, head_w, x_last);
     ggml_set_name(logits, "lm.depth.ck_logits");
     *out = logits;
     return true;
@@ -622,7 +622,7 @@ ggml_tensor * rda_depth_layer_kv(
     ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q,     0, 2, 1, 3));
     ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k_all, 0, 2, 1, 3));
 
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_tensor * scores = codec_mul_mat(ctx, k_p, q_p);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
     // Causal mask offset by the already-cached prefix: q at relative
     // position i (overall = kv_pos_start + i) can attend to k at
@@ -634,7 +634,7 @@ ggml_tensor * rda_depth_layer_kv(
     scores = ggml_soft_max(ctx, scores);
 
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v_all, 1, 2, 0, 3));
-    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_tensor * attn = codec_mul_mat(ctx, v_p, scores);
     attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
     attn = ggml_reshape_2d(ctx, attn, (int64_t) q_dim, T_new);
 
@@ -755,7 +755,7 @@ bool rda_build_depth_step_kv(ggml_context * ctx_eval, void * ud, ggml_tensor ** 
         impl->depth_heads[(size_t) b->head_idx] == nullptr) return false;
     ggml_tensor * head_w = codec_graph_mat_lhs(
         ctx_eval, impl->depth_heads[(size_t) b->head_idx]);
-    ggml_tensor * logits = ggml_mul_mat(ctx_eval, head_w, x_last);
+    ggml_tensor * logits = codec_mul_mat(ctx_eval, head_w, x_last);
     ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
     ggml_set_name(logits, "lm.depth.kv.ck_logits");
     *out = logits;
@@ -1663,9 +1663,9 @@ static bool rda_build_text_proj(ggml_context * ctx_eval, void * ud, ggml_tensor 
     ggml_tensor * tok = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, 1);
     ggml_set_name(tok, "lm.text_proj.token");
     ggml_tensor * x = codec_graph_cast_f32(ctx_eval, ggml_get_rows(ctx_eval, impl->tp_text_embd, tok));   // [H_text, 1]
-    x = ggml_mul_mat(ctx_eval, impl->tp_fc1_w, x);
+    x = codec_mul_mat(ctx_eval, impl->tp_fc1_w, x);
     if (impl->tp_fc1_b) x = ggml_add(ctx_eval, x, codec_graph_cast_f32(ctx_eval, impl->tp_fc1_b));
-    x = ggml_mul_mat(ctx_eval, impl->tp_fc2_w, ggml_silu(ctx_eval, x));
+    x = codec_mul_mat(ctx_eval, impl->tp_fc2_w, ggml_silu(ctx_eval, x));
     if (impl->tp_fc2_b) x = ggml_add(ctx_eval, x, codec_graph_cast_f32(ctx_eval, impl->tp_fc2_b));
     ggml_set_name(x, "lm.text_proj.out");
     *out = x;

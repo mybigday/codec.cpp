@@ -63,7 +63,7 @@ static ggml_tensor * codec_conv1d_impl(
 
     ggml_tensor * lhs = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
     ggml_tensor * rhs = ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]);
-    ggml_tensor * y = ggml_mul_mat(ctx, lhs, rhs);
+    ggml_tensor * y = codec_mul_mat(ctx, lhs, rhs);
     if (y == nullptr) {
         return nullptr;
     }
@@ -90,7 +90,7 @@ static ggml_tensor * codec_conv1d_depthwise_impl(
         return nullptr;
     }
 
-    ggml_tensor * y = ggml_mul_mat(ctx, im2col, w);
+    ggml_tensor * y = codec_mul_mat(ctx, im2col, w);
     if (y == nullptr) {
         return nullptr;
     }

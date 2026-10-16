@@ -38,7 +38,7 @@ static ggml_tensor * nemo_conv1d_replicate(
     ggml_tensor * im2col = ggml_im2col(ctx, w_f32, x_pad, stride, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1]));
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_f32, (w_f32->ne[0] * w_f32->ne[1]), w_f32->ne[2]);
-    ggml_tensor * y = ggml_mul_mat(ctx, im2col_2d, w_2d);
+    ggml_tensor * y = codec_mul_mat(ctx, im2col_2d, w_2d);
     y = ggml_reshape_3d(ctx, y, im2col->ne[1], w_f32->ne[2], im2col->ne[2]);
     if (b_f32 != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, 1, y->ne[1]);

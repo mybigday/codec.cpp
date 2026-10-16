@@ -26,7 +26,7 @@ ggml_tensor * grouped_causal_conv(ggml_context * ctx, ggml_tensor * x_tc, ggml_t
     ggml_tensor * kshape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, cg);
     ggml_tensor * cols = ggml_im2col(ctx, kshape, xg, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);   // [k*cg, T, groups]
     ggml_tensor * wg = ggml_reshape_3d(ctx, w, k * cg, cg, groups);
-    ggml_tensor * y = ggml_mul_mat(ctx, wg, cols);                                          // [cg, T, groups]
+    ggml_tensor * y = codec_mul_mat(ctx, wg, cols);                                          // [cg, T, groups]
     y = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3)), T, C);       // [T, C]
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C));
 }

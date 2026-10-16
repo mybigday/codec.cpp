@@ -106,7 +106,7 @@ ggml_tensor * interp_matrix(ggml_context * ctx, ggml_tensor * x, int32_t n_out, 
         row[i1] += lam;
     }
     ggml_tensor * w = codec_graph_const_f32(ctx, name.c_str(), m, n_in, n_out);
-    return ggml_mul_mat(ctx, w, ggml_cont(ctx, x));   // contract over time: [n_out, c]
+    return codec_mul_mat(ctx, w, ggml_cont(ctx, x));   // contract over time: [n_out, c]
 }
 
 ggml_tensor * interp_linear(ggml_context * ctx, ggml_tensor * x, int32_t n_out, const char * tag) {

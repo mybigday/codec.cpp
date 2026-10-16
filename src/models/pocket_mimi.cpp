@@ -89,9 +89,9 @@ ggml_tensor * pm_transformer_block(
     if (h == nullptr) return nullptr;
     const int64_t t_cur = h->ne[1];
 
-    ggml_tensor * q = ggml_mul_mat(ctx_eval, q_w, h);
-    ggml_tensor * k = ggml_mul_mat(ctx_eval, k_w, h);
-    ggml_tensor * v = ggml_mul_mat(ctx_eval, v_w, h);
+    ggml_tensor * q = codec_mul_mat(ctx_eval, q_w, h);
+    ggml_tensor * k = codec_mul_mat(ctx_eval, k_w, h);
+    ggml_tensor * v = codec_mul_mat(ctx_eval, v_w, h);
     if (q == nullptr || k == nullptr || v == nullptr) return nullptr;
 
     ggml_tensor * q_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, q, head_dim, n_heads, t_cur), 0, 2, 1, 3);
@@ -111,16 +111,16 @@ ggml_tensor * pm_transformer_block(
 
     ggml_tensor * attn_ct = ggml_reshape_2d(
         ctx_eval, ggml_cont(ctx_eval, ggml_permute(ctx_eval, attn_ctx, 0, 2, 1, 3)), c, t_cur);
-    ggml_tensor * attn_proj = ggml_mul_mat(ctx_eval, o_w, attn_ct);
+    ggml_tensor * attn_proj = codec_mul_mat(ctx_eval, o_w, attn_ct);
     if (attn_proj == nullptr) return nullptr;
     x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, attn_proj, sa_scale));
 
     ggml_tensor * m = codec_op_layer_norm_ct(ctx_eval, x_ct, 1e-5f, paln_w, paln_b);
     if (m == nullptr) return nullptr;
-    m = ggml_mul_mat(ctx_eval, fc1_w, m);
+    m = codec_mul_mat(ctx_eval, fc1_w, m);
     if (m == nullptr) return nullptr;
     m = ggml_gelu_erf(ctx_eval, m);
-    m = ggml_mul_mat(ctx_eval, fc2_w, m);
+    m = codec_mul_mat(ctx_eval, fc2_w, m);
     if (m == nullptr) return nullptr;
     x_ct = ggml_add(ctx_eval, x_ct, codec_op_channel_scale(ctx_eval, m, mlp_scale));
     return x_ct;

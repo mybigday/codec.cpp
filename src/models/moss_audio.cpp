@@ -114,7 +114,7 @@ ggml_tensor * codec_moss_transformer_layer_tc(
 
     // h_tc → h_ct (mul_mat needs ne[0]=in_dim).
     ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, h));   // [c=hidden, t]
-    ggml_tensor * qkv = ggml_mul_mat(ctx, qkv_w, h_ct);            // [3*hidden, t]
+    ggml_tensor * qkv = codec_mul_mat(ctx, qkv_w, h_ct);            // [3*hidden, t]
     if (qkv == nullptr) return nullptr;
     ggml_tensor * q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, t, qkv->nb[1], 0));
     ggml_tensor * k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, t, qkv->nb[1], (size_t) hidden * qkv->nb[0]));
@@ -152,7 +152,7 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     // Permute back (d, t, h) → (d, h, t) → reshape (hidden, t).
     ggml_tensor * attn_dht = ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3));
     ggml_tensor * attn_ct = ggml_reshape_2d(ctx, attn_dht, hidden, t);
-    ggml_tensor * out_ct = ggml_mul_mat(ctx, out_w, attn_ct);                            // [hidden, t]
+    ggml_tensor * out_ct = codec_mul_mat(ctx, out_w, attn_ct);                            // [hidden, t]
     if (out_ct == nullptr) return nullptr;
     ggml_tensor * out_tc = ggml_cont(ctx, ggml_transpose(ctx, out_ct));                   // [t, hidden]
 
@@ -169,11 +169,11 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     res = x_tc;
     h = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, n2_w, n2_b);
     h_ct = ggml_cont(ctx, ggml_transpose(ctx, h));            // [hidden, t]
-    ggml_tensor * ff = ggml_mul_mat(ctx, fc1_w, h_ct);        // [ffn_dim, t]
+    ggml_tensor * ff = codec_mul_mat(ctx, fc1_w, h_ct);        // [ffn_dim, t]
     ff = ggml_cont(ctx, ggml_transpose(ctx, ff));             // [t, ffn_dim] — gelu reads any layout
     ff = ggml_gelu(ctx, ff);
     ff = ggml_cont(ctx, ggml_transpose(ctx, ff));             // [ffn_dim, t]
-    ff = ggml_mul_mat(ctx, fc2_w, ff);                        // [hidden, t]
+    ff = codec_mul_mat(ctx, fc2_w, ff);                        // [hidden, t]
     if (ff == nullptr) return nullptr;
     ggml_tensor * ff_tc = ggml_cont(ctx, ggml_transpose(ctx, ff));
     if (ls2 != nullptr) {
@@ -213,7 +213,7 @@ ggml_tensor * codec_moss_projected_transformer_ct(
     ggml_tensor * in_w  = W(base + ".input_proj.w");
     ggml_tensor * out_w = W(base + ".output_proj.w");
 
-    ggml_tensor * h_ct = (in_w != nullptr) ? ggml_mul_mat(ctx, in_w, x_ct) : x_ct;
+    ggml_tensor * h_ct = (in_w != nullptr) ? codec_mul_mat(ctx, in_w, x_ct) : x_ct;
     if (h_ct == nullptr) return nullptr;
     ggml_tensor * h_tc = ggml_cont(ctx, ggml_transpose(ctx, h_ct));   // [t, d_model]
     (void) d_model;
@@ -237,7 +237,7 @@ ggml_tensor * codec_moss_projected_transformer_ct(
 
     h_ct = ggml_cont(ctx, ggml_transpose(ctx, h_tc));     // [d_model, t]
     if (out_w == nullptr) return h_ct;
-    return ggml_mul_mat(ctx, out_w, h_ct);                // [out_dim, t]
+    return codec_mul_mat(ctx, out_w, h_ct);                // [out_dim, t]
     (void) out_dim;
 }
 

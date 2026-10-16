@@ -27,7 +27,7 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
     const bool causal = params != nullptr && params->causal;
 
     ggml_tensor * k_cont = ggml_cont(ctx, k_dth);
-    ggml_tensor * attn_scores = ggml_mul_mat(ctx, k_cont, q_dth); // [t, t, h]
+    ggml_tensor * attn_scores = codec_mul_mat(ctx, k_cont, q_dth); // [t, t, h]
     if (attn_scores == nullptr) {
         return nullptr;
     }
@@ -94,7 +94,7 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
     }
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
-    ggml_tensor * out_dth = ggml_mul_mat(ctx, v_tdh, attn_probs); // [d, t, h]
+    ggml_tensor * out_dth = codec_mul_mat(ctx, v_tdh, attn_probs); // [d, t, h]
     if (params != nullptr && params->n_valid > 0 && params->n_valid < (int32_t) q_dth->ne[1]) {
         // Zero out output rows for queries at positions >= n_valid (mirrors
         // MOSS's `torch.where(valid_q, out, 0)`).  Build a per-time mask
@@ -198,9 +198,9 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     if (q_u == nullptr || q_v == nullptr) return nullptr;
 
     // matrix_ac = q_u · k.T  → (t, t, h).
-    ggml_tensor * mat_ac = ggml_mul_mat(ctx, ggml_cont(ctx, k_dth), q_u);
+    ggml_tensor * mat_ac = codec_mul_mat(ctx, ggml_cont(ctx, k_dth), q_u);
     // matrix_bd = q_v · p.T  → (2t-1, t, h), then rel-shift to (t, t, h).
-    ggml_tensor * mat_bd = ggml_mul_mat(ctx, ggml_cont(ctx, p_dth), q_v);
+    ggml_tensor * mat_bd = codec_mul_mat(ctx, ggml_cont(ctx, p_dth), q_v);
     if (mat_ac == nullptr || mat_bd == nullptr) return nullptr;
     mat_bd = codec_op_rel_shift_espnet(ctx, mat_bd);
     if (mat_bd == nullptr) return nullptr;
@@ -213,7 +213,7 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     ggml_tensor * attn_w = ggml_soft_max(ctx, scores);
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
-    return ggml_mul_mat(ctx, v_tdh, attn_w);
+    return codec_mul_mat(ctx, v_tdh, attn_w);
 }
 
 ggml_tensor * codec_op_lm_attn_rel_key_dth(
@@ -243,7 +243,7 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
         : (1.0f / std::sqrt((float) std::max<int64_t>(1, head_dim)));
 
     // Standard attention scores: [t_k, t_q, h].
-    ggml_tensor * ac = ggml_mul_mat(ctx, ggml_cont(ctx, k_dth), q_dth);
+    ggml_tensor * ac = codec_mul_mat(ctx, ggml_cont(ctx, k_dth), q_dth);
     if (ac == nullptr) return nullptr;
 
     // Gather E[d, t_k * t_q] = D[d, bucket(t_k, t_q)]. The bucket index is laid
@@ -256,7 +256,7 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
     ggml_tensor * q_dh_tq = ggml_cont(ctx, ggml_permute(ctx, q_dth, 0, 2, 1, 3));  // [d, h, t_q]
 
     // Per-t_q batched mul_mat: result ne=(t_k, h, t_q). mul_mat contracts d.
-    ggml_tensor * rel = ggml_mul_mat(ctx, E_3d, q_dh_tq);                          // [t_k, h, t_q]
+    ggml_tensor * rel = codec_mul_mat(ctx, E_3d, q_dh_tq);                          // [t_k, h, t_q]
     if (rel == nullptr) return nullptr;
 
     // Permute to [t_k, t_q, h] to align with `ac`.
@@ -267,7 +267,7 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
     ggml_tensor * probs = ggml_soft_max(ctx, scores);
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
-    return ggml_mul_mat(ctx, v_tdh, probs);
+    return codec_mul_mat(ctx, v_tdh, probs);
 }
 
 
@@ -314,7 +314,7 @@ ggml_tensor * codec_op_lm_per_pos_linear(
         // downcast); GGML_PREC_F32 alone does not prevent the src[1] cast.
         // codec_graph_cast_f32 is a no-op for weights already F32.
         ggml_tensor * w_lhs = codec_graph_cast_f32(ctx, w);
-        ggml_tensor * y     = ggml_mul_mat(ctx, w_lhs, x_2d);
+        ggml_tensor * y     = codec_mul_mat(ctx, w_lhs, x_2d);
         ggml_mul_mat_set_prec(y, GGML_PREC_F32);
         return y;
     }
@@ -329,7 +329,7 @@ ggml_tensor * codec_op_lm_per_pos_linear(
     // `a` may broadcast.  Putting the input as `a` keeps the rule
     // satisfied for both balanced (a.ne[2] == b.ne[2] == T) and
     // broadcast-from-1 (when x is a single position repeated) cases.
-    ggml_tensor * y_3d    = ggml_mul_mat(ctx, x_3d, w_slice);
+    ggml_tensor * y_3d    = codec_mul_mat(ctx, x_3d, w_slice);
     return ggml_reshape_2d(ctx, y_3d, (int64_t) out_dim, (int64_t) T);
 }
 
@@ -394,13 +394,13 @@ ggml_tensor * codec_op_lm_llama_depth_block(
     ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_tensor * scores = codec_mul_mat(ctx, k_p, q_p);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
     scores = ggml_diag_mask_inf(ctx, scores, /*n_past=*/0);
     scores = ggml_soft_max(ctx, scores);
 
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
-    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_tensor * attn = codec_mul_mat(ctx, v_p, scores);
     attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
     attn = ggml_reshape_2d(ctx, attn, (int64_t) q_dim, T);
 

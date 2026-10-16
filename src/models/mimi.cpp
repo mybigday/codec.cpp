@@ -473,9 +473,9 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
             return false;
         }
 
-        ggml_tensor * q = ggml_mul_mat(ctx_eval, q_w, h);
-        ggml_tensor * k = ggml_mul_mat(ctx_eval, k_w, h);
-        ggml_tensor * v = ggml_mul_mat(ctx_eval, v_w, h);
+        ggml_tensor * q = codec_mul_mat(ctx_eval, q_w, h);
+        ggml_tensor * k = codec_mul_mat(ctx_eval, k_w, h);
+        ggml_tensor * v = codec_mul_mat(ctx_eval, v_w, h);
         if (q == nullptr || k == nullptr || v == nullptr) {
             return false;
         }
@@ -506,7 +506,7 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
         if (attn_ct == nullptr) {
             return false;
         }
-        ggml_tensor * attn_proj = ggml_mul_mat(ctx_eval, o_w, attn_ct);
+        ggml_tensor * attn_proj = codec_mul_mat(ctx_eval, o_w, attn_ct);
         if (attn_proj == nullptr) {
             return false;
         }
@@ -516,12 +516,12 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
         if (m == nullptr) {
             return false;
         }
-        m = ggml_mul_mat(ctx_eval, fc1_w, m);
+        m = codec_mul_mat(ctx_eval, fc1_w, m);
         if (m == nullptr) {
             return false;
         }
         m = ggml_gelu_erf(ctx_eval, m);
-        m = ggml_mul_mat(ctx_eval, fc2_w, m);
+        m = codec_mul_mat(ctx_eval, fc2_w, m);
         if (m == nullptr) {
             return false;
         }
@@ -550,8 +550,8 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     }
 
     ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x)); // [downsample.out_c, t]
-    ggml_tensor * sem_residual = ggml_mul_mat(ctx_eval, t_qs_ip_w, x_ct);
-    ggml_tensor * acu_residual = ggml_mul_mat(ctx_eval, t_qa_ip_w, x_ct);
+    ggml_tensor * sem_residual = codec_mul_mat(ctx_eval, t_qs_ip_w, x_ct);
+    ggml_tensor * acu_residual = codec_mul_mat(ctx_eval, t_qa_ip_w, x_ct);
     if (sem_residual == nullptr || acu_residual == nullptr) {
         return false;
     }
@@ -672,7 +672,7 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
             (void) tag;
             return nullptr;
         }
-        return ggml_mul_mat(ctx_eval, a, b);
+        return codec_mul_mat(ctx_eval, a, b);
     };
 
     if (p->model == nullptr) {

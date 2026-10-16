@@ -132,7 +132,7 @@ static bool codec_s3g_build_flow(ggml_context * ctx_eval, void * user_data, ggml
             ggml_tensor * r_emb = codec_block_cfm_time_mlp(ctx_eval, model, "s3g.cfm", r, kCfmInChannels, kCfmTimeEmbedScale);
             ggml_tensor * mixer = W("s3g.cfm.t_mix.w");
             if (r_emb == nullptr || mixer == nullptr) return nullptr;
-            t_emb = ggml_mul_mat(ctx_eval, mixer, ggml_concat(ctx_eval, t_emb, r_emb, 0));
+            t_emb = codec_mul_mat(ctx_eval, mixer, ggml_concat(ctx_eval, t_emb, r_emb, 0));
         }
         return codec_block_cfm_unet(ctx_eval, model, "s3g.cfm", up, x, mu, sk, cd, t_emb);
     };

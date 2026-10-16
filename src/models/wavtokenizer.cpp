@@ -211,7 +211,7 @@ static ggml_tensor * codec_wt_pos_attn(
         return nullptr;
     }
 
-    ggml_tensor * scores = ggml_mul_mat(ctx_eval, k_ct, q_ct); // [t, t]
+    ggml_tensor * scores = codec_mul_mat(ctx_eval, k_ct, q_ct); // [t, t]
     if (scores == nullptr) {
         return nullptr;
     }
@@ -223,7 +223,7 @@ static ggml_tensor * codec_wt_pos_attn(
     }
 
     ggml_tensor * v_tc = ggml_cont(ctx_eval, v); // [t, c]
-    ggml_tensor * ctx_ct = ggml_mul_mat(ctx_eval, v_tc, probs); // [c, t]
+    ggml_tensor * ctx_ct = codec_mul_mat(ctx_eval, v_tc, probs); // [c, t]
     if (ctx_ct == nullptr) {
         return nullptr;
     }
@@ -646,8 +646,8 @@ static ggml_tensor * codec_wt_encode_lstm_layers(
 
             ggml_tensor * gates = ggml_add(
                 ctx_eval,
-                ggml_mul_mat(ctx_eval, w_ih[(size_t) li], layer_in),
-                ggml_mul_mat(ctx_eval, w_hh[(size_t) li], h_prev[(size_t) li]));
+                codec_mul_mat(ctx_eval, w_ih[(size_t) li], layer_in),
+                codec_mul_mat(ctx_eval, w_hh[(size_t) li], h_prev[(size_t) li]));
             ggml_tensor * b_ih2 = ggml_reshape_2d(ctx_eval, b_ih[(size_t) li], 4 * dim, 1);
             ggml_tensor * b_hh2 = ggml_reshape_2d(ctx_eval, b_hh[(size_t) li], 4 * dim, 1);
             gates = ggml_add(ctx_eval, ggml_add(ctx_eval, gates, b_ih2), b_hh2);

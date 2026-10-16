@@ -38,7 +38,7 @@ ggml_tensor * resnet(ggml_context * ctx, const codec_model * model, const std::s
     ggml_tensor * h = block1d_gn(ctx, x, W("b1.cv.w"), W("b1.cv.b"), W("b1.ln.w"), W("b1.ln.b"), p.gn_groups);
     if (h == nullptr) return nullptr;
     ggml_tensor * tm = codec_op_unary(ctx, t_emb, CODEC_UNARY_MISH);
-    ggml_tensor * tp = ggml_mul_mat(ctx, mlp_w, ggml_reshape_2d(ctx, tm, tm->ne[0], 1));
+    ggml_tensor * tp = codec_mul_mat(ctx, mlp_w, ggml_reshape_2d(ctx, tm, tm->ne[0], 1));
     if (mlp_b != nullptr) tp = ggml_add(ctx, tp, ggml_reshape_2d(ctx, mlp_b, mlp_b->ne[0], 1));
     h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_cont(ctx, ggml_transpose(ctx, tp)), h));
     h = block1d_gn(ctx, h, W("b2.cv.w"), W("b2.cv.b"), W("b2.ln.w"), W("b2.ln.b"), p.gn_groups);

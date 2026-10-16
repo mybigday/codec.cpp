@@ -133,7 +133,7 @@ ggml_tensor * codec_op_linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
     ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
     ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
 
-    ggml_tensor * y = ggml_mul_mat(ctx, w_f32, x);
+    ggml_tensor * y = codec_mul_mat(ctx, w_f32, x);
     if (b_f32 != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, w_f32->ne[1], 1);
         y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
@@ -455,7 +455,7 @@ ggml_tensor * codec_op_cfm_causal_resnet_block_tc(
     ggml_tensor * tm = codec_op_unary(ctx, t_emb, CODEC_UNARY_MISH);
     if (tm == nullptr) return nullptr;
     ggml_tensor * tm_2d = ggml_reshape_2d(ctx, tm, tm->ne[0], 1);
-    ggml_tensor * tm_proj = ggml_mul_mat(ctx, mlp_w, tm_2d);  // [out, 1]
+    ggml_tensor * tm_proj = codec_mul_mat(ctx, mlp_w, tm_2d);  // [out, 1]
     if (tm_proj == nullptr) return nullptr;
     if (mlp_b != nullptr) {
         ggml_tensor * mlp_b_2d = ggml_reshape_2d(ctx, mlp_b, mlp_b->ne[0], 1);
@@ -555,7 +555,7 @@ ggml_tensor * codec_op_whisper_encoder_layer_tc(
     ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, h));     // [c, t]
 
     auto linear_with_bias = [&](ggml_tensor * w, ggml_tensor * b) -> ggml_tensor * {
-        ggml_tensor * y = ggml_mul_mat(ctx, w, h_ct);                // [out, t]
+        ggml_tensor * y = codec_mul_mat(ctx, w, h_ct);                // [out, t]
         if (y == nullptr) return nullptr;
         if (b != nullptr) {
             ggml_tensor * b2 = ggml_reshape_2d(ctx, b, b->ne[0], 1);
@@ -585,7 +585,7 @@ ggml_tensor * codec_op_whisper_encoder_layer_tc(
     ggml_tensor * attn_dht = ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3));
     ggml_tensor * attn_ct  = ggml_reshape_2d(ctx, attn_dht, hidden, t);
 
-    ggml_tensor * out_ct = ggml_mul_mat(ctx, ow, attn_ct);             // [hidden, t]
+    ggml_tensor * out_ct = codec_mul_mat(ctx, ow, attn_ct);             // [hidden, t]
     if (ob != nullptr) {
         ggml_tensor * ob_2d = ggml_reshape_2d(ctx, ob, ob->ne[0], 1);
         ggml_tensor * obr = ggml_repeat(ctx, ob_2d, out_ct);
@@ -601,7 +601,7 @@ ggml_tensor * codec_op_whisper_encoder_layer_tc(
     ggml_tensor * f1_tc = ggml_cont(ctx, ggml_transpose(ctx, f1));
     f1_tc = ggml_gelu_erf(ctx, f1_tc);
     f1 = ggml_cont(ctx, ggml_transpose(ctx, f1_tc));                   // [ffn, t]
-    ggml_tensor * f2 = ggml_mul_mat(ctx, fc2w, f1);                    // [hidden, t]
+    ggml_tensor * f2 = codec_mul_mat(ctx, fc2w, f1);                    // [hidden, t]
     if (fc2b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, fc2b, fc2b->ne[0], 1);
         ggml_tensor * br = ggml_repeat(ctx, b2, f2);
@@ -766,7 +766,7 @@ ggml_tensor * codec_op_roformer_block_ct(
     ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ct, 1e-6f, att_norm_w);
     if (h == nullptr) return nullptr;
 
-    ggml_tensor * qkv = ggml_mul_mat(ctx, c_attn_w, h);                                  // [3*hidden, t]
+    ggml_tensor * qkv = codec_mul_mat(ctx, c_attn_w, h);                                  // [3*hidden, t]
     if (qkv == nullptr) return nullptr;
 
     const int64_t t = qkv->ne[1];
@@ -796,15 +796,15 @@ ggml_tensor * codec_op_roformer_block_ct(
         ggml_cont(ctx, ggml_permute(ctx, attn_ctx, 0, 2, 1, 3)),
         hidden_dim,
         t);
-    ggml_tensor * attn_proj = ggml_mul_mat(ctx, c_proj_w, attn_ct);                       // [hidden, t]
+    ggml_tensor * attn_proj = codec_mul_mat(ctx, c_proj_w, attn_ct);                       // [hidden, t]
     if (attn_proj == nullptr) return nullptr;
     x_ct = ggml_add(ctx, x_ct, attn_proj);
 
     ggml_tensor * m = codec_op_rms_norm_ct(ctx, x_ct, 1e-6f, ffn_norm_w);
     if (m == nullptr) return nullptr;
-    ggml_tensor * ff = ggml_mul_mat(ctx, fc1_w, m);
+    ggml_tensor * ff = codec_mul_mat(ctx, fc1_w, m);
     ff = ggml_silu(ctx, ff);
-    ff = ggml_mul_mat(ctx, fc2_w, ff);
+    ff = codec_mul_mat(ctx, fc2_w, ff);
     if (ff == nullptr) return nullptr;
     return ggml_add(ctx, x_ct, ff);
 }

@@ -327,7 +327,7 @@ static ggml_tensor * codec_neu_transformer_block(
         return nullptr;
     }
 
-    ggml_tensor * qkv = ggml_mul_mat(ctx_eval, att_c_attn_w, h); // [3*hidden, t]
+    ggml_tensor * qkv = codec_mul_mat(ctx_eval, att_c_attn_w, h); // [3*hidden, t]
     if (qkv == nullptr) {
         return nullptr;
     }
@@ -362,7 +362,7 @@ static ggml_tensor * codec_neu_transformer_block(
         hidden_dim,
         t);
 
-    ggml_tensor * attn_proj = ggml_mul_mat(ctx_eval, att_c_proj_w, attn_ct); // [hidden, t]
+    ggml_tensor * attn_proj = codec_mul_mat(ctx_eval, att_c_proj_w, attn_ct); // [hidden, t]
     if (attn_proj == nullptr) {
         return nullptr;
     }
@@ -372,9 +372,9 @@ static ggml_tensor * codec_neu_transformer_block(
     if (m == nullptr) {
         return nullptr;
     }
-    ggml_tensor * ff = ggml_mul_mat(ctx_eval, mlp_fc1_w, m);
+    ggml_tensor * ff = codec_mul_mat(ctx_eval, mlp_fc1_w, m);
     ff = ggml_silu(ctx_eval, ff);
-    ff = ggml_mul_mat(ctx_eval, mlp_fc2_w, ff);
+    ff = codec_mul_mat(ctx_eval, mlp_fc2_w, ff);
     if (ff == nullptr) {
         return nullptr;
     }

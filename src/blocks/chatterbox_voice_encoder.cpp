@@ -101,7 +101,7 @@ ggml_tensor * codec_block_chatterbox_voice_encoder(
         ggml_tensor * bias = ggml_add(ctx, codec_graph_cast_f32(ctx, b_ih), codec_graph_cast_f32(ctx, b_hh));
         ggml_tensor * wx_all = nullptr;
         if (l == 0) {
-            wx_all = ggml_mul_mat(ctx, w_ih, ggml_reshape_2d(ctx, x, p.n_mels, (int64_t) B * T));   // [4H, B * T]
+            wx_all = codec_mul_mat(ctx, w_ih, ggml_reshape_2d(ctx, x, p.n_mels, (int64_t) B * T));   // [4H, B * T]
             wx_all = ggml_add(ctx, wx_all, bias);
         }
         ggml_tensor * h = nullptr;
@@ -109,8 +109,8 @@ ggml_tensor * codec_block_chatterbox_voice_encoder(
         for (int32_t t = 0; t < T; ++t) {
             ggml_tensor * gates = wx_all != nullptr
                 ? ggml_view_2d(ctx, wx_all, 4 * H, B, wx_all->nb[1], (size_t) t * B * wx_all->nb[1])
-                : ggml_add(ctx, ggml_mul_mat(ctx, w_ih, h_seq[(size_t) t]), bias);
-            if (h != nullptr) gates = ggml_add(ctx, gates, ggml_mul_mat(ctx, w_hh, h));
+                : ggml_add(ctx, codec_mul_mat(ctx, w_ih, h_seq[(size_t) t]), bias);
+            if (h != nullptr) gates = ggml_add(ctx, gates, codec_mul_mat(ctx, w_hh, h));
             ggml_tensor * sg = ggml_sigmoid(ctx, gates);
             ggml_tensor * tg = ggml_tanh(ctx, gates);
             auto gate = [&](ggml_tensor * a, int k) {
@@ -124,7 +124,7 @@ ggml_tensor * codec_block_chatterbox_voice_encoder(
     }
 
     // Final hidden state → Linear (+ ReLU) → L2 per partial → mean → L2.
-    ggml_tensor * e = ggml_mul_mat(ctx, codec_graph_cast_f32(ctx, W("proj.weight")), h_seq.back());
+    ggml_tensor * e = codec_mul_mat(ctx, codec_graph_cast_f32(ctx, W("proj.weight")), h_seq.back());
     if (missing) return nullptr;
     e = ggml_add(ctx, e, codec_graph_cast_f32(ctx, W("proj.bias")));                      // [E, B]
     if (p.final_relu) e = ggml_relu(ctx, e);

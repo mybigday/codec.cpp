@@ -186,6 +186,24 @@ ggml_tensor * codec_graph_weight_mat(ggml_context * ctx_eval, const codec_model 
     return codec_graph_weight_mat(ctx_eval, model, name.c_str());
 }
 
+static ggml_tensor * codec_graph_uncast_weight(ggml_context * ctx_eval, ggml_tensor * t) {
+    if (t->op == GGML_OP_RESHAPE && t->src[0] != nullptr) {
+        ggml_tensor * src = codec_graph_uncast_weight(ctx_eval, t->src[0]);
+        return src == t->src[0] ? t : ggml_reshape(ctx_eval, src, t);
+    }
+    ggml_tensor * w = t->src[0];
+    if (t->op != GGML_OP_CPY || t->type != GGML_TYPE_F32 || w == nullptr || w->op != GGML_OP_NONE ||
+        w->buffer == nullptr || (w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_BF16) ||
+        !ggml_is_contiguous(w) || !ggml_are_same_shape(w, t)) {
+        return t;
+    }
+    return w;
+}
+
+ggml_tensor * codec_mul_mat(ggml_context * ctx_eval, ggml_tensor * a, ggml_tensor * b) {
+    return ggml_mul_mat(ctx_eval, codec_graph_uncast_weight(ctx_eval, a), b);
+}
+
 ggml_tensor * codec_graph_weight(ggml_context * ctx_eval, const codec_model * model, const std::string & name) {
     return codec_graph_weight_or_null(ctx_eval, model, name.c_str());
 }
