@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 static bool codec_graph_key_equal(const codec_graph_cache_key & a, const codec_graph_cache_key & b) {
     return a.kind == b.kind &&
@@ -16,7 +17,7 @@ static bool codec_graph_key_equal(const codec_graph_cache_key & a, const codec_g
 }
 
 struct codec_graph_count_state {
-    std::vector<ggml_tensor *> visited;
+    std::unordered_set<const ggml_tensor *> visited;
     size_t n_nodes = 0;
     size_t n_leafs = 0;
 };
@@ -26,10 +27,9 @@ static void codec_graph_count_visit(ggml_tensor * node, codec_graph_count_state 
         return;
     }
 
-    if (std::find(state->visited.begin(), state->visited.end(), node) != state->visited.end()) {
+    if (!state->visited.insert(node).second) {
         return;
     }
-    state->visited.push_back(node);
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         codec_graph_count_visit(node->src[i], state);
@@ -70,8 +70,12 @@ ggml_tensor * codec_graph_const(
             data == nullptr || n_dims < 1 || n_dims > GGML_MAX_DIMS) {
         return nullptr;
     }
-    if (ggml_tensor * existing = ggml_get_tensor(ctx_eval, name)) {
-        return existing;
+    // Search the registered constants, not ctx_eval: ggml_get_tensor scans every
+    // object of a graph that can hold 100k+ nodes.
+    for (const codec_graph_const_input & c : ctx->eval_consts) {
+        if (std::strcmp(ggml_get_name(c.tensor), name) == 0) {
+            return c.tensor;
+        }
     }
     ggml_tensor * t = ggml_new_tensor(ctx_eval, type, n_dims, ne);
     if (t == nullptr) {

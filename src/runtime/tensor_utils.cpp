@@ -97,7 +97,8 @@ ggml_tensor * codec_model_get_tensor(const codec_model * model, const char * nam
     if (model == nullptr || model->weights == nullptr || name == nullptr) {
         return nullptr;
     }
-    return ggml_get_tensor(model->weights, name);
+    const auto it = model->weight_index.find(name);
+    return it == model->weight_index.end() ? nullptr : it->second;
 }
 
 ggml_tensor * codec_model_get_tensor(const codec_model * model, const std::string & name) {
@@ -135,7 +136,7 @@ ggml_tensor * codec_graph_weight_or_null(ggml_context * ctx_eval, const codec_mo
     if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr || name == nullptr) {
         return nullptr;
     }
-    ggml_tensor * w = ggml_get_tensor(model->weights, name);
+    ggml_tensor * w = codec_model_get_tensor(model, name);
     if (w == nullptr) {
         return nullptr;
     }
@@ -154,7 +155,7 @@ ggml_tensor * codec_graph_weight_mat(ggml_context * ctx_eval, const codec_model 
     if (ctx_eval == nullptr || model == nullptr || model->weights == nullptr || name == nullptr) {
         return nullptr;
     }
-    ggml_tensor * w = ggml_get_tensor(model->weights, name);
+    ggml_tensor * w = codec_model_get_tensor(model, name);
     if (w == nullptr) {
         return nullptr;
     }

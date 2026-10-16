@@ -8,6 +8,7 @@
 #include <gguf.h>
 
 #include <string>
+#include <unordered_map>
 #include <cstdint>
 #include <vector>
 
@@ -40,6 +41,9 @@ struct codec_speaker {
 struct codec_model {
     struct gguf_context * gguf;
     struct ggml_context * weights;
+    // name -> tensor of `weights`; ggml_get_tensor is a linear strcmp scan and
+    // graph builders look weights up tens of thousands of times per build.
+    std::unordered_map<std::string, ggml_tensor *> weight_index;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_type_t buffer_type = nullptr;
     ggml_backend_buffer_t weights_buffer = nullptr;

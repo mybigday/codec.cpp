@@ -386,6 +386,9 @@ struct codec_model * codec_model_load_from_file_ext(
 
     model->gguf = gf;
     model->weights = weights;
+    for (ggml_tensor * t = ggml_get_first_tensor(weights); t != nullptr; t = ggml_get_next_tensor(weights, t)) {
+        model->weight_index.emplace(ggml_get_name(t), t);
+    }
     model->metadata = { nullptr, 0 };
     model->arch = CODEC_ARCH_UNKNOWN;
     model->name = "unknown";
