@@ -70,6 +70,11 @@ cv_lengths cv_lengths_for(const codec_cosyvoice & cv, int32_t n_prompt, int32_t 
     return l;
 }
 
+// Mel frames after the speed change: int(mel / speed) (cli/model.py token2wav).
+int32_t speed_mel_len(const codec_cosyvoice & cv, int32_t mel) {
+    return cv.speed == 1.0f ? mel : (int32_t) ((double) mel / (double) cv.speed);
+}
+
 ggml_tensor * time_slice(ggml_context * ctx, ggml_tensor * x, int64_t t0, int64_t n) {
     return ggml_cont(ctx, ggml_view_2d(ctx, x, n, x->ne[1], x->nb[1], (size_t) t0 * x->nb[0]));
 }
@@ -253,9 +258,11 @@ bool build_decode(ggml_context * ctx, void * user_data, ggml_tensor ** out) {
     ggml_tensor * x = codec_block_cfm_solve(ctx, sp, t_z, mu, spks, cond, estimator);
     if (x == nullptr) return false;
     ggml_tensor * mel = time_slice(ctx, ggml_cont(ctx, x), l.mel_len1, T_mel - l.mel_len1);
+    const int32_t n_mel = speed_mel_len(cv, T_mel - l.mel_len1);
+    if (n_mel != T_mel - l.mel_len1) mel = interp_matrix(ctx, mel, n_mel, false, "lut.cv.speed");
     ggml_set_name(mel, "cv.mel");
 
-    const int32_t T_pcm = (T_mel - l.mel_len1) * codec_hift_upsample_factor(cv.hift);
+    const int32_t T_pcm = n_mel * codec_hift_upsample_factor(cv.hift);
     ggml_tensor * t_phase = nullptr;   // SineGen2 has no per-harmonic initial phase input
     if (cv.hift.sinegen == 1) {
         t_phase = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cv.hift.nb_harmonics + 1);
@@ -472,11 +479,11 @@ enum codec_status decode(codec_context * ctx, const codec_token_buffer * tokens,
     build.len = cv_lengths_for(cv, n_prompt, n_target, s_feat != nullptr ? (int32_t) s_feat->ne[1] : 0);
     build.model = ctx->model;
     const cv_lengths & l = build.len;
-    if (l.mel_len1 >= l.mel_total) {
+    if (l.mel_len1 >= l.mel_total || speed_mel_len(cv, l.mel_total - l.mel_len1) < 1) {
         codec_context_set_error(ctx, "prompt mel longer than the flow output");
         return CODEC_STATUS_INVALID_ARG;
     }
-    const int32_t T_pcm = (l.mel_total - l.mel_len1) * codec_hift_upsample_factor(cv.hift);
+    const int32_t T_pcm = speed_mel_len(cv, l.mel_total - l.mel_len1) * codec_hift_upsample_factor(cv.hift);
 
     codec_graph_eval_guard guard(ctx);
     codec_graph_cache_entry * entry = nullptr;
@@ -551,6 +558,7 @@ enum codec_status init(codec_model * model) {
     cv.codebook_size = codec_read_i32_kv(g, "codec.codebook_size", cv.version == 1 ? 4096 : 6561);
     cv.n_timesteps = codec_read_i32_kv(g, "cosyvoice.flow.n_timesteps", 10);
     cv.cfg_rate = codec_read_f32_kv(g, "cosyvoice.flow.cfg_rate", 0.7f);
+    cv.speed = codec_read_f32_kv(g, "cosyvoice.flow.speed", 1.0f);
     cv.token_mel_ratio = codec_read_i32_kv(g, "cosyvoice.flow.token_mel_ratio", 2);
     cv.length_regulator = codec_read_str_kv(g, "cosyvoice.flow.length_regulator", "split_linear");
     cv.lr_blocks = codec_read_i32_kv(g, "cosyvoice.flow.lr_blocks", 4);
@@ -585,7 +593,7 @@ enum codec_status init(codec_model * model) {
     cv.tokenizer_layers = codec_read_i32_kv(g, "cosyvoice.spk.tokenizer_layers", 6);
 
     if (cv.version < 1 || cv.version > 3 || cv.n_timesteps < 1 || cv.n_timesteps > kMaxTimesteps ||
-        !(cv.cfg_rate >= 0.0f) || cv.hift.upsample_rates.empty() ||
+        !(cv.cfg_rate >= 0.0f) || !(cv.speed > 0.0f && cv.speed < 100.0f) || cv.hift.upsample_rates.empty() ||
         cv.hift.upsample_rates.size() != cv.hift.upsample_kernels.size() ||
         cv.hift.upsample_rates.size() != cv.hift.source_resblock_kernels.size() ||
         (cv.version == 1 && cv.length_regulator != "joint_nearest" && cv.length_regulator != "split_linear")) {

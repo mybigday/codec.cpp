@@ -60,6 +60,29 @@ Voices from `spk2info.pt`: 中文女 `zh_female`, 中文男 `zh_male`, 日语男
 BreezyVoice's voices also carry prompt tokens / mel (no transcript, so they run
 in cross-lingual mode).
 
+## Tunable metadata
+
+Inference knobs are GGUF metadata with upstream defaults; change them per run
+with `--override-kv KEY=TYPE:VALUE` (repeatable) or, through the C API, the
+`kv_overrides` argument of `codec_model_load_from_file_ext`. Keys missing from
+older GGUFs fall back to the defaults below.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `cosyvoice.flow.speed` | 1.0 | speaking rate: the flow mel is linearly resampled to `int(frames / speed)` before HiFT (`token2wav(speed=)`) |
+| `cosyvoice.flow.n_timesteps` | 10 | Euler steps |
+| `cosyvoice.flow.cfg_rate` | 0.7 | classifier-free guidance |
+| `codec.lm.cosyvoice.sampling` | `ras` (`topk` for BreezyVoice) | `ras` or `topk` |
+| `codec.lm.cosyvoice.top_k` / `top_p` | 25 / 0.8 | nucleus sampling |
+| `codec.lm.cosyvoice.win_size` / `tau_r` | 10 / 0.1 | RAS repetition window / threshold |
+| `codec.lm.cosyvoice.min_token_text_ratio` / `max_token_text_ratio` | 2 / 20 | speech-length bounds per text token |
+| `codec.lm.cosyvoice.max_silent_run` | 5 (v3), 0 (off) | drop longer runs of silent tokens |
+
+```bash
+tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2 \
+    --override-kv codec.lm.cosyvoice.top_k=int:10
+```
+
 ## Runtime contract
 
 - **Prompt** (`common/tts_runner.cpp::run_cosyvoice`, `cosyvoice/llm/llm.py`):
@@ -94,7 +117,7 @@ in cross-lingual mode).
 - BreezyVoice's g2pw polyphone annotation (注音 inserted after ambiguous
   characters, `single_inference.py`): plain text works; annotate externally for
   polyphone control.
-- Streaming (chunked flow / HiFT caches); `speed`.
+- Streaming (chunked flow / HiFT caches).
 
 ## Validation (CPU, F32 GGUFs, reference = upstream PyTorch / BreezyVoice fork)
 

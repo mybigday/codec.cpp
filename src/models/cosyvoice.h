@@ -21,6 +21,7 @@ struct codec_cosyvoice {
     // Flow.
     int32_t n_timesteps = 10;
     float cfg_rate = 0.7f;
+    float speed = 1.0f;                   // mel time-stretch before HiFT (non-streaming)
     int32_t token_mel_ratio = 2;          // v2 / v3
     std::string length_regulator;         // v1: "joint_nearest" | "split_linear"
     int32_t lr_blocks = 4;

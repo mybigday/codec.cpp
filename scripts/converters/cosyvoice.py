@@ -467,6 +467,7 @@ class CosyVoiceConverter(BaseConverter):
         writer.add_uint32(p + "version", v)
         writer.add_uint32(p + "flow.n_timesteps", 10)
         writer.add_float32(p + "flow.cfg_rate", 0.7)
+        writer.add_float32(p + "flow.speed", 1.0)   # tunable: --override-kv cosyvoice.flow.speed=float:1.2
         if v == 1:
             writer.add_string(p + "flow.length_regulator", "joint_nearest" if c["breezyvoice"] else "split_linear")
             writer.add_uint32(p + "flow.lr_blocks", c["lr_blocks"])
