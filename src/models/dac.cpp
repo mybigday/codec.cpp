@@ -389,7 +389,7 @@ static ggml_tensor * codec_dac_sum_quantized_latent(
         ggml_tensor * t_lat_q = codec_mul_mat(ctx_eval, t_out_proj, t_embed);     // [hidden_dim, t]
         ggml_tensor * t_lat_qt = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_lat_q));
         ggml_tensor * t_bias_2d = ggml_reshape_2d(ctx_eval, t_out_bias, 1, hidden_dim);
-        t_lat_qt = ggml_add(ctx_eval, t_lat_qt, ggml_repeat(ctx_eval, t_bias_2d, t_lat_qt));
+        t_lat_qt = ggml_add(ctx_eval, t_lat_qt, t_bias_2d);
         t_lat_q = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, t_lat_qt));
         acc = (acc == nullptr) ? t_lat_q : ggml_add(ctx_eval, acc, t_lat_q);
     }

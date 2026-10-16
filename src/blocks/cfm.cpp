@@ -40,7 +40,7 @@ ggml_tensor * resnet(ggml_context * ctx, const codec_model * model, const std::s
     ggml_tensor * tm = codec_op_unary(ctx, t_emb, CODEC_UNARY_MISH);
     ggml_tensor * tp = codec_mul_mat(ctx, mlp_w, ggml_reshape_2d(ctx, tm, tm->ne[0], 1));
     if (mlp_b != nullptr) tp = ggml_add(ctx, tp, ggml_reshape_2d(ctx, mlp_b, mlp_b->ne[0], 1));
-    h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_cont(ctx, ggml_transpose(ctx, tp)), h));
+    h = ggml_add(ctx, h, ggml_cont(ctx, ggml_transpose(ctx, tp)));
     h = block1d_gn(ctx, h, W("b2.cv.w"), W("b2.cv.b"), W("b2.ln.w"), W("b2.ln.b"), p.gn_groups);
     if (h == nullptr) return nullptr;
     ggml_tensor * res = codec_conv1d(ctx, x, W("res.w"), W("res.b"), 1, 1, 0);

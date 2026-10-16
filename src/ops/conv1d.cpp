@@ -117,7 +117,7 @@ ggml_tensor * codec_conv1d(
     ggml_tensor * y = codec_conv1d_impl(ctx, x, w, stride, padding, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     y = ggml_cont(ctx, y);
     // Squeeze the trailing batch dim when input was 2D so callers don't
@@ -148,7 +148,7 @@ ggml_tensor * codec_conv1d_depthwise(
     ggml_tensor * y = codec_conv1d_depthwise_impl(ctx, x, w, stride, padding, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     return ggml_cont(ctx, y);
 }
@@ -185,7 +185,7 @@ ggml_tensor * codec_conv1d_causal(
     ggml_tensor * y = codec_conv1d_impl(ctx, x_pad, w, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     return ggml_cont(ctx, y);
 }
@@ -222,7 +222,7 @@ ggml_tensor * codec_conv1d_causal_replicate(
     ggml_tensor * y = codec_conv1d_impl(ctx, x_pad, w, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     return ggml_cont(ctx, y);
 }
@@ -259,7 +259,7 @@ ggml_tensor * codec_conv1d_depthwise_causal(
     ggml_tensor * y = codec_conv1d_depthwise_impl(ctx, x_pad, w, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     return ggml_cont(ctx, y);
 }

@@ -42,7 +42,7 @@ static ggml_tensor * nemo_conv1d_replicate(
     y = ggml_reshape_3d(ctx, y, im2col->ne[1], w_f32->ne[2], im2col->ne[2]);
     if (b_f32 != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     return ggml_cont(ctx, y);
 }

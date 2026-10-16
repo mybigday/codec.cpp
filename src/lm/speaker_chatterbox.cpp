@@ -249,7 +249,7 @@ ggml_tensor * perceiver_attn_block(
         ggml_tensor * y = codec_mul_mat(ctx, W_lhs, x_2d);   // (H_out, T)
         ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
         ggml_tensor * b_2d  = ggml_reshape_2d(ctx, b_f32, H, 1);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b_2d, y));
+        y = ggml_add(ctx, y, b_2d);
         return y;
     };
     ggml_tensor * q = linear_HH(impl->perc_to_q_W, impl->perc_to_q_b, x1_norm);  // (H, T_q)

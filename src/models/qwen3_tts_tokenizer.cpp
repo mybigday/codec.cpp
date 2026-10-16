@@ -180,13 +180,13 @@ static ggml_tensor * codec_q3t_convnext_block(
     ggml_tensor * pw1 = codec_mul_mat(ctx_eval, pw1_w, h_ct);
     if (pw1_b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, pw1_b, pw1_w->ne[1], 1);
-        pw1 = ggml_add(ctx_eval, pw1, ggml_repeat(ctx_eval, b2, pw1));
+        pw1 = ggml_add(ctx_eval, pw1, b2);
     }
     pw1 = ggml_gelu_erf(ctx_eval, pw1);
     ggml_tensor * pw2 = codec_mul_mat(ctx_eval, pw2_w, pw1);
     if (pw2_b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx_eval, pw2_b, pw2_w->ne[1], 1);
-        pw2 = ggml_add(ctx_eval, pw2, ggml_repeat(ctx_eval, b2, pw2));
+        pw2 = ggml_add(ctx_eval, pw2, b2);
     }
     pw2 = codec_op_channel_scale(ctx_eval, pw2, gamma);
     ggml_tensor * out_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, pw2)); // [t, c]
@@ -341,7 +341,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     x_ct = codec_mul_mat(ctx_eval, t_in_w, x_ct);
     ggml_tensor * in_b2 = ggml_reshape_2d(ctx_eval, t_in_b, t_in_w->ne[1], 1);
-    x_ct = ggml_add(ctx_eval, x_ct, ggml_repeat(ctx_eval, in_b2, x_ct));
+    x_ct = ggml_add(ctx_eval, x_ct, in_b2);
 
     for (int32_t li = 0; li < p->transformer_layers; ++li) {
         ggml_tensor * inln_w = W(codec_q3t_decode_pt_layer_name(li, "inln.w"));
@@ -430,7 +430,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
     x_ct = codec_mul_mat(ctx_eval, t_out_w, x_ct);
     ggml_tensor * out_b2 = ggml_reshape_2d(ctx_eval, t_out_b, t_out_w->ne[1], 1);
-    x_ct = ggml_add(ctx_eval, x_ct, ggml_repeat(ctx_eval, out_b2, x_ct));
+    x_ct = ggml_add(ctx_eval, x_ct, out_b2);
 
     x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct)); // [t, latent_dim]
     ggml_set_name(x_tc, "q3t.dec.pt");

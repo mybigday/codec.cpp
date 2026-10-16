@@ -114,8 +114,8 @@ ggml_tensor * rms_norm_unbiased(ggml_context * c, ggml_tensor * x, ggml_tensor *
     // unbiased variance: sum(sq)/(D-1)
     ggml_tensor * var  = ggml_scale(c, ggml_sum_rows(c, sq), 1.0f / (float) (D - 1));  // (1, N)
     ggml_tensor * denom = ggml_sqrt(c, ggml_scale_bias(c, var, 1.0f, eps));            // sqrt(var+eps), (1,N)
-    ggml_tensor * y    = ggml_div(c, x, ggml_repeat(c, denom, x));                     // x / sqrt(var+eps)
-    return ggml_mul(c, y, ggml_repeat(c, ggml_reshape_2d(c, codec_graph_cast_f32(c, alpha), D, 1), y));
+    ggml_tensor * y    = ggml_div(c, x, denom);                     // x / sqrt(var+eps)
+    return ggml_mul(c, y, ggml_reshape_2d(c, codec_graph_cast_f32(c, alpha), D, 1));
 }
 
 // One transformer layer, incremental KV step (T_new new tokens).  Causal,

@@ -72,7 +72,7 @@ ggml_tensor * codec_convtr1d(
     ggml_tensor * y = gemm ? codec_convtr1d_gemm(ctx, x, w, stride) : ggml_conv_transpose_1d(ctx, w, x, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
-        y = ggml_add(ctx, y, ggml_repeat(ctx, b2, y));
+        y = ggml_add(ctx, y, b2);
     }
     if (padding > 0) {
         y = codec_op_crop_1d(ctx, y, padding, padding);

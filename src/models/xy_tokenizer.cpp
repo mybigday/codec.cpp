@@ -587,8 +587,7 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
         ggml_tensor * d1_b = W("xy.acoust_dec.deconv1.b");
         if (d1_b != nullptr) {
             ggml_tensor * d1_b_2d = ggml_reshape_2d(ctx, d1_b, 1, d1_b->ne[0]);
-            ggml_tensor * d1_b_rep = ggml_repeat(ctx, d1_b_2d, d1);
-            d1 = ggml_add(ctx, d1, d1_b_rep);
+            d1 = ggml_add(ctx, d1, d1_b_2d);
         }
         d1 = ggml_gelu_erf(ctx, d1);
         ggml_tensor * d2 = ggml_conv_transpose_1d(
@@ -598,8 +597,7 @@ static bool xy_build_decode(ggml_context * ctx, void * user_data, ggml_tensor **
         ggml_tensor * d2_b = W("xy.acoust_dec.deconv2.b");
         if (d2_b != nullptr) {
             ggml_tensor * d2_b_2d = ggml_reshape_2d(ctx, d2_b, 1, d2_b->ne[0]);
-            ggml_tensor * d2_b_rep = ggml_repeat(ctx, d2_b_2d, d2);
-            d2 = ggml_add(ctx, d2, d2_b_rep);
+            d2 = ggml_add(ctx, d2, d2_b_2d);
         }
         d2 = ggml_gelu_erf(ctx, d2);
         // d2 has ggml ne=(t_audio, 80) — already TC.

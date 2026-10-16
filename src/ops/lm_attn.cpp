@@ -191,7 +191,7 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     // Add per-head bias broadcast over t: q + bias_u, q + bias_v.
     auto add_bias = [&](ggml_tensor * q, ggml_tensor * bias_dh) -> ggml_tensor * {
         ggml_tensor * b3 = ggml_reshape_3d(ctx, bias_dh, head_dim, 1, h);
-        return ggml_add(ctx, q, ggml_repeat(ctx, b3, q));
+        return ggml_add(ctx, q, b3);
     };
     ggml_tensor * q_u = add_bias(q_dth, pos_bias_u);
     ggml_tensor * q_v = add_bias(q_dth, pos_bias_v);

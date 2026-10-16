@@ -157,11 +157,10 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     ggml_tensor * out_tc = ggml_cont(ctx, ggml_transpose(ctx, out_ct));                   // [t, hidden]
 
     // LayerScale_1: per-channel multiply.  Broadcast ls1 (ne=(hidden,)) over
-    // the time axis via reshape (1, hidden) + ggml_repeat to match out_tc.
+    // the time axis via reshape (1, hidden); ggml_mul broadcasts it.
     if (ls1 != nullptr) {
         ggml_tensor * ls1_2d = ggml_reshape_2d(ctx, ls1, 1, hidden);
-        ggml_tensor * ls1_rep = ggml_repeat(ctx, ls1_2d, out_tc);
-        out_tc = ggml_mul(ctx, out_tc, ls1_rep);
+        out_tc = ggml_mul(ctx, out_tc, ls1_2d);
     }
     x_tc = ggml_add(ctx, res, out_tc);
 
@@ -178,8 +177,7 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     ggml_tensor * ff_tc = ggml_cont(ctx, ggml_transpose(ctx, ff));
     if (ls2 != nullptr) {
         ggml_tensor * ls2_2d = ggml_reshape_2d(ctx, ls2, 1, hidden);
-        ggml_tensor * ls2_rep = ggml_repeat(ctx, ls2_2d, ff_tc);
-        ff_tc = ggml_mul(ctx, ff_tc, ls2_rep);
+        ff_tc = ggml_mul(ctx, ff_tc, ls2_2d);
     }
     return ggml_add(ctx, res, ff_tc);
 }
