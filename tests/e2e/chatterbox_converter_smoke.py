@@ -9,31 +9,17 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
+from _common import REPO, run_cmd
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CONVERT = REPO_ROOT / "scripts" / "convert-to-gguf.py"
-INSPECT = REPO_ROOT / "build" / "inspect-codec"
+import codec_cpp
 
-
-def run(cmd: list[str], cwd: Path | None = None) -> str:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd or REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stdout}")
-    return proc.stdout
+CONVERT = REPO / "scripts" / "convert-to-gguf.py"
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -92,22 +78,23 @@ def make_s3g_checkpoint(root: Path) -> Path:
     return ckpt
 
 
-def assert_contains(output: str, needle: str) -> None:
-    if needle not in output:
-        raise AssertionError(f"missing expected text: {needle}\n--- output ---\n{output}")
+def check_model(gguf: Path, *, arch: str, has_encoder: bool, has_decoder: bool) -> None:
+    with codec_cpp.Model(gguf) as m:
+        got = (m.arch_name, m.sample_rate, m.has_encoder, m.has_decoder, m.hop_size, m.codebook_size)
+    want = (arch, 24000, has_encoder, has_decoder, 960, 6561)
+    if got != want:
+        raise AssertionError(f"{gguf.name}: (arch, sample_rate, has_encoder, has_decoder, hop, codebook) "
+                             f"= {got}, want {want}")
 
 
 def main() -> int:
     try:
         import safetensors.numpy  # noqa: F401
     except ModuleNotFoundError:
-        venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+        venv_python = REPO / ".venv" / "bin" / "python"
         if venv_python.is_file() and Path(sys.executable).resolve() != venv_python.resolve():
             os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve())])
         raise
-
-    if not INSPECT.is_file():
-        raise RuntimeError(f"Missing inspect binary: {INSPECT}. Build the project first.")
 
     with tempfile.TemporaryDirectory(prefix="codec-chatterbox-smoke-") as td:
         root = Path(td)
@@ -116,46 +103,12 @@ def main() -> int:
         s3t_gguf = root / "s3t.gguf"
         s3g_gguf = root / "s3g.gguf"
 
-        run(
-            [
-                sys.executable,
-                str(CONVERT),
-                "--checkpoint-path",
-                str(s3t_ckpt),
-                "--model-type",
-                "chatterbox_s3t",
-                "--output",
-                str(s3t_gguf),
-            ]
-        )
-        run(
-            [
-                sys.executable,
-                str(CONVERT),
-                "--checkpoint-path",
-                str(s3g_ckpt),
-                "--model-type",
-                "chatterbox_s3g",
-                "--output",
-                str(s3g_gguf),
-            ]
-        )
+        for ckpt, kind, gguf in ((s3t_ckpt, "chatterbox_s3t", s3t_gguf), (s3g_ckpt, "chatterbox_s3g", s3g_gguf)):
+            run_cmd([sys.executable, CONVERT, "--checkpoint-path", ckpt, "--model-type", kind, "--output", gguf],
+                    cwd=REPO)
 
-        out_s3t = run([str(INSPECT), str(s3t_gguf)])
-        assert_contains(out_s3t, "arch:       Chatterbox-S3T")
-        assert_contains(out_s3t, "sample_rate    24000")
-        assert_contains(out_s3t, "has_encoder    true")
-        assert_contains(out_s3t, "has_decoder    false")
-        assert_contains(out_s3t, "hop_size       960")
-        assert_contains(out_s3t, "codebook_size  6561")
-
-        out_s3g = run([str(INSPECT), str(s3g_gguf)])
-        assert_contains(out_s3g, "arch:       Chatterbox-S3G")
-        assert_contains(out_s3g, "sample_rate    24000")
-        assert_contains(out_s3g, "has_encoder    false")
-        assert_contains(out_s3g, "has_decoder    true")
-        assert_contains(out_s3g, "hop_size       960")
-        assert_contains(out_s3g, "codebook_size  6561")
+        check_model(s3t_gguf, arch="Chatterbox-S3T", has_encoder=True, has_decoder=False)
+        check_model(s3g_gguf, arch="Chatterbox-S3G", has_encoder=False, has_decoder=True)
 
     print("chatterbox converter smoke test passed")
     return 0

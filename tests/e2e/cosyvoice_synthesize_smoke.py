@@ -23,10 +23,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ttscli_synthesize_smoke import _try_cer, _wav_stats  # noqa: E402
-
-REPO = Path(__file__).resolve().parents[2]
+from _common import REPO
+from ttscli_synthesize_smoke import _try_cer, _wav_stats
 TTS_CLI = REPO / "build" / "tts-cli"
 MODELS = REPO / "models" / "cosyvoice"
 REF_WAV = REPO / "input_audio" / "10_2_24k.wav"

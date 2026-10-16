@@ -11,51 +11,17 @@ reconstruction vs HF.
 
 from __future__ import annotations
 
-import struct
-import subprocess
 import sys
-import tempfile
-import wave
-from pathlib import Path
 
 import numpy as np
 
+from _common import REPO as REPO_ROOT, read_wav_mono_f32, run_cmd
+import codec_cpp
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CODEC_CLI = REPO_ROOT / "build" / "codec-cli"
 CONVERT = REPO_ROOT / "scripts" / "convert-to-gguf.py"
 XY_DIR = REPO_ROOT / ".model-src" / "xy_tokenizer"
 GGUF = REPO_ROOT / "models" / "xy_tokenizer" / "xy_tokenizer.gguf"
-
-
-def run(cmd: list[str]) -> bytes:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.decode(errors='replace')[:4096]}")
-    return proc.stdout
-
-
-def read_wav_mono_f32(path: Path) -> tuple[np.ndarray, int]:
-    with wave.open(str(path), "rb") as wf:
-        sr = wf.getframerate()
-        nch = wf.getnchannels()
-        sw = wf.getsampwidth()
-        n = wf.getnframes()
-        raw = wf.readframes(n)
-    if sw != 2:
-        raise RuntimeError(f"{path}: expected PCM16, got sample_width={sw}")
-    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    return pcm.reshape(-1, nch).mean(axis=1), sr
-
-
-def write_wav_mono_pcm16(path: Path, audio: np.ndarray, sr: int) -> None:
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = np.round(audio * 32767.0).astype(np.int16)
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(pcm.tobytes())
+N_THREADS = 4
 
 
 def synth_test_input() -> tuple[np.ndarray, int]:
@@ -110,129 +76,111 @@ def hf_encode_decode(pcm: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> int:
-    if not CODEC_CLI.is_file():
-        print(f"SKIP: {CODEC_CLI} not built")
-        return 0
     if not GGUF.is_file():
         if not XY_DIR.is_dir():
             print(f"SKIP: {XY_DIR} missing — run scripts/converters/xy_tokenizer.py first")
             return 0
         GGUF.parent.mkdir(parents=True, exist_ok=True)
-        run([sys.executable, str(CONVERT),
-             "--checkpoint-path", str(XY_DIR),
-             "--model-type", "xy_tokenizer",
-             "--output", str(GGUF)])
+        run_cmd([sys.executable, str(CONVERT),
+                 "--checkpoint-path", str(XY_DIR),
+                 "--model-type", "xy_tokenizer",
+                 "--output", str(GGUF)])
 
-    with tempfile.TemporaryDirectory(prefix="codec-xy-") as td:
-        td = Path(td)
-        in_wav = td / "input.wav"
+    model = codec_cpp.Model(GGUF, use_gpu=False, n_threads=N_THREADS)
+    ctx = model.context()
 
-        pcm, sr = synth_test_input()
-        write_wav_mono_pcm16(in_wav, pcm, sr)
+    pcm, sr = synth_test_input()
+    # The library sees the same PCM16-quantized input the reference sees via WAV.
+    pcm = (np.round(np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16).astype(np.float32) / 32768.0)
 
-        # ---- 1. HF reference codes & audio --------------------------------
-        hf_codes, hf_audio = hf_encode_decode(pcm, sr)
-        print(f"  hf codes: {hf_codes.shape}, hf audio: {hf_audio.shape} rms={hf_audio.std():.4f}")
+    # ---- 1. HF reference codes & audio --------------------------------
+    hf_codes, hf_audio = hf_encode_decode(pcm, sr)
+    print(f"  hf codes: {hf_codes.shape}, hf audio: {hf_audio.shape} rms={hf_audio.std():.4f}")
+    n_q = int(hf_codes.shape[0])
 
-        # ---- 2. cpp decode of HF codes (decoder parity) -------------------
-        codes_npy = td / "hf_codes.npy"
-        np.save(codes_npy, hf_codes.astype(np.int32))
-        cpp_dec_wav = td / "cpp_dec.wav"
-        run([str(CODEC_CLI), "decode", "--model", str(GGUF), "--codes", str(codes_npy),
-             "--out", str(cpp_dec_wav), "--nq", str(hf_codes.shape[0])])
-        cpp_dec, cpp_dec_sr = read_wav_mono_f32(cpp_dec_wav)
-        n = min(len(cpp_dec), len(hf_audio))
-        dec_corr = float(np.corrcoef(hf_audio[:n], cpp_dec[:n])[0, 1])
-        dec_max = float(np.abs(hf_audio[:n] - cpp_dec[:n]).max())
-        print(f"  cpp_decode(HF codes) vs HF: corr={dec_corr:.6f} max_diff={dec_max:.4f}")
-        if dec_corr < 0.95:
-            print(f"FAIL: decoder corr {dec_corr:.4f} < 0.95")
-            return 1
+    # ---- 2. cpp decode of HF codes (decoder parity) -------------------
+    cpp_dec, cpp_dec_sr = ctx.decode(hf_codes.T, n_q=n_q, n_threads=N_THREADS)
+    n = min(len(cpp_dec), len(hf_audio))
+    dec_corr = float(np.corrcoef(hf_audio[:n], cpp_dec[:n])[0, 1])
+    dec_max = float(np.abs(hf_audio[:n] - cpp_dec[:n]).max())
+    print(f"  cpp_decode(HF codes) vs HF: corr={dec_corr:.6f} max_diff={dec_max:.4f}")
+    if dec_corr < 0.95:
+        print(f"FAIL: decoder corr {dec_corr:.4f} < 0.95")
+        return 1
 
-        # ---- 2b. cpp encoder: codes match HF -----------------------------
-        cpp_codes_npy = td / "cpp_codes.npy"
-        run([str(CODEC_CLI), "encode", "--model", str(GGUF), "--in", str(in_wav),
-             "--out", str(cpp_codes_npy), "--nq", str(hf_codes.shape[0])])
-        cpp_codes = np.load(cpp_codes_npy)  # (n_q, T)
-        n = min(hf_codes.shape[1], cpp_codes.shape[1])
-        match = (hf_codes[:, :n] == cpp_codes[:, :n]).sum()
-        total = int(hf_codes.shape[0]) * int(n)
-        match_frac = match / max(1, total)
-        print(f"  cpp encode vs HF codes: {match}/{total} = {match_frac:.2%}")
-        if match_frac < 0.95:
-            print(f"FAIL: code match {match_frac:.2%} < 95%")
-            return 1
+    # ---- 2b. cpp encoder: codes match HF -----------------------------
+    cpp_codes = ctx.encode(pcm, sr, n_q=n_q, n_threads=N_THREADS).T  # (n_q, T)
+    n = min(hf_codes.shape[1], cpp_codes.shape[1])
+    match = (hf_codes[:, :n] == cpp_codes[:, :n]).sum()
+    total = int(hf_codes.shape[0]) * int(n)
+    match_frac = match / max(1, total)
+    print(f"  cpp encode vs HF codes: {match}/{total} = {match_frac:.2%}")
+    if match_frac < 0.95:
+        print(f"FAIL: code match {match_frac:.2%} < 95%")
+        return 1
 
-        # ---- 3. cpp e2e produces sane output ------------------------------
-        cpp_e2e_wav = td / "cpp_e2e.wav"
-        run([str(CODEC_CLI), "e2e", "--model", str(GGUF), "--in", str(in_wav),
-             "--out", str(cpp_e2e_wav), "--nq", str(hf_codes.shape[0])])
-        cpp_e2e, cpp_e2e_sr = read_wav_mono_f32(cpp_e2e_wav)
-        if cpp_e2e_sr != 24000:
-            print(f"FAIL: expected 24 kHz output, got {cpp_e2e_sr}")
-            return 1
-        if not np.all(np.isfinite(cpp_e2e)):
-            print("FAIL: cpp e2e contains non-finite samples")
-            return 1
-        if cpp_e2e.std() < 1e-3:
-            print(f"FAIL: cpp e2e is silent (rms={cpp_e2e.std():.4f})")
-            return 1
-        # cpp's audio length should be roughly proportional to input duration.
-        expected_n = (len(pcm) // 1280) * 1920
-        if abs(len(cpp_e2e) - expected_n) > 4 * 1920:
-            print(f"FAIL: cpp e2e length {len(cpp_e2e)} != expected ~{expected_n}")
-            return 1
-        # Reconstruction parity vs HF e2e.
-        n = min(len(cpp_e2e), len(hf_audio))
-        e2e_corr = float(np.corrcoef(hf_audio[:n], cpp_e2e[:n])[0, 1])
-        print(f"  cpp e2e: len={len(cpp_e2e)} rms={cpp_e2e.std():.4f} corr_vs_hf={e2e_corr:.4f}")
-        if e2e_corr < 0.95:
-            print(f"FAIL: e2e corr {e2e_corr:.4f} < 0.95")
-            return 1
+    # ---- 3. cpp e2e produces sane output ------------------------------
+    cpp_e2e, cpp_e2e_sr = ctx.decode(cpp_codes.T, n_q=n_q, n_threads=N_THREADS)
+    if cpp_e2e_sr != 24000:
+        print(f"FAIL: expected 24 kHz output, got {cpp_e2e_sr}")
+        return 1
+    if not np.all(np.isfinite(cpp_e2e)):
+        print("FAIL: cpp e2e contains non-finite samples")
+        return 1
+    if cpp_e2e.std() < 1e-3:
+        print(f"FAIL: cpp e2e is silent (rms={cpp_e2e.std():.4f})")
+        return 1
+    # cpp's audio length should be roughly proportional to input duration.
+    expected_n = (len(pcm) // 1280) * 1920
+    if abs(len(cpp_e2e) - expected_n) > 4 * 1920:
+        print(f"FAIL: cpp e2e length {len(cpp_e2e)} != expected ~{expected_n}")
+        return 1
+    # Reconstruction parity vs HF e2e.
+    n = min(len(cpp_e2e), len(hf_audio))
+    e2e_corr = float(np.corrcoef(hf_audio[:n], cpp_e2e[:n])[0, 1])
+    print(f"  cpp e2e: len={len(cpp_e2e)} rms={cpp_e2e.std():.4f} corr_vs_hf={e2e_corr:.4f}")
+    if e2e_corr < 0.95:
+        print(f"FAIL: e2e corr {e2e_corr:.4f} < 0.95")
+        return 1
 
-        # ---- 4. long decode crossing the chunk boundary ------------------
-        # The decode transformer pos_emb tables are sized for a single
-        # chunk_code_length (=375) window; longer sequences must be decoded in
-        # overlapping chunks (HF `decode(overlap_seconds=10)`).  Regression:
-        # decode a 500-code synthetic sequence (2 HF chunks) and check it
-        # (a) completes without the ggml_view_2d assert and (b) matches HF.
-        T_long = 500
-        rng = np.random.default_rng(1234)
-        long_codes = rng.integers(0, 1024, size=(int(hf_codes.shape[0]), T_long)).astype(np.int32)
-        long_hf_audio = None
-        try:
-            import torch as _torch
-            m_mod2 = sys.modules["modeling_xy_tokenizer"]
-            cfg2 = sys.modules["configuration_xy_tokenizer"].XYTokenizerConfig.from_pretrained(XY_DIR)
-            model2 = m_mod2.XYTokenizerModel.from_pretrained(XY_DIR, config=cfg2).eval()
-            with _torch.no_grad():
-                dec2 = model2.decode(_torch.from_numpy(long_codes.astype(np.int64))[:, None, :],
-                                     overlap_seconds=10)
-            long_hf_audio = dec2["audio_values"][0].cpu().numpy().flatten()
-        except Exception as exc:  # pragma: no cover
-            print(f"  (skipping HF long-decode parity: {exc})")
+    # ---- 4. long decode crossing the chunk boundary ------------------
+    # The decode transformer pos_emb tables are sized for a single
+    # chunk_code_length (=375) window; longer sequences must be decoded in
+    # overlapping chunks (HF `decode(overlap_seconds=10)`).  Regression:
+    # decode a 500-code synthetic sequence (2 HF chunks) and check it
+    # (a) completes without the ggml_view_2d assert and (b) matches HF.
+    T_long = 500
+    rng = np.random.default_rng(1234)
+    long_codes = rng.integers(0, 1024, size=(n_q, T_long)).astype(np.int32)
+    long_hf_audio = None
+    try:
+        import torch as _torch
+        m_mod2 = sys.modules["modeling_xy_tokenizer"]
+        cfg2 = sys.modules["configuration_xy_tokenizer"].XYTokenizerConfig.from_pretrained(XY_DIR)
+        model2 = m_mod2.XYTokenizerModel.from_pretrained(XY_DIR, config=cfg2).eval()
+        with _torch.no_grad():
+            dec2 = model2.decode(_torch.from_numpy(long_codes.astype(np.int64))[:, None, :],
+                                 overlap_seconds=10)
+        long_hf_audio = dec2["audio_values"][0].cpu().numpy().flatten()
+    except Exception as exc:  # pragma: no cover
+        print(f"  (skipping HF long-decode parity: {exc})")
 
-        long_codes_npy = td / "long_codes.npy"
-        np.save(long_codes_npy, long_codes)
-        long_wav = td / "long_dec.wav"
-        run([str(CODEC_CLI), "decode", "--model", str(GGUF), "--codes", str(long_codes_npy),
-             "--out", str(long_wav), "--nq", str(hf_codes.shape[0])])
-        long_cpp, long_sr = read_wav_mono_f32(long_wav)
-        expected_long = T_long * 1920
-        print(f"  long decode: T={T_long} codes -> len={len(long_cpp)} (expected {expected_long})")
-        if not np.all(np.isfinite(long_cpp)):
-            print("FAIL: long decode contains non-finite samples")
+    long_cpp, long_sr = ctx.decode(long_codes.T, n_q=n_q, n_threads=N_THREADS)
+    expected_long = T_long * 1920
+    print(f"  long decode: T={T_long} codes -> len={len(long_cpp)} (expected {expected_long})")
+    if not np.all(np.isfinite(long_cpp)):
+        print("FAIL: long decode contains non-finite samples")
+        return 1
+    if abs(len(long_cpp) - expected_long) > 1920:
+        print(f"FAIL: long decode length {len(long_cpp)} != expected {expected_long}")
+        return 1
+    if long_hf_audio is not None:
+        n = min(len(long_cpp), len(long_hf_audio))
+        long_corr = float(np.corrcoef(long_hf_audio[:n], long_cpp[:n])[0, 1])
+        print(f"  long decode corr_vs_hf={long_corr:.6f}")
+        if long_corr < 0.95:
+            print(f"FAIL: long decode corr {long_corr:.4f} < 0.95")
             return 1
-        if abs(len(long_cpp) - expected_long) > 1920:
-            print(f"FAIL: long decode length {len(long_cpp)} != expected {expected_long}")
-            return 1
-        if long_hf_audio is not None:
-            n = min(len(long_cpp), len(long_hf_audio))
-            long_corr = float(np.corrcoef(long_hf_audio[:n], long_cpp[:n])[0, 1])
-            print(f"  long decode corr_vs_hf={long_corr:.6f}")
-            if long_corr < 0.95:
-                print(f"FAIL: long decode corr {long_corr:.4f} < 0.95")
-                return 1
 
     print("XY-Tokenizer smoke test passed")
     return 0

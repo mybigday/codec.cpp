@@ -36,14 +36,22 @@ Expected behaviour, validated against MOSS-TTSD-v0.5 / Qwen3-2B (F16 GGUF):
 from __future__ import annotations
 
 import argparse
-import ctypes
+import os as _os
 import sys
 from pathlib import Path
 
 import numpy as np
 
-import os as _os
-REPO          = Path(__file__).resolve().parents[2]
+# Load order matters: llama-cpp-python ships its own libggml.so which
+# is API-incompatible with the libggml the codec.cpp build uses.  Importing
+# llama_cpp before the first codec_cpp call locks its libllama.so +
+# libggml.so into the process; codec_cpp then dlopens libcodec.so so its
+# ggml symbols stay private.
+import llama_cpp  # noqa: F401
+
+from _common import REPO, LlamaBackbone, must
+from codec_cpp import Model
+
 GGUF_BACKBONE = Path(_os.environ.get(
     "GGUF_BACKBONE_OVERRIDE",
     str(REPO / "models/moss_ttsd_v0_5/qwen3_backbone.gguf")))
@@ -57,23 +65,6 @@ HF_LM         = "fnlp/MOSS-TTSD-v0.5"
 # fatal (F16-vs-BF16 argmax flips on close-call codebooks are expected).
 MIN_FREE_MATCH = 8
 MAX_FRAMES_DEFAULT = 32
-
-# Load order matters: llama-cpp-python ships its own libggml.so which
-# is API-incompatible with the libggml the codec.cpp build uses.  Importing
-# llama_cpp first locks its libllama.so + libggml.so into the process;
-# our `_codec_lm_ctypes` then dlopens libcodec.so with RTLD_LOCAL so its
-# ggml symbols stay private.
-import llama_cpp  # noqa: F401  (ordering: must precede _codec_lm_ctypes)
-
-sys.path.insert(0, str(Path(__file__).parent))
-from _codec_lm_ctypes import CodecLM
-
-
-def must(cond: bool, msg: str) -> None:
-    if not cond:
-        print(f"FAIL: {msg}", file=sys.stderr)
-        sys.exit(1)
-
 
 # ---------------------------------------------------------------------
 # HF reference: build prompt + run greedy AR for K steps
@@ -153,102 +144,6 @@ def hf_reference(prompt_text: str, max_frames: int):
 
 
 # ---------------------------------------------------------------------
-# llama.cpp backbone wrapper for AR
-# ---------------------------------------------------------------------
-
-class LlamaBackbone:
-    """Minimal AR driver: feed embeddings, read last-position hidden state."""
-
-    def __init__(self, gguf: Path, n_ctx: int):
-        import llama_cpp as lc
-        self.lc = lc
-
-        lc.llama_backend_init()
-        mp = lc.llama_model_default_params()
-        mp.use_mmap     = True
-        mp.n_gpu_layers = 0
-        self.model = lc.llama_model_load_from_file(str(gguf).encode("utf-8"), mp)
-        if not self.model:
-            raise RuntimeError(f"llama_model_load_from_file failed: {gguf}")
-
-        self.hidden = lc.llama_model_n_embd(self.model)
-
-        cp = lc.llama_context_default_params()
-        cp.n_ctx       = n_ctx
-        cp.n_batch     = max(n_ctx, 64)
-        cp.n_ubatch    = max(n_ctx, 64)
-        cp.embeddings  = True
-        cp.pooling_type = 0   # NONE
-        self.ctx = lc.llama_init_from_model(self.model, cp)
-        if not self.ctx:
-            raise RuntimeError("llama_init_from_model failed")
-
-        self.pos = 0   # next absolute position to write into the KV cache
-
-    def feed_embeds(self, input_embeds: np.ndarray) -> np.ndarray:
-        """Feed (T, hidden) embeds as a single batch; return last-position
-        hidden state.  Sets logits[T-1]=1 only — we just want the last."""
-        T = input_embeds.shape[0]
-        must(input_embeds.shape[1] == self.hidden,
-             f"feed_embeds: width {input_embeds.shape[1]} != model n_embd {self.hidden}")
-
-        batch = self.lc.llama_batch_init(T, self.hidden, 1)
-        batch.n_tokens = T
-        flat = np.ascontiguousarray(input_embeds.astype(np.float32, copy=False)).ravel()
-        ctypes.memmove(batch.embd, flat.ctypes.data, flat.nbytes)
-        for t in range(T):
-            batch.pos[t]       = self.pos + t
-            batch.n_seq_id[t]  = 1
-            batch.seq_id[t][0] = 0
-            batch.logits[t]    = 1 if t == T - 1 else 0
-        rc = self.lc.llama_decode(self.ctx, batch)
-        if rc != 0:
-            self.lc.llama_batch_free(batch)
-            raise RuntimeError(f"llama_decode rc={rc}")
-
-        emb_ptr = self.lc.llama_get_embeddings_ith(self.ctx, 0)
-        if not emb_ptr:
-            self.lc.llama_batch_free(batch)
-            raise RuntimeError("llama_get_embeddings_ith(0) NULL")
-        out = np.zeros(self.hidden, dtype=np.float32)
-        ctypes.memmove(out.ctypes.data, emb_ptr, self.hidden * 4)
-
-        self.lc.llama_batch_free(batch)
-        self.pos += T
-        return out
-
-    def close(self) -> None:
-        if getattr(self, "ctx", None):
-            self.lc.llama_free(self.ctx); self.ctx = None
-        if getattr(self, "model", None):
-            self.lc.llama_model_free(self.model); self.model = None
-
-
-# ---------------------------------------------------------------------
-# Greedy step on codec_lm
-# ---------------------------------------------------------------------
-
-def codec_lm_greedy_step(state, h_in: np.ndarray) -> tuple[list[int], list[float]]:
-    state.step_begin(h_in)
-    codes_out: list[int] = []
-    top_logits: list[float] = []
-    while True:
-        try:
-            cb_idx, n, lg = state.step_logits()
-        except RuntimeError:
-            # No more logits — done with this step.
-            break
-        # greedy
-        arr = np.frombuffer(lg, dtype=np.float32)   # zero-copy view
-        best = int(np.argmax(arr))
-        codes_out.append(best)
-        top_logits.append(float(arr[best]))
-        state.step_push_code(best)
-    final = state.step_finish()
-    return final, top_logits
-
-
-# ---------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------
 
@@ -263,10 +158,12 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
           flush=True)
 
     print(f"[cpp] loading codec_lm + backbone …", flush=True)
-    cpp_lm = CodecLM(GGUF_CODEC_LM)
-    must(cpp_lm.n_cb == n_cb, f"n_cb mismatch cpp={cpp_lm.n_cb} hf={n_cb}")
-    must(cpp_lm.hidden_dim == ref["prompt_embeds"].shape[1],
-         f"hidden mismatch cpp={cpp_lm.hidden_dim} prompt={ref['prompt_embeds'].shape[1]}")
+    model = Model(GGUF_CODEC_LM, use_gpu=False, n_threads=max(1, (_os.cpu_count() or 1) // 2))
+    cpp_lm = model.get_lm_adaptor()
+    info = cpp_lm.info
+    must(info.n_codebook == n_cb, f"n_cb mismatch cpp={info.n_codebook} hf={n_cb}")
+    must(info.hidden_dim == ref["prompt_embeds"].shape[1],
+         f"hidden mismatch cpp={info.hidden_dim} prompt={ref['prompt_embeds'].shape[1]}")
 
     n_ctx = ref["prompt_embeds"].shape[0] + max_frames + 8
     backbone = LlamaBackbone(GGUF_BACKBONE, n_ctx=n_ctx)
@@ -284,16 +181,16 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
     # text vocab; end-of-audio == text EOS sampled on cb0.  eos_code_c0
     # must equal the HF reference's text_eos.
     text_eos = int(ref["text_eos"])
-    must(cpp_lm.eos_code_c0 == text_eos,
-         f"eos_code_c0={cpp_lm.eos_code_c0} != HF text_eos={text_eos}")
-    must(cpp_lm.eos_min_step == 0,
-         f"expected eos_min_step=0, got {cpp_lm.eos_min_step}")
+    must(info.eos_code_c0 == text_eos,
+         f"eos_code_c0={info.eos_code_c0} != HF text_eos={text_eos}")
+    must(info.eos_min_step == 0,
+         f"expected eos_min_step=0, got {info.eos_min_step}")
     # HF stopped early iff its LAST frame's cb0 == text_eos.
     hf_stopped_on_eos = int(ref["codes"][-1][0]) == text_eos
     cpp_eos_step = -1
 
     for step in range(actual_steps):
-        codes, _ = codec_lm_greedy_step(state, cur_hidden)
+        codes = [int(c) for c in state.step_greedy(cur_hidden)]
         cpp_codes.append(codes)
 
         # Model-owned EOS decision: assert step_is_eos fires exactly on
@@ -321,8 +218,7 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
         # Compose next-step input embedding from EITHER our codes
         # (free-running) or HF's codes (teacher-forced).
         feed_codes = codes if mode == "free" else [int(x) for x in ref_step]
-        embd = cpp_lm.compose_audio_embd(feed_codes)
-        next_embeds = np.frombuffer(embd, dtype=np.float32).reshape(1, -1).copy()
+        next_embeds = cpp_lm.compose_audio_embd(feed_codes).reshape(1, -1)
         cur_hidden = backbone.feed_embeds(next_embeds)
 
     cpp_codes_arr = np.array(cpp_codes, dtype=np.int32)
@@ -331,7 +227,7 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
     for cb in range(n_cb):
         rate = n_match_per_cb[cb] / max(1, actual_steps)
         print(f"  cb={cb:2d}  match={n_match_per_cb[cb]:3d}/{actual_steps}  "
-              f"({rate*100:.1f}%)  vocab={cpp_lm.codebook_sizes[cb]}")
+              f"({rate*100:.1f}%)  vocab={info.codebook_sizes[cb]}")
     print(f"first full-frame mismatch step: "
           f"{first_mismatch_step if first_mismatch_step >= 0 else 'none'}")
 
@@ -350,7 +246,8 @@ def run(prompt: str, max_frames: int, mode: str) -> int:
                  f"step_is_eos fired at {cpp_eos_step} but HF never stopped on EOS")
 
     state.close()
-    cpp_lm.close()
+    cpp_lm.model.close()
+    model.close()
     backbone.close()
 
     if mode == "teacher_forced":

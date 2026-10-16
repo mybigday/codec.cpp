@@ -84,7 +84,7 @@ Codec encode/dec:   — (raw PCM /        —                  codec.cpp codec_m
 ### Adjusted Tier 1 (was: "ship Whisper-encoder in codec.cpp")
 
 **Now:** ship a Python ctypes wrapper around `libmtmd.so` (parallels
-`tests/e2e/_codec_lm_ctypes.py`) and rewire `examples/asr.py` so
+`python/codec_cpp`) and rewire `examples/asr.py` so
 each profile can run via either:
 
   1. **Stage A (current):** stock HF transformers — what's in this

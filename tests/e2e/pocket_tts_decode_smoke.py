@@ -13,14 +13,13 @@ Run:  .venv/bin/python tests/e2e/pocket_tts_decode_smoke.py
 
 from __future__ import annotations
 
-import ctypes
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
-LIBCODEC = REPO / "build" / "libcodec.so"
+from _common import REPO
+import codec_cpp
+
 GGUF = REPO / "models" / "pocket_tts" / "pocket_tts_en.gguf"
 FIX = REPO / "tests" / "e2e" / "fixtures" / "pocket_tts"
 
@@ -28,95 +27,15 @@ DECODE_CORR_MIN = 0.999
 ENCODE_CORR_MIN = 0.999
 
 
-class codec_model_params(ctypes.Structure):
-    _fields_ = [("use_gpu", ctypes.c_bool), ("n_threads", ctypes.c_int32)]
-
-
-class codec_context_params(ctypes.Structure):
-    _fields_ = [("seed", ctypes.c_int32)]
-
-
-class codec_decode_params(ctypes.Structure):
-    _fields_ = [("n_threads", ctypes.c_int32), ("n_q", ctypes.c_int32), ("speaker", ctypes.c_void_p)]
-
-
-class codec_pcm_buffer(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.POINTER(ctypes.c_float)),
-        ("n_samples", ctypes.c_int32),
-        ("sample_rate", ctypes.c_int32),
-        ("n_channels", ctypes.c_int32),
-    ]
-
-
-class codec_audio(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.c_void_p), ("n_samples", ctypes.c_int32),
-        ("sample_rate", ctypes.c_int32), ("n_channels", ctypes.c_int32),
-        ("pcm_type", ctypes.c_int32),
-    ]
-
-
-class codec_encode_params(ctypes.Structure):
-    _fields_ = [("n_threads", ctypes.c_int32), ("frame_size", ctypes.c_int32),
-                ("hop_size", ctypes.c_int32), ("n_q", ctypes.c_int32)]
-
-
-class codec_token_buffer(ctypes.Structure):
-    _fields_ = [("data", ctypes.c_void_p), ("n_tokens", ctypes.c_int32),
-                ("n_frames", ctypes.c_int32), ("n_q", ctypes.c_int32),
-                ("codebook_size", ctypes.c_int32), ("sample_rate", ctypes.c_int32),
-                ("hop_size", ctypes.c_int32)]
-
-
-class codec_latent_buffer(ctypes.Structure):
-    _fields_ = [("data", ctypes.POINTER(ctypes.c_float)), ("latent_dim", ctypes.c_int32),
-                ("n_frames", ctypes.c_int32), ("sample_rate", ctypes.c_int32),
-                ("hop_size", ctypes.c_int32)]
-
-
-def _bind():
-    lib = ctypes.CDLL(str(LIBCODEC))
-    lib.codec_model_load_from_file.argtypes = [ctypes.c_char_p, codec_model_params]
-    lib.codec_model_load_from_file.restype = ctypes.c_void_p
-    lib.codec_init_from_model.argtypes = [ctypes.c_void_p, codec_context_params]
-    lib.codec_init_from_model.restype = ctypes.c_void_p
-    lib.codec_decode_quantized_representation.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
-        ctypes.c_int32, ctypes.c_int32,
-        ctypes.POINTER(codec_pcm_buffer), codec_decode_params,
-    ]
-    lib.codec_decode_quantized_representation.restype = ctypes.c_int
-    lib.codec_get_last_error.argtypes = [ctypes.c_void_p]
-    lib.codec_get_last_error.restype = ctypes.c_char_p
-    lib.codec_pcm_buffer_free.argtypes = [ctypes.POINTER(codec_pcm_buffer)]
-    lib.codec_free.argtypes = [ctypes.c_void_p]
-    lib.codec_model_free.argtypes = [ctypes.c_void_p]
-    lib.codec_encode_latent.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(codec_audio),
-        ctypes.POINTER(codec_token_buffer), ctypes.POINTER(codec_latent_buffer),
-        codec_encode_params]
-    lib.codec_encode_latent.restype = ctypes.c_int
-    lib.codec_latent_buffer_free.argtypes = [ctypes.POINTER(codec_latent_buffer)]
-    return lib
-
-
-def check_decode(lib, ctx) -> bool:
+def check_decode(ctx: codec_cpp.Context) -> bool:
     z = np.load(FIX / "decode_latent.npy").astype(np.float32)   # [32, T] channel-major
     ref = np.load(FIX / "decode_pcm.npy").astype(np.float32)    # [N]
-    latent_dim, n_frames = z.shape
-    buf = np.ascontiguousarray(z).reshape(-1)                   # buffer[d*T + t]
-
-    pcm = codec_pcm_buffer()
-    st = lib.codec_decode_quantized_representation(
-        ctx, buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        latent_dim, n_frames, ctypes.byref(pcm), codec_decode_params(1, 0))
-    if st != 0:
-        print(f"decode: FAIL status={st} err={lib.codec_get_last_error(ctx).decode()}")
+    try:
+        out, sr = ctx.decode_latent(z, n_threads=1)
+    except codec_cpp.CodecError as e:
+        print(f"decode: FAIL {e}")
         return False
-    out = np.ctypeslib.as_array(pcm.data, shape=(pcm.n_samples,)).copy()
-    sr, n_out = pcm.sample_rate, pcm.n_samples
-    lib.codec_pcm_buffer_free(ctypes.byref(pcm))
+    n_out = len(out)
 
     n = min(len(out), len(ref))
     corr = float(np.corrcoef(out[:n], ref[:n])[0, 1])
@@ -128,21 +47,16 @@ def check_decode(lib, ctx) -> bool:
     return ok
 
 
-def check_encode(lib, ctx) -> bool:
+def check_encode(ctx: codec_cpp.Context) -> bool:
     z = np.load(FIX / "encode.npz")
-    audio = np.ascontiguousarray(z["audio"].astype(np.float32))
+    audio = z["audio"].astype(np.float32)
     ref = z["mu"]  # [32, T] channel-major
-    au = codec_audio(audio.ctypes.data_as(ctypes.c_void_p), audio.size, 24000, 1, 0)
-    tb = codec_token_buffer()
-    lb = codec_latent_buffer()
-    st = lib.codec_encode_latent(ctx, ctypes.byref(au), ctypes.byref(tb), ctypes.byref(lb),
-                                 codec_encode_params(1, 0, 0, 0))
-    if st != 0:
-        print(f"encode: FAIL status={st} err={lib.codec_get_last_error(ctx).decode()}")
+    try:
+        out, _ = ctx.encode_latent(audio, 24000, n_threads=1)
+    except codec_cpp.CodecError as e:
+        print(f"encode: FAIL {e}")
         return False
-    D, T = lb.latent_dim, lb.n_frames
-    out = np.ctypeslib.as_array(lb.data, shape=(D * T,)).copy().reshape(D, T)
-    lib.codec_latent_buffer_free(ctypes.byref(lb))
+    D, T = out.shape
     n = min(T, ref.shape[1])
     corr = float(np.corrcoef(out[:, :n].reshape(-1), ref[:, :n].reshape(-1))[0, 1])
     max_abs = float(np.max(np.abs(out[:, :n] - ref[:, :n])))
@@ -153,27 +67,14 @@ def check_encode(lib, ctx) -> bool:
 
 
 def main() -> int:
-    for p in (LIBCODEC, GGUF, FIX / "decode_latent.npy", FIX / "decode_pcm.npy", FIX / "encode.npz"):
+    for p in (GGUF, FIX / "decode_latent.npy", FIX / "decode_pcm.npy", FIX / "encode.npz"):
         if not p.is_file():
             print(f"FAIL: missing {p}")
             return 1
 
-    lib = _bind()
-    model = lib.codec_model_load_from_file(str(GGUF).encode(), codec_model_params(False, 1))
-    if not model:
-        print("FAIL: model load")
-        return 1
-    ctx = lib.codec_init_from_model(model, codec_context_params(0))
-    if not ctx:
-        print("FAIL: ctx init")
-        lib.codec_model_free(model)
-        return 1
-
-    decode_ok = check_decode(lib, ctx)
-    encode_ok = check_encode(lib, ctx)
-
-    lib.codec_free(ctx)
-    lib.codec_model_free(model)
+    with codec_cpp.Model(GGUF, use_gpu=False, n_threads=1) as model, model.context(seed=0) as ctx:
+        decode_ok = check_decode(ctx)
+        encode_ok = check_encode(ctx)
 
     ok = decode_ok and encode_ok
     print("PASS" if ok else "FAIL")

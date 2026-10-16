@@ -13,7 +13,7 @@ The Realtime + LFM2-Audio commits also produced shared infrastructure:
   - `decode_n_q` hook on TTSSession (lets profiles whose codec_lm has
     fewer codebooks than the codec exposes pass that down to
     `codec.decode` — used by LFM2: 8 vs Mimi's 32).
-  - Bug fix in `_codec_lm_ctypes.CodecLM.compose_audio_embd` —
+  - Bug fix in `CodecLM.compose_audio_embd` (now `codec_cpp.LM.compose_audio_embd`) —
     allocate the output buffer at `compose_audio_embed_dim` (not
     `audio_embed_dim`) when the model publishes a separate compose dim.
   - `_layout_moss_tts_local` shared between Realtime + Nano (Nano half

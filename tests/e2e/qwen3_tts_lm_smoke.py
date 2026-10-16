@@ -26,12 +26,14 @@ well under 5e-3 with correlation 1.000000 (rounded).
 
 from __future__ import annotations
 
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO  = Path(__file__).resolve().parents[2]
+from _common import REPO, corr, must
+from codec_cpp import Model
+
 GGUF  = REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf"
 HF_LM = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
@@ -44,15 +46,6 @@ LOGITS_CORR_MIN     = 0.99999
 # the additions slightly — corr stays at 1.000000 across all codebooks,
 # the absolute diff just sits in the same band as the other models'.
 LOGITS_MAX_ABS_DIFF = 2e-2
-
-sys.path.insert(0, str(Path(__file__).parent))
-from _codec_lm_ctypes import CodecLM
-
-
-def must(cond: bool, msg: str) -> None:
-    if not cond:
-        print(f"FAIL: {msg}", file=sys.stderr)
-        sys.exit(1)
 
 
 def hf_reference(h_in_np: np.ndarray):
@@ -121,38 +114,32 @@ def hf_reference(h_in_np: np.ndarray):
     return all_logits, codes
 
 
-def corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = a.astype(np.float64).ravel()
-    b = b.astype(np.float64).ravel()
-    if a.std() == 0 or b.std() == 0:
-        return 1.0 if np.allclose(a, b) else 0.0
-    return float(np.corrcoef(a, b)[0, 1])
-
-
 def main() -> int:
     must(GGUF.is_file(),
          f"missing GGUF: {GGUF} (run convert-to-gguf.py "
          f"--model-id {HF_LM} --output ... first)")
 
     rng = np.random.default_rng(42)
-    cpp_lm = CodecLM(GGUF)
-    must(cpp_lm.host_arch == "qwen3",
-         f"unexpected host_arch={cpp_lm.host_arch!r}")
+    model = Model(GGUF, use_gpu=False, n_threads=max(1, (os.cpu_count() or 1) // 2))
+    cpp_lm = model.get_lm_adaptor()
+    info = cpp_lm.info
+    must(info.host_arch == "qwen3",
+         f"unexpected host_arch={info.host_arch!r}")
 
     # Phase A: end-of-audio metadata must be populated from the talker
     # config (codec_eos_token_id=2150, honored from frame 0).
-    print(f"[cpp] eos_code_c0={cpp_lm.eos_code_c0} eos_min_step={cpp_lm.eos_min_step}",
+    print(f"[cpp] eos_code_c0={info.eos_code_c0} eos_min_step={info.eos_min_step}",
           flush=True)
-    must(cpp_lm.eos_code_c0 == 2150,
-         f"expected eos_code_c0=2150 (codec_eos_token_id), got {cpp_lm.eos_code_c0}")
-    must(cpp_lm.eos_min_step == 0,
-         f"expected eos_min_step=0, got {cpp_lm.eos_min_step}")
+    must(info.eos_code_c0 == 2150,
+         f"expected eos_code_c0=2150 (codec_eos_token_id), got {info.eos_code_c0}")
+    must(info.eos_min_step == 0,
+         f"expected eos_min_step=0, got {info.eos_min_step}")
     # And step_is_eos must fire iff cb0 == eos on a finished frame.
     _eos_state = cpp_lm.state()
-    _eos_state.step_begin(np.zeros(cpp_lm.hidden_dim, dtype=np.float32))
-    for k in range(cpp_lm.n_cb):
+    _eos_state.step_begin(np.zeros(info.hidden_dim, dtype=np.float32))
+    for k in range(info.n_codebook):
         _eos_state.step_logits()
-        _eos_state.step_push_code(cpp_lm.eos_code_c0 if k == 0 else 0)
+        _eos_state.step_push_code(info.eos_code_c0 if k == 0 else 0)
     _eos_codes = _eos_state.step_finish()
     must(_eos_state.step_is_eos(_eos_codes),
          "step_is_eos should fire when cb0 == eos_code_c0")
@@ -161,10 +148,10 @@ def main() -> int:
          "step_is_eos should NOT fire when cb0 != eos_code_c0")
     _eos_state.close()
 
-    h_in = rng.normal(0.0, 0.1, cpp_lm.hidden_dim).astype(np.float32)
+    h_in = rng.normal(0.0, 0.1, info.hidden_dim).astype(np.float32)
 
     ref_logits, ref_codes = hf_reference(h_in)
-    n_cb = cpp_lm.n_cb
+    n_cb = info.n_codebook
     must(len(ref_logits) == n_cb,
          f"hf produced {len(ref_logits)} logits, expected {n_cb}")
 
@@ -173,9 +160,9 @@ def main() -> int:
     state.step_begin(h_in)
     cpp_logits: list[np.ndarray] = []
     for k in range(n_cb):
-        cb_idx, n, lg = state.step_logits()
+        cb_idx, lg = state.step_logits()
         must(cb_idx == k, f"cb_idx out of order: got {cb_idx}, expected {k}")
-        cpp_logits.append(np.array(lg, dtype=np.float32))
+        cpp_logits.append(lg)
         state.step_push_code(int(ref_codes[k]))
     state.step_finish()
     state.close()
@@ -195,7 +182,8 @@ def main() -> int:
               f"max_abs_diff={mad:.5g}  corr={cc:.6f}")
         all_pass &= ok
 
-    cpp_lm.close()
+    cpp_lm.model.close()
+    model.close()
 
     if all_pass:
         print("\nQwen3-TTS-0.6B-Base codec_lm parity test PASSED")

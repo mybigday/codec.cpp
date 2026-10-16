@@ -25,26 +25,19 @@ This validates:
 
 from __future__ import annotations
 
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO  = Path(__file__).resolve().parents[2]
+from _common import REPO, corr, must
+from codec_cpp import Model
+
 GGUF  = REPO / "models/lfm2_audio/lfm2_audio.gguf"
 HF_LM = "LiquidAI/LFM2-Audio-1.5B"
 
 LOGITS_CORR_MIN     = 0.99999
 LOGITS_MAX_ABS_DIFF = 2e-2
-
-sys.path.insert(0, str(Path(__file__).parent))
-from _codec_lm_ctypes import CodecLM
-
-
-def must(cond: bool, msg: str) -> None:
-    if not cond:
-        print(f"FAIL: {msg}", file=sys.stderr)
-        sys.exit(1)
 
 
 def hf_reference(h_in_np: np.ndarray):
@@ -94,27 +87,20 @@ def hf_reference(h_in_np: np.ndarray):
     return all_logits, codes
 
 
-def corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = a.astype(np.float64).ravel()
-    b = b.astype(np.float64).ravel()
-    if a.std() == 0 or b.std() == 0:
-        return 1.0 if np.allclose(a, b) else 0.0
-    return float(np.corrcoef(a, b)[0, 1])
-
-
 def main() -> int:
     must(GGUF.is_file(),
          f"missing GGUF: {GGUF} (run convert-to-gguf.py --model-id {HF_LM} first)")
 
-    cpp_lm = CodecLM(GGUF)
-    must(cpp_lm.host_arch == "lfm2",
-         f"unexpected host_arch={cpp_lm.host_arch!r}")
+    cpp_lm = Model(GGUF, use_gpu=False, n_threads=max(1, (os.cpu_count() or 1) // 2)).get_lm_adaptor()
+    info = cpp_lm.info
+    must(info.host_arch == "lfm2",
+         f"unexpected host_arch={info.host_arch!r}")
 
     rng = np.random.default_rng(42)
-    h_in = rng.normal(0.0, 0.1, cpp_lm.hidden_dim).astype(np.float32)
+    h_in = rng.normal(0.0, 0.1, info.hidden_dim).astype(np.float32)
 
     ref_logits, ref_codes = hf_reference(h_in)
-    n_cb = cpp_lm.n_cb
+    n_cb = info.n_codebook
     must(len(ref_logits) == n_cb,
          f"hf produced {len(ref_logits)} logits, expected {n_cb}")
 
@@ -123,7 +109,7 @@ def main() -> int:
     state.step_begin(h_in)
     cpp_logits: list[np.ndarray] = []
     for k in range(n_cb):
-        cb_idx, n, lg = state.step_logits()
+        cb_idx, lg = state.step_logits()
         must(cb_idx == k, f"cb_idx out of order: got {cb_idx}, expected {k}")
         cpp_logits.append(np.array(lg, dtype=np.float32))
         state.step_push_code(int(ref_codes[k]))
@@ -145,7 +131,7 @@ def main() -> int:
         print(f"  [{tag}] cb={k:2d}  max_abs_diff={mad:.5g}  corr={cc:.6f}")
         all_pass &= ok
 
-    cpp_lm.close()
+    cpp_lm.model.close()
 
     if all_pass:
         print("\nLFM2-Audio codec_lm parity test PASSED")

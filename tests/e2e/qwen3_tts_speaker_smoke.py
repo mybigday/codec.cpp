@@ -8,47 +8,17 @@ The reference path runs in PyTorch using the vendored Qwen3-TTS
 package; codec.cpp's CPU ECAPA-TDNN must match end-to-end within
 F16-projection noise (corr ≥ 0.9999).
 """
-import ctypes
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "tests/e2e"))
+from _common import REPO
+from codec_cpp import Model
+
 sys.path.insert(0, str(REPO / ".model-src/Qwen3-TTS"))
 
-from _codec_lm_ctypes import lib, codec_audio, CODEC_PCM_TYPE_F32, CodecLM
-
 GGUF = REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf"
-
-
-class CodecLMSpeakerInfo(ctypes.Structure):
-    _fields_ = [
-        ("needs_ref_pcm",           ctypes.c_bool),
-        ("needs_ref_speech_tokens", ctypes.c_bool),
-        ("needs_emotion_scalar",    ctypes.c_bool),
-        ("ref_sample_rate",         ctypes.c_int32),
-        ("emotion_default",         ctypes.c_float),
-        ("n_rows",                  ctypes.c_int32),
-        ("hidden_dim",              ctypes.c_int32),
-        ("speaker_emb_dim",         ctypes.c_int32),
-    ]
-
-
-def setup_bindings():
-    lib.codec_lm_speaker_get_info.argtypes = [ctypes.c_void_p]
-    lib.codec_lm_speaker_get_info.restype  = ctypes.POINTER(CodecLMSpeakerInfo)
-    lib.codec_lm_speaker_encode.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(codec_audio),
-        ctypes.POINTER(ctypes.c_int32), ctypes.c_int32,
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
-    ]
-    lib.codec_lm_speaker_encode.restype = ctypes.c_int
-    lib.codec_lm_get_last_error.argtypes = [ctypes.c_void_p]
-    lib.codec_lm_get_last_error.restype = ctypes.c_char_p
 
 
 def synth_ref_pcm(seconds=3.0, sr=24000):
@@ -101,29 +71,7 @@ def reference_xvector(pcm, sr):
     return xvec.cpu().float().numpy()
 
 
-def codec_cpp_xvector(lm_ptr, pcm, sr):
-    audio = codec_audio()
-    p = pcm.astype(np.float32, copy=False)
-    audio.data        = p.ctypes.data_as(ctypes.c_void_p)
-    audio.n_samples   = p.size
-    audio.sample_rate = sr
-    audio.n_channels  = 1
-    audio.pcm_type    = CODEC_PCM_TYPE_F32
-
-    info = lib.codec_lm_speaker_get_info(lm_ptr).contents
-    out = (ctypes.c_float * (info.n_rows * info.hidden_dim))()
-    rc = lib.codec_lm_speaker_encode(
-        lm_ptr, ctypes.byref(audio), None, 0, None,
-        out, info.n_rows * info.hidden_dim,
-    )
-    if rc != 0:
-        err = lib.codec_lm_get_last_error(lm_ptr) or b""
-        raise RuntimeError(f"speaker_encode rc={rc}: {err.decode()!r}")
-    return np.frombuffer(out, dtype=np.float32).reshape(info.n_rows, info.hidden_dim).copy()
-
-
 def main() -> int:
-    setup_bindings()
     if not GGUF.is_file():
         print(f"FAIL: missing {GGUF}", file=sys.stderr); return 2
 
@@ -134,11 +82,9 @@ def main() -> int:
     print(f"      ref shape={ref.shape}")
 
     print(f"[cpp] running codec_lm_speaker_encode …")
-    cpp_lm = CodecLM(str(GGUF))
-    try:
-        got = codec_cpp_xvector(cpp_lm.lm, pcm, sr)
-    finally:
-        cpp_lm.close()
+    with Model(GGUF, use_gpu=False, n_threads=max(1, (os.cpu_count() or 1) // 2)) as model:
+        cpp_lm = model.get_lm_adaptor()
+        got = cpp_lm.speaker_encode(ref_pcm=pcm, ref_sample_rate=sr)
     print(f"      got shape={got.shape}")
 
     row_ref = ref

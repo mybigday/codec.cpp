@@ -21,12 +21,12 @@ Run from the repo root:  .venv/bin/python tests/e2e/ttscli_synthesize_smoke.py
 import os
 import subprocess
 import sys
-import wave
 from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
+from _common import REPO, read_wav_mono_f32
+
 TTS_CLI = REPO / "build" / "tts-cli"
 
 
@@ -54,11 +54,7 @@ def _run_synth(codec, backbone, text, out_wav, extra=None, greedy=True):
 
 
 def _wav_stats(path):
-    w = wave.open(str(path), "rb")
-    n = w.getnframes()
-    sr = w.getframerate()
-    x = np.frombuffer(w.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
-    w.close()
+    x, sr = read_wav_mono_f32(path)
     return sr, len(x) / sr, float(np.sqrt((x ** 2).mean()))
 
 
@@ -70,10 +66,7 @@ def _try_cer(wav, ref, lang):
     except Exception:
         return None
     try:
-        w = wave.open(str(wav), "rb")
-        sr = w.getframerate()
-        x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-        w.close()
+        x, sr = read_wav_mono_f32(wav)
         if sr != 16000:
             import librosa
             x = librosa.resample(x, orig_sr=sr, target_sr=16000)

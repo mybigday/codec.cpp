@@ -3,7 +3,7 @@
 Loads the HF MOSS-TTSD-v0.5 model, runs a forward pass on a synthetic
 input to capture the backbone's last hidden state and the reference per-
 codebook logits + the reference next-step audio embedding (channel-sum).
-Then drives our codec_lm via the codec-lm-cli binary against the same
+Then drives our codec_lm through codec_cpp against the same
 hidden / codes and compares.
 
 This isolates LM-adaptor correctness from any llama.cpp backbone work:
@@ -19,17 +19,14 @@ expected; correlation must be very high.
 
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
+from _common import REPO, corr, must
+from codec_cpp import Model
+
 GGUF = REPO / "models/moss_ttsd_v0_5/moss_ttsd_v0_5.gguf"
-CODEC_LM_CLI = REPO / "build/codec-lm-cli"
 
 # The HF v0.5 release.  Tied to the GGUF the converter produced.
 HF_LM_REPO = "fnlp/MOSS-TTSD-v0.5"
@@ -43,59 +40,17 @@ EMBD_CORR_MIN       = 0.99999
 EMBD_MAX_ABS_DIFF   = 1e-3
 
 
-def must(cond: bool, msg: str) -> None:
-    if not cond:
-        print(f"FAIL: {msg}", file=sys.stderr)
-        sys.exit(1)
-
-
-def run_codec_lm_step(hidden: np.ndarray, gguf: Path, tmp: Path) -> dict[int, np.ndarray]:
-    """Drive codec-lm-cli step → returns {cb_idx: logits np.ndarray}."""
-    h_path = tmp / "h.npy"
-    np.save(h_path, hidden.astype(np.float32))
-    pfx = tmp / "logits"
-    cmd = [
-        str(CODEC_LM_CLI), "step",
-        "--model",  str(gguf),
-        "--hidden", str(h_path),
-        "--logits-prefix", str(pfx),
-    ]
-    env = {**os.environ, "GGML_DISABLE_VULKAN": "1"}
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout, file=sys.stderr)
-        print(r.stderr, file=sys.stderr)
-        raise RuntimeError(f"codec-lm-cli step exit={r.returncode}")
+def run_codec_lm_step(lm, hidden: np.ndarray) -> dict[int, np.ndarray]:
+    """Greedy codec_lm step on `hidden` -> {cb_idx: logits}."""
     out: dict[int, np.ndarray] = {}
-    i = 0
-    while True:
-        p = tmp / f"logits_{i}.npy"
-        if not p.exists():
-            break
-        out[i] = np.load(p)
-        i += 1
-    if not out:
-        raise RuntimeError(f"no logits_*.npy produced; stderr:\n{r.stderr}")
+    with lm.state() as st:
+        st.step_begin(hidden)
+        while st.step_pending:
+            cb, logits = st.step_logits()
+            out[cb] = logits
+            st.step_push_code(int(np.argmax(logits)))
+        st.step_finish()
     return out
-
-
-def run_codec_lm_compose(codes: np.ndarray, gguf: Path, tmp: Path) -> np.ndarray:
-    c_path = tmp / "c.npy"
-    np.save(c_path, codes.astype(np.int32))
-    e_path = tmp / "e.npy"
-    cmd = [
-        str(CODEC_LM_CLI), "compose",
-        "--model",     str(gguf),
-        "--codes",     str(c_path),
-        "--embd-out",  str(e_path),
-    ]
-    env = {**os.environ, "GGML_DISABLE_VULKAN": "1"}
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout, file=sys.stderr)
-        print(r.stderr, file=sys.stderr)
-        raise RuntimeError(f"codec-lm-cli compose exit={r.returncode}")
-    return np.load(e_path)
 
 
 def hf_reference(prompt_text: str):
@@ -154,17 +109,8 @@ def hf_reference(prompt_text: str):
     return ref_hidden, ref_logits, codes, ref_embd
 
 
-def corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = a.astype(np.float64).ravel()
-    b = b.astype(np.float64).ravel()
-    if a.std() == 0 or b.std() == 0:
-        return 1.0 if np.allclose(a, b) else 0.0
-    return float(np.corrcoef(a, b)[0, 1])
-
-
 def main() -> int:
     must(GGUF.is_file(),         f"missing GGUF: {GGUF} (run convert-to-gguf first)")
-    must(CODEC_LM_CLI.is_file(), f"missing binary: {CODEC_LM_CLI}")
 
     # Use a deterministic prompt so the test is reproducible.
     prompt = "[S1] Hello, this is a quick parity test."
@@ -172,11 +118,11 @@ def main() -> int:
     ref_hidden, ref_logits, codes, ref_embd = hf_reference(prompt)
     n_cb = len(ref_logits)
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
+    with Model(GGUF, use_gpu=False) as model:
+        lm = model.get_lm_adaptor()
         # ---- step parity ----
-        print("[cpp] running codec-lm-cli step …", flush=True)
-        cpp_logits = run_codec_lm_step(ref_hidden, GGUF, tmp)
+        print("[cpp] running codec_lm step …", flush=True)
+        cpp_logits = run_codec_lm_step(lm, ref_hidden)
         must(len(cpp_logits) == n_cb,
              f"cpp produced {len(cpp_logits)} logits, expected {n_cb}")
 
@@ -195,8 +141,8 @@ def main() -> int:
             all_pass &= ok
 
         # ---- compose parity ----
-        print("[cpp] running codec-lm-cli compose …", flush=True)
-        cpp_embd = run_codec_lm_compose(codes, GGUF, tmp)
+        print("[cpp] running codec_lm compose …", flush=True)
+        cpp_embd = lm.compose_audio_embd(codes)
         must(cpp_embd.shape == ref_embd.shape,
              f"embd shape mismatch cpp={cpp_embd.shape} hf={ref_embd.shape}")
         mad = float(np.max(np.abs(cpp_embd - ref_embd)))

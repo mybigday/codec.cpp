@@ -9,6 +9,12 @@ einops==0.8.2
 librosa==0.11.0
 soundfile==0.13.1
 
+# Held at 4.57.3: qwen-tts 0.1.1 pins it exactly, and the transformers 5.x line
+# breaks the reference model code several smokes load (qwen_tts
+# check_model_inputs, MOSS-TTSD / XY-Tokenizer remote code). Every
+# tests/e2e smoke passes on 4.57.3 (checked 2026-10-16 against 5.20.0).
+# Installing outetts (pins 4.52.3) or chatterbox-tts (pins 5.2.0) into this
+# venv downgrades/upgrades it; reinstall this file afterwards.
 transformers==4.57.3
 safetensors==0.7.0
 

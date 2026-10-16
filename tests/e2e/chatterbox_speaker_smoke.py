@@ -18,19 +18,16 @@ Notes:
     by passing already-trimmed PCM (synthetic signal, no silence
     boundary).
 """
-import ctypes
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "tests/e2e"))
-sys.path.insert(0, str(REPO / ".model-src/chatterbox/src"))
+from _common import REPO
 
-from _codec_lm_ctypes import (
-    lib, codec_audio, CODEC_PCM_TYPE_F32, CodecLM,
-)
+import codec_cpp
+
+sys.path.insert(0, str(REPO / ".model-src/chatterbox/src"))
 
 GGUF = REPO / "models/chatterbox/chatterbox.gguf"
 
@@ -38,33 +35,6 @@ GGUF = REPO / "models/chatterbox/chatterbox.gguf"
 EMOTION       = 0.5
 N_REF_SPEECH  = 16
 SPEECH_TOKENS = np.arange(100, 100 + N_REF_SPEECH, dtype=np.int32)
-
-
-class CodecLMSpeakerInfo(ctypes.Structure):
-    _fields_ = [
-        ("needs_ref_pcm",           ctypes.c_bool),
-        ("needs_ref_speech_tokens", ctypes.c_bool),
-        ("needs_emotion_scalar",    ctypes.c_bool),
-        ("ref_sample_rate",         ctypes.c_int32),
-        ("emotion_default",         ctypes.c_float),
-        ("n_rows",                  ctypes.c_int32),
-        ("hidden_dim",              ctypes.c_int32),
-    ]
-
-
-def setup_lib_bindings():
-    lib.codec_lm_speaker_get_info.argtypes = [ctypes.c_void_p]
-    lib.codec_lm_speaker_get_info.restype  = ctypes.POINTER(CodecLMSpeakerInfo)
-    lib.codec_lm_speaker_encode.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(codec_audio),
-        ctypes.POINTER(ctypes.c_int32), ctypes.c_int32,
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
-    ]
-    lib.codec_lm_speaker_encode.restype = ctypes.c_int
-    lib.codec_lm_get_last_error.argtypes = [ctypes.c_void_p]
-    lib.codec_lm_get_last_error.restype = ctypes.c_char_p
 
 
 def synth_ref_pcm(seconds: float = 5.0, sr: int = 16000) -> np.ndarray:
@@ -127,40 +97,16 @@ def reference_cond_emb(pcm: np.ndarray, sr: int) -> np.ndarray:
     return cond_emb.squeeze(0).cpu().float().numpy()
 
 
-def codec_cpp_cond_emb(lm_ptr, pcm: np.ndarray, sr: int) -> np.ndarray:
+def codec_cpp_cond_emb(pcm: np.ndarray, sr: int) -> np.ndarray:
     """Run codec_lm_speaker_encode via the public C API."""
-    audio = codec_audio()
-    pcm_c = pcm.astype(np.float32, copy=False)
-    audio.data        = pcm_c.ctypes.data_as(ctypes.c_void_p)
-    audio.n_samples   = pcm_c.size
-    audio.sample_rate = sr
-    audio.n_channels  = 1
-    audio.pcm_type    = CODEC_PCM_TYPE_F32
-
-    tokens = np.ascontiguousarray(SPEECH_TOKENS, dtype=np.int32)
-    emo    = ctypes.c_float(EMOTION)
-
-    info_ptr = lib.codec_lm_speaker_get_info(lm_ptr)
-    if not info_ptr:
-        raise RuntimeError("codec_lm has no speaker section")
-    info = info_ptr.contents
-    n_elems = info.n_rows * info.hidden_dim
-    out = (ctypes.c_float * n_elems)()
-
-    rc = lib.codec_lm_speaker_encode(
-        lm_ptr, ctypes.byref(audio),
-        tokens.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), tokens.size,
-        ctypes.byref(emo),
-        out, n_elems,
-    )
-    if rc != 0:
-        err = lib.codec_lm_get_last_error(lm_ptr) or b""
-        raise RuntimeError(f"codec_lm_speaker_encode rc={rc}, err={err.decode()!r}")
-    return np.frombuffer(out, dtype=np.float32).reshape(info.n_rows, info.hidden_dim).copy()
+    model = codec_cpp.Model(GGUF, use_gpu=False, n_threads=max(1, (os.cpu_count() or 1) // 2))
+    with model:
+        lm = model.get_lm_adaptor()
+        return lm.speaker_encode(ref_pcm=pcm, ref_sample_rate=sr,
+                                 ref_speech_tokens=SPEECH_TOKENS, emotion=EMOTION)
 
 
 def main() -> int:
-    setup_lib_bindings()
     if not GGUF.is_file():
         print(f"FAIL: missing {GGUF}", file=sys.stderr)
         return 2
@@ -172,11 +118,7 @@ def main() -> int:
     print(f"      ref shape={ref.shape} dtype={ref.dtype}")
 
     print(f"[cpp] running codec_lm_speaker_encode …")
-    cpp_lm = CodecLM(str(GGUF))
-    try:
-        got = codec_cpp_cond_emb(cpp_lm.lm, pcm, sr)
-    finally:
-        cpp_lm.close()
+    got = codec_cpp_cond_emb(pcm, sr)
     print(f"      got shape={got.shape}")
 
     if got.shape != ref.shape:

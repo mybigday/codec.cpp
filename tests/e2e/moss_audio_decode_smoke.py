@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end smoke test for MOSS-Audio-Tokenizer-Nano.
 
-Drives the public C API via codec-cli (encode + decode) and compares the
+Drives the public C API via codec_cpp (encode + decode) and compares the
 reconstruction against a reference produced by the upstream HF model. The
 encoder is allowed to flip a small fraction of codes due to argmax sensitivity
 at codebook ties under FP noise; correctness is judged on reconstruction
@@ -9,19 +9,17 @@ correlation, not exact code match."""
 
 from __future__ import annotations
 
-import struct
-import subprocess
 import sys
-import tempfile
 import wave
 from pathlib import Path
 
 import numpy as np
 
+from _common import REPO as REPO_ROOT, run_cmd
+import codec_cpp
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CODEC_CLI = REPO_ROOT / "build" / "codec-cli"
 CONVERT = REPO_ROOT / "scripts" / "convert-to-gguf.py"
+N_THREADS = 4
 
 # Variant under test.  Set MOSS_VARIANT=full to test the 1.6B mono 24 kHz
 # checkpoint instead.
@@ -36,13 +34,6 @@ else:
     NUM_QUANTIZERS = 16
 
 
-def run(cmd: list[str]) -> bytes:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.decode(errors='replace')[:4096]}")
-    return proc.stdout
-
-
 def read_wav_stereo_f32(path: Path) -> tuple[np.ndarray, int]:
     with wave.open(str(path), "rb") as wf:
         sr = wf.getframerate()
@@ -54,16 +45,6 @@ def read_wav_stereo_f32(path: Path) -> tuple[np.ndarray, int]:
         raise RuntimeError(f"{path}: expected PCM16, got sample_width={sw}")
     pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     return pcm.reshape(-1, nch), sr
-
-
-def write_wav_stereo_pcm16(path: Path, audio: np.ndarray, sr: int) -> None:
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = np.round(audio * 32767.0).astype(np.int16)
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(audio.shape[1])
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(pcm.tobytes())
 
 
 def synth_test_input(target_sr: int, n_channels: int) -> tuple[np.ndarray, int]:
@@ -135,15 +116,12 @@ def hf_reconstruction(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def main() -> int:
-    if not CODEC_CLI.is_file():
-        print(f"SKIP: {CODEC_CLI} not built")
-        return 0
     if not GGUF.is_file():
         if not MOSS_DIR.is_dir():
             print(f"SKIP: {MOSS_DIR} missing — run scripts/converters/moss_audio.py first")
             return 0
         GGUF.parent.mkdir(parents=True, exist_ok=True)
-        run([sys.executable, str(CONVERT), "--checkpoint-path", str(MOSS_DIR), "--model-type", "moss_audio", "--output", str(GGUF)])
+        run_cmd([sys.executable, str(CONVERT), "--checkpoint-path", str(MOSS_DIR), "--model-type", "moss_audio", "--output", str(GGUF)])
 
     # Read variant config from the HF config.json so we use the right
     # sample rate and channel count without hardcoding it per variant.
@@ -152,18 +130,16 @@ def main() -> int:
     sr = int(cfg_json.get("sampling_rate", 48000))
     n_channels = int(cfg_json.get("number_channels") or 1)
 
-    with tempfile.TemporaryDirectory(prefix="codec-moss-") as td:
-        td = Path(td)
-        in_wav = td / "input.wav"
-        cpp_wav = td / "cpp_e2e.wav"
+    audio, _ = synth_test_input(sr, n_channels)
+    # The library sees the same PCM16-quantized input it used to read via WAV.
+    audio_q = np.round(np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).astype(np.float32) / 32768.0
+    with codec_cpp.Model(GGUF, use_gpu=False, n_threads=N_THREADS) as model, model.context() as ctx:
+        codes = ctx.encode(audio_q, sr, n_q=NUM_QUANTIZERS, n_threads=N_THREADS)
+        cpp_out, cpp_sr = ctx.decode(codes, n_q=NUM_QUANTIZERS, n_threads=N_THREADS)
+    if cpp_out.ndim == 1:
+        cpp_out = cpp_out.reshape(-1, 1)
 
-        audio, _ = synth_test_input(sr, n_channels)
-        write_wav_stereo_pcm16(in_wav, audio, sr)
-
-        run([str(CODEC_CLI), "e2e", "--model", str(GGUF), "--in", str(in_wav), "--out", str(cpp_wav), "--nq", str(NUM_QUANTIZERS)])
-
-        cpp_out, cpp_sr = read_wav_stereo_f32(cpp_wav)
-        hf_out = hf_reconstruction(audio, sr)
+    hf_out = hf_reconstruction(audio, sr)
 
     if cpp_sr != sr:
         print(f"FAIL: cpp output sample_rate {cpp_sr} != input {sr}")

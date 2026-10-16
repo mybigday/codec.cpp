@@ -1,0 +1,172 @@
+"""Shared helpers for the tests/e2e smoke scripts.
+
+The C API is reached through the `codec_cpp` package (python/codec_cpp);
+this module only adds what tests need on top: assertions, metrics, WAV I/O
+and a llama.cpp backbone driver.
+
+When `codec_cpp` is not installed (`pip install -e python`), the source
+tree's python/ directory is put on sys.path so scripts run straight from a
+checkout.
+
+Load order: llama-cpp-python ships its own libggml.  Scripts that drive a
+backbone through `llama_cpp` must import it before the first codec_cpp
+call (codec_cpp loads libcodec lazily, so importing codec_cpp is fine).
+"""
+
+from __future__ import annotations
+
+import ctypes
+import subprocess
+import sys
+import wave
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[2]
+
+try:
+    import codec_cpp  # noqa: F401
+except ImportError:
+    sys.path.insert(0, str(REPO / "python"))
+    import codec_cpp  # noqa: F401
+
+
+# --- assertions / metrics ----------------------------------------------
+
+
+def must(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"FAIL: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+
+def corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation over flattened arrays (1.0 for two equal constants)."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    if a.std() == 0 or b.std() == 0:
+        return 1.0 if np.allclose(a, b) else 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def run_cmd(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Run a command, echo it, and fail with its output when it exits non-zero."""
+    print("$ " + " ".join(str(c) for c in cmd), flush=True)
+    proc = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kw)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout + proc.stderr)
+        raise RuntimeError(f"command failed (exit={proc.returncode}): {cmd[0]}")
+    return proc
+
+
+# --- WAV I/O (PCM16) ---------------------------------------------------
+
+
+def read_wav_mono_f32(path: Path) -> tuple[np.ndarray, int]:
+    """PCM16 WAV -> (float32 mono in [-1, 1), sample_rate); channels are averaged."""
+    with wave.open(str(path), "rb") as wf:
+        sr, nch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+    if sw != 2:
+        raise RuntimeError(f"{path}: expected PCM16, got sample_width={sw}")
+    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return pcm.reshape(-1, nch).mean(axis=1), sr
+
+
+def write_wav_pcm16(path: Path, pcm: np.ndarray, sr: int) -> None:
+    """float32 (n,) or (n, channels) -> PCM16 WAV."""
+    pcm = np.asarray(pcm, dtype=np.float32)
+    nch = 1 if pcm.ndim == 1 else int(pcm.shape[1])
+    s = np.clip(np.round(pcm * 32767.0), -32768, 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(nch)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(s.tobytes())
+
+
+# --- llama.cpp backbone (llama-cpp-python) -----------------------------
+
+
+class LlamaBackbone:
+    """Embedding-in / hidden-out driver for an AR backbone GGUF.
+
+    Mirrors how tts-cli runs the backbone: inputs are embedding rows, the
+    output is the last-layer hidden state (embeddings=True, no pooling).
+    """
+
+    def __init__(self, gguf: Path, n_ctx: int, *, n_gpu_layers: int = 0):
+        import llama_cpp as lc
+        self.lc = lc
+        lc.llama_backend_init()
+        mp = lc.llama_model_default_params()
+        mp.use_mmap = True
+        mp.n_gpu_layers = n_gpu_layers
+        self.model = lc.llama_model_load_from_file(str(gguf).encode("utf-8"), mp)
+        if not self.model:
+            raise RuntimeError(f"llama_model_load_from_file failed: {gguf}")
+        self.hidden = lc.llama_model_n_embd(self.model)
+        cp = lc.llama_context_default_params()
+        cp.n_ctx = n_ctx
+        cp.n_batch = max(n_ctx, 64)
+        cp.n_ubatch = max(n_ctx, 64)
+        cp.embeddings = True
+        cp.pooling_type = 0
+        self.ctx = lc.llama_init_from_model(self.model, cp)
+        if not self.ctx:
+            raise RuntimeError("llama_init_from_model failed")
+        self.pos = 0
+
+    def feed_embeds(self, embeds: np.ndarray, *, all_hidden: bool = False) -> np.ndarray:
+        """Append rows (T, hidden) at the current position.
+
+        Returns the last row's hidden state (hidden,), or every row's
+        (T, hidden) when ``all_hidden``.
+        """
+        lc = self.lc
+        embeds = np.ascontiguousarray(embeds, dtype=np.float32)
+        T = int(embeds.shape[0])
+        if embeds.shape[1] != self.hidden:
+            raise ValueError(f"feed_embeds: width {embeds.shape[1]} != model n_embd {self.hidden}")
+        batch = lc.llama_batch_init(T, self.hidden, 1)
+        try:
+            batch.n_tokens = T
+            ctypes.memmove(batch.embd, embeds.ctypes.data, embeds.nbytes)
+            for t in range(T):
+                batch.pos[t] = self.pos + t
+                batch.n_seq_id[t] = 1
+                batch.seq_id[t][0] = 0
+                batch.logits[t] = 1 if (all_hidden or t == T - 1) else 0
+            rc = lc.llama_decode(self.ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode rc={rc}")
+            rows = range(T) if all_hidden else (T - 1,)
+            out = np.zeros((len(rows), self.hidden), dtype=np.float32)
+            for i, t in enumerate(rows):
+                p = lc.llama_get_embeddings_ith(self.ctx, t if all_hidden else -1)
+                if not p:
+                    raise RuntimeError(f"llama_get_embeddings_ith({t}) returned NULL")
+                ctypes.memmove(out[i].ctypes.data, p, self.hidden * 4)
+        finally:
+            lc.llama_batch_free(batch)
+        self.pos += T
+        return out if all_hidden else out[0]
+
+    def close(self) -> None:
+        if getattr(self, "ctx", None):
+            self.lc.llama_free(self.ctx)
+            self.ctx = None
+        if getattr(self, "model", None):
+            self.lc.llama_model_free(self.model)
+            self.model = None
+
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+
+
+def llamacpp_hidden_seq(embeds: np.ndarray, gguf: Path) -> np.ndarray:
+    """One-shot: run a whole (T, hidden) prompt and return every hidden row."""
+    T = int(embeds.shape[0])
+    with LlamaBackbone(gguf, n_ctx=max(T + 8, 64)) as bb:
+        return bb.feed_embeds(embeds, all_hidden=True)

@@ -16,24 +16,16 @@ This smoke confirms the fused-compose runtime matches HF bit-exactly.
 
 from __future__ import annotations
 
-import ctypes
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[2]
+from _common import REPO, corr, must
+from codec_cpp import Model
+
 GGUF = REPO / "models/lfm2_audio/lfm2_audio.gguf"
 HF   = "LiquidAI/LFM2-Audio-1.5B"
-
-sys.path.insert(0, str(Path(__file__).parent))
-from _codec_lm_ctypes import CodecLM, lib
-
-
-def must(cond, msg):
-    if not cond:
-        print(f"FAIL: {msg}", file=sys.stderr)
-        sys.exit(1)
 
 
 def main() -> int:
@@ -47,13 +39,13 @@ def main() -> int:
     N = int(m.codebooks)
 
     print("[cpp] loading codec_lm …", flush=True)
-    lm = CodecLM(GGUF)
-    must(lm.n_cb == N,
-         f"n_cb mismatch lm={lm.n_cb} hf={N}")
-    must(lm.compose_audio_embed_dim > 0,
+    lm = Model(GGUF, use_gpu=False, n_threads=max(1, (os.cpu_count() or 1) // 2)).get_lm_adaptor()
+    must(lm.info.n_codebook == N,
+         f"n_cb mismatch lm={lm.info.n_codebook} hf={N}")
+    must(lm.info.compose_audio_embed_dim > 0,
          "compose_audio_embed_dim not set — converter didn't write "
          "lm.compose.audio_embd / codec.lm.compose.audio_embed_dim")
-    out_dim = lm.compose_audio_embed_dim
+    out_dim = lm.info.compose_audio_embed_dim
     print(f"  compose_audio_embed_dim = {out_dim}", flush=True)
 
     rng = np.random.default_rng(0)
@@ -67,25 +59,18 @@ def main() -> int:
                 torch.from_numpy(codes) + m.codebook_offsets
             ).sum(0).cpu().float().numpy()
 
-        out_buf = (ctypes.c_float * out_dim)()
-        codes_i32 = codes.astype(np.int32)
-        rc = lib.codec_lm_compose_audio_embd(
-            lm.lm,
-            codes_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            out_buf)
-        must(rc == 0, f"compose rc={rc} on case {case}")
-        cpp = np.frombuffer(out_buf, dtype=np.float32, count=out_dim).copy()
+        cpp = lm.compose_audio_embd(codes)
+        must(cpp.shape == (out_dim,), f"compose returned {cpp.shape} on case {case}")
 
         mad = float(np.max(np.abs(cpp - ref)))
-        a = cpp.astype(np.float64); b = ref.astype(np.float64)
-        cc  = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else 1.0
+        cc  = corr(cpp, ref)
         ok  = mad <= 1e-5 and cc >= 0.99999
         tag = "OK " if ok else "FAIL"
         print(f"  [{tag}] case={case}  codes={codes.tolist()}  "
               f"max_abs_diff={mad:.5g}  corr={cc:.6f}")
         all_pass &= ok
 
-    lm.close()
+    lm.model.close()
     if all_pass:
         print("\nLFM2-Audio compose-embd parity PASSED")
         return 0

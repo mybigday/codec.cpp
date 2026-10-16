@@ -5,9 +5,9 @@ Run from repo root:  .venv/bin/python tests/e2e/tts_constraint_smoke.py
 """
 import subprocess
 import sys
-from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+from _common import REPO
+
 BIN = REPO / "build" / "tts-constraint-test"
 
 def main() -> int:
