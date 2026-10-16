@@ -26,9 +26,9 @@
 //
 // We attribute the interval between two consecutive ask=false callbacks to the
 // node observed at the *end* of that interval (its result just became ready),
-// which is the standard "delta since previous observe" accounting.  The very
-// first node's own compute isn't isolated (it shares the interval from compute
-// start), a negligible edge effect over thousands of nodes.
+// which is the standard "delta since previous observe" accounting.  The first
+// node's interval also carries the compute-start overhead (split setup, input
+// copies), a negligible edge effect over thousands of nodes.
 //
 // A summary is appended to the file at the end of each compute.
 // ---------------------------------------------------------------------------
@@ -44,7 +44,6 @@ struct op_profiler {
     bool                                  resolved  = false;
     bool                                  active    = false;   // inside one compute
     int64_t                               t_prev_us = 0;
-    ggml_tensor *                         prev_node = nullptr;
     std::map<std::string, op_profile_bucket> buckets;
 
     const char * resolve() {
@@ -73,16 +72,14 @@ std::string profile_key(const ggml_tensor * t) {
     return std::string(buf);
 }
 
-// Attribute the elapsed interval to the *previous* observed node.
+// The interval since the previous observation is the compute of `node` (its
+// result just became ready).
 void profile_observe(ggml_tensor * node) {
     op_profiler & p = profiler();
     const int64_t now = ggml_time_us();
-    if (p.prev_node != nullptr) {
-        op_profile_bucket & b = p.buckets[profile_key(p.prev_node)];
-        b.total_us += now - p.t_prev_us;
-        b.count    += 1;
-    }
-    p.prev_node = node;
+    op_profile_bucket & b = p.buckets[profile_key(node)];
+    b.total_us += now - p.t_prev_us;
+    b.count    += 1;
     p.t_prev_us = now;
 }
 
@@ -98,20 +95,12 @@ void profile_begin() {
     op_profiler & p = profiler();
     if (p.resolve() == nullptr) { p.active = false; return; }
     p.active    = true;
-    p.prev_node = nullptr;
     p.t_prev_us = ggml_time_us();
 }
 
 void profile_end(int graph_kind, int n_nodes) {
     op_profiler & p = profiler();
     if (!p.active) return;
-    // flush the last observed node using compute-end as its interval boundary.
-    if (p.prev_node != nullptr) {
-        op_profile_bucket & b = p.buckets[profile_key(p.prev_node)];
-        b.total_us += ggml_time_us() - p.t_prev_us;
-        b.count    += 1;
-    }
-    p.prev_node = nullptr;
 
     // Aggregate by op-name (strip the shape suffix) for a compact top-level view,
     // then dump the detailed per-shape buckets.
