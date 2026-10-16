@@ -60,6 +60,17 @@ Voices from `spk2info.pt`: 中文女 `zh_female`, 中文男 `zh_male`, 日语男
 BreezyVoice's voices also carry prompt tokens / mel (no transcript, so they run
 in cross-lingual mode).
 
+## Chunked decoding
+
+There is no separate streaming API. Decode overlapping token windows with
+`codec_decode` and the same speaker, then cross-fade the shared region (as
+OuteTTS does). For example, use windows of 50 new tokens plus 10 tokens of
+context on each side, place window `[lo, hi)` at sample `lo * sample_rate /
+token_rate`, and fade linearly over the `2 * 10` overlapping tokens. The right
+context also gives v2/v3 their 3-token pre-lookahead. On the reference clip, this
+transcribes like a single `codec_decode` on v1, v2 and v3. Each window re-runs
+the prompt through the flow, as upstream streaming does.
+
 ## Tunable metadata
 
 Inference knobs are GGUF metadata with upstream defaults; change them per run
@@ -117,7 +128,8 @@ tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2 \
 - BreezyVoice's g2pw polyphone annotation (注音 inserted after ambiguous
   characters, `single_inference.py`): plain text works; annotate externally for
   polyphone control.
-- Streaming (chunked flow / HiFT caches).
+- Upstream's exact streaming (flow / HiFT caches). Chunked playback works
+  with `codec_decode` alone; see below.
 
 ## Validation (CPU, F32 GGUFs, reference = upstream PyTorch / BreezyVoice fork)
 
