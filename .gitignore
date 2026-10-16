@@ -20,6 +20,7 @@ dist/
 .venv/
 .audio-env/
 __pycache__/
+*.egg-info/
 *.pyc
 
 # Checkpoints

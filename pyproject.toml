@@ -1,0 +1,40 @@
+# Python bindings (python/codec_cpp) packaged together with libcodec.
+#   pip install .                                   # CPU build
+#   pip install . -C cmake.define.GGML_VULKAN=ON    # any ggml backend flag
+# Not published to PyPI yet; see python/README.md.
+
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "codec-cpp"
+dynamic = ["version"]
+description = "Python bindings for codec.cpp: neural audio codecs on ggml"
+readme = "python/README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Repository = "https://github.com/mybigday/codec.cpp"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+wheel.packages = ["python/codec_cpp"]
+wheel.py-api = "py3"  # ctypes only: one wheel per platform, any CPython
+build.targets = ["codec_shared"]
+install.components = ["python"]
+# Anchored to the repo root ("models/" alone would also drop src/models/).
+sdist.exclude = ["/models/", "/build*/", "/.venv/", "/.model-src/", "/input_audio/", "/benchmarks/",
+                 "/common/third-party/", "/patches/", "/docs/", "/tests/", "/scripts/", "/tools/",
+                 "/assets/", "/.claude/", "/.agents/", "*.gguf", "*.wav", "*.npy", "*.ckpt"]
+
+[tool.scikit-build.cmake.define]
+BUILD_SHARED_LIBS = "OFF"
+CMAKE_POSITION_INDEPENDENT_CODE = "ON"
+CODEC_BUILD_TTS_CLI = "OFF"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/codec_cpp/__init__.py"

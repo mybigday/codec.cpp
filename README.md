@@ -32,6 +32,16 @@ python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantiz
 ./build/codec-cli decode --model mimi.gguf --codes input.npy --out output.wav --use-gpu
 ```
 
+### 3. Python
+
+```python
+import codec_cpp
+ctx = codec_cpp.Model("mimi.gguf").context()
+audio, sr = ctx.decode(ctx.encode(pcm, 24000))
+```
+
+`pip install .` builds libcodec and installs the `codec_cpp` package; see [python/README.md](python/README.md).
+
 ## Build with GPU Acceleration
 
 ### CUDA (NVIDIA)

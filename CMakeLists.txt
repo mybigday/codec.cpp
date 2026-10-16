@@ -123,6 +123,15 @@ target_include_directories(codec_shared
 target_link_libraries(codec        PRIVATE ggml)
 target_link_libraries(codec_shared PRIVATE ggml)
 
+# Python wheel (pyproject.toml, scikit-build-core): install libcodec into the
+# codec_cpp package so the bindings find it next to themselves.  Wheel builds
+# link ggml statically (BUILD_SHARED_LIBS=OFF) so libcodec is self-contained.
+if(SKBUILD)
+    install(TARGETS codec_shared
+        LIBRARY DESTINATION codec_cpp/lib COMPONENT python
+        RUNTIME DESTINATION codec_cpp/lib COMPONENT python)
+endif()
+
 # Small reusable example IO helpers (WAV / NPY).  Declared before
 # codec_common so the self-contained FlowLM runner (which loads ref-audio
 # WAVs) can link it.  `examples` is on the public include path so consumers
