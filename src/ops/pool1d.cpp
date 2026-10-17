@@ -4,6 +4,21 @@
 
 #include <algorithm>
 
+ggml_tensor * codec_op_pool_1d(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    enum ggml_op_pool op,
+    int32_t k,
+    int32_t s,
+    int32_t p) {
+
+    if (ctx == nullptr || x == nullptr || x->ne[3] > 1) return nullptr;
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    ggml_tensor * x4 = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
+    ggml_tensor * y = ggml_pool_2d(ctx, x4, op, k, 1, s, 1, (float) p, 0.0f);   // [t_out, 1, c, n]
+    return ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], y->ne[3]);
+}
+
 // Length-preserving (stride=1) max / avg pool with constant-zero padding,
 // matching PyTorch `nn.MaxPool1d(k, padding=p)` and
 // `nn.AvgPool1d(k, padding=p, count_include_pad=True)`.
@@ -35,7 +50,7 @@ static ggml_tensor * codec_pool1d(
     ggml_tensor * x_pad = (p > 0) ? codec_op_pad_1d(ctx, x_f32, p, p) : x_f32;
     if (x_pad == nullptr) return nullptr;
 
-    ggml_tensor * y = ggml_pool_1d(ctx, x_pad, op, /*k0=*/k, /*s0=*/1, /*p0=*/0);
+    ggml_tensor * y = codec_op_pool_1d(ctx, x_pad, op, /*k=*/k, /*s=*/1, /*p=*/0);
     return y ? ggml_cont(ctx, y) : nullptr;
 }
 

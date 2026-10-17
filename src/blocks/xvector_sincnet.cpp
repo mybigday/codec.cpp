@@ -1,6 +1,7 @@
 #include "xvector_sincnet.h"
 
 #include "../ops/conv1d.h"
+#include "../ops/pool1d.h"
 #include "../ops/ggml_ops.h"
 #include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
@@ -65,7 +66,7 @@ ggml_tensor * codec_block_xvector_sincnet(
             x = codec_conv1d(ctx, x, W(pre, ci + ".w"), W(pre, ci + ".b"), 1, 1, 0);
         }
         if (missing || x == nullptr) return nullptr;
-        x = ggml_pool_1d(ctx, x, GGML_OP_POOL_MAX, kPool, kPool, 0);
+        x = codec_op_pool_1d(ctx, x, GGML_OP_POOL_MAX, kPool, kPool, 0);
         const std::string ni = "norm" + std::to_string(i);
         x = instance_norm_tc(ctx, x, W(pre, ni + ".w"), W(pre, ni + ".b"));
         return missing ? nullptr : ggml_leaky_relu(ctx, x, kLeakySlope, false);

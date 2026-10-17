@@ -206,12 +206,11 @@ static ggml_tensor * codec_snac_quantize_level(
     const std::string base = "snac.q." + std::to_string(qi);
 
     // 1) Avg-pool along time by `stride` (matches torch.nn.functional.avg_pool1d).
-    //    In TC layout (ne[0]=t, ne[1]=c), ggml_pool_1d reduces ne[0] which is
+    //    In TC layout (ne[0]=t, ne[1]=c), pooling reduces ne[0] which is
     //    exactly the time axis — no transpose needed.
     ggml_tensor * pooled_tc = residual_tc;
     if (stride > 1) {
-        pooled_tc = ggml_pool_1d(ctx_eval, residual_tc,
-                                 GGML_OP_POOL_AVG, stride, stride, 0);
+        pooled_tc = codec_op_pool_1d(ctx_eval, residual_tc, GGML_OP_POOL_AVG, stride, stride, 0);
         if (pooled_tc == nullptr) return nullptr;
         pooled_tc = ggml_cont(ctx_eval, pooled_tc);
     }
