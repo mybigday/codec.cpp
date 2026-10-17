@@ -1,8 +1,31 @@
 #include "lm_attn.h"
 #include "ggml_ops.h"
+#include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
 
 #include <cmath>
+#include <string>
+#include <vector>
+
+// Additive [t_k, t_q] F32 mask shared by every head: causal, the
+// sliding window and key padding in one graph constant.  nullptr outside a
+// graph build (codec_graph_const unavailable).
+static ggml_tensor * codec_lm_attn_mask_const(ggml_context * ctx, int64_t t, bool causal, int32_t window,
+                                              int32_t n_valid) {
+    const std::string name = "lut.attn_mask." + std::to_string(t) + "." + std::to_string(causal) + "." +
+                             std::to_string(window) + "." + std::to_string(n_valid);
+    std::vector<float> m((size_t) (t * t));
+    for (int64_t i = 0; i < t; ++i) {          // query
+        for (int64_t j = 0; j < t; ++j) {      // key
+            // Window / padding use a finite -1e30 (as the unfused path did) so a
+            // query row with every key masked stays finite instead of NaN.
+            float v = (window > 0 && j < i - window + 1) || (n_valid > 0 && j >= n_valid) ? -1e30f : 0.0f;
+            m[(size_t) (i * t + j)] = causal && j > i ? -INFINITY : v;
+        }
+    }
+    const int64_t ne[2] = {t, t};
+    return codec_graph_const(ctx, name.c_str(), GGML_TYPE_F32, 2, ne, m.data());
+}
 
 ggml_tensor * codec_op_lm_attn_ctx_dth(
     ggml_context * ctx,
@@ -32,63 +55,77 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
         return nullptr;
     }
 
-    attn_scores = ggml_scale_inplace(ctx, attn_scores, scale);
-    if (causal) {
-        attn_scores = ggml_diag_mask_inf_inplace(ctx, attn_scores, 0);
+    const int64_t t_attn = q_dth->ne[1];
+    const int32_t window = causal && params->window > 0 && params->window < (int32_t) t_attn ? params->window : 0;
+    const int32_t n_valid = params != nullptr && params->n_valid > 0 && params->n_valid < (int32_t) t_attn
+        ? params->n_valid : 0;
+    ggml_tensor * attn_probs = nullptr;
+    // Fused scale + mask + softmax: one pass over the [t, t, h] scores instead
+    // of three, with one mask for all heads.
+    if (!causal && n_valid == 0) {
+        attn_probs = ggml_soft_max_ext(ctx, attn_scores, nullptr, scale, 0.0f);
+    } else if (ggml_tensor * mask = codec_lm_attn_mask_const(ctx, t_attn, causal, window, n_valid)) {
+        attn_probs = ggml_soft_max_ext(ctx, attn_scores, mask, scale, 0.0f);
     }
-    if (params != nullptr && params->n_valid > 0 && params->n_valid < (int32_t) q_dth->ne[1]) {
-        // Padding mask: set scores for keys at positions >= n_valid to -inf.
-        // attn_scores shape is (k, q, h).  Mask the *last* (t - n_valid) rows
-        // of ne[0] (the key dim).
-        const int64_t t = q_dth->ne[1];
-        const int64_t h = q_dth->ne[2];
-        const int32_t n_valid = params->n_valid;
-        // Build a 1D bias [t]: 0 for k < n_valid, -inf otherwise.  Use arange
-        // + scale_bias + clamp + scale (mirrors the windowed-mask trick).
-        ggml_tensor * arange_k = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
-        // diff = k - n_valid + 1; mask if diff > 0.  Equivalently mask if k > n_valid - 1.
-        ggml_tensor * diff = ggml_scale_bias(ctx, arange_k, 1.0f, (float) -(n_valid - 1));
-        // We want -inf where diff > 0, i.e. clip lo=0 then negate so clipped >= 0
-        // becomes <= 0, then scale by -1e30.
-        ggml_tensor * clipped = ggml_clamp(ctx, diff, 0.0f, 1e9f);                          // >= 0
-        ggml_tensor * bias_1d = ggml_scale(ctx, clipped, -1e30f);                           // -inf where k >= n_valid
-        // Broadcast to (t, t, h).
-        ggml_tensor * bias_2d = ggml_reshape_2d(ctx, bias_1d, t, 1);
-        ggml_tensor * bias_3d = ggml_reshape_3d(ctx, bias_2d, t, 1, 1);
-        ggml_tensor * bias_dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t, t, h);
-        ggml_tensor * bias_rep = ggml_repeat(ctx, bias_3d, bias_dst);
-        attn_scores = ggml_add(ctx, attn_scores, bias_rep);
-    }
-    if (causal && params != nullptr && params->window > 0 && params->window < (int32_t) q_dth->ne[1]) {
-        // Sliding-window causal mask: in addition to the upper triangle
-        // (handled by ggml_diag_mask_inf above), zero out keys older than
-        // `window-1` steps.  attn_scores shape is (k, q, h).  We add a
-        // -inf bias where `j < i - window + 1` (i query, j key).
-        const int64_t t = q_dth->ne[1];
-        const int64_t h = q_dth->ne[2];
-        const int32_t window = params->window;
-        // Build the mask in-graph from arange tensors.
-        ggml_tensor * arange = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
-        ggml_tensor * row_q = ggml_reshape_2d(ctx, arange, 1, t);                         // [1, t]  (i along ne[1])
-        ggml_tensor * col_k = ggml_reshape_2d(ctx, arange, t, 1);                         // [t, 1]  (j along ne[0])
-        ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, t);
-        ggml_tensor * row_q_rep = ggml_repeat(ctx, row_q, tmpl);
-        ggml_tensor * col_k_rep = ggml_repeat(ctx, col_k, tmpl);
-        // diff = j - (i - window + 1)  → if diff < 0 the key is too old; mask.
-        ggml_tensor * diff = ggml_sub(ctx, col_k_rep, row_q_rep);
-        diff = ggml_scale_bias(ctx, diff, 1.0f, (float) (window - 1));
-        // Build a mask tensor: where diff < 0, output = -inf, else 0.  We
-        // approximate this by clipping diff to (-large, 0) and scaling.
-        // Concretely: bias = min(diff, 0) * INF_SCALE.
-        ggml_tensor * clipped = ggml_clamp(ctx, diff, -1e9f, 0.0f);
-        ggml_tensor * bias = ggml_scale(ctx, clipped, 1e30f);   // -inf where diff < 0
-        ggml_tensor * bias_3d = ggml_reshape_3d(ctx, bias, t, t, 1);
-        ggml_tensor * bias_dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t, t, h);
-        ggml_tensor * bias_rep = ggml_repeat(ctx, bias_3d, bias_dst);
-        attn_scores = ggml_add(ctx, attn_scores, bias_rep);
-    }
+    if (attn_probs == nullptr) {  // no graph build to hold the mask constant
+        attn_scores = ggml_scale_inplace(ctx, attn_scores, scale);
+        if (causal) {
+            attn_scores = ggml_diag_mask_inf_inplace(ctx, attn_scores, 0);
+        }
+        if (params != nullptr && params->n_valid > 0 && params->n_valid < (int32_t) q_dth->ne[1]) {
+            // Padding mask: set scores for keys at positions >= n_valid to -inf.
+            // attn_scores shape is (k, q, h).  Mask the *last* (t - n_valid) rows
+            // of ne[0] (the key dim).
+            const int64_t t = q_dth->ne[1];
+            const int64_t h = q_dth->ne[2];
+            const int32_t n_valid = params->n_valid;
+            // Build a 1D bias [t]: 0 for k < n_valid, -inf otherwise.  Use arange
+            // + scale_bias + clamp + scale (mirrors the windowed-mask trick).
+            ggml_tensor * arange_k = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
+            // diff = k - n_valid + 1; mask if diff > 0.  Equivalently mask if k > n_valid - 1.
+            ggml_tensor * diff = ggml_scale_bias(ctx, arange_k, 1.0f, (float) -(n_valid - 1));
+            // We want -inf where diff > 0, i.e. clip lo=0 then negate so clipped >= 0
+            // becomes <= 0, then scale by -1e30.
+            ggml_tensor * clipped = ggml_clamp(ctx, diff, 0.0f, 1e9f);                          // >= 0
+            ggml_tensor * bias_1d = ggml_scale(ctx, clipped, -1e30f);                           // -inf where k >= n_valid
+            // Broadcast to (t, t, h).
+            ggml_tensor * bias_2d = ggml_reshape_2d(ctx, bias_1d, t, 1);
+            ggml_tensor * bias_3d = ggml_reshape_3d(ctx, bias_2d, t, 1, 1);
+            ggml_tensor * bias_dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t, t, h);
+            ggml_tensor * bias_rep = ggml_repeat(ctx, bias_3d, bias_dst);
+            attn_scores = ggml_add(ctx, attn_scores, bias_rep);
+        }
+        if (causal && params != nullptr && params->window > 0 && params->window < (int32_t) q_dth->ne[1]) {
+            // Sliding-window causal mask: in addition to the upper triangle
+            // (handled by ggml_diag_mask_inf above), zero out keys older than
+            // `window-1` steps.  attn_scores shape is (k, q, h).  We add a
+            // -inf bias where `j < i - window + 1` (i query, j key).
+            const int64_t t = q_dth->ne[1];
+            const int64_t h = q_dth->ne[2];
+            const int32_t window = params->window;
+            // Build the mask in-graph from arange tensors.
+            ggml_tensor * arange = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
+            ggml_tensor * row_q = ggml_reshape_2d(ctx, arange, 1, t);                         // [1, t]  (i along ne[1])
+            ggml_tensor * col_k = ggml_reshape_2d(ctx, arange, t, 1);                         // [t, 1]  (j along ne[0])
+            ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, t);
+            ggml_tensor * row_q_rep = ggml_repeat(ctx, row_q, tmpl);
+            ggml_tensor * col_k_rep = ggml_repeat(ctx, col_k, tmpl);
+            // diff = j - (i - window + 1)  → if diff < 0 the key is too old; mask.
+            ggml_tensor * diff = ggml_sub(ctx, col_k_rep, row_q_rep);
+            diff = ggml_scale_bias(ctx, diff, 1.0f, (float) (window - 1));
+            // Build a mask tensor: where diff < 0, output = -inf, else 0.  We
+            // approximate this by clipping diff to (-large, 0) and scaling.
+            // Concretely: bias = min(diff, 0) * INF_SCALE.
+            ggml_tensor * clipped = ggml_clamp(ctx, diff, -1e9f, 0.0f);
+            ggml_tensor * bias = ggml_scale(ctx, clipped, 1e30f);   // -inf where diff < 0
+            ggml_tensor * bias_3d = ggml_reshape_3d(ctx, bias, t, t, 1);
+            ggml_tensor * bias_dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t, t, h);
+            ggml_tensor * bias_rep = ggml_repeat(ctx, bias_3d, bias_dst);
+            attn_scores = ggml_add(ctx, attn_scores, bias_rep);
+        }
 
-    ggml_tensor * attn_probs = ggml_soft_max(ctx, attn_scores);
+        attn_probs = ggml_soft_max(ctx, attn_scores);
+    }
     if (attn_probs == nullptr) {
         return nullptr;
     }
@@ -206,11 +243,10 @@ ggml_tensor * codec_op_lm_attn_rel_pos_dth(
     if (mat_bd == nullptr) return nullptr;
 
     ggml_tensor * scores = ggml_add(ctx, mat_ac, mat_bd);
-    scores = ggml_scale(ctx, scores, scale);
     if (params != nullptr && params->causal) {
         scores = ggml_diag_mask_inf(ctx, scores, 0);
     }
-    ggml_tensor * attn_w = ggml_soft_max(ctx, scores);
+    ggml_tensor * attn_w = ggml_soft_max_ext(ctx, scores, nullptr, scale, 0.0f);
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
     return codec_mul_mat(ctx, v_tdh, attn_w);
@@ -263,8 +299,7 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
     rel = ggml_cont(ctx, ggml_permute(ctx, rel, 0, 2, 1, 3));
 
     ggml_tensor * scores = ggml_add(ctx, ac, rel);
-    scores = ggml_scale(ctx, scores, scale);
-    ggml_tensor * probs = ggml_soft_max(ctx, scores);
+    ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, nullptr, scale, 0.0f);
 
     ggml_tensor * v_tdh = ggml_cont(ctx, ggml_permute(ctx, v_dth, 1, 0, 2, 3));
     return codec_mul_mat(ctx, v_tdh, probs);
@@ -396,9 +431,8 @@ ggml_tensor * codec_op_lm_llama_depth_block(
     ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
     ggml_tensor * scores = codec_mul_mat(ctx, k_p, q_p);
-    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) head_dim));
     scores = ggml_diag_mask_inf(ctx, scores, /*n_past=*/0);
-    scores = ggml_soft_max(ctx, scores);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt((float) head_dim), 0.0f);
 
     ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
     ggml_tensor * attn = codec_mul_mat(ctx, v_p, scores);
