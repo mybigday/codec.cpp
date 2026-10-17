@@ -22,17 +22,22 @@ static ggml_tensor * codec_convtr1d_pad_rows(ggml_context * ctx, ggml_tensor * x
     return right > 0 ? ggml_pad(ctx, x, 0, (int) right, 0, 0) : x;
 }
 
-// ConvTranspose1d as one GEMM plus K/stride shifted adds (dilation 1, K a
-// multiple of stride).  ggml's CPU CONV_TRANSPOSE_1D runs one dot product per
-// output sample with no blocking; this is the same arithmetic in F32 (bit-level
+// ConvTranspose1d as one GEMM plus ceil(K/stride) shifted adds (dilation 1).
+// ggml's CPU CONV_TRANSPOSE_1D runs one dot product per output sample with no
+// blocking; this is the same arithmetic in F32 (bit-level
 // equal up to summation order) at GEMM speed.
 //   cols[k + K*co, t] = sum_ci w[k, co, ci] * x[t, ci]
 //   y[t*s + k, co]   += cols[k + K*co, t];  with k = j*s + p, phase block j
 //   lands j frames later.
 static ggml_tensor * codec_convtr1d_gemm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, int32_t stride) {
-    const int64_t K = w->ne[0], C_out = w->ne[1], C_in = w->ne[2], T = x->ne[0];
+    const int64_t K0 = w->ne[0];
+    // A kernel that is not a multiple of the stride gets zero taps appended;
+    // they only add samples past the true output end, cropped below.
+    const int64_t K = (K0 + stride - 1) / stride * stride;
+    const int64_t C_out = w->ne[1], C_in = w->ne[2], T = x->ne[0];
     const int64_t J = K / stride;
     w = codec_graph_cast_f32(ctx, w);
+    if (K != K0) w = ggml_pad(ctx, w, (int) (K - K0), 0, 0, 0);
     ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, w, K * C_out, C_in)));  // [C_in, K*C_out]
     ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, x, T, C_in)));          // [C_in, T]
     ggml_tensor * cols = ggml_mul_mat(ctx, wt, xt);                                                    // [K*C_out, T]
@@ -44,7 +49,8 @@ static ggml_tensor * codec_convtr1d_gemm(ggml_context * ctx, ggml_tensor * x, gg
         blk = codec_convtr1d_pad_rows(ctx, blk, j, J - 1 - j);                                         // [s, T+J-1, C_out]
         y = y == nullptr ? blk : ggml_add(ctx, y, blk);
     }
-    return ggml_reshape_2d(ctx, y, stride * (T + J - 1), C_out);
+    y = ggml_reshape_2d(ctx, y, stride * (T + J - 1), C_out);
+    return K == K0 ? y : codec_op_crop_1d(ctx, y, 0, (int32_t) (K - K0));
 }
 
 ggml_tensor * codec_convtr1d(
@@ -68,7 +74,7 @@ ggml_tensor * codec_convtr1d(
     }
     b = codec_graph_cast_f32(ctx, b);
 
-    const bool gemm = dilation == 1 && w->ne[0] % stride == 0 && x->ne[1] == w->ne[2] && x->ne[2] <= 1 && x->ne[3] <= 1;
+    const bool gemm = dilation == 1 && x->ne[1] == w->ne[2] && x->ne[2] <= 1 && x->ne[3] <= 1;
     ggml_tensor * y = gemm ? codec_convtr1d_gemm(ctx, x, w, stride) : ggml_conv_transpose_1d(ctx, w, x, stride, 0, dilation);
     if (b != nullptr) {
         ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
