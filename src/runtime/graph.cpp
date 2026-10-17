@@ -109,6 +109,22 @@ ggml_tensor * codec_graph_pin_cpu(ggml_tensor * node) {
     return node;
 }
 
+bool codec_graph_backend_is_gpu() {
+    return t_building_ctx != nullptr && t_building_ctx->backend != nullptr &&
+           ggml_backend_dev_type(ggml_backend_get_device(t_building_ctx->backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+const char * codec_graph_backend_reg_name() {
+    if (t_building_ctx == nullptr || t_building_ctx->backend == nullptr) return "";
+    ggml_backend_dev_t dev = ggml_backend_get_device(t_building_ctx->backend);
+    return dev != nullptr ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+}
+
+ggml_tensor ** codec_graph_weight_cast_slot(ggml_context * ctx_eval, const ggml_tensor * w) {
+    if (t_building_ctx == nullptr || ctx_eval != t_building_ctx->eval_ctx || w == nullptr) return nullptr;
+    return &t_building_ctx->eval_weight_casts[w];
+}
+
 bool codec_graph_backend_supports(const ggml_tensor * node) {
     static const bool force_composite = [] {
         const char * v = std::getenv("CODEC_FORCE_COMPOSITE_OPS");
@@ -132,17 +148,16 @@ codec_graph_cpu_scope::codec_graph_cpu_scope(ggml_context * ctx_eval)
 
 codec_graph_cpu_scope::~codec_graph_cpu_scope() {
     // A view must live on its source's backend: pin views only of pinned tensors.
-    std::vector<ggml_tensor *> pinned;
+    std::unordered_set<const ggml_tensor *> pinned;
     ggml_tensor * t = last_before != nullptr ? ggml_get_next_tensor(ctx, last_before) : ggml_get_first_tensor(ctx);
     for (; t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (t->op == GGML_OP_NONE) {
             continue;
         }
-        if (t->view_src != nullptr &&
-            std::find(pinned.begin(), pinned.end(), t->view_src) == pinned.end()) {
+        if (t->view_src != nullptr && pinned.count(t->view_src) == 0) {
             continue;
         }
-        pinned.push_back(t);
+        pinned.insert(t);
         codec_graph_pin_cpu(t);
     }
 }
@@ -177,6 +192,7 @@ void codec_graph_release(codec_context * ctx) {
     ctx->eval_entry = nullptr;
     ctx->eval_consts.clear();
     ctx->eval_cpu_nodes.clear();
+    ctx->eval_weight_casts.clear();
     ctx->eval_graph_allocated = false;
 }
 

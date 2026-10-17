@@ -132,6 +132,7 @@ struct codec_context {
     codec_graph_cache_entry * eval_entry = nullptr;
     std::vector<codec_graph_const_input> eval_consts; // constants of the current eval graph
     std::vector<ggml_tensor *> eval_cpu_nodes;         // nodes pinned to the CPU backend
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> eval_weight_casts; // weight -> its F32 cast in this graph
     bool eval_graph_allocated = false; // sched_alloc_graph done for current eval_ctx
     int32_t sched_reserved_graph_size = 0;
 };

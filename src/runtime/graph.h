@@ -107,6 +107,17 @@ ggml_tensor * codec_graph_pin_cpu(ggml_tensor * node);
 // graph to the CPU (ggml-opencl has no SIN / COS, ggml-vulkan no ELU, ...).
 // CODEC_FORCE_COMPOSITE_OPS=1 answers false, to test those fallbacks on CPU.
 bool codec_graph_backend_supports(const ggml_tensor * node);
+// Whether the graph being built targets a non-CPU backend (false outside a
+// build).  For layout / algorithm choices that are measurably faster on GPUs
+// and slower on CPUs.
+bool codec_graph_backend_is_gpu();
+// Registry name of that backend's device ("CPU", "MTL" for Metal, "Vulkan",
+// "CUDA", ...); "" outside a build.
+const char * codec_graph_backend_reg_name();
+// Slot memoizing the F32 cast of stored weight `w` within the graph being
+// built (nullptr outside a build), so unrolled passes (20 CFM estimator calls)
+// share one cast node instead of re-casting every bias per pass.
+ggml_tensor ** codec_graph_weight_cast_slot(ggml_context * ctx_eval, const ggml_tensor * w);
 
 // Pins every op created in `ctx_eval` while the scope is alive. Views of
 // pinned tensors cannot cross backends, so a scope should end on a non-view

@@ -1,4 +1,5 @@
 #include "tensor_utils.h"
+#include "graph.h"
 
 #include <ggml-backend.h>
 
@@ -105,12 +106,43 @@ ggml_tensor * codec_model_get_tensor(const codec_model * model, const std::strin
     return codec_model_get_tensor(model, name.c_str());
 }
 
+static ggml_tensor * codec_graph_cast_f32_new(ggml_context * ctx_eval, ggml_tensor * t);
+
 ggml_tensor * codec_graph_cast_f32(ggml_context * ctx_eval, ggml_tensor * t) {
     if (ctx_eval == nullptr || t == nullptr) {
         return nullptr;
     }
     if (t->type == GGML_TYPE_F32) {
         return t;
+    }
+    // Small stored weights (biases, norm scales) are cast once per graph and
+    // shared; large ones are not, so their F32 copies don't all stay alive.
+    ggml_tensor ** slot = nullptr;
+    if (t->op == GGML_OP_NONE && t->buffer != nullptr && ggml_nelements(t) <= 65536) {
+        slot = codec_graph_weight_cast_slot(ctx_eval, t);
+        if (slot != nullptr && *slot != nullptr) {
+            return *slot;
+        }
+    }
+    ggml_tensor * y = codec_graph_cast_f32_new(ctx_eval, t);
+    if (slot != nullptr) {
+        *slot = y;
+    }
+    return y;
+}
+
+static ggml_tensor * codec_graph_cast_f32_new(ggml_context * ctx_eval, ggml_tensor * t) {
+    // Short rows (1x1 conv weights are [1, c_in, c_out]) make GPU copy kernels,
+    // which run one threadgroup per row, crawl (Metal: 56 ms for a 1024x2048
+    // weight).  Cast those as wide rows and view the result back.
+    if (t->ne[0] < 32 && ggml_is_contiguous(t) && (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
+        const int64_t n = ggml_nelements(t);
+        for (int64_t w = 4096; w >= 32; w /= 2) {
+            if (n % w == 0) {
+                ggml_tensor * flat = ggml_cast(ctx_eval, ggml_reshape_2d(ctx_eval, t, w, n / w), GGML_TYPE_F32);
+                return ggml_reshape_4d(ctx_eval, flat, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+            }
+        }
     }
     return ggml_cast(ctx_eval, t, GGML_TYPE_F32);
 }
