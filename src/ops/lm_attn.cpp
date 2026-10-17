@@ -313,8 +313,9 @@ ggml_tensor * codec_op_lm_per_pos_linear(
         // Casting the weight to F32 keeps both operands F32 (no activation
         // downcast); GGML_PREC_F32 alone does not prevent the src[1] cast.
         // codec_graph_cast_f32 is a no-op for weights already F32.
+        // Plain ggml_mul_mat on purpose: codec_mul_mat would drop this cast.
         ggml_tensor * w_lhs = codec_graph_cast_f32(ctx, w);
-        ggml_tensor * y     = codec_mul_mat(ctx, w_lhs, x_2d);
+        ggml_tensor * y     = ggml_mul_mat(ctx, w_lhs, x_2d);
         ggml_mul_mat_set_prec(y, GGML_PREC_F32);
         return y;
     }
