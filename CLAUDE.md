@@ -108,7 +108,8 @@ If a needed op is missing in ggml:
 
 **Pick ops every target backend runs — Metal and Vulkan, not just CPU.** An unsupported op does not fail: the scheduler silently moves it to CPU, splitting the graph (and a view crossing that boundary can crash). Check `ggml_metal_device_supports_op` (`ggml/src/ggml-metal/ggml-metal-device.m`) and `ggml_backend_vk_device_supports_op` before choosing an op, including their dtype/contiguity conditions. Known gaps and the replacements in `src/ops`:
 - Metal: no `ROUND`/`FLOOR` unary (`codec_op_round_bounded`: STEP-based, bit-exact with `ggml_round` incl. ties, for FSQ-style bounded inputs), `PAD` only pads at the end (`codec_op_pad_1d` prepends a zero constant), binary ops need an F32 src0 with contiguous rows.
-- Vulkan: no `PAD_REFLECT_1D` (`codec_op_pad_reflect_tc`).
+- Vulkan: no `PAD_REFLECT_1D` (`codec_op_pad_reflect_tc`), no `ELU` (`codec_op_unary(..., CODEC_UNARY_ELU)`), no `POOL_1D` (`codec_op_pool_1d`).
+- OpenCL (llama.rn's Android GPU; Adreno only, ggml-opencl refuses Mali): no `SIN`/`COS`/`LEAKY_RELU`/`ARANGE`/`POOL_*`/`ARGMAX`/`CONV_TRANSPOSE_1D`/`LOG`. Use `codec_op_sin`/`codec_op_cos`/`codec_op_leaky_relu`/`codec_op_arange`/`codec_op_pool_1d` and `codec_convtr1d` (GEMM path); they keep the native op where `codec_graph_backend_supports` says it runs and compose otherwise. `CODEC_FORCE_COMPOSITE_OPS=1` exercises the fallbacks on CPU.
 - Both: `ggml_clamp` is in-place (`codec_op_clamp_min`).
 
 ---
