@@ -351,7 +351,7 @@ ggml_tensor * codec_op_lm_per_pos_linear(
         // Plain ggml_mul_mat on purpose: codec_mul_mat would drop this cast.
         ggml_tensor * w_lhs = codec_graph_cast_f32(ctx, w);
         ggml_tensor * y     = ggml_mul_mat(ctx, w_lhs, x_2d);
-        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+        ggml_prec_set_acc(y, GGML_PREC_F32);
         return y;
     }
     // 3D per-pos branch: still cast to F32 because the broadcast

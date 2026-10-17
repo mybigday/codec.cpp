@@ -756,7 +756,7 @@ bool rda_build_depth_step_kv(ggml_context * ctx_eval, void * ud, ggml_tensor ** 
     ggml_tensor * head_w = codec_graph_mat_lhs(
         ctx_eval, impl->depth_heads[(size_t) b->head_idx]);
     ggml_tensor * logits = codec_mul_mat(ctx_eval, head_w, x_last);
-    ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    ggml_prec_set_acc(logits, GGML_PREC_F32);
     ggml_set_name(logits, "lm.depth.kv.ck_logits");
     *out = logits;
     return true;

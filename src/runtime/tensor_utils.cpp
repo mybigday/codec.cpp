@@ -240,7 +240,7 @@ ggml_tensor * codec_mul_mat(ggml_context * ctx_eval, ggml_tensor * a, ggml_tenso
         // The F32 cast this replaces kept GPU backends on F32 accumulation;
         // without it Vulkan's F16 matmul may accumulate in F16 (S3Gen decode
         // GPU vs CPU 39 dB -> 20 dB).
-        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+        ggml_prec_set_acc(y, GGML_PREC_F32);
     }
     return y;
 }
