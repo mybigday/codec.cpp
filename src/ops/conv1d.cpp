@@ -78,19 +78,30 @@ static ggml_tensor * codec_conv1d_impl(
         const int64_t t_out = xp->ne[0] - (int64_t) dilation * (K - 1);
         if (t_out <= 0) return nullptr;
         ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, xp));                              // [C_in, T]
+        // Vulkan binds each operand at its view offset, which must meet the device's
+        // minStorageBufferOffsetAlignment (64 B on Mali) unless the shader handles a
+        // misaligned start; ggml-vulkan allows that only for mul_mat's src1. The
+        // shifted x views (offset k*d*C_in floats) are therefore src1, and every tap
+        // of the weights starts on a 16-float boundary. Metal binds any offset and runs
+        // the [T_out, C_out] orientation ~6% faster (DAC), so it keeps x as src0.
+        const int64_t tap = metal ? C_in * C_out : (C_in * C_out + 15) / 16 * 16;
         ggml_tensor ** slot = codec_graph_weight_cast_slot(ctx, w);
         ggml_tensor * wk_all = slot != nullptr ? *slot : nullptr;
         if (wk_all == nullptr) {
             wk_all = ggml_cont(ctx, ggml_permute(ctx, codec_graph_cast_f32(ctx, w), 2, 0, 1, 3));   // [C_in, C_out, K]
-            if (slot != nullptr) *slot = wk_all;
+            wk_all = ggml_reshape_2d(ctx, wk_all, C_in * C_out, K);
+            if (tap != C_in * C_out) wk_all = ggml_pad(ctx, wk_all, (int) (tap - C_in * C_out), 0, 0, 0);
+            if (slot != nullptr) *slot = wk_all;                                                    // [tap, K]
         }
         ggml_tensor * y = nullptr;
         for (int64_t k = 0; k < K; ++k) {
             ggml_tensor * xk = ggml_view_2d(ctx, x_ct, C_in, t_out, x_ct->nb[1], (size_t) (k * dilation) * x_ct->nb[1]);
-            ggml_tensor * wk = ggml_view_2d(ctx, wk_all, C_in, C_out, wk_all->nb[1], (size_t) k * wk_all->nb[2]);
-            ggml_tensor * yk = ggml_mul_mat(ctx, xk, wk);                                          // [T_out, C_out]
+            ggml_tensor * wk = ggml_view_2d(ctx, wk_all, C_in, C_out, C_in * sizeof(float), (size_t) k * wk_all->nb[1]);
+            ggml_tensor * yk = metal ? ggml_mul_mat(ctx, xk, wk)                                   // [T_out, C_out]
+                                     : ggml_mul_mat(ctx, wk, xk);                                  // [C_out, T_out]
             y = y == nullptr ? yk : ggml_add(ctx, y, yk);
         }
+        if (!metal) y = ggml_cont(ctx, ggml_transpose(ctx, y));
         return ggml_reshape_3d(ctx, y, t_out, C_out, 1);
     }
 
