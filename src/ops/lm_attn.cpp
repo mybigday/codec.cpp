@@ -81,7 +81,7 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
             const int32_t n_valid = params->n_valid;
             // Build a 1D bias [t]: 0 for k < n_valid, -inf otherwise.  Use arange
             // + scale_bias + clamp + scale (mirrors the windowed-mask trick).
-            ggml_tensor * arange_k = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
+            ggml_tensor * arange_k = codec_op_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
             // diff = k - n_valid + 1; mask if diff > 0.  Equivalently mask if k > n_valid - 1.
             ggml_tensor * diff = ggml_scale_bias(ctx, arange_k, 1.0f, (float) -(n_valid - 1));
             // We want -inf where diff > 0, i.e. clip lo=0 then negate so clipped >= 0
@@ -104,7 +104,7 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
             const int64_t h = q_dth->ne[2];
             const int32_t window = params->window;
             // Build the mask in-graph from arange tensors.
-            ggml_tensor * arange = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
+            ggml_tensor * arange = codec_op_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
             ggml_tensor * row_q = ggml_reshape_2d(ctx, arange, 1, t);                         // [1, t]  (i along ne[1])
             ggml_tensor * col_k = ggml_reshape_2d(ctx, arange, t, 1);                         // [t, 1]  (j along ne[0])
             ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, t);
@@ -140,7 +140,7 @@ ggml_tensor * codec_op_lm_attn_ctx_dth(
         const int64_t d = q_dth->ne[0];
         const int64_t h = q_dth->ne[2];
         const int32_t n_valid = params->n_valid;
-        ggml_tensor * arange_q = ggml_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
+        ggml_tensor * arange_q = codec_op_arange(ctx, 0.0f, (float) t, 1.0f);                  // [t]
         // diff = t_idx - (n_valid - 1); want mask=1 if diff <= 0 else 0.
         ggml_tensor * diff = ggml_scale_bias(ctx, arange_q, 1.0f, (float) -(n_valid - 1));
         // valid = clamp(diff, -1, 0) maps:

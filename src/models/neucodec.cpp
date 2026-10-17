@@ -213,7 +213,7 @@ static ggml_tensor * codec_neu_snake_tc(
     ggml_tensor * alpha_2d = ggml_reshape_2d(ctx_eval, alpha, 1, x_tc->ne[1]);
     ggml_tensor * alpha_eps = ggml_scale_bias(ctx_eval, alpha_2d, 1.0f, eps);
     ggml_tensor * ax = ggml_mul(ctx_eval, x_tc, alpha_2d);
-    ggml_tensor * s = ggml_sin(ctx_eval, ax);
+    ggml_tensor * s = codec_op_sin(ctx_eval, ax);
     ggml_tensor * s2 = ggml_mul(ctx_eval, s, s);
     ggml_tensor * frac = ggml_div(ctx_eval, s2, alpha_eps);
     return ggml_add(ctx_eval, x_tc, frac);

@@ -127,7 +127,7 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     // ordering) and call ggml_rope_ext directly with the natural (d, h, t)
     // layout — that matches ggml's expected (n_embd_per_head, n_head,
     // n_tokens) shape and uses NEOX-mode for interleaved pairs.
-    ggml_tensor * t_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) t, 1.0f), GGML_TYPE_I32);
+    ggml_tensor * t_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) t, 1.0f), GGML_TYPE_I32);
     // ggml NEOX = half-split pairs (k, k+D/2); NORMAL = interleaved (2k, 2k+1).
     // MOSS does `q.view(..., D//2, 2)` which is interleaved → NORMAL mode.
     ggml_tensor * q_rope_dht = ggml_rope_ext(ctx, q_dht, t_pos, nullptr,

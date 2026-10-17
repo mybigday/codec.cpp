@@ -148,11 +148,11 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
                     return false;
                 }
 
-                ggml_tensor * h = ggml_leaky_relu(ctx_eval, x_block, 0.01f, false);
+                ggml_tensor * h = codec_op_leaky_relu(ctx_eval, x_block, 0.01f);
                 const int32_t pad_in = (k * dilations[ri] - dilations[ri]) / 2;
                 const int32_t pad_sk = k / 2;
                 h = nemo_conv1d_replicate(ctx_eval, h, t_in_w, t_in_b, 1, dilations[ri], pad_in);
-                h = ggml_leaky_relu(ctx_eval, h, 0.01f, false);
+                h = codec_op_leaky_relu(ctx_eval, h, 0.01f);
                 h = nemo_conv1d_replicate(ctx_eval, h, t_sk_w, t_sk_b, 1, 1, pad_sk);
                 x_block = ggml_add(ctx_eval, x_block, h);
                 ggml_set_name(x_block, ("nemo.enc.l" + std::to_string(li) + ".b" + std::to_string(bi) + ".r" + std::to_string(ri) + ".out").c_str());
@@ -161,7 +161,7 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
         }
 
         x = ggml_scale(ctx_eval, res_sum, 1.0f / 3.0f);
-        x = ggml_leaky_relu(ctx_eval, x, 0.01f, false);
+        x = codec_op_leaky_relu(ctx_eval, x, 0.01f);
 
         const int32_t out_channels = in_channels * 2;
         const int32_t stride = down_rates[li];
@@ -181,7 +181,7 @@ static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_te
         in_channels = out_channels;
     }
 
-    x = ggml_leaky_relu(ctx_eval, x, 0.01f, false);
+    x = codec_op_leaky_relu(ctx_eval, x, 0.01f);
     ggml_tensor * t_post_w = W("nemo.enc.post.w");
     ggml_tensor * t_post_b = W("nemo.enc.post.b");
     if (t_post_w == nullptr || t_post_b == nullptr) {
@@ -291,7 +291,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
         ggml_tensor * x_left = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels / 2, x->nb[1], 0);
         ggml_tensor * x_right = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels - in_channels / 2, x->nb[1], (size_t) (in_channels / 2) * x->nb[1]);
         ggml_tensor * x_snake = codec_op_snake(ctx_eval, x_left, t_act, 1e-9f);
-        ggml_tensor * x_lr = ggml_leaky_relu(ctx_eval, x_right, 0.01f, false);
+        ggml_tensor * x_lr = codec_op_leaky_relu(ctx_eval, x_right, 0.01f);
         ggml_tensor * x_cat = ggml_concat(ctx_eval, x_snake, x_lr, 1);
         x = x_cat;
 
@@ -328,7 +328,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
                 ggml_tensor * x_left_r = ggml_view_2d(ctx_eval, x_block, (int32_t) x_block->ne[0], in_channels / 2, x_block->nb[1], 0);
                 ggml_tensor * x_right_r = ggml_view_2d(ctx_eval, x_block, (int32_t) x_block->ne[0], in_channels - in_channels / 2, x_block->nb[1], (size_t) (in_channels / 2) * x_block->nb[1]);
                 ggml_tensor * x_snake_r = codec_op_snake(ctx_eval, x_left_r, t_in_a, 1e-9f);
-                ggml_tensor * x_lr_r = ggml_leaky_relu(ctx_eval, x_right_r, 0.01f, false);
+                ggml_tensor * x_lr_r = codec_op_leaky_relu(ctx_eval, x_right_r, 0.01f);
                 ggml_tensor * x_act = ggml_concat(ctx_eval, x_snake_r, x_lr_r, 1);
 
                 ggml_tensor * h = codec_conv1d_causal(ctx_eval, x_act, t_in_w, t_in_b, 1, dilations[ri]);
@@ -339,7 +339,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
                 ggml_tensor * h_left = ggml_view_2d(ctx_eval, h, (int32_t) h->ne[0], in_channels / 2, h->nb[1], 0);
                 ggml_tensor * h_right = ggml_view_2d(ctx_eval, h, (int32_t) h->ne[0], in_channels - in_channels / 2, h->nb[1], (size_t) (in_channels / 2) * h->nb[1]);
                 ggml_tensor * h_snake = codec_op_snake(ctx_eval, h_left, t_sk_a, 1e-9f);
-                ggml_tensor * h_lr = ggml_leaky_relu(ctx_eval, h_right, 0.01f, false);
+                ggml_tensor * h_lr = codec_op_leaky_relu(ctx_eval, h_right, 0.01f);
                 ggml_tensor * h_act = ggml_concat(ctx_eval, h_snake, h_lr, 1);
 
                 h = codec_conv1d_causal(ctx_eval, h_act, t_sk_w, t_sk_b, 1, 1);
@@ -361,7 +361,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
     ggml_tensor * x_left_f = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels / 2, x->nb[1], 0);
     ggml_tensor * x_right_f = ggml_view_2d(ctx_eval, x, (int32_t) x->ne[0], in_channels - in_channels / 2, x->nb[1], (size_t) (in_channels / 2) * x->nb[1]);
     ggml_tensor * x_snake_f = codec_op_snake(ctx_eval, x_left_f, t_post_a, 1e-9f);
-    ggml_tensor * x_lr_f = ggml_leaky_relu(ctx_eval, x_right_f, 0.01f, false);
+    ggml_tensor * x_lr_f = codec_op_leaky_relu(ctx_eval, x_right_f, 0.01f);
     ggml_tensor * x_act_f = ggml_concat(ctx_eval, x_snake_f, x_lr_f, 1);
     x = x_act_f;
     ggml_set_name(x, "nemo.dec.post.act");

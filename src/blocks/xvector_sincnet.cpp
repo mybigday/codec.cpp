@@ -69,7 +69,7 @@ ggml_tensor * codec_block_xvector_sincnet(
         x = codec_op_pool_1d(ctx, x, GGML_OP_POOL_MAX, kPool, kPool, 0);
         const std::string ni = "norm" + std::to_string(i);
         x = instance_norm_tc(ctx, x, W(pre, ni + ".w"), W(pre, ni + ".b"));
-        return missing ? nullptr : ggml_leaky_relu(ctx, x, kLeakySlope, false);
+        return missing ? nullptr : codec_op_leaky_relu(ctx, x, kLeakySlope);
     };
     ggml_tensor * x = ggml_cont(ctx, instance_norm_tc(ctx, wav, W(pre, "wav_norm.w"), W(pre, "wav_norm.b")));
     {
@@ -89,7 +89,7 @@ ggml_tensor * codec_block_xvector_sincnet(
         const std::string ti = "tdnn" + std::to_string(i);
         x = codec_conv1d(ctx, x, W(pre, ti + ".w"), W(pre, ti + ".b"), 1, kTdnnDilation[i], 0);
         if (missing || x == nullptr) return nullptr;
-        x = ggml_leaky_relu(ctx, x, kLeakySlope, false);
+        x = codec_op_leaky_relu(ctx, x, kLeakySlope);
         ggml_tensor * s = W(pre, ti + ".bn.s");
         ggml_tensor * t = W(pre, ti + ".bn.t");
         if (missing) return nullptr;

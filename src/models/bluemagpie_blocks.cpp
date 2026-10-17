@@ -123,7 +123,7 @@ ggml_tensor * codec_bm_minicpm_block_htb(
             ggml_tensor * t_pos = (rope_pos != nullptr && rope_pos->ne[0] >= T)
                 ? ((rope_pos->ne[0] == T) ? rope_pos
                    : ggml_view_1d(ctx, rope_pos, T, 0))
-                : ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
+                : ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
             auto rope_ext = [&](ggml_tensor * x) {
                 // x (head_dim, n_head, T, B); positions length T broadcast over B.
                 return ggml_rope_ext(ctx, x, t_pos, short_factor, head_dim,
@@ -214,7 +214,7 @@ ggml_tensor * bm_locdit_core(
     seq = ggml_concat(ctx, seq, x_h, 1);
     // Shared rope position vector for all layers (hoisted; kills per-block ARANGE).
     const int64_t T_seq = seq->ne[1];
-    ggml_tensor * rope_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T_seq, 1.0f), GGML_TYPE_I32);
+    ggml_tensor * rope_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) T_seq, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < n_layers; ++i) {
         seq = codec_bm_minicpm_block_ht(ctx, seq, "lm.locdit.layers." + std::to_string(i), model,
                                         n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false, rope_pos);
@@ -253,7 +253,7 @@ void bm_locdit_core_batched(
         ggml_reshape_3d(ctx, seq_neg, h_dit, T, 1), 2);
 
     // Shared rope position vector for all layers (hoisted; kills per-block ARANGE).
-    ggml_tensor * rope_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
+    ggml_tensor * rope_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) T, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < n_layers; ++i) {
         seq = codec_bm_minicpm_block_htb(ctx, seq, "lm.locdit.layers." + std::to_string(i), model,
                                          n_heads, n_kv, head_dim, eps, cos_t, sin_t, /*causal=*/false, rope_pos);

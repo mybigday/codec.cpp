@@ -101,6 +101,12 @@ ggml_tensor * codec_graph_const(
 // tiles in fp16 shared memory, too coarse for framed DFTs whose quiet bins
 // come from cancelling large terms. Returns `node`.
 ggml_tensor * codec_graph_pin_cpu(ggml_tensor * node);
+// Whether the backend the current graph is built for runs `node` natively
+// (true outside a graph build).  Ops in src/ops use it to fall back to a
+// composition of more common ops instead of letting the scheduler split the
+// graph to the CPU (ggml-opencl has no SIN / COS, ggml-vulkan no ELU, ...).
+// CODEC_FORCE_COMPOSITE_OPS=1 answers false, to test those fallbacks on CPU.
+bool codec_graph_backend_supports(const ggml_tensor * node);
 
 // Pins every op created in `ctx_eval` while the scope is alive. Views of
 // pinned tensors cannot cross backends, so a scope should end on a non-view

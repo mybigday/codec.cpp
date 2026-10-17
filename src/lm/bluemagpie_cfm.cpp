@@ -596,7 +596,7 @@ bool build_step(ggml_context * ctx, void * ud, ggml_tensor ** out) {
     const int64_t Te = le->ne[1];
     ggml_tensor * ecos = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.cos"), I.head_dim, Te, W("lm.rope.cos")->nb[1], 0));
     ggml_tensor * esin = ggml_cont(ctx, ggml_view_2d(ctx, W("lm.rope.sin"), I.head_dim, Te, W("lm.rope.sin")->nb[1], 0));
-    ggml_tensor * le_pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) Te, 1.0f), GGML_TYPE_I32);
+    ggml_tensor * le_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) Te, 1.0f), GGML_TYPE_I32);
     for (int32_t i = 0; i < I.n_locenc; ++i) {
         le = codec_bm_minicpm_block_ht(ctx, le, "lm.locenc.layers." + std::to_string(i), model,
                                        I.n_heads, I.n_kv, I.head_dim, I.eps, ecos, esin, /*causal=*/false, le_pos);

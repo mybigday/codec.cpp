@@ -193,7 +193,7 @@ ggml_tensor * flow_time_embed(ggml_context * ctx, const codec_model * model, con
     const int64_t half = freqs->ne[0];
     ggml_tensor * args  = ggml_scale(ctx, freqs, sval);             // t*freqs
     // frequency embedding = cat([cos(args), sin(args)]) -> (2*half,) = freq_embed_size
-    ggml_tensor * emb   = ggml_concat(ctx, ggml_cos(ctx, args), ggml_sin(ctx, args), 0);
+    ggml_tensor * emb   = ggml_concat(ctx, codec_op_cos(ctx, args), codec_op_sin(ctx, args), 0);
     emb = ggml_reshape_2d(ctx, emb, 2 * half, 1);
     ggml_tensor * h = ggml_silu(ctx, lin(ctx, WM(".l1.w"), emb, W(".l1.b")));   // (flow_dim,1)
     h = lin(ctx, WM(".l2.w"), h, W(".l2.b"));

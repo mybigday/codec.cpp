@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
@@ -25,9 +26,10 @@ ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op
             return ggml_scale_bias(ctx, th, 0.5f, 0.5f);
         }
         case CODEC_UNARY_ELU: {
-            // elu(x) = relu(x) + exp(min(x, 0)) - 1 from ops every backend runs
-            // (Vulkan has no ELU: ggml_elu split the graph to CPU and crashed
-            // Mimi's encode on a view crossing the split).
+            ggml_tensor * native = ggml_elu(ctx, x);
+            if (codec_graph_backend_supports(native)) return native;
+            // elu(x) = relu(x) + exp(min(x, 0)) - 1 for backends without ELU
+            // (Vulkan: ggml_elu split the graph to the CPU).
             if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
             ggml_tensor * neg_part = ggml_neg(ctx, ggml_relu(ctx, ggml_neg(ctx, x)));     // min(x, 0)
             ggml_tensor * em1 = ggml_scale_bias(ctx, ggml_exp(ctx, neg_part), 1.0f, -1.0f);
@@ -162,6 +164,61 @@ ggml_tensor * codec_op_linear_tc(ggml_context * ctx, ggml_tensor * x_tc, ggml_te
     return ggml_cont(ctx, ggml_transpose(ctx, y_ct));
 }
 
+static ggml_tensor * codec_op_sin_poly(ggml_context * ctx, ggml_tensor * x) {
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    // r = x - 2*pi*round(x / (2*pi)) in two steps (Cody-Waite: 6.28125 is exact).
+    const float two_pi_hi = 6.28125f, two_pi_lo = 1.9353071795864769e-3f;
+    ggml_tensor * k = ggml_round(ctx, ggml_scale(ctx, x, 0.15915494309189535f));
+    ggml_tensor * r = ggml_sub(ctx, x, ggml_scale(ctx, k, two_pi_hi));
+    r = ggml_sub(ctx, r, ggml_scale(ctx, k, two_pi_lo));
+    // sin(r) = r * P(r^2), minimax on [-pi, pi].
+    static const float c[6] = {9.999995828e-01f, -1.666655391e-01f, 8.332410827e-03f,
+                               -1.980882371e-04f, 2.699913694e-06f, -2.036979119e-08f};
+    ggml_tensor * r2 = ggml_sqr(ctx, r);
+    ggml_tensor * p = ggml_scale_bias(ctx, r2, c[5], c[4]);
+    for (int i = 3; i >= 0; --i) {
+        p = ggml_scale_bias(ctx, ggml_mul(ctx, p, r2), 1.0f, c[i]);
+    }
+    return ggml_mul(ctx, p, r);
+}
+
+ggml_tensor * codec_op_sin(ggml_context * ctx, ggml_tensor * x) {
+    if (ctx == nullptr || x == nullptr) return nullptr;
+    ggml_tensor * native = ggml_sin(ctx, x);
+    return codec_graph_backend_supports(native) ? native : codec_op_sin_poly(ctx, x);
+}
+
+ggml_tensor * codec_op_cos(ggml_context * ctx, ggml_tensor * x) {
+    if (ctx == nullptr || x == nullptr) return nullptr;
+    ggml_tensor * native = ggml_cos(ctx, x);
+    if (codec_graph_backend_supports(native)) return native;
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    return codec_op_sin_poly(ctx, ggml_scale_bias(ctx, x, 1.0f, 1.5707963267948966f));
+}
+
+ggml_tensor * codec_op_leaky_relu(ggml_context * ctx, ggml_tensor * x, float slope) {
+    if (ctx == nullptr || x == nullptr) return nullptr;
+    ggml_tensor * native = ggml_leaky_relu(ctx, x, slope, false);
+    if (codec_graph_backend_supports(native)) return native;
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    return ggml_add(ctx, ggml_relu(ctx, x), ggml_scale(ctx, ggml_relu(ctx, ggml_neg(ctx, x)), -slope));
+}
+
+ggml_tensor * codec_op_arange(ggml_context * ctx, float start, float stop, float step) {
+    if (ctx == nullptr || step == 0.0f) return nullptr;
+    ggml_tensor * native = ggml_arange(ctx, start, stop, step);
+    if (codec_graph_backend_supports(native)) return native;
+    const int64_t n = (int64_t) std::ceil((stop - start) / step);
+    if (n <= 0) return nullptr;
+    std::vector<float> v((size_t) n);
+    for (int64_t i = 0; i < n; ++i) v[(size_t) i] = start + step * (float) i;   // ggml_arange's formula
+    char name[96];
+    std::snprintf(name, sizeof(name), "lut.arange.%a.%a.%a", start, stop, step);
+    const int64_t ne[1] = {n};
+    ggml_tensor * t = codec_graph_const(ctx, name, GGML_TYPE_F32, 1, ne, v.data());
+    return t != nullptr ? t : native;
+}
+
 ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha, float eps) {
     if (ctx == nullptr || x == nullptr || alpha == nullptr) {
         return nullptr;
@@ -173,7 +230,7 @@ ggml_tensor * codec_op_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * 
     // ggml_clamp is in-place: clamp a per-channel copy, then broadcast it.
     ggml_tensor * alpha_clamped = ggml_clamp(ctx, ggml_cont(ctx, alpha_2d), eps, FLT_MAX);
     ggml_tensor * ax = ggml_mul(ctx, x, alpha_clamped);
-    ggml_tensor * s = ggml_sin(ctx, ax);
+    ggml_tensor * s = codec_op_sin(ctx, ax);
     ggml_tensor * s2 = ggml_mul(ctx, s, s);
     ggml_tensor * frac = ggml_div(ctx, s2, alpha_clamped);
     return ggml_add(ctx, x, frac);
@@ -191,7 +248,7 @@ ggml_tensor * codec_op_snake_beta(ggml_context * ctx, ggml_tensor * x, ggml_tens
     // ggml_clamp is in-place: clamp a per-channel copy, then broadcast it.
     ggml_tensor * alpha_clamped = ggml_clamp(ctx, ggml_cont(ctx, alpha_2d), eps, FLT_MAX);
     ggml_tensor * ax = ggml_mul(ctx, x, alpha_clamped);
-    ggml_tensor * s = ggml_sin(ctx, ax);
+    ggml_tensor * s = codec_op_sin(ctx, ax);
     ggml_tensor * s2 = ggml_mul(ctx, s, s);
     ggml_tensor * invb_2d = ggml_reshape_2d(ctx, inv_beta, 1, x->ne[1]);
     ggml_tensor * frac = ggml_mul(ctx, s2, invb_2d);
@@ -264,7 +321,7 @@ ggml_tensor * codec_op_round_bounded(ggml_context * ctx, ggml_tensor * x, int32_
     // [max_abs, n]: every element against thresholds t = 0.5, 1.5, ...
     // round(x) = #{t : x >= t} - #{t : -x >= t} = sum_t step(x + t) - step(t - x).
     ggml_tensor * xr = ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, xc, 1, n), max_abs, n, 1, 1);
-    ggml_tensor * thr = ggml_arange(ctx, 0.5f, (float) max_abs, 1.0f);
+    ggml_tensor * thr = codec_op_arange(ctx, 0.5f, (float) max_abs, 1.0f);
     ggml_tensor * up = ggml_sum_rows(ctx, ggml_step(ctx, ggml_add(ctx, xr, thr)));
     ggml_tensor * dn = ggml_sum_rows(ctx, ggml_step(ctx, ggml_add(ctx, ggml_scale(ctx, xr, -1.0f), thr)));
     return ggml_reshape(ctx, ggml_sub(ctx, up, dn), xc);
@@ -648,11 +705,11 @@ ggml_tensor * codec_op_sinusoidal_time_emb(
     float scale) {
     if (ctx == nullptr || dim <= 0 || (dim & 1) != 0) return nullptr;
     const int32_t half = dim / 2;
-    ggml_tensor * idx = ggml_arange(ctx, 0.0f, (float) half, 1.0f);
+    ggml_tensor * idx = codec_op_arange(ctx, 0.0f, (float) half, 1.0f);
     ggml_tensor * log_idx = ggml_scale(ctx, idx, -std::log(10000.0f) / (float) (half - 1));
     ggml_tensor * freqs = ggml_exp(ctx, log_idx);
     ggml_tensor * e = ggml_scale(ctx, freqs, t_v * scale);
-    return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), /*dim=*/0);
+    return ggml_concat(ctx, codec_op_sin(ctx, e), codec_op_cos(ctx, e), /*dim=*/0);
 }
 
 // Shared-filter FIR along time as block-Toeplitz GEMMs:
@@ -895,11 +952,11 @@ ggml_tensor * codec_op_espnet_rel_pos_emb(
 
     // Position values per row r ∈ [0, 2T-2] are p_r = (T-1) - r, giving the
     // sequence [T-1, T-2, ..., 0, -1, ..., -(T-1)].
-    ggml_tensor * row_idx = ggml_arange(ctx, 0.0f, (float) pe_len, 1.0f);    // [pe_len]
+    ggml_tensor * row_idx = codec_op_arange(ctx, 0.0f, (float) pe_len, 1.0f);    // [pe_len]
     ggml_tensor * pos = ggml_scale_bias(ctx, row_idx, -1.0f, (float) (t - 1));
 
     // freq[k] = exp(-2k * log(10000) / d_model) for k ∈ [0, half).
-    ggml_tensor * k_idx = ggml_arange(ctx, 0.0f, (float) half, 1.0f);
+    ggml_tensor * k_idx = codec_op_arange(ctx, 0.0f, (float) half, 1.0f);
     ggml_tensor * log_k = ggml_scale(ctx, k_idx, -2.0f * std::log(10000.0f) / (float) d_model);
     ggml_tensor * freqs = ggml_exp(ctx, log_k);                                // [half]
 
@@ -914,8 +971,8 @@ ggml_tensor * codec_op_espnet_rel_pos_emb(
     // Interleave sin/cos along ne[0]: stack as [half, 2, pe_len], permute axes
     // (ne[0],ne[1]) → (ne[1],ne[0]) so the interleaved layout falls out as the
     // contiguous flatten over (k, j∈{sin,cos}, r).
-    ggml_tensor * sin_3d = ggml_reshape_3d(ctx, ggml_sin(ctx, angle), half, 1, pe_len);
-    ggml_tensor * cos_3d = ggml_reshape_3d(ctx, ggml_cos(ctx, angle), half, 1, pe_len);
+    ggml_tensor * sin_3d = ggml_reshape_3d(ctx, codec_op_sin(ctx, angle), half, 1, pe_len);
+    ggml_tensor * cos_3d = ggml_reshape_3d(ctx, codec_op_cos(ctx, angle), half, 1, pe_len);
     ggml_tensor * stacked = ggml_concat(ctx, sin_3d, cos_3d, /*dim=*/1);       // [half, 2, pe_len]
     ggml_tensor * permuted = ggml_cont(ctx, ggml_permute(ctx, stacked, 1, 0, 2, 3));
     return ggml_reshape_2d(ctx, permuted, d_model, pe_len);

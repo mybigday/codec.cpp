@@ -133,7 +133,7 @@ ggml_tensor * hift_source(ggml_context * ctx, const codec_model * model, const c
         T_pcm, 1);
     ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_pcm, n_harm);
     ggml_tensor * scales = ggml_reshape_2d(ctx,
-        ggml_scale(ctx, ggml_arange(ctx, 1.0f, (float) (n_harm + 1), 1.0f), 1.0f / (float) p.sample_rate),
+        ggml_scale(ctx, codec_op_arange(ctx, 1.0f, (float) (n_harm + 1), 1.0f), 1.0f / (float) p.sample_rate),
         1, n_harm);
 
     ggml_tensor * sine = nullptr;
@@ -147,14 +147,14 @@ ggml_tensor * hift_source(ggml_context * ctx, const codec_model * model, const c
         ggml_tensor * rad = ggml_mul(ctx, ggml_repeat(ctx, f0_2d, ftmpl), ggml_repeat(ctx, scales, ftmpl));
         rad = frac_bounded(ctx, rad);
         ggml_tensor * phase = ggml_scale(ctx, ggml_cumsum(ctx, rad), 2.0f * (float) M_PI * (float) up);
-        sine = ggml_sin(ctx, p.causal ? ggml_interpolate(ctx, phase, T_pcm, n_harm, 1, 1, GGML_SCALE_MODE_NEAREST)
+        sine = codec_op_sin(ctx, p.causal ? ggml_interpolate(ctx, phase, T_pcm, n_harm, 1, 1, GGML_SCALE_MODE_NEAREST)
                                       : upsample_linear_half_pixel(ctx, phase, up, join(prefix, "lut.sg2_w").c_str()));
     } else {
         // SineGen: theta = 2*pi*cumsum_t(f0 * k / sr) + phi_k.
         ggml_tensor * f_harm = ggml_mul(ctx, ggml_repeat(ctx, f0_pcm, tmpl), ggml_repeat(ctx, scales, tmpl));
         ggml_tensor * theta = ggml_scale(ctx, ggml_cumsum(ctx, f_harm), 2.0f * (float) M_PI);
         ggml_tensor * phase_2d = ggml_reshape_2d(ctx, nsf_phase, 1, n_harm);
-        sine = ggml_sin(ctx, ggml_add(ctx, theta, ggml_repeat(ctx, phase_2d, tmpl)));
+        sine = codec_op_sin(ctx, ggml_add(ctx, theta, ggml_repeat(ctx, phase_2d, tmpl)));
     }
     sine = ggml_scale(ctx, sine, p.nsf_alpha);
 
@@ -245,7 +245,7 @@ ggml_tensor * codec_block_hift(
         const std::string si_s = std::to_string(i);
         const int32_t u = p.upsample_rates[(size_t) i];
         const int32_t k = p.upsample_kernels[(size_t) i];
-        x = ggml_leaky_relu(ctx, x, p.lrelu_slope, false);
+        x = codec_op_leaky_relu(ctx, x, p.lrelu_slope);
         if (p.causal) {
             // CausalConv1dUpsample: nearest x u, left-pad k - 1, Conv1d.
             x = ggml_interpolate(ctx, x, x->ne[0] * u, x->ne[1], 1, 1, GGML_SCALE_MODE_NEAREST);
@@ -285,7 +285,7 @@ ggml_tensor * codec_block_hift(
         x = ggml_scale(ctx, xs, 1.0f / (float) n_rb);
     }
 
-    x = ggml_leaky_relu(ctx, x, kLreluSlopeDefault, false);
+    x = codec_op_leaky_relu(ctx, x, kLreluSlopeDefault);
     ggml_tensor * cpw = W("conv_post.w");
     if (cpw == nullptr) return nullptr;
     const int32_t k_post = (int32_t) cpw->ne[0];
@@ -301,9 +301,9 @@ ggml_tensor * codec_block_hift(
     ggml_tensor * ph = ggml_cont(ctx, ggml_view_2d(ctx, head_ct, n_bins, T_head, head_ct->nb[1],
                                                    (size_t) n_bins * head_ct->nb[0]));
     ggml_tensor * mag = ggml_exp(ctx, ggml_clamp(ctx, mag_log, -1e30f, std::log(1e2f)));
-    ggml_tensor * ph_s = ggml_sin(ctx, ph);
-    ggml_tensor * re = ggml_mul(ctx, mag, ggml_cos(ctx, ph_s));
-    ggml_tensor * im = ggml_mul(ctx, mag, ggml_sin(ctx, ph_s));
+    ggml_tensor * ph_s = codec_op_sin(ctx, ph);
+    ggml_tensor * re = ggml_mul(ctx, mag, codec_op_cos(ctx, ph_s));
+    ggml_tensor * im = ggml_mul(ctx, mag, codec_op_sin(ctx, ph_s));
     ggml_tensor * fr_re = codec_op_linear(ctx, re, t_istft_re, nullptr);
     ggml_tensor * fr_im = codec_op_linear(ctx, im, t_istft_im, nullptr);
     if (fr_re == nullptr || fr_im == nullptr) return nullptr;

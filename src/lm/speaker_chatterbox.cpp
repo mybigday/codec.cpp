@@ -323,7 +323,7 @@ bool build_cond_graph(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
     ggml_tensor * seq = codec_graph_cast_f32(ctx_eval, emb_rows);
     if (impl->learned_pos_emb) {
         // pos_ids = [0, 1, ..., T_speech-1]
-        ggml_tensor * pos_ids = ggml_arange(ctx_eval, 0.0f, (float) T_speech, 1.0f);
+        ggml_tensor * pos_ids = codec_op_arange(ctx_eval, 0.0f, (float) T_speech, 1.0f);
         pos_ids = ggml_cast(ctx_eval, pos_ids, GGML_TYPE_I32);
         ggml_tensor * pos_rows = ggml_get_rows(ctx_eval, impl->speech_pos_emb, pos_ids);
         seq = ggml_add(ctx_eval, seq, codec_graph_cast_f32(ctx_eval, pos_rows));

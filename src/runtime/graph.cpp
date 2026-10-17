@@ -109,6 +109,16 @@ ggml_tensor * codec_graph_pin_cpu(ggml_tensor * node) {
     return node;
 }
 
+bool codec_graph_backend_supports(const ggml_tensor * node) {
+    static const bool force_composite = [] {
+        const char * v = std::getenv("CODEC_FORCE_COMPOSITE_OPS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (force_composite) return false;
+    if (t_building_ctx == nullptr || t_building_ctx->backend == nullptr || node == nullptr) return true;
+    return ggml_backend_supports_op(t_building_ctx->backend, node);
+}
+
 static ggml_tensor * codec_graph_last_tensor(ggml_context * ctx) {
     ggml_tensor * last = nullptr;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {

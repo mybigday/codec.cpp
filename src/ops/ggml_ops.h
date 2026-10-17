@@ -12,6 +12,17 @@ enum codec_unary_op {
 };
 
 ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op op);
+// sin / cos: ggml_sin / ggml_cos where the backend runs them, else range
+// reduction to [-pi, pi] plus a degree-11 odd minimax polynomial (max abs error
+// ~6e-7 in F32) from scale / round / mul ops (ggml-opencl has no SIN / COS).
+ggml_tensor * codec_op_sin(ggml_context * ctx, ggml_tensor * x);
+ggml_tensor * codec_op_cos(ggml_context * ctx, ggml_tensor * x);
+// ggml_leaky_relu where the backend runs it, else relu(x) - slope * relu(-x)
+// (the same values; ggml-opencl has no LEAKY_RELU).
+ggml_tensor * codec_op_leaky_relu(ggml_context * ctx, ggml_tensor * x, float slope);
+// ggml_arange where the backend runs it, else the same values as a graph
+// constant (ggml-opencl has no ARANGE).
+ggml_tensor * codec_op_arange(ggml_context * ctx, float start, float stop, float step);
 ggml_tensor * codec_op_layer_norm(ggml_context * ctx, ggml_tensor * x, float eps, ggml_tensor * gamma, ggml_tensor * beta);
 ggml_tensor * codec_op_layer_norm_ct(ggml_context * ctx, ggml_tensor * x_ct, float eps, ggml_tensor * gamma, ggml_tensor * beta);
 ggml_tensor * codec_op_layer_norm_tc(ggml_context * ctx, ggml_tensor * x_tc, float eps, ggml_tensor * gamma, ggml_tensor * beta);

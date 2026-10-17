@@ -1,6 +1,7 @@
 #include "pool1d.h"
 
 #include "ggml_ops.h"
+#include "../runtime/graph.h"
 
 #include <algorithm>
 
@@ -16,6 +17,14 @@ ggml_tensor * codec_op_pool_1d(
     if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
     ggml_tensor * x4 = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
     ggml_tensor * y = ggml_pool_2d(ctx, x4, op, k, 1, s, 1, (float) p, 0.0f);   // [t_out, 1, c, n]
+    if (!codec_graph_backend_supports(y) && op == GGML_OP_POOL_AVG && k == s && p == 0) {
+        // Non-overlapping average (ggml-opencl has no POOL_*): row sums of
+        // [k, t/k, c] blocks, / k.
+        const int64_t t_out = x->ne[0] / k;
+        ggml_tensor * xs = x->ne[0] == t_out * k ? x : ggml_cont(ctx, ggml_view_3d(ctx, x, t_out * k, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0));
+        ggml_tensor * sums = ggml_sum_rows(ctx, ggml_reshape_4d(ctx, xs, k, t_out, x->ne[1], x->ne[2]));   // [1, t/k, c, n]
+        return ggml_reshape_3d(ctx, ggml_scale(ctx, sums, 1.0f / (float) k), t_out, x->ne[1], x->ne[2]);
+    }
     return ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], y->ne[3]);
 }
 
