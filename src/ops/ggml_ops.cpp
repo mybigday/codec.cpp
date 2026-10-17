@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -647,6 +648,64 @@ ggml_tensor * codec_op_sinusoidal_time_emb(
     return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), /*dim=*/0);
 }
 
+// Shared-filter FIR along time as block-Toeplitz GEMMs:
+//   y[n, c] = scale * sum_m x[m, c] * h[tap(n, m)]     (tap outside [0, K): no term)
+// with tap shift-invariant under (n + bo, m + bi).  Time is cut into blocks of
+// bi input / bo output samples; output block j is M0 . x_blk[j] + M1 . x_blk[j+1]
+// with [bi, bo] matrices gathered from h in-graph.  Replaces a depthwise im2col
+// conv (a K-fold copy of x) by two small GEMMs: the same F32 products in a
+// different summation order.  nullptr when a tap reaches past those two blocks
+// or outside a graph build.
+static ggml_tensor * codec_op_fir_blocked_tc(
+    ggml_context * ctx, ggml_tensor * x_tc, ggml_tensor * h, float scale,
+    int64_t bi, int64_t bo, int64_t t_out, const std::function<int64_t(int64_t, int64_t)> & tap) {
+
+    const int64_t K = h->ne[0], c = x_tc->ne[1];
+    auto valid = [&](int64_t k) { return k >= 0 && k < K; };
+    // Block j = 1 keeps every index non-negative; blocks j-1 and j+2 must be empty.
+    std::vector<int32_t> idx((size_t) (2 * bi * bo));
+    for (int64_t o = 0; o < bo; ++o) {
+        for (int64_t i = 0; i < bi; ++i) {
+            if (valid(tap(bo + o, i)) || valid(tap(bo + o, 3 * bi + i))) return nullptr;
+            for (int64_t r = 0; r < 2; ++r) {
+                const int64_t k = tap(bo + o, (1 + r) * bi + i);
+                idx[(size_t) ((r * bo + o) * bi + i)] = (int32_t) (valid(k) ? k : K);   // K -> appended zero
+            }
+        }
+    }
+    const std::string sig(reinterpret_cast<const char *>(idx.data()), idx.size() * sizeof(int32_t));
+    const std::string key = std::to_string(K) + "." + std::to_string(bi) + "." + std::to_string(bo) + "." +
+                            std::to_string(std::hash<std::string>{}(sig));
+    const int64_t ne_idx[1] = {2 * bi * bo};
+    ggml_tensor * idx_t = codec_graph_const(ctx, ("lut.fir_idx." + key).c_str(), GGML_TYPE_I32, 1, ne_idx, idx.data());
+    const float zero = 0.0f;
+    const int64_t ne_z[1] = {1};
+    ggml_tensor * z = codec_graph_const(ctx, "lut.zeros.f32.1", GGML_TYPE_F32, 1, ne_z, &zero);
+    if (idx_t == nullptr || z == nullptr) return nullptr;
+
+    // [1, K+1] rows of h (scaled) plus a zero row -> gathered [bi, bo, 2] matrices.
+    ggml_tensor * hz = ggml_concat(ctx, ggml_scale(ctx, codec_graph_cast_f32(ctx, h), scale), z, 0);
+    ggml_tensor * m = ggml_get_rows(ctx, ggml_reshape_2d(ctx, hz, 1, K + 1), idx_t);       // [1, 2*bo*bi]
+    m = ggml_reshape_3d(ctx, m, bi, bo, 2);
+
+    const int64_t nblk = (t_out + bo - 1) / bo;
+    const int64_t len = (nblk + 1) * bi;
+    ggml_tensor * x = x_tc;
+    if (x->ne[0] > len) x = ggml_cont(ctx, ggml_view_2d(ctx, x, len, c, x->nb[1], 0));
+    if (x->ne[0] < len) x = ggml_pad(ctx, x, (int) (len - x->ne[0]), 0, 0, 0);
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    ggml_tensor * xb = ggml_reshape_3d(ctx, x, bi, nblk + 1, c);
+    ggml_tensor * y = nullptr;
+    for (int64_t r = 0; r < 2; ++r) {
+        ggml_tensor * mr = ggml_view_2d(ctx, m, bi, bo, m->nb[1], r * m->nb[2]);
+        ggml_tensor * xr = ggml_view_3d(ctx, xb, bi, nblk, c, xb->nb[1], xb->nb[2], r * xb->nb[1]);
+        ggml_tensor * yr = ggml_mul_mat(ctx, mr, xr);                                       // [bo, nblk, c]
+        y = y == nullptr ? yr : ggml_add(ctx, y, yr);
+    }
+    y = ggml_reshape_2d(ctx, y, bo * nblk, c);
+    return y->ne[0] == t_out ? y : ggml_cont(ctx, ggml_view_2d(ctx, y, t_out, c, y->nb[1], 0));
+}
+
 ggml_tensor * codec_op_alias_free_snake_beta_tc(
     ggml_context * ctx,
     ggml_tensor * x_tc,
@@ -670,6 +729,23 @@ ggml_tensor * codec_op_alias_free_snake_beta_tc(
     // [x[0], 0, x[1], 0, …, x[t_rp-1], 0] using ggml_pad along a new
     // innermost axis.  Reshape (t_rp, c) → (1, t_rp, c) → ggml_pad(0, 1, 0…)
     // → (2, t_rp, c) with the second slot zeroed → reshape to (2*t_rp, c).
+    // Upsample: zero-insert by 2, pad 11, 12-tap correlation, x2, trim 1 + 15/15
+    // collapses to y[n] = 2 * sum_m x_rp[m] * h[2m - n - 4], n < 2t.
+    ggml_tensor * y_up = codec_op_fir_blocked_tc(ctx, x_rp, kernel_12, 2.0f, 16, 32, 2 * x_tc->ne[0],
+        [](int64_t n, int64_t m) { return 2 * m - n - 4; });
+    if (y_up != nullptr) {
+        ggml_tensor * y_act = codec_op_snake_beta(ctx, y_up, alpha, inv_beta, /*eps=*/1e-9f);
+        if (y_act == nullptr) return nullptr;
+        // Downsample: replicate-pad (5, 6), 12-tap correlation at stride 2.
+        ggml_tensor * d_pad = codec_op_pad_1d_replicate(ctx, y_act, 5, 6);
+        ggml_tensor * y_dn = codec_op_fir_blocked_tc(ctx, d_pad, kernel_12, 1.0f, 32, 16, x_tc->ne[0],
+            [](int64_t n, int64_t m) { return m - 2 * n; });
+        if (y_dn != nullptr) return y_dn;
+        ggml_tensor * w_dw = ggml_repeat(ctx, ggml_reshape_3d(ctx, kernel_12, 12, 1, 1),
+                                         ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 12, 1, c));
+        return codec_conv1d_depthwise(ctx, d_pad, w_dw, nullptr, /*stride=*/2, /*dilation=*/1, /*padding=*/0);
+    }
+
     ggml_tensor * x_3d = ggml_reshape_3d(ctx, x_rp, 1, t_rp, c);
     ggml_tensor * x_zero_3d = ggml_pad(ctx, x_3d, 1, 0, 0, 0);  // ne=(2, t_rp, c)
     if (x_zero_3d == nullptr) return nullptr;
