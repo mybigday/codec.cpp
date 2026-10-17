@@ -547,7 +547,7 @@ static ggml_tensor * codec_wt_encode_resblock(
     if (ctx_eval == nullptr || model == nullptr || x == nullptr || pad_id == nullptr) {
         return nullptr;
     }
-    ggml_tensor * h = ggml_elu(ctx_eval, x);
+    ggml_tensor * h = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     h = codec_wt_sconv1d(
         ctx_eval,
         model,
@@ -561,7 +561,7 @@ static ggml_tensor * codec_wt_encode_resblock(
     if (h == nullptr) {
         return nullptr;
     }
-    h = ggml_elu(ctx_eval, h);
+    h = codec_op_unary(ctx_eval, h, CODEC_UNARY_ELU);
     h = codec_wt_sconv1d(
         ctx_eval,
         model,
@@ -704,25 +704,25 @@ static bool codec_wt_build_encode(ggml_context * ctx_eval, void * user_data, ggm
 
     x = codec_wt_encode_resblock(ctx_eval, p->model, x, "enc.model.1", &pad_id);
     if (x == nullptr) return false;
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = sconv(x, 4, 2, 1, "enc.model.3.conv.conv");
     if (x == nullptr) return false;
 
     x = codec_wt_encode_resblock(ctx_eval, p->model, x, "enc.model.4", &pad_id);
     if (x == nullptr) return false;
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = sconv(x, 8, 4, 1, "enc.model.6.conv.conv");
     if (x == nullptr) return false;
 
     x = codec_wt_encode_resblock(ctx_eval, p->model, x, "enc.model.7", &pad_id);
     if (x == nullptr) return false;
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = sconv(x, 10, 5, 1, "enc.model.9.conv.conv");
     if (x == nullptr) return false;
 
     x = codec_wt_encode_resblock(ctx_eval, p->model, x, "enc.model.10", &pad_id);
     if (x == nullptr) return false;
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = sconv(x, 16, 8, 1, "enc.model.12.conv.conv");
     if (x == nullptr) return false;
 
@@ -731,7 +731,7 @@ static bool codec_wt_build_encode(ggml_context * ctx_eval, void * user_data, ggm
         return false;
     }
 
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = sconv(x, 7, 1, 1, "enc.model.15.conv.conv");
     if (x == nullptr) return false;
 

@@ -24,8 +24,15 @@ ggml_tensor * codec_op_unary(ggml_context * ctx, ggml_tensor * x, codec_unary_op
             ggml_tensor * th = ggml_tanh(ctx, x_half);
             return ggml_scale_bias(ctx, th, 0.5f, 0.5f);
         }
-        case CODEC_UNARY_ELU:
-            return ggml_elu(ctx, x);
+        case CODEC_UNARY_ELU: {
+            // elu(x) = relu(x) + exp(min(x, 0)) - 1 from ops every backend runs
+            // (Vulkan has no ELU: ggml_elu split the graph to CPU and crashed
+            // Mimi's encode on a view crossing the split).
+            if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+            ggml_tensor * neg_part = ggml_neg(ctx, ggml_relu(ctx, ggml_neg(ctx, x)));     // min(x, 0)
+            ggml_tensor * em1 = ggml_scale_bias(ctx, ggml_exp(ctx, neg_part), 1.0f, -1.0f);
+            return ggml_add(ctx, ggml_relu(ctx, x), em1);
+        }
         case CODEC_UNARY_SILU:
             return ggml_silu(ctx, x);
         case CODEC_UNARY_GELU_ERF:

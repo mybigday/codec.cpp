@@ -200,12 +200,12 @@ static ggml_tensor * codec_mimi_resblock_ggml(
         return nullptr;
     }
 
-    ggml_tensor * h = ggml_elu(ctx_eval, x);
+    ggml_tensor * h = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     ggml_tensor * y1 = codec_conv1d_causal(ctx_eval, h, w1, b1, 1, 1);
     if (y1 == nullptr) {
         return nullptr;
     }
-    y1 = ggml_elu(ctx_eval, y1);
+    y1 = codec_op_unary(ctx_eval, y1, CODEC_UNARY_ELU);
     ggml_tensor * y2 = codec_conv1d_causal(ctx_eval, y1, w2, b2, 1, 1);
     if (y2 == nullptr) {
         return nullptr;
@@ -389,14 +389,11 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
-    ggml_tensor * t_l0_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
-    ggml_set_name(t_l0_dbg, "mimi.encode_frontend.l0");
-    x = ggml_cpy(ctx_eval, x, t_l0_dbg);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_w[1], t_b[1], t_w[2], t_b[2]);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
 
     x = codec_conv1d_causal(ctx_eval, x, t_w[3], t_b[3], p->frontend.conv[3].stride, 1);
     if (x == nullptr) {
@@ -406,7 +403,7 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
 
     x = codec_conv1d_causal(ctx_eval, x, t_w[6], t_b[6], p->frontend.conv[6].stride, 1);
     if (x == nullptr) {
@@ -416,7 +413,7 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
 
     x = codec_conv1d_causal(ctx_eval, x, t_w[9], t_b[9], p->frontend.conv[9].stride, 1);
     if (x == nullptr) {
@@ -426,21 +423,17 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
 
     x = codec_conv1d_causal(ctx_eval, x, t_w[12], t_b[12], p->frontend.conv[12].stride, 1);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = codec_conv1d_causal(ctx_eval, x, t_w[13], t_b[13], p->frontend.conv[13].stride, 1);
     if (x == nullptr) {
         return false;
     }
-
-    ggml_tensor * t_front_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
-    ggml_set_name(t_front_dbg, "mimi.encode_frontend.out");
-    x = ggml_cpy(ctx_eval, x, t_front_dbg);
 
     // Transformer layers operate on channel-major [c, t].
     x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x));
@@ -529,9 +522,6 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
     }
     // Convolution/downsample path expects time-major [t, c].
     x = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x));
-    ggml_tensor * t_x_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, x->ne[0], x->ne[1]);
-    ggml_set_name(t_x_dbg, "mimi.encode_transformer.out");
-    x = ggml_cpy(ctx_eval, x, t_x_dbg);
 
     ggml_tensor * t_downsample_w = W("dn.cv.w");
     if (t_downsample_w == nullptr) {
@@ -574,11 +564,6 @@ static bool codec_mimi_build_encode(ggml_context * ctx_eval, void * user_data, g
             return false;
         }
 
-        if (d.group == CODEC_MIMI_RVQ_GROUP_ACOUSTIC && d.group_layer == 4) {
-            ggml_tensor * t_dbg = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, acu_residual->ne[0], acu_residual->ne[1]);
-            ggml_set_name(t_dbg, "mimi.encode_rvq.acu_input_q5");
-            acu_residual = ggml_cpy(ctx_eval, acu_residual, t_dbg);
-        }
         codec_rvq_layer_result_ggml res = {};
         if (d.group == CODEC_MIMI_RVQ_GROUP_SEMANTIC) {
             if (!codec_rvq_build_layer_ggml(ctx_eval, sem_residual, t_codebook, &res)) {
@@ -847,31 +832,31 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = codec_convtr1d_causal(ctx_eval, x, t_l2_w, t_l2_b, 8, 1);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_r0_c1_w, t_r0_c1_b, t_r0_c2_w, t_r0_c2_b);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = codec_convtr1d_causal(ctx_eval, x, t_l5_w, t_l5_b, 6, 1);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_r1_c1_w, t_r1_c1_b, t_r1_c2_w, t_r1_c2_b);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = codec_convtr1d_causal(ctx_eval, x, t_l8_w, t_l8_b, 5, 1);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_r2_c1_w, t_r2_c1_b, t_r2_c2_w, t_r2_c2_b);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     x = codec_convtr1d_causal(ctx_eval, x, t_l11_w, t_l11_b, 4, 1);
     x = codec_mimi_resblock_ggml(ctx_eval, x, t_r3_c1_w, t_r3_c1_b, t_r3_c2_w, t_r3_c2_b);
     if (x == nullptr) {
         return false;
     }
-    x = ggml_elu(ctx_eval, x);
+    x = codec_op_unary(ctx_eval, x, CODEC_UNARY_ELU);
     ggml_tensor * t_pcm = codec_conv1d_causal(ctx_eval, x, t_l14_w, t_l14_b, 1, 1);
     if (t_pcm == nullptr) {
         return false;
