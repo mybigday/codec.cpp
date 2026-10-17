@@ -717,7 +717,7 @@ ggml_tensor * codec_op_sinusoidal_time_emb(
 // with tap shift-invariant under (n + bo, m + bi).  Time is cut into blocks of
 // bi input / bo output samples; output block j is M0 . x_blk[j] + M1 . x_blk[j+1]
 // with [bi, bo] matrices gathered from h in-graph.  Replaces a depthwise im2col
-// conv (a K-fold copy of x) by two small GEMMs: the same F32 products in a
+// conv (a K-fold copy of x) by one small GEMM: the same F32 products in a
 // different summation order.  nullptr when a tap reaches past those two blocks
 // or outside a graph build.
 static ggml_tensor * codec_op_fir_blocked_tc(
@@ -747,10 +747,10 @@ static ggml_tensor * codec_op_fir_blocked_tc(
     ggml_tensor * z = codec_graph_const(ctx, "lut.zeros.f32.1", GGML_TYPE_F32, 1, ne_z, &zero);
     if (idx_t == nullptr || z == nullptr) return nullptr;
 
-    // [1, K+1] rows of h (scaled) plus a zero row -> gathered [bi, bo, 2] matrices.
+    // [1, K+1] rows of h (scaled) plus a zero row -> gathered [bi, 2*bo]: M0 | M1.
     ggml_tensor * hz = ggml_concat(ctx, ggml_scale(ctx, codec_graph_cast_f32(ctx, h), scale), z, 0);
     ggml_tensor * m = ggml_get_rows(ctx, ggml_reshape_2d(ctx, hz, 1, K + 1), idx_t);       // [1, 2*bo*bi]
-    m = ggml_reshape_3d(ctx, m, bi, bo, 2);
+    m = ggml_reshape_2d(ctx, m, bi, 2 * bo);
 
     const int64_t nblk = (t_out + bo - 1) / bo;
     const int64_t len = (nblk + 1) * bi;
@@ -758,14 +758,17 @@ static ggml_tensor * codec_op_fir_blocked_tc(
     if (x->ne[0] > len) x = ggml_cont(ctx, ggml_view_2d(ctx, x, len, c, x->nb[1], 0));
     if (x->ne[0] < len) x = ggml_pad(ctx, x, (int) (len - x->ne[0]), 0, 0, 0);
     if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
-    ggml_tensor * xb = ggml_reshape_3d(ctx, x, bi, nblk + 1, c);
-    ggml_tensor * y = nullptr;
-    for (int64_t r = 0; r < 2; ++r) {
-        ggml_tensor * mr = ggml_view_2d(ctx, m, bi, bo, m->nb[1], r * m->nb[2]);
-        ggml_tensor * xr = ggml_view_3d(ctx, xb, bi, nblk, c, xb->nb[1], xb->nb[2], r * xb->nb[1]);
-        ggml_tensor * yr = ggml_mul_mat(ctx, mr, xr);                                       // [bo, nblk, c]
-        y = y == nullptr ? yr : ggml_add(ctx, y, yr);
-    }
+    // One GEMM over every block (contiguous operands only: ggml-vulkan mishandled
+    // a strided [bi, nblk, c] view as src1), then block j of the output is
+    // M0 . x_blk[j] + M1 . x_blk[j+1] = rows [0, bo) of block j + rows [bo, 2bo)
+    // of block j+1.
+    // A single 2D GEMM over the flattened [bi, (nblk+1)*c] blocks rather than a
+    // batch of c small ones (Metal ran the batched form ~5x slower).
+    ggml_tensor * yy = ggml_mul_mat(ctx, m, ggml_reshape_2d(ctx, x, bi, (nblk + 1) * c));
+    yy = ggml_reshape_3d(ctx, yy, 2 * bo, nblk + 1, c);                                   // [2*bo, nblk+1, c]
+    ggml_tensor * y0 = ggml_view_3d(ctx, yy, bo, nblk, c, yy->nb[1], yy->nb[2], 0);
+    ggml_tensor * y1 = ggml_view_3d(ctx, yy, bo, nblk, c, yy->nb[1], yy->nb[2], yy->nb[1] + bo * yy->nb[0]);
+    ggml_tensor * y = ggml_add(ctx, y0, y1);   // row-contiguous views: fine for binary ops everywhere
     y = ggml_reshape_2d(ctx, y, bo * nblk, c);
     return y->ne[0] == t_out ? y : ggml_cont(ctx, ggml_view_2d(ctx, y, t_out, c, y->nb[1], 0));
 }
