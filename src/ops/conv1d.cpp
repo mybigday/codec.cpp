@@ -1,7 +1,11 @@
 #include "conv1d.h"
 
 #include "ggml_ops.h"
+#include "../runtime/graph.h"
 #include "../runtime/tensor_utils.h"
+
+#include <algorithm>
+#include <cstring>
 
 // Conv weights are loaded directly from the GGUF context. Quantized weight
 // types can't be reshaped (their row size is fixed by the block format), so
@@ -53,6 +57,41 @@ static ggml_tensor * codec_conv1d_impl(
 
     if (w->ne[0] == 1 && stride == 1 && dilation == 1 && padding == 0) {
         return codec_conv1d_pointwise_impl(ctx, x, w);
+    }
+
+    // GPUs: one GEMM per tap over a shifted view of channel-major x instead of
+    // im2col (Metal's 1D im2col runs K threads per threadgroup; ggml-vulkan's is
+    // slow too): dac decode 352 -> 80 ms on Vulkan, 1214 -> 1051 ms on Metal.
+    // On Metal the [T_out, C_out] per-tap GEMMs lose to im2col for long
+    // sequences with few channels (nemo decode, 27-54 channels: 1.5 s -> 3.1 s),
+    // so it takes the GEMM path only from 64 input and output channels; Vulkan
+    // gains even there (nemo decode 339 -> 67 ms).  Other GPU backends are
+    // unmeasured and follow Vulkan.  On CPUs im2col stays faster (x86, M1,
+    // Pixel 7 Pro).
+    //   y[t, co] = sum_k sum_ci x[t + k*d, ci] * w[k, ci, co]
+    const bool metal = std::strcmp(codec_graph_backend_reg_name(), "MTL") == 0;
+    const bool gemm_taps = !metal || std::min(w->ne[1], w->ne[2]) >= 64;
+    if (codec_graph_backend_is_gpu() && gemm_taps && stride == 1 && x->ne[2] <= 1 && x->ne[3] <= 1 &&
+        x->ne[1] == w->ne[1]) {
+        const int64_t K = w->ne[0], C_in = w->ne[1], C_out = w->ne[2];
+        ggml_tensor * xp = padding > 0 ? codec_op_pad_1d(ctx, x, padding, padding) : x;
+        const int64_t t_out = xp->ne[0] - (int64_t) dilation * (K - 1);
+        if (t_out <= 0) return nullptr;
+        ggml_tensor * x_ct = ggml_cont(ctx, ggml_transpose(ctx, xp));                              // [C_in, T]
+        ggml_tensor ** slot = codec_graph_weight_cast_slot(ctx, w);
+        ggml_tensor * wk_all = slot != nullptr ? *slot : nullptr;
+        if (wk_all == nullptr) {
+            wk_all = ggml_cont(ctx, ggml_permute(ctx, codec_graph_cast_f32(ctx, w), 2, 0, 1, 3));   // [C_in, C_out, K]
+            if (slot != nullptr) *slot = wk_all;
+        }
+        ggml_tensor * y = nullptr;
+        for (int64_t k = 0; k < K; ++k) {
+            ggml_tensor * xk = ggml_view_2d(ctx, x_ct, C_in, t_out, x_ct->nb[1], (size_t) (k * dilation) * x_ct->nb[1]);
+            ggml_tensor * wk = ggml_view_2d(ctx, wk_all, C_in, C_out, wk_all->nb[1], (size_t) k * wk_all->nb[2]);
+            ggml_tensor * yk = ggml_mul_mat(ctx, xk, wk);                                          // [T_out, C_out]
+            y = y == nullptr ? yk : ggml_add(ctx, y, yk);
+        }
+        return ggml_reshape_3d(ctx, y, t_out, C_out, 1);
     }
 
     const ggml_type im2col_type = w->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
