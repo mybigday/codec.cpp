@@ -83,6 +83,25 @@ static ggml_tensor * codec_conv1d_depthwise_impl(
         return nullptr;
     }
 
+    // Stride 1, unbatched: y = sum_k x[t + k*d] * w[k] as K broadcast multiply-adds
+    // over shifted views — F32 throughout, no K-fold im2col copy.
+    if (stride == 1 && x->ne[2] <= 1 && x->ne[3] <= 1 && w->ne[1] == 1 && w->ne[2] == x->ne[1]) {
+        const int64_t K = w->ne[0], C = x->ne[1];
+        ggml_tensor * xp = padding > 0 ? codec_op_pad_1d(ctx, x, padding, padding) : x;
+        if (!ggml_is_contiguous(xp)) xp = ggml_cont(ctx, xp);
+        const int64_t t_out = xp->ne[0] - (int64_t) dilation * (K - 1);
+        if (t_out <= 0) return nullptr;
+        ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, codec_graph_cast_f32(ctx, w), K, C)));  // [C, K]
+        ggml_tensor * y = nullptr;
+        for (int64_t k = 0; k < K; ++k) {
+            ggml_tensor * xk = ggml_view_2d(ctx, xp, t_out, C, xp->nb[1], (size_t) (k * dilation) * xp->nb[0]);
+            ggml_tensor * wk = ggml_view_2d(ctx, wt, 1, C, wt->nb[0], (size_t) k * wt->nb[1]);              // [1, C]
+            ggml_tensor * term = ggml_mul(ctx, xk, wk);
+            y = y == nullptr ? term : ggml_add(ctx, y, term);
+        }
+        return ggml_reshape_3d(ctx, y, t_out, C, 1);
+    }
+
     ggml_tensor * x4 = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
     const ggml_type im2col_type = w->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ggml_tensor * im2col = ggml_im2col(ctx, w, x4, stride, 0, padding, 0, dilation, 0, false, im2col_type);
