@@ -3,6 +3,7 @@
 #include "utils/wav_io.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,9 +15,9 @@
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "usage:\n"
-        "  %s e2e --model <gguf> --in <wav> --out <wav> [--threads N] [--nq N] [--use-gpu]\n"
+        "  %s e2e --model <gguf> --in <wav> --out <wav> [--threads N] [--nq N] [--use-gpu] [--repeat N]\n"
         "  %s encode --model <gguf> --in <wav> --out <codes.npy> [--threads N] [--nq N] [--use-gpu]\n"
-        "  %s decode --model <gguf> --codes <codes.npy> --out <wav> [--threads N] [--nq N] [--use-gpu]\n"
+        "  %s decode --model <gguf> --codes <codes.npy> --out <wav> [--threads N] [--nq N] [--use-gpu] [--repeat N]\n"
         "  %s decode-latent --model <gguf> --latent <latent.npy> --out <wav> [--threads N] [--use-gpu]\n",
         prog, prog, prog, prog);
 }
@@ -44,6 +45,7 @@ struct e2e_args {
     int32_t n_threads = 4;
     int32_t n_q = 0;
     bool use_gpu = false;
+    int32_t repeat = 1;   // timed encode+decode rounds (the first one builds the graphs)
 };
 
 struct decode_args {
@@ -53,6 +55,7 @@ struct decode_args {
     int32_t n_threads = 4;
     int32_t n_q = 0;
     bool use_gpu = false;
+    int32_t repeat = 1;
 };
 
 struct encode_args {
@@ -107,6 +110,12 @@ static bool parse_e2e_args(int argc, char ** argv, e2e_args * out) {
             ++i;
         } else if (std::strcmp(arg, "--use-gpu") == 0) {
             out->use_gpu = true;
+        } else if (std::strcmp(arg, "--repeat") == 0) {
+            if (i + 1 >= argc || !parse_i32(argv[i + 1], &out->repeat) || out->repeat < 1) {
+                std::fprintf(stderr, "invalid value for --repeat\n");
+                return false;
+            }
+            ++i;
         } else {
             std::fprintf(stderr, "unknown argument for e2e: %s\n", arg);
             return false;
@@ -156,6 +165,12 @@ static bool parse_decode_args(int argc, char ** argv, decode_args * out) {
             ++i;
         } else if (std::strcmp(arg, "--use-gpu") == 0) {
             out->use_gpu = true;
+        } else if (std::strcmp(arg, "--repeat") == 0) {
+            if (i + 1 >= argc || !parse_i32(argv[i + 1], &out->repeat) || out->repeat < 1) {
+                std::fprintf(stderr, "invalid value for --repeat\n");
+                return false;
+            }
+            ++i;
         } else {
             std::fprintf(stderr, "unknown argument for decode: %s\n", arg);
             return false;
@@ -308,28 +323,42 @@ static int cmd_e2e(const e2e_args & args) {
     struct codec_encode_params eparams = codec_encode_default_params();
     eparams.n_threads = args.n_threads;
     eparams.n_q = args.n_q;
-
-    enum codec_status st = codec_encode_latent(ctx, &in_audio, &tokens, &latent, eparams);
-    if (st != CODEC_STATUS_SUCCESS) {
-        std::fprintf(stderr, "codec_encode_latent failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
-        codec_free(ctx);
-        codec_model_free(model);
-        return 6;
-    }
-
     struct codec_pcm_buffer pcm = {};
     struct codec_decode_params dparams = codec_decode_default_params();
     dparams.n_threads = args.n_threads;
     dparams.n_q = args.n_q;
 
-    st = codec_decode(ctx, &tokens, &pcm, dparams);
-    if (st != CODEC_STATUS_SUCCESS) {
-        std::fprintf(stderr, "codec_decode failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
-        codec_latent_buffer_free(&latent);
-        codec_token_buffer_free(&tokens);
-        codec_free(ctx);
-        codec_model_free(model);
-        return 7;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    enum codec_status st = CODEC_STATUS_SUCCESS;
+    for (int32_t it = 0; it < args.repeat; ++it) {
+        if (it > 0) {
+            codec_pcm_buffer_free(&pcm);
+            codec_latent_buffer_free(&latent);
+            codec_token_buffer_free(&tokens);
+        }
+        const clk::time_point t0 = clk::now();
+        st = codec_encode_latent(ctx, &in_audio, &tokens, &latent, eparams);
+        if (st != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "codec_encode_latent failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
+            codec_free(ctx);
+            codec_model_free(model);
+            return 6;
+        }
+
+        const clk::time_point t1 = clk::now();
+        st = codec_decode(ctx, &tokens, &pcm, dparams);
+        if (st != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "codec_decode failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
+            codec_latent_buffer_free(&latent);
+            codec_token_buffer_free(&tokens);
+            codec_free(ctx);
+            codec_model_free(model);
+            return 7;
+        }
+        if (args.repeat > 1) {
+            std::printf("iter %d: encode_ms=%.1f decode_ms=%.1f\n", it, ms(t0, t1), ms(t1, clk::now()));
+        }
     }
 
     std::string write_err;
@@ -402,12 +431,22 @@ static int cmd_decode(const decode_args & args) {
     dparams.n_threads = args.n_threads;
     dparams.n_q = args.n_q;
 
-    enum codec_status st = codec_decode(ctx, &tokens, &pcm, dparams);
-    if (st != CODEC_STATUS_SUCCESS) {
-        std::fprintf(stderr, "codec_decode failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
-        codec_free(ctx);
-        codec_model_free(model);
-        return 6;
+    using clk = std::chrono::steady_clock;
+    enum codec_status st = CODEC_STATUS_SUCCESS;
+    for (int32_t it = 0; it < args.repeat; ++it) {
+        if (it > 0) codec_pcm_buffer_free(&pcm);
+        const clk::time_point t0 = clk::now();
+        st = codec_decode(ctx, &tokens, &pcm, dparams);
+        if (st != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "codec_decode failed: status=%d err=%s\n", (int)st, codec_get_last_error(ctx));
+            codec_free(ctx);
+            codec_model_free(model);
+            return 6;
+        }
+        if (args.repeat > 1) {
+            std::printf("iter %d: decode_ms=%.1f\n", it,
+                        std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+        }
     }
 
     std::string wav_err;
