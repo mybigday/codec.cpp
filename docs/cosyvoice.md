@@ -94,6 +94,33 @@ tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2 \
     --override-kv codec.lm.cosyvoice.top_k=int:10
 ```
 
+### Faster flow decoding
+
+The flow decode is the CFM U-Net unrolled over `n_timesteps` × 2 passes (CFG
+cond + uncond), so its cost is linear in both. Fewer steps or `cfg_rate=0`
+trade a little speaker fidelity for speed; intelligibility is unaffected.
+Measured 2026-10-17 on CPU (Ryzen AI MAX+ 395, 12 threads), CosyVoice2 with
+`--ref-audio` cloning, 5 zh/en sentences: Whisper large-v3-turbo CER, speaker
+cosine (CAMPPlus) of each output against the default-settings output, and the
+flow decode time for 4 s of audio (16 threads). Chatterbox S3Gen
+(`chatterbox_s3g.flow.n_timesteps` / `cfg_rate`, same defaults) measures
+alike.
+
+| `n_timesteps` / `cfg_rate` | CER | speaker cos vs default | flow decode |
+|---|---|---|---|
+| 10 / 0.7 (default) | 0.000 | 1 | 1× |
+| 6 / 0.7 | 0.000 | 0.993 | ~1.6× faster |
+| 4 / 0.7 | 0.000 | 0.985 | ~2.5× faster |
+| 10 / 0 | 0.000 | 0.967 | ~2× faster |
+| 5 / 0 | 0.000 | 0.957 | ~3.9× faster |
+
+`n_timesteps=6` keeps the voice closest; dropping CFG moves it further than
+cutting steps for the same speedup.
+
+```bash
+tts-cli synthesize ... --override-kv cosyvoice.flow.n_timesteps=int:6
+```
+
 ## Runtime contract
 
 - **Prompt** (`common/tts_runner.cpp::run_cosyvoice`, `cosyvoice/llm/llm.py`):

@@ -280,6 +280,11 @@ For `llama.cpp`, Turbo is the better first implementation target because it has:
 
 `S3Gen` is not a plain discrete codec decoder. It is a conditioned decoder.
 
+Its CFM flow defaults to 10 Euler steps with CFG 0.7, overridable as
+`chatterbox_s3g.flow.n_timesteps` / `chatterbox_s3g.flow.cfg_rate`; see
+"Faster flow decoding" in `docs/cosyvoice.md` for the measured
+speed / quality trade-off (6 steps: speaker cosine 0.995 vs the default).
+
 It needs:
 
 - speech token IDs
