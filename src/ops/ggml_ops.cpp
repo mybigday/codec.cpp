@@ -471,9 +471,9 @@ ggml_tensor * codec_op_cfm_causal_resnet_block_tc(
     return ggml_add(ctx, h, res);
 }
 
-ggml_tensor * codec_op_basic_transformer_block_tc(
+ggml_tensor * codec_op_basic_transformer_block_ct(
     ggml_context * ctx,
-    ggml_tensor * x_tc,
+    ggml_tensor * x_ct,
     ggml_tensor * norm1_w, ggml_tensor * norm1_b,
     ggml_tensor * qw, ggml_tensor * kw, ggml_tensor * vw,
     ggml_tensor * ow, ggml_tensor * ob,
@@ -482,16 +482,15 @@ ggml_tensor * codec_op_basic_transformer_block_tc(
     ggml_tensor * ff2_w, ggml_tensor * ff2_b,
     int32_t head_dim,
     int32_t num_heads) {
-    if (ctx == nullptr || x_tc == nullptr || qw == nullptr || kw == nullptr || vw == nullptr ||
+    if (ctx == nullptr || x_ct == nullptr || qw == nullptr || kw == nullptr || vw == nullptr ||
         ow == nullptr || ff1_w == nullptr || ff2_w == nullptr || head_dim <= 0 || num_heads <= 0) {
         return nullptr;
     }
     const int32_t inner = head_dim * num_heads;
-    const int32_t T = (int32_t) x_tc->ne[0];
+    const int32_t T = (int32_t) x_ct->ne[1];
 
-    ggml_tensor * h_tc = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, norm1_w, norm1_b);
-    if (h_tc == nullptr) return nullptr;
-    ggml_tensor * h_ct = ggml_cont(ctx, ggml_transpose(ctx, h_tc));
+    ggml_tensor * h_ct = codec_op_layer_norm_ct(ctx, x_ct, 1e-5f, norm1_w, norm1_b);
+    if (h_ct == nullptr) return nullptr;
     ggml_tensor * q_ct = codec_op_linear(ctx, h_ct, qw, /*b=*/nullptr);
     ggml_tensor * k_ct = codec_op_linear(ctx, h_ct, kw, /*b=*/nullptr);
     ggml_tensor * v_ct = codec_op_linear(ctx, h_ct, vw, /*b=*/nullptr);
@@ -513,17 +512,16 @@ ggml_tensor * codec_op_basic_transformer_block_tc(
         inner, T);
     ggml_tensor * proj_ct = codec_op_linear(ctx, attn_ct, ow, ob);
     if (proj_ct == nullptr) return nullptr;
-    x_tc = ggml_add(ctx, x_tc, ggml_cont(ctx, ggml_transpose(ctx, proj_ct)));
+    x_ct = ggml_add(ctx, x_ct, proj_ct);
 
-    ggml_tensor * f_tc = codec_op_layer_norm_tc(ctx, x_tc, 1e-5f, norm3_w, norm3_b);
-    if (f_tc == nullptr) return nullptr;
-    ggml_tensor * f_ct = ggml_cont(ctx, ggml_transpose(ctx, f_tc));
+    ggml_tensor * f_ct = codec_op_layer_norm_ct(ctx, x_ct, 1e-5f, norm3_w, norm3_b);
+    if (f_ct == nullptr) return nullptr;
     ggml_tensor * ff = codec_op_linear(ctx, f_ct, ff1_w, ff1_b);
     if (ff == nullptr) return nullptr;
     ff = codec_op_unary(ctx, ff, CODEC_UNARY_GELU_ERF);
     ff = codec_op_linear(ctx, ff, ff2_w, ff2_b);
     if (ff == nullptr) return nullptr;
-    return ggml_add(ctx, x_tc, ggml_cont(ctx, ggml_transpose(ctx, ff)));
+    return ggml_add(ctx, x_ct, ff);
 }
 
 ggml_tensor * codec_op_whisper_encoder_layer_tc(

@@ -111,12 +111,13 @@ ggml_tensor * codec_op_cfm_causal_resnet_block_tc(
 // Diffusers BasicTransformerBlock without cross-attention (standard
 // `LayerNorm → self-attn → +res` then `LayerNorm → GELU FFN → +res`). Used by
 // any diffusion model that pulls in `diffusers.models.attention.BasicTransformerBlock`.
-// `x_tc` is `[t, c]`; norms run along the channel dim. Q/K/V have no bias;
+// `x_ct` is `[c, t]` (channels contiguous, so stacked blocks need no
+// transposes); norms run along the channel dim. Q/K/V have no bias;
 // only `out` and the FFN linears carry biases. `head_dim * num_heads` must
 // equal the inner attention dim implied by `qw`'s rows.
-ggml_tensor * codec_op_basic_transformer_block_tc(
+ggml_tensor * codec_op_basic_transformer_block_ct(
     ggml_context * ctx,
-    ggml_tensor * x_tc,
+    ggml_tensor * x_ct,
     ggml_tensor * norm1_w, ggml_tensor * norm1_b,
     ggml_tensor * qw, ggml_tensor * kw, ggml_tensor * vw,
     ggml_tensor * ow, ggml_tensor * ob,

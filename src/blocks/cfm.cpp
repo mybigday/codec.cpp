@@ -50,17 +50,19 @@ ggml_tensor * resnet(ggml_context * ctx, const codec_model * model, const std::s
 
 ggml_tensor * transformers(ggml_context * ctx, const codec_model * model, const std::string & pfx,
                            const codec_cfm_unet_params & p, ggml_tensor * x) {
+    if (p.n_transformers <= 0) return x;
+    x = ggml_cont(ctx, ggml_transpose(ctx, x));  // [c, t] through the whole stack
     for (int32_t j = 0; j < p.n_transformers && x != nullptr; ++j) {
         const std::string tp = pfx + ".t." + std::to_string(j) + ".";
         auto W = [&](const std::string & n) { return codec_graph_weight(ctx, model, tp + n); };
-        x = codec_op_basic_transformer_block_tc(ctx, x,
+        x = codec_op_basic_transformer_block_ct(ctx, x,
             W("norm1.w"), W("norm1.b"),
             W("attn.q.w"), W("attn.k.w"), W("attn.v.w"), W("attn.o.w"), W("attn.o.b"),
             W("norm3.w"), W("norm3.b"),
             W("ff.w1.w"), W("ff.w1.b"), W("ff.w2.w"), W("ff.w2.b"),
             p.head_dim, p.n_heads);
     }
-    return x;
+    return x == nullptr ? nullptr : ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
 // Down/up resampling conv `x` of a level: the last level keeps the length
