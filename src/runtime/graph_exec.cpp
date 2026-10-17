@@ -289,6 +289,12 @@ bool codec_graph_prepare_io(
     }
 
     if (ctx->eval_graph_allocated) {
+        // Consecutive-call fast path (same graph, same allocation): the graph
+        // constants are leaf inputs whose buffers galloc may hand to later
+        // nodes after their last use, so write them again before each compute.
+        for (const codec_graph_const_input & c : ctx->eval_consts) {
+            ggml_backend_tensor_set(c.tensor, c.data.data(), 0, c.data.size());
+        }
         return true;
     }
 
