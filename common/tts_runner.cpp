@@ -167,6 +167,12 @@ struct TextEmbdTable {
 // chain + grammar apply/resample) and accepts the token (penalty + grammar
 // state).  build() returns false + err on a grammar parse failure (clean
 // error, not a crash).
+// llama.cpp's penalties sampler clamps penalty_last_n to >= 0 and treats 0 as
+// "disabled" (common's old -1 -> n_ctx mapping is commented out), so "-1 =
+// whole history" silently turned repetition penalties off.  Use a window
+// larger than any generation instead.
+static constexpr int32_t kRepPenaltyFullHistory = 1 << 16;
+
 struct BackboneSampler {
     common_sampler * smpl = nullptr;
 
@@ -188,7 +194,7 @@ struct BackboneSampler {
         sp.top_p         = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
         sp.min_p         = min_p > 0.0f ? min_p : 0.0f;
         sp.penalty_repeat = rep_penalty;                 // 1.0 = disabled
-        sp.penalty_last_n = rep_penalty != 1.0f ? (rep_last_n > 0 ? rep_last_n : -1) : 0;
+        sp.penalty_last_n = rep_penalty != 1.0f ? (rep_last_n > 0 ? rep_last_n : kRepPenaltyFullHistory) : 0;
         sp.penalty_freq   = 0.0f;
         sp.penalty_present = 0.0f;
         // Reduce the chain to exactly the reference warpers (no DRY / XTC /
@@ -286,7 +292,7 @@ struct SamplerChain {
         sp.no_perf = true;
         chain = llama_sampler_chain_init(sp);
         if (rep_penalty != 1.0f) {
-            const int32_t last_n = rep_last_n > 0 ? rep_last_n : -1;  // -1 = full history
+            const int32_t last_n = rep_last_n > 0 ? rep_last_n : kRepPenaltyFullHistory;
             llama_sampler_chain_add(chain,
                 llama_sampler_init_penalties(last_n, rep_penalty, 0.0f, 0.0f));
             has_penalties = true;
@@ -314,7 +320,7 @@ struct SamplerChain {
         if (top_p > 0.0f && top_p < 1.0f)
             llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
         if (rep_penalty != 1.0f) {
-            llama_sampler_chain_add(chain, llama_sampler_init_penalties(-1, rep_penalty, 0.0f, 0.0f));
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(kRepPenaltyFullHistory, rep_penalty, 0.0f, 0.0f));
             has_penalties = true;
         }
         llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));

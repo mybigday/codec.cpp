@@ -167,6 +167,16 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_uint32 ("codec.lm.chatterbox.speaker_embed_dim",
                        SPEAKER_EMBED_DIM)
     writer.add_uint32 ("codec.lm.chatterbox.cond_len", COND_LEN)
+    # Reference sampling regime (tts.py::generate defaults).  mtl_tts.py uses
+    # repetition_penalty=2.0, but only together with its AlignmentStreamAnalyzer
+    # (attention-driven EOS forcing), which this runtime does not have: without
+    # it 2.0 runs to max length on half the test sentences, so both variants
+    # keep 1.2.
+    writer.add_float32("codec.lm.chatterbox.sampling.temperature", 0.8)
+    writer.add_float32("codec.lm.chatterbox.sampling.top_p",       1.0)
+    writer.add_float32("codec.lm.chatterbox.sampling.min_p",       0.05)
+    writer.add_float32("codec.lm.chatterbox.sampling.repetition_penalty", 1.2)
+    writer.add_float32("codec.lm.chatterbox.sampling.cfg_weight",  0.5)
 
     # ---- speech embed + head (the n_cb=1 codec_lm pair) --------------
     # Tensor names follow the parallel_heads_delay convention
