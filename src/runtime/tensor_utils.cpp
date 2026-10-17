@@ -202,7 +202,15 @@ static ggml_tensor * codec_graph_uncast_weight(ggml_context * ctx_eval, ggml_ten
 }
 
 ggml_tensor * codec_mul_mat(ggml_context * ctx_eval, ggml_tensor * a, ggml_tensor * b) {
-    return ggml_mul_mat(ctx_eval, codec_graph_uncast_weight(ctx_eval, a), b);
+    ggml_tensor * w = codec_graph_uncast_weight(ctx_eval, a);
+    ggml_tensor * y = ggml_mul_mat(ctx_eval, w, b);
+    if (w != a) {
+        // The F32 cast this replaces kept GPU backends on F32 accumulation;
+        // without it Vulkan's F16 matmul may accumulate in F16 (S3Gen decode
+        // GPU vs CPU 39 dB -> 20 dB).
+        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    }
+    return y;
 }
 
 ggml_tensor * codec_graph_weight(ggml_context * ctx_eval, const codec_model * model, const std::string & name) {
