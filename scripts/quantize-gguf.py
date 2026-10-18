@@ -7,9 +7,12 @@ mix of F32 / F16 / BF16 / block-quantized weights.  This tool rewrites an
 existing GGUF (any model, metadata copied as is) with a per-tensor type plan.
 
 Rules, first match wins:
-  --tensor-type REGEX=TYPE   (repeatable; re.search on the tensor name)
+  --tensor-type REGEX=TYPE   (repeatable; re.search on the tensor name; TYPE=KEEP
+                             leaves the source type)
   --type TYPE                for every other float tensor with >= --min-dims dims
   otherwise                  the source type is kept
+Block-quantized targets only apply to tensors with >= --min-dims dims (rules
+included): biases and norm scales are elementwise operands.
 
 A tensor whose row length (ne0) is not a multiple of the target block size
 gets --fallback, else keeps its source type (reported).  Integer tensors are always copied.
@@ -49,6 +52,9 @@ REPO_QUANT = {T.Q4_K: repo_quant.quantize_tensor_q4_k_m, T.Q5_K: repo_quant.quan
 TARGETS = {"F32": T.F32, "F16": T.F16, **{t.name: t for t in NATIVE_QUANT | set(REPO_QUANT)}}
 
 
+KEEP = "KEEP"
+
+
 def parse_type(s: str) -> T:
     t = TARGETS.get(s.upper())
     if t is None:
@@ -60,7 +66,7 @@ def parse_rule(s: str):
     pattern, sep, type_name = s.rpartition("=")
     if not sep or not pattern:
         raise argparse.ArgumentTypeError(f"expected REGEX=TYPE, got {s!r}")
-    return re.compile(pattern), parse_type(type_name)
+    return re.compile(pattern), KEEP if type_name.upper() == KEEP else parse_type(type_name)
 
 
 def to_f32(tensor) -> np.ndarray:
@@ -106,10 +112,14 @@ def plan_type(tensor, rules, default, min_dims, ne, fallback=None):
         if pattern.search(tensor.name):
             want = qtype
             break
+    if want is KEEP:
+        return src, None
     if want is None:
         if default is None or len(ne) < min_dims:
             return src, None
         want = default
+    if want not in FLOAT_TYPES and len(ne) < min_dims:
+        return src, None  # biases / norm scales are elementwise operands: never block-quantized
     block, _ = gguf.GGML_QUANT_SIZES[want]
     ne0 = ne[0]
     if ne0 % block != 0:
