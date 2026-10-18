@@ -33,8 +33,7 @@ FIX  = REPO / "tests" / "e2e" / "fixtures" / "bluemagpie" / "stop_gen.npz"
 # orchestration is exact; residual per-patch drift is codec.cpp quantized weights
 # vs the PyTorch f32 reference.  F16: one patch ~0.9986, rest >= 0.9997 → 0.998.
 # Q8_0 carries no quality guarantee: its matmuls run natively quantized (min
-# ~0.89, mean ~0.992; ~0.992 min with CODEC_MAT_NATIVE_QUANT=0), so smoking Q8
-# only checks it is not broken.  Uncorrelated patches sit near 0.
+# ~0.89, mean ~0.992), so smoking Q8 only checks it is not broken.  Uncorrelated patches sit near 0.
 PATCH_CORR_MIN = 0.85 if "q8" in GGUF.name.lower() else 0.998
 
 
