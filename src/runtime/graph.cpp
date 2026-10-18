@@ -126,11 +126,13 @@ ggml_tensor ** codec_graph_weight_cast_slot(ggml_context * ctx_eval, const ggml_
 }
 
 bool codec_graph_backend_supports(const ggml_tensor * node) {
+#ifdef CODEC_DEBUG_TOOLS
     static const bool force_composite = [] {
         const char * v = std::getenv("CODEC_FORCE_COMPOSITE_OPS");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     if (force_composite) return false;
+#endif
     if (t_building_ctx == nullptr || t_building_ctx->backend == nullptr || node == nullptr) return true;
     return ggml_backend_supports_op(t_building_ctx->backend, node);
 }

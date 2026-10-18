@@ -11,12 +11,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#ifdef CODEC_DEBUG_TOOLS
 // ---------------------------------------------------------------------------
-// Per-node profiler (zero-cost unless CODEC_OP_PROFILE=<path> is set).
+// Per-node profiler (CODEC_DEBUG_TOOLS builds; active when CODEC_OP_PROFILE=<path>).
 //
 // Registers a ggml_backend_sched eval callback that timestamps successive node
 // observation callbacks and accumulates wall time + call count per
@@ -147,6 +149,7 @@ void profile_end(int graph_kind, int n_nodes) {
 }
 
 }  // namespace
+#endif // CODEC_DEBUG_TOOLS
 
 static bool codec_backend_is_cpu(ggml_backend_t backend) {
     if (backend == nullptr) {
@@ -214,7 +217,11 @@ static bool codec_sched_ensure_capacity(codec_context * ctx, int32_t required, s
         n_backends = 2;
     }
 
+#ifdef CODEC_DEBUG_TOOLS
     const bool op_offload = std::getenv("CODEC_NO_OP_OFFLOAD") == nullptr;
+#else
+    const bool op_offload = true;
+#endif
     ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, n_backends, target, false, op_offload);
     if (ctx->sched == nullptr) {
         if (error != nullptr) {
@@ -326,6 +333,43 @@ bool codec_graph_prepare_io(
     return true;
 }
 
+#ifdef CODEC_DEBUG_TOOLS
+// CODEC_AUDIT_UPCAST=1: report every matmul / convtr operand that is a stored
+// weight cast to another type (weights must run at their stored type).
+static const ggml_tensor * audit_upcast_leaf(const ggml_tensor * t, int depth = 0) {
+    if (t == nullptr || depth > 16) return nullptr;
+    switch (t->op) {
+        case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+        case GGML_OP_CONT: case GGML_OP_PAD: case GGML_OP_CONCAT: case GGML_OP_SCALE:
+            return audit_upcast_leaf(t->src[0], depth + 1);
+        case GGML_OP_CPY: case GGML_OP_DUP: {
+            const ggml_tensor * s = t->src[0];
+            if (s != nullptr && s->op == GGML_OP_NONE && s->buffer != nullptr && s->type != t->type &&
+                (s->flags & GGML_TENSOR_FLAG_INPUT) == 0 && std::strncmp(s->name, "lut.", 4) != 0) return s;
+            return audit_upcast_leaf(s, depth + 1);
+        }
+        default: return nullptr;
+    }
+}
+static void audit_upcast(ggml_cgraph * g) {
+    static const bool on = std::getenv("CODEC_AUDIT_UPCAST") != nullptr;
+    if (!on) return;
+    static std::set<std::string> seen;
+    for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+        const ggml_tensor * n = ggml_graph_node(g, i);
+        if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID && n->op != GGML_OP_CONV_TRANSPOSE_1D &&
+            n->op != GGML_OP_OUT_PROD) continue;
+        for (int k = 0; k < 2; ++k) {
+            const ggml_tensor * leaf = audit_upcast_leaf(n->src[k]);
+            if (leaf != nullptr && seen.insert(leaf->name).second) {
+                std::fprintf(stderr, "AUDIT-UPCAST %s src%d <- %s (%s) via %s\n", ggml_op_name(n->op), k, leaf->name,
+                             ggml_type_name(leaf->type), n->name);
+            }
+        }
+    }
+}
+#endif // CODEC_DEBUG_TOOLS
+
 bool codec_graph_compute(
     codec_context * ctx,
     codec_graph_cache_entry * entry,
@@ -355,18 +399,23 @@ bool codec_graph_compute(
         return false;
     }
 
+#ifdef CODEC_DEBUG_TOOLS
     const bool profile_on = profiler().resolve() != nullptr;
     if (profile_on) {
         ggml_backend_sched_set_eval_callback(ctx->sched, profile_eval_callback, nullptr);
         profile_begin();
     }
+    audit_upcast(ctx->eval_graph);
+#endif
 
     const ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, ctx->eval_graph);
 
+#ifdef CODEC_DEBUG_TOOLS
     if (profile_on) {
         profile_end(entry ? entry->key.kind : -1, ggml_graph_n_nodes(ctx->eval_graph));
         ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
     }
+#endif
 
     if (st != GGML_STATUS_SUCCESS) {
         if (error != nullptr) {

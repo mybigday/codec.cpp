@@ -58,7 +58,9 @@ trivial timing noise) or fed into the `compare` subcommand.
 ## Workflow
 
 ```bash
-# 1. Build (Release, no GPU backends so timings are deterministic)
+# 1. Build (Release, no GPU backends so timings are deterministic).  The perf
+#    scopes are only compiled in with CODEC_DEBUG_TOOLS.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCODEC_DEBUG_TOOLS=ON
 cmake --build build -j
 
 # 2. Capture baseline before optimising
@@ -93,7 +95,8 @@ codec_perf_scope("phase_name");                  // RAII timer
 codec_perf_event("phase_name", "free-form");     // one-off snapshot, no timing
 ```
 
-When `CODEC_PERF_LOG` is unset (the default for normal users), every scope
+Without `-DCODEC_DEBUG_TOOLS=ON` (production builds) the scopes compile to
+nothing.  In a debug-tools build with `CODEC_PERF_LOG` unset, every scope
 costs one `ggml_time_us()` call at construction and a no-op at destruction
 (early return on `resolve_path() == nullptr`).  When set, each scope
 appends one JSON-lines record.

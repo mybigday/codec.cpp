@@ -97,6 +97,14 @@ set(CODEC_SOURCES
 # and external integrations).  Use OBJECT to compile sources once.
 add_library(codec_objs OBJECT ${CODEC_SOURCES})
 set_target_properties(codec_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Development hooks read from environment variables (CODEC_PERF_LOG,
+# CODEC_OP_PROFILE, CODEC_FORCE_COMPOSITE_OPS, CODEC_NO_OP_OFFLOAD,
+# CODEC_AUDIT_UPCAST).  Off for production builds: the code is not compiled in.
+option(CODEC_DEBUG_TOOLS "Compile the env-var debug/profiling hooks into libcodec" OFF)
+if (CODEC_DEBUG_TOOLS)
+    target_compile_definitions(codec_objs PRIVATE CODEC_DEBUG_TOOLS)
+endif()
 add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)
 add_library(codec_shared SHARED $<TARGET_OBJECTS:codec_objs>)
 set_target_properties(codec_shared PROPERTIES OUTPUT_NAME codec)
