@@ -118,14 +118,6 @@ def apply_weight_norm(weight_v: np.ndarray, weight_g: np.ndarray) -> np.ndarray:
     return weight_v * scale.reshape(reshape)
 
 
-def maybe_transpose_lstm_weight(key: str, arr: np.ndarray) -> np.ndarray:
-    if ".lstm.weight_ih_" in key or ".lstm.weight_hh_" in key:
-        if arr.ndim != 2:
-            raise ValueError(f"lstm weight must be rank-2: {key} shape={arr.shape}")
-        return arr.T.copy()
-    return arr
-
-
 def _construct_state_dict_key(module_name, param_name):
     return f"{module_name}.{param_name}" if module_name else param_name
 
@@ -481,7 +473,6 @@ class WavTokenizerConverter(BaseConverter):
                     continue
 
             arr = to_numpy(value)
-            arr = maybe_transpose_lstm_weight(src_key, arr)
             arr = transform_tensor_for_codec(src_key, arr, self.conv_transforms)
             out_name = shorten_tensor_name(mapped, used_names)
             st_dtype = self._get_target_dtype(out_name, arr)

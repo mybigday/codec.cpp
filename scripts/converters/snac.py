@@ -47,6 +47,10 @@ def _apply_weight_norm(weight_v: np.ndarray, weight_g: np.ndarray, dim: int = 0)
 
 
 class SnacConverter(BaseConverter):
+    # The encoder + quantizer input projections feed the code search: at F16
+    # compute a 10 s clip keeps only 75% of the codes, so they are stored F32.
+    extra_f32_patterns = (r"^snac\.enc\.", r"^snac\.q\.\d+\.in_proj\.")
+
     @property
     def model_type(self) -> str:
         return "snac"
@@ -205,8 +209,8 @@ class SnacConverter(BaseConverter):
             # encodings and codebook through `F.normalize` before the
             # cosine-NN argmax.
             cb_norm = cb / (np.linalg.norm(cb, axis=1, keepdims=True) + 1e-12)
-            self._add_tensor(writer, f"snac.q.{qi}.codebook", cb, "F16")
-            self._add_tensor(writer, f"snac.q.{qi}.codebook_norm", cb_norm, "F16")
+            self._add_tensor(writer, f"snac.q.{qi}.codebook", cb)
+            self._add_tensor(writer, f"snac.q.{qi}.codebook_norm", cb_norm)
 
         # ------------------------------------------------------------------
         # Decoder

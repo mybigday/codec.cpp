@@ -349,8 +349,8 @@ class MossAudioConverter(BaseConverter):
             add_wn_conv(base + ".out_proj", o + ".out_proj")
             cb = _t(base + ".codebook.weight").astype(np.float32)  # (codebook_size, codebook_dim)
             cb_norm = cb / (np.linalg.norm(cb, axis=1, keepdims=True) + 1e-12)
-            self._add_tensor(writer, o + ".codebook", cb, "F16")
-            self._add_tensor(writer, o + ".codebook_norm", cb_norm, "F16")
+            self._add_tensor(writer, o + ".codebook", cb)
+            self._add_tensor(writer, o + ".codebook_norm", cb_norm)
 
         if self.lm_source is not None:
             from .lm_adaptor import dump_lm_into

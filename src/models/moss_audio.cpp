@@ -355,7 +355,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
         // mul_mat which contracts ne[0]=cb_dim.
         ggml_tensor * cb_norm = W(base + ".codebook_norm");
         if (cb_norm == nullptr) return false;
-        cb_norm = codec_graph_cast_f32(ctx_eval, cb_norm);
+        cb_norm = codec_graph_stored_weight(ctx_eval, cb_norm);                      // search at the stored type
         ggml_tensor * sims = ggml_mul_mat(ctx_eval, cb_norm, z_n_ct);                // [cb_size, t]
         ggml_tensor * idx = ggml_argmax(ctx_eval, sims);                              // ne=(t,) i32
         codes_per_level[qi] = idx;
@@ -363,8 +363,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
         // Reconstruction: gather codebook (raw, not normalised) + out_proj.
         ggml_tensor * cb = W(base + ".codebook");
         if (cb == nullptr) return false;
-        cb = codec_graph_cast_f32(ctx_eval, cb);
-        ggml_tensor * z_q_ct = ggml_get_rows(ctx_eval, cb, idx);                      // [cb_dim, t]
+        ggml_tensor * z_q_ct = ggml_get_rows(ctx_eval, codec_graph_stored_weight(ctx_eval, cb), idx);                      // [cb_dim, t]
         ggml_tensor * z_q_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_q_ct));
         ggml_tensor * z_q_proj = codec_conv1d(ctx_eval, z_q_tc,
                                               W(base + ".out_proj.w"),
@@ -424,8 +423,7 @@ static bool codec_moss_build_decode(ggml_context * ctx_eval, void * user_data, g
         const std::string base = "moss.q." + std::to_string(qi);
         ggml_tensor * cb = W(base + ".codebook");
         if (cb == nullptr) return false;
-        cb = codec_graph_cast_f32(ctx_eval, cb);
-        ggml_tensor * z_p_ct = ggml_get_rows(ctx_eval, cb, idx);                      // [cb_dim, t]
+        ggml_tensor * z_p_ct = ggml_get_rows(ctx_eval, codec_graph_stored_weight(ctx_eval, cb), idx);                      // [cb_dim, t]
         ggml_tensor * z_p_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_p_ct)); // [t, cb_dim]
         ggml_tensor * z_q = codec_conv1d(ctx_eval, z_p_tc,
                                          W(base + ".out_proj.w"),

@@ -323,49 +323,29 @@ ggml_tensor * codec_op_lm_per_pos_linear(
         int32_t out_dim,
         int32_t T) {
     if (ctx == nullptr || w == nullptr || x_2d == nullptr) return nullptr;
+    w = codec_graph_stored_weight(ctx, w);
     // 2D weights have ne[2] == 1 (ggml tensors are internally 4D with
     // missing dims set to 1).  3D per-pos weights have ne[2] = N >= T.
     if (w->ne[2] <= 1) {
-        // Shared: plain matmul, gives (out_dim, T).  mul_mat handles
-        // F16/BF16 src[0] natively — let codec_graph_mat_lhs pass those
-        // through and cast only true quantized types.  Removing the
-        // unconditional F32 cast that used to live here saves a full
-        // weight dequant per graph execution, the dominant cost in the
-        // residual_depth_ar prefix-recompute regime where this helper
-        // runs depth_layers × 7 times per cb step.
-        //
-        // Force F32 accumulation explicitly: some backends default to
-        // F16 accumulation for F16 src[0], which adds a few millibits
-        // of drift versus the legacy cast-to-F32 path.  PREC_F32 keeps
-        // the dot product accumulator in F32 without materialising a
-        // dequanted weight tensor — best of both worlds.
-        // Dequant F16/BF16 weights to F32 before mul_mat.  ggml_mul_mat with
-        // an F16 src[0] converts src[1] (the activations) to F16 for the
-        // F16 vec_dot path — which overflows to +/-inf when an activation
-        // exceeds F16 max (65504).  The Qwen3-TTS depth FFN legitimately
-        // produces SwiGLU activations ~1.4e5 (large-activation channels),
-        // so the F16 activation cast turns them into inf -> NaN logits.
-        // Casting the weight to F32 keeps both operands F32 (no activation
-        // downcast); GGML_PREC_F32 alone does not prevent the src[1] cast.
-        // codec_graph_cast_f32 is a no-op for weights already F32.
-        // Plain ggml_mul_mat on purpose: codec_mul_mat would drop this cast.
-        ggml_tensor * w_lhs = codec_graph_cast_f32(ctx, w);
-        ggml_tensor * y     = ggml_mul_mat(ctx, w_lhs, x_2d);
+        // Shared: plain matmul, gives (out_dim, T).  The weight runs at its
+        // stored type: an F16 weight converts x to F16 (values past 65504 turn
+        // into inf, e.g. Qwen3-TTS depth FFN SwiGLU outputs ~1.4e5), so models
+        // that need F32 range store those weights F32.  PREC_F32 asks for F32
+        // accumulation where a backend would otherwise accumulate in F16.
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x_2d);
         ggml_prec_set_acc(y, GGML_PREC_F32);
         return y;
     }
-    // 3D per-pos branch: still cast to F32 because the broadcast
-    // arrangement puts the weight slice as mul_mat's src[1] (which must
-    // be F32) — see comment below.
-    ggml_tensor * w_f32   = codec_graph_cast_f32(ctx, w);
-    ggml_tensor * w_slice = lm_per_pos_weight_slice(ctx, w_f32, T);
+    // 3D per-pos branch: per-position weight slices are src[0] (any stored type),
+    // x is batched over ne[2]; a single x row is repeated over the T positions
+    // (only src[0] may broadcast in mul_mat).
+    ggml_tensor * w_slice = lm_per_pos_weight_slice(ctx, w, T);
     const int64_t in_dim  = x_2d->ne[0];
-    ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x_2d, in_dim, 1, (int64_t) T);
-    // ggml's batch broadcast requires `b.ne[2] % a.ne[2] == 0` — only
-    // `a` may broadcast.  Putting the input as `a` keeps the rule
-    // satisfied for both balanced (a.ne[2] == b.ne[2] == T) and
-    // broadcast-from-1 (when x is a single position repeated) cases.
-    ggml_tensor * y_3d    = codec_mul_mat(ctx, x_3d, w_slice);
+    ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x_2d, in_dim, 1, x_2d->ne[1]);
+    if (x_3d->ne[2] != T) {
+        x_3d = ggml_repeat(ctx, x_3d, ggml_new_tensor_3d(ctx, x_3d->type, in_dim, 1, (int64_t) T));
+    }
+    ggml_tensor * y_3d    = ggml_mul_mat(ctx, w_slice, x_3d);                // [out, 1, T]
     return ggml_reshape_2d(ctx, y_3d, (int64_t) out_dim, (int64_t) T);
 }
 

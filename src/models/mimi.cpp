@@ -621,7 +621,7 @@ static ggml_tensor * codec_mimi_sum_codebook_lookup(
         const std::string base = qi < n_sem
             ? ("q.s.layers." + std::to_string(qi))
             : ("q.a.layers." + std::to_string(qi - n_sem));
-        ggml_tensor * t_codebook = codec_graph_weight(ctx_eval, model, base + ".codebook.embed");
+        ggml_tensor * t_codebook = codec_graph_weight_mat(ctx_eval, model, base + ".codebook.embed");  // get_rows -> F32
         if (t_codebook == nullptr) {
             return nullptr;
         }

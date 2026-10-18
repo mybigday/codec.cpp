@@ -9,6 +9,7 @@
 #include "../runtime/tensor_utils.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -83,10 +84,17 @@ static ggml_tensor * codec_wt_W_linear(ggml_context * ctx_eval, const codec_mode
         return nullptr;
     }
     if (src->ne[0] == in_dim && src->ne[1] == out_dim) {
-        return codec_graph_cast_f32(ctx_eval, src);
+        return src;
     }
+    // Transposed storage (older converters): transpose at the stored type.  Rows
+    // of a block-quantized tensor can't be transposed.
     if (src->ne[0] == out_dim && src->ne[1] == in_dim) {
-        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, codec_graph_cast_f32(ctx_eval, src)));
+        if (ggml_is_quantized(src->type)) {
+            std::fprintf(stderr, "wavtokenizer: %s is %s in transposed (out, in) layout; quantized weights need "
+                         "ne0 = in (reconvert with the current converter)\n", name.c_str(), ggml_type_name(src->type));
+            return nullptr;
+        }
+        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, src));
     }
     return nullptr;
 }
@@ -129,9 +137,8 @@ static ggml_tensor * codec_wt_sum_codebook_features(
         // Codebook is stored (codebook_dim, codebook_size). ggml_get_rows treats
         // ne[1] as the row index dim, so this picks rows of length codebook_dim
         // indexed by token id.
-        ggml_tensor * t_codebook_f32 = codec_graph_cast_f32(ctx_eval, t_codebook);
         ggml_tensor * t_idx = ggml_view_1d(ctx_eval, t_tok, t, (size_t) qi * t_tok->nb[1]);
-        ggml_tensor * t_q = ggml_get_rows(ctx_eval, t_codebook_f32, t_idx); // [codebook_dim, t]
+        ggml_tensor * t_q = ggml_get_rows(ctx_eval, t_codebook, t_idx); // [codebook_dim, t], F32
         sum = (sum == nullptr) ? t_q : ggml_add(ctx_eval, sum, t_q);
     }
     return sum;

@@ -355,7 +355,7 @@ class NemoNanoCodecConverter(BaseConverter):
                 arr = np.asarray(arr)
                 if arr.shape[0] != codebook_size or arr.shape[1] != codebook_dim:
                     raise ValueError(f"codebook shape mismatch: {arr.shape}")
-                st = "F16" if not self.quantize_codebook else None
+                st = "F32" if not self.quantize_codebook else None
                 self._add_tensor(writer, name, arr, st_dtype=st)
                 continue
             self._add_tensor(writer, name, np.asarray(arr))

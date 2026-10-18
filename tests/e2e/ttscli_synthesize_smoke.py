@@ -306,11 +306,10 @@ def main():
     # injects the projected trailing text per-step).  The talker backbone runs
     # as plain `qwen3` (1D RoPE) which is the exact reduction of the reference's
     # interleaved-MRoPE for pure-audio TTS — see qwen3_tts_backbone_smoke.py.
-    # Intelligibility was fixed by carrying the depth-decoder FFN matmuls at F32
-    # (the SwiGLU intermediate reaches ~1.4e5, which overflowed the F16 mul_mat
-    # activation downcast to inf -> NaN codes; codec_op_lm_per_pos_linear now
-    # dequants F16 weights to F32 so activations stay F32).  Asserted: stop via
-    # eos_code_c0 and CER within bound.
+    # Intelligibility needs the depth-decoder ffn_down at F32: the SwiGLU
+    # intermediate reaches ~1.4e5, which overflows an F16 matmul's activation
+    # downcast to inf -> NaN codes, so the converter stores that weight F32.
+    # Asserted: stop via eos_code_c0 and CER within bound.
     results.append(_case(
         "qwen3_tts_refaudio",
         REPO / "models" / "qwen3_tts" / "qwen3_tts_06b_base.gguf",

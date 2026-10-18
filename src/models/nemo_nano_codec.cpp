@@ -33,18 +33,7 @@ static ggml_tensor * nemo_conv1d_replicate(
         return nullptr;
     }
 
-    ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
-    ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
-    ggml_tensor * im2col = ggml_im2col(ctx, w_f32, x_pad, stride, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
-    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1]));
-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_f32, (w_f32->ne[0] * w_f32->ne[1]), w_f32->ne[2]);
-    ggml_tensor * y = codec_mul_mat(ctx, im2col_2d, w_2d);
-    y = ggml_reshape_3d(ctx, y, im2col->ne[1], w_f32->ne[2], im2col->ne[2]);
-    if (b_f32 != nullptr) {
-        ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, 1, y->ne[1]);
-        y = ggml_add(ctx, y, b2);
-    }
-    return ggml_cont(ctx, y);
+    return codec_conv1d(ctx, x_pad, w, b, stride, dilation, 0);
 }
 
 static std::string nemo_enc_down_w_name(int32_t i) { return "nemo.enc.down." + std::to_string(i) + ".w"; }

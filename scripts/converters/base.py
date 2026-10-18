@@ -139,6 +139,24 @@ class BaseConverter(ABC):
         
         return False
     
+    # codec.cpp computes every tensor at its stored type, so tensors whose
+    # consumers need F32 numerics are stored F32 by default: codebooks (the
+    # nearest-neighbour search flips codes at F16) and DSP front-end tables
+    # (mel filterbanks / windows on raw audio).  Converters add their own
+    # patterns via `extra_f32_patterns` (e.g. weights fed activations beyond
+    # F16 range).
+    F32_PATTERNS = (
+        r"codebook",
+        r"(?:^|\.)cb\.embed$",
+        r"mel_filters|mel\.filters|mel_basis|mel_fb",
+        r"(?:^|\.)window$",
+    )
+    extra_f32_patterns: tuple = ()
+
+    def keep_f32_tensor(self, name: str, arr: np.ndarray) -> bool:
+        import re
+        return any(re.search(p, name) for p in self.F32_PATTERNS + tuple(self.extra_f32_patterns))
+
     def _get_target_dtype(self, name: str, arr: np.ndarray) -> str:
         """Determine target dtype for a tensor."""
         if self.quantization == "F32":
@@ -146,6 +164,9 @@ class BaseConverter(ABC):
         
         if self.should_quantize_tensor(name, arr):
             return self.quantization
+
+        if self.keep_f32_tensor(name, arr):
+            return "F32"
         
         return "F16"
 

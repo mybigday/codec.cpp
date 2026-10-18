@@ -199,7 +199,7 @@ class NeuCodecConverter(BaseConverter):
         # GGUF reverses shapes on write, so store [codebook_size, codebook_dim]
         # to get ggml tensor layout [codebook_dim, codebook_size].
         codebook = _fsq_implicit_codebook(FSQ_LEVELS).T
-        self._add_tensor(writer, "neucodec.decode.codebook", codebook, "F16")
+        self._add_tensor(writer, "neucodec.decode.codebook", codebook)
 
         def conv_weight(prefix: str) -> np.ndarray:
             wv = self.state_dict.get(prefix + ".weight_v")

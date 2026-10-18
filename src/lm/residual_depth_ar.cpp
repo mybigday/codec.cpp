@@ -432,21 +432,10 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
         // per-pos `in_proj[p] @ h_in (+ bias[p])`.
         x = t_x;
         if (impl->in_proj != nullptr) {
-            ggml_tensor * w_f32 = codec_graph_cast_f32(ctx_eval, impl->in_proj);
-            // Slice first T positions of the 3D weight.  Inlined
-            // (rather than via codec_op_lm_per_pos_linear) because the
-            // input here is a single h_in vector broadcast across
-            // batch, not a per-pos prefix; we want mul_mat with the
-            // input as the LHS broadcaster.
-            ggml_tensor * w_sl = ggml_view_3d(
-                ctx_eval, w_f32,
-                w_f32->ne[0], w_f32->ne[1], (int64_t) T,
-                w_f32->nb[1], w_f32->nb[2], 0);
-            ggml_tensor * h_3d   = ggml_reshape_3d(
-                ctx_eval, t_h_in, impl->hidden_dim, 1, 1);
-            ggml_tensor * proj_3d = codec_mul_mat(ctx_eval, h_3d, w_sl);
-            ggml_tensor * proj    = ggml_reshape_2d(
-                ctx_eval, proj_3d, impl->depth_hidden, T);
+            // The single h_in vector is projected by each of the first T
+            // per-pos weight slices.
+            ggml_tensor * proj = codec_op_lm_per_pos_linear(
+                ctx_eval, impl->in_proj, t_h_in, impl->depth_hidden, T);
 
             if (impl->in_proj_bias != nullptr) {
                 ggml_tensor * bias_f32 = codec_graph_cast_f32(ctx_eval, impl->in_proj_bias);

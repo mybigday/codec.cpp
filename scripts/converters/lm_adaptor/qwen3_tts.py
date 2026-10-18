@@ -332,7 +332,9 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
                 raise RuntimeError(
                     f"{src} shape {arr.shape} != expected {expect}"
                 )
-            dt = "F32" if dst_suf.endswith("_norm.weight") else "F16"
+            # ffn_down is fed the SwiGLU intermediate, which reaches ~1.4e5:
+            # past F16 range, so it is stored (and computed) F32.
+            dt = "F32" if dst_suf.endswith("_norm.weight") or dst_suf == "ffn_down.weight" else "F16"
             writer.add_tensor(f"{prefix_out}.{dst_suf}",
                               arr.astype(np.float32), st_dtype=dt)
 

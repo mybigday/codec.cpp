@@ -385,12 +385,13 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
                 add_tensor(name, embed)
 
     def _get_target_dtype(self, name: str, arr: np.ndarray) -> np.dtype:
+        if self.keep_f32_tensor(name, arr) and not (self.quantize_codebook and self.should_quantize_tensor(name, arr)):
+            return np.float32
         if arr.dtype == np.float16:
             return np.float16
         if any(
             token in name
             for token in (
-                ".codebook",
                 ".norm.",
                 ".inln.",
                 ".paln.",

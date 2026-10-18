@@ -234,7 +234,7 @@ static ggml_tensor * codec_snac_quantize_level(
     //    cb_size), `mul_mat(codebook, z_n_ct)` returns (cb_size, t).
     ggml_tensor * cb_norm = W(base + ".codebook_norm");
     if (cb_norm == nullptr) return nullptr;
-    cb_norm = codec_graph_cast_f32(ctx_eval, cb_norm);
+    cb_norm = codec_graph_stored_weight(ctx_eval, cb_norm);                      // search at the stored type
 
     ggml_tensor * z_n_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_n));   // [d, t_lat]
     ggml_tensor * sims = ggml_mul_mat(ctx_eval, cb_norm, z_n_ct);                 // [cb_size, t_lat]
@@ -246,8 +246,7 @@ static ggml_tensor * codec_snac_quantize_level(
     // 6) Reconstruction: gather codebook[idx] (shape (t_lat, cb_dim)) → out_proj.
     ggml_tensor * cb = W(base + ".codebook");
     if (cb == nullptr) return nullptr;
-    cb = codec_graph_cast_f32(ctx_eval, cb);
-    ggml_tensor * z_q = ggml_get_rows(ctx_eval, cb, idx);                         // [cb_dim, t_lat]
+    ggml_tensor * z_q = ggml_get_rows(ctx_eval, codec_graph_stored_weight(ctx_eval, cb), idx);   // [cb_dim, t_lat]
     // out_proj is a 1×1 conv mapping cb_dim -> latent_dim.  Switch back to TC.
     ggml_tensor * z_q_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_q));    // [t_lat, cb_dim]
     z_q_tc = codec_conv1d(ctx_eval, z_q_tc,
@@ -439,8 +438,7 @@ static bool codec_snac_build_decode(ggml_context * ctx_eval, void * user_data, g
         const std::string base = "snac.q." + std::to_string(qi);
         ggml_tensor * cb = W(base + ".codebook");
         if (cb == nullptr) return false;
-        cb = codec_graph_cast_f32(ctx_eval, cb);
-        ggml_tensor * z_p = ggml_get_rows(ctx_eval, cb, codes[qi]);                 // [cb_dim, t_qi]
+        ggml_tensor * z_p = ggml_get_rows(ctx_eval, codec_graph_stored_weight(ctx_eval, cb), codes[qi]);   // [cb_dim, t_qi]
         ggml_tensor * z_p_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_p));  // [t_qi, cb_dim]
         ggml_tensor * z_qi = codec_conv1d(ctx_eval, z_p_tc,
                                           W(base + ".out_proj.w"),

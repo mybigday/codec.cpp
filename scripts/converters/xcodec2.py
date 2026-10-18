@@ -216,7 +216,7 @@ class XCodec2Converter(BaseConverter):
         writer.add_float32("xcodec2.rope_theta", float(cfg["rope_theta"]))
 
         codebook = _fsq_implicit_codebook(FSQ_LEVELS).T  # [codebook_size, codebook_dim] for GGUF write
-        self._add_tensor(writer, "xcodec2.decode.codebook", codebook, "F16")
+        self._add_tensor(writer, "xcodec2.decode.codebook", codebook)
 
         def _t(name: str) -> np.ndarray:
             arr = sd.get(name)

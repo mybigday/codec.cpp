@@ -42,6 +42,8 @@ The intended architecture is **llama.cpp-style**:
 
 CMake project with ggml as a subdirectory.
 
+Env-var debug hooks (`CODEC_PERF_LOG`, `CODEC_OP_PROFILE`, `CODEC_FORCE_COMPOSITE_OPS`, `CODEC_NO_OP_OFFLOAD`, `CODEC_AUDIT_UPCAST`) are compiled in only with `-DCODEC_DEBUG_TOOLS=ON`; production builds carry none of them. New debug env flags go behind the same `#ifdef CODEC_DEBUG_TOOLS`.
+
 Typical CPU build:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -109,7 +111,7 @@ If a needed op is missing in ggml:
 **Pick ops every target backend runs — Metal and Vulkan, not just CPU.** An unsupported op does not fail: the scheduler silently moves it to CPU, splitting the graph (and a view crossing that boundary can crash). Check `ggml_metal_device_supports_op` (`ggml/src/ggml-metal/ggml-metal-device.m`) and `ggml_backend_vk_device_supports_op` before choosing an op, including their dtype/contiguity conditions. Known gaps and the replacements in `src/ops`:
 - Metal: no `ROUND`/`FLOOR` unary (`codec_op_round_bounded`: STEP-based, bit-exact with `ggml_round` incl. ties, for FSQ-style bounded inputs), `PAD` only pads at the end (`codec_op_pad_1d` prepends a zero constant), binary ops need an F32 src0 with contiguous rows.
 - Vulkan: no `PAD_REFLECT_1D` (`codec_op_pad_reflect_tc`), no `ELU` (`codec_op_unary(..., CODEC_UNARY_ELU)`), no `POOL_1D` (`codec_op_pool_1d`).
-- OpenCL (llama.rn's Android GPU; Adreno only, ggml-opencl refuses Mali): no `SIN`/`COS`/`LEAKY_RELU`/`ARANGE`/`POOL_*`/`ARGMAX`/`CONV_TRANSPOSE_1D`/`LOG`. Use `codec_op_sin`/`codec_op_cos`/`codec_op_leaky_relu`/`codec_op_arange`/`codec_op_pool_1d` and `codec_convtr1d` (GEMM path); they keep the native op where `codec_graph_backend_supports` says it runs and compose otherwise. `CODEC_FORCE_COMPOSITE_OPS=1` exercises the fallbacks on CPU.
+- OpenCL (llama.rn's Android GPU; Adreno only, ggml-opencl refuses Mali): no `SIN`/`COS`/`LEAKY_RELU`/`ARANGE`/`POOL_*`/`ARGMAX`/`CONV_TRANSPOSE_1D`/`LOG`. Use `codec_op_sin`/`codec_op_cos`/`codec_op_leaky_relu`/`codec_op_arange`/`codec_op_pool_1d` and `codec_convtr1d` (GEMM path); they keep the native op where `codec_graph_backend_supports` says it runs and compose otherwise. `CODEC_FORCE_COMPOSITE_OPS=1` exercises the fallbacks on CPU (debug-tools build).
 - Both: `ggml_clamp` is in-place (`codec_op_clamp_min`).
 
 ---
@@ -127,7 +129,7 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 ## Conventions / guardrails for changes
 
 - Keep encode/decode numerics stable (unit/regression tests where possible).
-- Precision tiers: the reference is the original model's algorithm and precision, and quality is guaranteed at the usual release precisions (F32/F16/BF16). Q8_0 and lower get the fastest path (native quantized `ggml_mul_mat`, no per-eval dequant) with no quality promise; smokes only check they are not broken. Per-tensor mixed precision lives in each converter's `should_quantize_tensor`.
+- Compute at the stored precision: a weight runs at its GGUF type (F32 / F16 / BF16 / block-quantized) in every matmul, conv, convtr and codebook search. Never cast a weight operand (`codec_graph_stored_weight` recovers the stored tensor behind a `codec_graph_weight` cast; widening a bias / norm scale for an elementwise op is lossless and fine). Precision is the publisher's choice: a tensor that needs F32 range or search numerics is stored F32 by the converter's defaults, and `scripts/quantize-gguf.py` writes any per-tensor mix. Where ggml cannot run a type (e.g. transposing a block-quantized tensor), fail loudly; never dequantize silently.
 - Avoid introducing new CPU-only intermediate buffers; build everything as ggml tensors.
 - When touching graph execution / backend scheduler: be careful with allocation lifetimes (`eval_ctx`, scheduler reset semantics).
 - Prefer small, reviewable commits.

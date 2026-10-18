@@ -112,11 +112,10 @@ static ggml_tensor * codec_dac_W_conv1d(ggml_context * ctx_eval, const codec_mod
     const int32_t n1 = (int32_t) src->ne[1];
     const int32_t n2 = (int32_t) src->ne[2];
     if (n0 == dk && n1 == din && n2 == dout) {
-        return codec_graph_cast_f32(ctx_eval, src);
+        return src;
     }
-    if (n0 == dout && n1 == din && n2 == dk) {
-        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
-        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, f32, 2, 1, 0, 3));
+    if (n0 == dout && n1 == din && n2 == dk && !ggml_is_quantized(src->type)) {
+        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, src, 2, 1, 0, 3));   // legacy layout, stored type
     }
     return nullptr;
 }
@@ -136,11 +135,10 @@ static ggml_tensor * codec_dac_W_convtr(ggml_context * ctx_eval, const codec_mod
     const int32_t n1 = (int32_t) src->ne[1];
     const int32_t n2 = (int32_t) src->ne[2];
     if (n0 == dk && n1 == dout && n2 == din) {
-        return codec_graph_cast_f32(ctx_eval, src);
+        return src;
     }
-    if (n0 == din && n1 == dout && n2 == dk) {
-        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
-        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, f32, 2, 1, 0, 3));
+    if (n0 == din && n1 == dout && n2 == dk && !ggml_is_quantized(src->type)) {
+        return ggml_cont(ctx_eval, ggml_permute(ctx_eval, src, 2, 1, 0, 3));   // legacy layout, stored type
     }
     return nullptr;
 }
@@ -156,10 +154,10 @@ static ggml_tensor * codec_dac_W_codebook(ggml_context * ctx_eval, const codec_m
         return nullptr;
     }
     if (src->ne[0] == cb_dim && src->ne[1] == cb_size) {
-        return codec_graph_cast_f32(ctx_eval, src);
+        return src;
     }
-    if (src->ne[0] == cb_size && src->ne[1] == cb_dim) {
-        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, codec_graph_cast_f32(ctx_eval, src)));
+    if (src->ne[0] == cb_size && src->ne[1] == cb_dim && !ggml_is_quantized(src->type)) {
+        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, src));
     }
     return nullptr;
 }
@@ -178,16 +176,13 @@ static ggml_tensor * codec_dac_W_out_proj(ggml_context * ctx_eval, const codec_m
     const int64_t n1 = src->ne[1];
     const int64_t n2 = src->ne[2];
     if (n0 == cb_dim && n1 == hidden_dim && n2 == 1) {
-        return codec_graph_cast_f32(ctx_eval, src);
+        return src;
     }
     if (n0 == 1 && n1 == cb_dim && n2 == hidden_dim) {
-        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
-        return ggml_reshape_2d(ctx_eval, f32, cb_dim, hidden_dim);
+        return ggml_reshape_2d(ctx_eval, src, cb_dim, hidden_dim);
     }
     if (n0 == 1 && n1 == hidden_dim && n2 == cb_dim) {
-        ggml_tensor * f32 = codec_graph_cast_f32(ctx_eval, src);
-        ggml_tensor * v2d = ggml_reshape_2d(ctx_eval, f32, hidden_dim, cb_dim);
-        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, v2d));
+        return ggml_cont(ctx_eval, ggml_transpose(ctx_eval, ggml_reshape_2d(ctx_eval, src, hidden_dim, cb_dim)));
     }
     return nullptr;
 }
@@ -890,7 +885,8 @@ static bool codec_dac_build_encode(ggml_context * ctx_eval, void * user_data, gg
         ggml_set_name(z_tc, ("dac.encode.vq.q" + std::to_string(qi) + ".in").c_str());
         ggml_tensor * z_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_tc)); // [codebook_dim, t]
         ggml_tensor * z_norm_ct = ggml_l2_norm(ctx_eval, z_ct, 1e-12f);
-        ggml_tensor * codebook_norm_dc = ggml_l2_norm(ctx_eval, t_codebook, 1e-12f);
+        // The L2-normalised codebook is computed (F32) from the stored one.
+        ggml_tensor * codebook_norm_dc = ggml_l2_norm(ctx_eval, codec_graph_cast_f32(ctx_eval, t_codebook), 1e-12f);
         if (z_norm_ct == nullptr || codebook_norm_dc == nullptr) {
             return false;
         }

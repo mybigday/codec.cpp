@@ -136,16 +136,13 @@ ggml_tensor * codec_op_linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
         return nullptr;
     }
 
-    // Cast weight to F32 to preserve numerical parity with the legacy
-    // dequant-into-graph-buffer path. ggml_mul_mat itself supports quantized
-    // weights natively, but mixing Q8_0 weight + F32 activations introduces
-    // additional per-block quantization on the activation side.
-    ggml_tensor * w_f32 = codec_graph_cast_f32(ctx, w);
+    // The weight runs at its stored type (mul_mat converts x to its dot type).
+    w = codec_graph_stored_weight(ctx, w);
     ggml_tensor * b_f32 = codec_graph_cast_f32(ctx, b);
 
-    ggml_tensor * y = codec_mul_mat(ctx, w_f32, x);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     if (b_f32 != nullptr) {
-        ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, w_f32->ne[1], 1);
+        ggml_tensor * b2 = ggml_reshape_2d(ctx, b_f32, w->ne[1], 1);
         y = ggml_add(ctx, y, b2);
     }
     return y;
