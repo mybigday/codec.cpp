@@ -57,7 +57,7 @@ everything else is `codec.lm.kitten.*` metadata in the codec GGUF.
   tokens of the test sentence (transformers bf16 itself diverges from fp32 at
   token 10). The Q4_0 backbone quantizes activations to Q8_0 in its matmuls and
   diverges at the same point as transformers bf16.
-- Speaker from audio: S3G slots as in [codec_speaker.md](codec_speaker.md);
+- Speaker from audio: S3G slots as in [codec_speaker.md](../codec_speaker.md);
   `lm_cond` cosine 1.0000 vs PyTorch fp32 (0.997 vs the shipped voice, which was
   computed in bf16); `ref_tokens` 94 % equal to the shipped ones (they were
   tokenized after a librosa/soxr resample, here torchaudio's sinc).

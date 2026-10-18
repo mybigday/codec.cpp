@@ -42,8 +42,8 @@ host should take next:
 
 | Type | Examples | Per-step shape | Next backbone input |
 |---|---|---|---|
-| **A** Token-based single-cb | OuteTTS, Orpheus, VibeVoice | sample one token from a unified vocab where some IDs encode audio | `embd.push_back(tok)` — standard token path |
-| **B** Embed-based single-cb | Chatterbox T3 (once llama.cpp's `chatterbox_t3` arch lands) | sample one speech token from a dedicated speech head | `speech_emb[tok] + speech_pos_emb[step]` via `inputs_embeds` |
+| **A** Token-based single-cb | OuteTTS, Orpheus | sample one token from a unified vocab where some IDs encode audio | `embd.push_back(tok)` — standard token path |
+| **B** Embed-based single-cb | Chatterbox T3 / Turbo | sample one speech token from a dedicated speech head | `speech_emb[tok] + speech_pos_emb[step]` via `inputs_embeds` |
 | **C** Residual depth-AR multi-cb | CSM, Qwen3-TTS, Moshi, LFM2-Audio | backbone samples cb0; a small depth decoder runs to sample cb1..N-1 conditioned on cb0 | `compose_audio_embd(cb0..cb_{N-1})` via `inputs_embeds` |
 | **D** Parallel heads delay multi-cb | MOSS-TTSD | backbone hidden feeds N parallel heads that sample all N codebooks in one step (delay pattern shifts emission per cb) | `compose_audio_embd(cb0..cb_{N-1})` via `inputs_embeds` |
 
@@ -269,8 +269,8 @@ hardcoded model lists.
 
 | Model | Modality | observe_action pattern | Notes |
 |---|---|---|---|
-| OuteTTS / Orpheus / VibeVoice | `INPUT_TEXT \| OUTPUT_AUDIO` | mostly CONSUMED, STOP at EOS | Type A — token path throughout |
-| Chatterbox T3 (post-llama.cpp arch) | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at speech_eos | Type B — `speech_emb + speech_pos_emb` override |
+| OuteTTS / Orpheus | `INPUT_TEXT \| OUTPUT_AUDIO` | mostly CONSUMED, STOP at EOS | Type A — token path throughout |
+| Chatterbox T3 / Turbo | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at speech_eos | Type B — `speech_emb + speech_pos_emb` override |
 | CSM | `INPUT_TEXT \| OUTPUT_AUDIO` | CONSUMED_EMBED per step (depth-AR internal), STOP at cb0=audio_eos | Type C — depth decoder hidden inside |
 | Qwen3-TTS | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at codec_eos_token_id | Type C — voice clone with x-vector prefix |
 | MOSS-TTSD | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at <\|end_of_speech\|> | Type D — delay-pattern multi-cb; some cb0 codes are text → may surface as PASSTHROUGH |
@@ -355,28 +355,7 @@ they become the integration surface for codec_common's
 `OBSERVE_CONSUMED_EMBED` path, just generalised so they're no longer
 model-specific.
 
-## Landing roadmap
-
-1. **`include/codec_common.h` + lifecycle / modality / decode_audio**.
-   Wraps existing codec.cpp / codec_lm.h.  No new concepts.  Smoke test
-   against an already-working model.
-2. **`build_prompt` for Type A**.  Reference impl: OuteTTS or Orpheus.
-   Validates token-path round-trip end-to-end through the new API.
-3. **`observe_token` Type A path** (`OBSERVE_PASSTHROUGH` /
-   `OBSERVE_CONSUMED` / `OBSERVE_STOP`).  Validates the same model still
-   works when driven through the API.
-4. **`observe_token` Type B path** (`OBSERVE_CONSUMED_EMBED` +
-   `get_next_embed`).  Reference impl: Chatterbox once llama.cpp's
-   `chatterbox_t3` arch lands.  Validates `inputs_embeds` override.
-5. **`observe_token` Type C / D** (depth decoder + parallel heads
-   inside `observe_token`).  Reference impls: CSM (C), MOSS-TTSD (D).
-   Heaviest milestone — touches the depth-AR KV cache wiring.
-6. **llama.rn integration**.  Replace tts_wrapper / mtmd_wrapper
-   internals with the codec_common bridge.  rn-completion gets the
-   minimal per-step branch + embed-path batch construction generalised
-   from the existing temporary patch.
-
-### Phase B (landed): `tts-cli synthesize` reference host
+## Reference host: `tts-cli synthesize`
 
 `examples/tts-cli.cpp` now drives the full host AR loop against a real
 llama.cpp backbone (`--backbone LLAMA.gguf`), proving codec_common's
@@ -401,11 +380,9 @@ hidden via version script).  tts-cli links codec's ggml 0.9 (shared) +
 the isolated backbone; the two ggml instances never see each other.
 Gated by `-DCODEC_TTS_BACKBONE=ON` (default; CPU-only).
 
-Wired + whisper-verified end-to-end (6/6 synthesize smoke): CSM,
-Chatterbox-T3, BlueMagpie, MOSS-TTSD v0.5, MOSS-TTS-Realtime, Qwen3-TTS,
-and **LFM2-Audio** (see below).
+Per-model status: [model_status.md](model_status.md).
 
-### LFM2-Audio: sequential text→audio TTS (Flow 5)
+## LFM2-Audio: sequential text→audio TTS (Flow 5)
 
 LFM2-Audio-1.5B is a *sequential* multimodal LM (`host_arch=lfm2`,
 `residual_depth_ar`, `depth_emits_c0=true`, 8 Mimi codebooks).  Unlike the
@@ -437,7 +414,7 @@ free-runs in TEXT modality and only switches to AUDIO_OUT when it samples
   a fixed seed).  The existing F16 `lfm_backbone.gguf` is sufficient (no
   BF16 backbone needed once sampled).
 
-### Moshi: why not in `synthesize`
+## Moshi: why not in `synthesize`
 
 Moshi is **formally out of scope** for `tts-cli synthesize`, for three
 concrete blockers:
@@ -466,26 +443,3 @@ The codec_lm side stays validated: `tests/e2e/moshi_lm_smoke.py` checks the
 no full generation).  `tts-cli synthesize` now **refuses a Moshi codec_lm
 with a clear message** (missing Helium backbone arch + duplex protocol)
 instead of running a stop-less loop against an unloadable backbone.
-
-Historic note — the earlier "refuses these cleanly (exit 10)" set (MOSS-*,
-Qwen3-TTS, LFM2, Chatterbox) is now all wired; only Moshi is refused.
-
-## Open questions / follow-ups
-
-* **`extra` schema** — what keys does each model accept?  Document as
-  a registry (`docs/codec_common_input_keys.md`) once the first 2–3
-  models are wired so the schema is grounded in real use.
-* **CFG pair handling** — for Type B Chatterbox, `embeds_uncond` is the
-  unconditional branch.  Does the host run that as a second
-  `llama_seq` in the same context, or two contexts?  Decide once
-  llama.cpp's `chatterbox_t3` arch lands (depends on whether it
-  supports the CFG pair natively).
-* **`get_next_embed` ownership** — points into internal buffer, valid
-  until next call.  Document the lifetime contract explicitly; hosts
-  that need to retain across calls memcpy it out.
-* **Streaming PCM output** — `decode_audio` is one-shot.  For long
-  generations, expose a `decode_audio_chunk(n_frames)` that returns
-  partial PCM after every K codes.  Defer to v2; one-shot is fine for
-  reference impl.
-* **Thread safety** — `audio_lm_context` per session, single-threaded.
-  Document; do not pretend to be re-entrant.

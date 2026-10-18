@@ -12,7 +12,7 @@ Each must stop on the speech EOS, produce non-silent audio, and (when Whisper
 is available) transcribe with CER below the threshold.
 
 GGUFs: <name>.gguf from scripts/convert-to-gguf.py and <name>-backbone.gguf
-from scripts/convert-backbone-to-gguf.py (see docs/cosyvoice.md).
+from scripts/convert-backbone-to-gguf.py (see docs/models/cosyvoice.md).
 Run from the repo root: .venv/bin/python tests/e2e/cosyvoice_synthesize_smoke.py
 """
 

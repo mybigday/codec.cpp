@@ -83,8 +83,7 @@ Per AR step:
 
 ## The two kinds
 
-Source-verified taxonomy (see `docs/codec_lm_verification.md` for file:line
-citations). **No stubs**: a kind only exists once a real model has been
+**No stubs**: a kind only exists once a real model has been
 integrated against it.
 
 ### `parallel_heads_delay`
@@ -299,49 +298,3 @@ Reuses existing runtime:
 New `codec_graph_kind` enum entries are added under the existing dispatch:
 `LM_PARALLEL_EXPAND`, `LM_PARALLEL_EMBED`, `LM_DEPTH_BACKBONE_HEAD`,
 `LM_DEPTH_DECODER_STEP`.
-
-## Roadmap
-
-Reordered per per-model verification (`docs/codec_lm_verification.md`).
-M1 is the simpler kind first; M3 is the bigger architectural test (depth
-decoder).
-
-| Milestone | Kind | First model end-to-end | Status |
-|---|---|---|---|
-| M1 | `parallel_heads_delay` + skeleton + GGUF metadata loader + converter scaffold | **MOSS-TTSD-v0.5** (XY-Tokenizer codec already in repo; backbone via llama.cpp `qwen3`) | go |
-| M3 | `residual_depth_ar` with `weight_layout = "shared"` | **CSM** (Mimi codec already in repo; backbone = Llama-3.2-1B via llama.cpp `llama`) | go |
-| M4 | M3 reused; verify llama.cpp `qwen3` MRoPE first | **Qwen3-TTS** / **Qwen3-Omni-MoE Talker** | gated on llama.cpp 3D MRoPE check |
-| M5 | M3 + `weight_layout = "flexible"` + `c0_input_modality = "text"` + dual-stream backbone audio embeds | **Moshi** | gated on M3 + flexible-weight runtime |
-| M6 | M3 reused | **LFM2-Audio** | gated on inspecting safetensors keys for tensor names |
-
-Out of scope for v1:
-- **MusicGen** — old, not worth dedicated effort.
-- **Parler-TTS / Dia** — both have a custom Bart/Llama-style audio decoder
-  with cross-attn to a T5 encoder. The three (MusicGen / Parler-TTS / Dia)
-  decoders differ on three axes (LayerNorm vs RMSNorm × sinusoidal vs RoPE
-  × ungated FFN vs SwiGLU), which makes a single codec_lm "xattn decoder"
-  kind effectively a small generic transformer runtime — past the
-  "specialized auxiliary module" line. Cleaner future paths if either is
-  wanted: (a) **Dia**: contribute "Llama-with-cross-attn" arch upstream to
-  llama.cpp (general-purpose extension, not audio-specific) — Dia's
-  decoder is RMSNorm + RoPE + SwiGLU + cross-attn, so this drops it
-  straight in; codec_lm provides only the parallel heads + sum-embed.
-  (b) **Parler-TTS**: revisit if/when there's a use case; either upstream
-  Bart-with-RoPE to llama.cpp or extend codec_lm with the third kind.
-- **VALL-E** — separate AR + NAR networks, different paradigm; needs its
-  own kind (`nar_refine`) when the time comes.
-- **Bark** — three independent decoder LLMs; pipeline of kinds, not one
-  codec_lm instance.
-- **Higgs Audio v2** — fits parallel_heads_delay on the audio side but
-  uses DualFFN host-LLM modifications that llama.cpp doesn't support
-  out of the box.
-
-Each milestone ends with a `tests/e2e/<model>_lm_smoke.py` that drives the
-public C API end-to-end against the HF reference, scored by audio waveform
-correlation. No per-stage parity test scaffolding lands in tree (per the
-project's "E2E-only validation" feedback rule).
-
-## Verification appendix
-
-See `docs/codec_lm_verification.md` for file:line citations confirming each
-in-scope model fits the design.

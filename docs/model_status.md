@@ -28,16 +28,16 @@
 | Model | Status | Note |
 |---|---|---|
 | CSM (Sesame) | ✅ | |
-| Chatterbox (Llama T3) | ✅ | |
+| Chatterbox (Llama T3) | ✅ | See [models/chatterbox.md](models/chatterbox.md) |
 | BlueMagpie | ✅ | |
 | MOSS-TTS-Realtime | ✅ | |
 | Qwen3-TTS | ✅ | Base model requires reference audio |
 | LFM2-Audio | ✅ | Must sample (greedy degenerates, as in reference) |
-| Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); GPU untested |
-| CosyVoice-300M (base / SFT / Instruct) | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see docs/cosyvoice.md |
+| Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); CPU and Vulkan verified; see [models/chatterbox.md](models/chatterbox.md) |
+| CosyVoice-300M (base / SFT / Instruct) | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/cosyvoice.md](models/cosyvoice.md) |
 | CosyVoice2 / CosyVoice3 | 🟡 | Same as CosyVoice-300M |
 | BreezyVoice | 🟡 | Same as CosyVoice-300M; g2pw 注音 annotation is external |
-| KittenTTS 2 | 🟡 | 47 builtin voices + voice clone; English text normalizer not ported (pass spoken text) |
+| KittenTTS 2 | 🟡 | 47 builtin voices + voice clone; English text normalizer not ported (pass spoken text); see [models/kitten_tts2.md](models/kitten_tts2.md) |
 | MOSS-TTSD | 🟡 | Requires BF16 backbone (F16/Q8 → babble) |
 | NeuTTS-Air | 🟡 | Input must be pre-phonemized (in-CLI espeak is opt-in); ref encode needs `distill_neucodec` |
 | NeuTTS-Nano | 🟡 | Same as Air; seed-fragile (~1/3 seeds collapse to silence) |

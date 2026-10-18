@@ -1,6 +1,6 @@
 # codec.cpp
 
-This repository is a C/C++ library + CLI that runs neural audio codecs (and the codec side of several TTS models) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.). Per-model implementation status lives in `docs/model_status.md`.
+This repository is a C/C++ library + CLI that runs neural audio codecs (and the codec side of several TTS models) using **ggml** graphs so execution can be offloaded via **ggml backends** (CPU/CUDA/Vulkan/Metal/etc.). Per-model implementation status lives in `docs/model_status.md`; per-model notes (conversion, quantization, runtime contract) in `docs/models/<model>.md`.
 
 The intended architecture is **llama.cpp-style**:
 - Build model forward passes as **ggml graphs (ops)**.

@@ -38,6 +38,37 @@ special-token list is read from a CosyVoice checkout in `.model-src/cosyvoice`.
 The v1 backbone needs `patches/cosyvoice-llamacpp.patch`, applied to the
 llama.cpp submodule by `cmake/SetupLlamaPatches.cmake` at configure time.
 
+### Quantized GGUFs
+
+Codec GGUF: `scripts/quantize-gguf.py`. Validated on BreezyVoice (= the
+CosyVoice-300M flow / HiFT / frontend), CPU and Vulkan, Q8_0 / Q5_K / Q4_K:
+
+```bash
+CT='(hift\.up\.\d+|cfm\.up\.0\.x)\.w$'   # ConvTranspose kernels
+.venv/bin/python scripts/quantize-gguf.py breezyvoice.gguf codec-q4_k_m.gguf \
+    --type Q4_K --fallback Q8_0 --tensor-type '^lm\.=Q8_0' \
+    --tensor-type 's3t\.q\.embed=KEEP' \
+    --flatten "^(?!.*$CT).*\.w$" --ci-major "$CT"
+```
+
+- `s3t.q.embed` is the speech tokenizer codebook; keep it F32.
+- ConvTranspose kernels take `--ci-major`, every other conv1d kernel
+  `--flatten`. The U-Net's ConvTranspose is the up-sampling conv of each
+  inner level (`cfm.up.<i>.x`, all levels but the last; level 0 for v1); the
+  last level's `x` is a plain conv1d.
+- The LM adaptor (`lm.*`, v1's text encoder and embeddings) at Q4_K
+  degrades the speech LM (repeated phrases); Q8_0 there keeps Q4 / Q5 codec
+  files close to F16 intelligibility.
+
+Backbone GGUF: `llama-quantize` from the patched llama.cpp. For the v1
+`cosyvoice` arch keep the rel-pos tensors at F32: the 2-D `pos_bias_u` /
+`pos_bias_v` are added to the query, and a block-quantized operand there
+aborts the graph.
+
+```bash
+llama-quantize --tensor-type attn_pos=f32 breezyvoice-backbone.gguf backbone-q4_k_m.gguf Q4_K_M
+```
+
 ## Synthesis
 
 ```bash
