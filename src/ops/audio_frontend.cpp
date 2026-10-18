@@ -63,7 +63,8 @@ std::vector<float> dft_kernel(const std::vector<float> & window, int32_t n_fft) 
 
 // mel_fb [n_bins, n_mels] · power [n_frames, n_bins]^T → [n_mels, n_frames].
 ggml_tensor * mel_project(ggml_context * ctx, ggml_tensor * mel_fb, ggml_tensor * power_tb) {
-    // The filterbank runs at its stored type (converters store it F32).
+    // The filterbank runs at its stored type; power spectra of raw audio need F32
+    // (range and precision), so converters store filterbanks F32.
     return ggml_mul_mat(ctx, codec_graph_stored_weight(ctx, mel_fb), ggml_cont(ctx, ggml_transpose(ctx, power_tb)));
 }
 

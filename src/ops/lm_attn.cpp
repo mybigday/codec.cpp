@@ -327,10 +327,7 @@ ggml_tensor * codec_op_lm_per_pos_linear(
     // 2D weights have ne[2] == 1 (ggml tensors are internally 4D with
     // missing dims set to 1).  3D per-pos weights have ne[2] = N >= T.
     if (w->ne[2] <= 1) {
-        // Shared: plain matmul, gives (out_dim, T).  The weight runs at its
-        // stored type: an F16 weight converts x to F16 (values past 65504 turn
-        // into inf, e.g. Qwen3-TTS depth FFN SwiGLU outputs ~1.4e5), so models
-        // that need F32 range store those weights F32.  PREC_F32 asks for F32
+        // Shared: plain matmul, gives (out_dim, T).  PREC_F32 asks for F32
         // accumulation where a backend would otherwise accumulate in F16.
         ggml_tensor * y = ggml_mul_mat(ctx, w, x_2d);
         ggml_prec_set_acc(y, GGML_PREC_F32);

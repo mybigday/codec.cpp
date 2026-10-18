@@ -1,5 +1,7 @@
 #include "dit.h"
 
+#include "../ops/conv1d.h"
+
 #include "cfm.h"
 #include "../ops/ggml_ops.h"
 #include "../ops/lm_attn.h"
@@ -19,8 +21,8 @@ ggml_tensor * grouped_causal_conv(ggml_context * ctx, ggml_tensor * x_tc, ggml_t
                                   int32_t groups) {
     const int64_t T = x_tc->ne[0];
     const int64_t C = x_tc->ne[1];
-    const int64_t k = w->ne[0];
     const int64_t cg = C / groups;
+    const int64_t k = codec_conv1d_kernel_size(w, cg);
     ggml_tensor * xp = codec_op_pad_1d(ctx, x_tc, (int32_t) (k - 1), 0);
     ggml_tensor * xg = ggml_reshape_3d(ctx, ggml_cont(ctx, xp), T + k - 1, cg, groups);
     ggml_tensor * kshape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, cg);

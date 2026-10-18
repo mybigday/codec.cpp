@@ -81,9 +81,10 @@ ggml_tensor * codec_op_lm_attn_rel_key_dth(
 //     batched mul_mat (with the input as the LHS operand because
 //     ggml's batch-broadcast rule only lets `a` broadcast).
 //
-// Casts `w` to F32 internally if it isn't already; the caller can pass
-// the raw GGUF weight tensor.  Used by codec_lm depth-decoder graphs
-// to keep the shared and flexible runtime paths on one helper.
+// `w` runs at its stored type (an F16 weight rounds x to F16, so weights fed
+// activations beyond F16 range are stored F32 by the converter).  Used by
+// codec_lm depth-decoder graphs to keep the shared and flexible runtime paths on
+// one helper.
 ggml_tensor * codec_op_lm_per_pos_linear(
     ggml_context * ctx,
     ggml_tensor * w,

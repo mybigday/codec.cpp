@@ -38,7 +38,7 @@ ggml_tensor * hift_f0(ggml_context * ctx, const codec_model * model, const char 
         ggml_tensor * w = W("f0.cn." + std::to_string(i) + ".w");
         ggml_tensor * b = W("f0.cn." + std::to_string(i) + ".b");
         if (w == nullptr || b == nullptr) return nullptr;
-        const int32_t k = (int32_t) w->ne[0];
+        const int32_t k = (int32_t) codec_conv1d_kernel_size(w, x->ne[1]);
         if (p.causal) {
             x = conv_padded(ctx, x, w, b, i == 0 ? 0 : k - 1, i == 0 ? k - 1 : 0);
         } else {

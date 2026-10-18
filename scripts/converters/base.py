@@ -139,12 +139,11 @@ class BaseConverter(ABC):
         
         return False
     
-    # codec.cpp computes every tensor at its stored type, so tensors whose
-    # consumers need F32 numerics are stored F32 by default: codebooks (the
-    # nearest-neighbour search flips codes at F16) and DSP front-end tables
-    # (mel filterbanks / windows on raw audio).  Converters add their own
-    # patterns via `extra_f32_patterns` (e.g. weights fed activations beyond
-    # F16 range).
+    # codec.cpp computes every tensor at its stored type, so a tensor whose
+    # computation needs a precision is stored at it: DSP front-end tables (mel
+    # filterbanks / windows on raw audio) and codebooks (nearest-neighbour search)
+    # are F32.  Converters add their own via `extra_f32_patterns` (e.g. weights
+    # fed activations beyond F16 range, SNAC's encoder).
     F32_PATTERNS = (
         r"codebook",
         r"(?:^|\.)cb\.embed$",

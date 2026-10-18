@@ -5,6 +5,7 @@
 #include "../runtime/tensor_utils.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 // Conv weights are used at their stored type (F32, F16, BF16 or block-quantized):
@@ -13,6 +14,36 @@
 // is mul_mat's src0 against an F32 im2col, the only orientation ggml runs for it.
 static bool codec_conv1d_w_is_src1(const ggml_tensor * w) {
     return w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16;
+}
+
+// A conv kernel is stored (K, C_in, C_out) or flattened (K*C_in, 1, C_out): the
+// same bytes, with rows long enough to block-quantize.  With the input channel
+// count the two never conflict (for C_in = 1 they read the same).
+static bool codec_conv1d_w_is_flat(const ggml_tensor * w, int64_t c_in) {
+    return w->ne[1] != c_in && w->ne[1] == 1 && w->ne[3] == 1;
+}
+
+int64_t codec_conv1d_kernel_size(const ggml_tensor * w, int64_t c_in) {
+    if (w == nullptr) return 0;
+    if (!codec_conv1d_w_is_flat(w, c_in)) return w->ne[0];
+    return c_in > 0 && w->ne[0] % c_in == 0 ? w->ne[0] / c_in : 0;
+}
+
+// y = conv(x, w) as im2col . w with the kernel as mul_mat's src[0]: every stored
+// type, flattened kernels included.  x: [T, C_in, N]  ->  [T_out, C_out, N].
+static ggml_tensor * codec_conv1d_im2col_w_src0(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, int64_t K,
+                                               int32_t stride, int32_t padding, int32_t dilation) {
+    const int64_t C_in = x->ne[1];
+    const int64_t C_out = w->ne[2];
+    // im2col reads only the kernel's shape: a data-less [K, C_in] stand-in.
+    ggml_tensor * kshape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C_in);
+    ggml_tensor * cols = ggml_im2col(ctx, kshape, x, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    if (cols == nullptr) return nullptr;
+    const int64_t t_out = cols->ne[1], n = cols->ne[2];
+    ggml_tensor * w2d = ggml_reshape_2d(ctx, w, K * C_in, C_out);
+    ggml_tensor * y = ggml_mul_mat(ctx, w2d, ggml_reshape_2d(ctx, cols, K * C_in, t_out * n));          // [C_out, T_out*N]
+    y = ggml_reshape_3d(ctx, y, C_out, t_out, n);
+    return ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));                                        // [T_out, C_out, N]
 }
 
 static ggml_tensor * codec_conv1d_pointwise_impl(
@@ -49,6 +80,15 @@ static ggml_tensor * codec_conv1d_impl(
         return nullptr;
     }
     w = codec_graph_stored_weight(ctx, w);
+    if (codec_conv1d_w_is_flat(w, x->ne[1])) {
+        const int64_t K = codec_conv1d_kernel_size(w, x->ne[1]);
+        if (K <= 0) {
+            std::fprintf(stderr, "codec_conv1d: flattened kernel '%s' [%lld, 1, %lld] does not fit %lld input channels\n",
+                         w->name, (long long) w->ne[0], (long long) w->ne[2], (long long) x->ne[1]);
+            return nullptr;
+        }
+        return codec_conv1d_im2col_w_src0(ctx, x, w, K, stride, padding, dilation);
+    }
 
     if (w->ne[0] == 1 && stride == 1 && dilation == 1 && padding == 0) {
         return codec_conv1d_pointwise_impl(ctx, x, w);
@@ -106,6 +146,9 @@ static ggml_tensor * codec_conv1d_impl(
         return ggml_reshape_3d(ctx, y, t_out, C_out, 1);
     }
 
+    if (!codec_conv1d_w_is_src1(w)) {
+        return codec_conv1d_im2col_w_src0(ctx, x, w, w->ne[0], stride, padding, dilation);
+    }
     const ggml_type im2col_type = w->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ggml_tensor * im2col = ggml_im2col(ctx, w, x, stride, 0, padding, 0, dilation, 0, false, im2col_type);
     if (im2col == nullptr) {
@@ -114,10 +157,6 @@ static ggml_tensor * codec_conv1d_impl(
 
     ggml_tensor * cols = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
     ggml_tensor * w2d = ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]);
-    if (!codec_conv1d_w_is_src1(w)) {
-        ggml_tensor * y = ggml_cont(ctx, ggml_transpose(ctx, ggml_mul_mat(ctx, w2d, cols)));   // [T_out*N, C_out]
-        return ggml_reshape_3d(ctx, y, im2col->ne[1], w->ne[2], im2col->ne[2]);
-    }
     ggml_tensor * y = ggml_mul_mat(ctx, cols, w2d);
     if (y == nullptr) {
         return nullptr;
@@ -242,13 +281,13 @@ ggml_tensor * codec_conv1d_causal(
         return nullptr;
     }
 
-    if (w->ne[0] < stride) {
+    const int32_t kernel = (int32_t) codec_conv1d_kernel_size(w, x->ne[1]);
+    if (kernel < stride) {
         return nullptr;
     }
 
     b = codec_graph_cast_f32(ctx, b);
 
-    const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;
     const int32_t pad_left = kernel_eff - stride;
     const int32_t t_in = (int32_t) x->ne[0];
@@ -278,13 +317,13 @@ ggml_tensor * codec_conv1d_causal_replicate(
         return nullptr;
     }
 
-    if (w->ne[0] < stride) {
+    const int32_t kernel = (int32_t) codec_conv1d_kernel_size(w, x->ne[1]);
+    if (kernel < stride) {
         return nullptr;
     }
 
     b = codec_graph_cast_f32(ctx, b);
 
-    const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;
     const int32_t pad_left = kernel_eff - stride;
     const int32_t t_in = (int32_t) x->ne[0];
@@ -314,13 +353,13 @@ ggml_tensor * codec_conv1d_depthwise_causal(
         return nullptr;
     }
 
-    if (w->ne[0] < stride) {
+    const int32_t kernel = (int32_t) w->ne[0];   // depthwise (K, 1, C)
+    if (kernel < stride) {
         return nullptr;
     }
 
     b = codec_graph_cast_f32(ctx, b);
 
-    const int32_t kernel = (int32_t) w->ne[0];
     const int32_t kernel_eff = (kernel - 1) * dilation + 1;
     const int32_t pad_left = kernel_eff - stride;
     const int32_t t_in = (int32_t) x->ne[0];
