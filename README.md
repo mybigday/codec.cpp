@@ -19,9 +19,22 @@ python convert-to-gguf.py --model-id kyutai/mimi --output mimi.gguf
 # From local checkpoint
 python convert-to-gguf.py --input-dir ./mimi-checkpoint --output mimi.gguf
 
+# Float precision (F32 / F16 / BF16 / AUTO = the checkpoint's; default F16, never wider than the checkpoint)
+python convert-to-gguf.py --model-id kyutai/mimi --output mimi-bf16.gguf --outtype BF16
+
 # With quantization (Q4_K_M, Q5_K_M, Q8_0)
 python convert-to-gguf.py --model-id kyutai/mimi --output mimi-q4.gguf --quantization Q4_K_M
+
+# A bundled LM-side adaptor (lm.* tensors) has its own settings
+python convert-to-gguf.py --model-id Qwen/Qwen3-TTS-Tokenizer-12Hz --lm-source Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+    --output qwen3-tts-codec.gguf --lm-outtype F16 --lm-quantization Q8_0
+
+# Requantize any GGUF per tensor
+python scripts/quantize-gguf.py in.gguf out.gguf --type Q8_0 --tensor-type 'codebook=F32'
 ```
+
+codec.cpp computes every tensor at the type stored in the GGUF, so precision is
+chosen here: converters store F32 where a computation needs it.
 
 ### 2. Decode Audio
 

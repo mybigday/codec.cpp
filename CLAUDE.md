@@ -124,6 +124,8 @@ Some tensors that could be generated at runtime should instead be baked into GGU
 
 If conversion scripts are involved, regenerate gguf after changes (stale gguf is a common source of “missing tensor” errors).
 
+Storage precision is a converter decision (`scripts/utils/precision.py`): `--outtype` (F32/F16/BF16/AUTO) and `--quantization` (Q8_0/Q5_K_M/Q4_K_M) for the codec part, `--lm-outtype` / `--lm-quantization` for the LM-side adaptor (`lm.*`). A float type is never wider than the checkpoint (F32 from a BF16 checkpoint stays BF16); generated DSP tables stay F32. In converter code `"F16"` means "this part's float type" and `"F32"` means "F32 capped at the checkpoint's precision".
+
 ---
 
 ## Conventions / guardrails for changes

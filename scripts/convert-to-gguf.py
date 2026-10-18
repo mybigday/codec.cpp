@@ -243,11 +243,38 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
     )
     
     parser.add_argument(
+        "--outtype",
+        type=str.upper,
+        default="F16",
+        choices=["F32", "F16", "BF16", "AUTO"],
+        help="Float storage precision of the codec part (default: F16; AUTO = the checkpoint's). "
+             "Never wider than the checkpoint: F32 from an F16/BF16 checkpoint stays at its precision."
+    )
+
+    parser.add_argument(
         "--quantization", "-q",
         type=str,
+        default=None,
+        choices=["Q8_0", "Q4_K_M", "Q5_K_M", "F32", "F16"],
+        help="Quantize the codec part's quantizable tensors (Q8_0 / Q4_K_M / Q5_K_M); off by default. "
+             "F32 / F16 are accepted for compatibility and mean --outtype."
+    )
+
+    parser.add_argument(
+        "--lm-outtype",
+        type=str.upper,
         default="F16",
-        choices=["F32", "F16", "Q8_0", "Q4_K_M", "Q5_K_M"],
-        help="Quantization type (default: F16)"
+        choices=["F32", "F16", "BF16", "AUTO"],
+        help="Float storage precision of the LM-side adaptor (lm.* tensors), separate from the codec "
+             "(default: F16; AUTO = the LM checkpoint's)."
+    )
+
+    parser.add_argument(
+        "--lm-quantization",
+        type=str,
+        default=None,
+        choices=["Q8_0", "Q4_K_M", "Q5_K_M"],
+        help="Quantize the LM-side adaptor's 2-D+ weights; off by default."
     )
     
     parser.add_argument(
@@ -415,8 +442,15 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
     converter_class = get_converter_for_model(model_type)
     
     # Create converter instance
+    if args.quantization in ("F32", "F16"):
+        print(f"Note: --quantization {args.quantization} is a float precision; use --outtype {args.quantization}.",
+              file=sys.stderr)
+        args.outtype, args.quantization = args.quantization, None
+
+    # Converters receive the quantization type, or the float type when none (they
+    # write "F16" for "this part's float type"; the writer policy resolves it).
     converter_kwargs = {
-        "quantization": args.quantization,
+        "quantization": args.quantization or (args.outtype if args.outtype in ("F32", "BF16") else "F16"),
         "quantize_codebook": args.quantize_codebook,
         "verbose": args.verbose
     }
@@ -451,9 +485,20 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
         # checkpoint_path is guaranteed to be not None here
         converter.load_from_checkpoint(checkpoint_path)
     
+    # Storage-precision policy: codec part vs LM-side adaptor, each capped at its
+    # checkpoint's precision.
+    from utils.precision import PartPolicy, PrecisionPolicy, detect_source_precision, set_policy
+    codec_src = detect_source_precision(args.model_id or checkpoint_path)
+    lm_src = detect_source_precision(args.lm_source) if args.lm_source else codec_src
+    set_policy(PrecisionPolicy(
+        codec=PartPolicy(args.outtype, args.quantization, codec_src),
+        lm=PartPolicy(args.lm_outtype, args.lm_quantization, lm_src),
+    ))
+
     # Convert and save
-    if args.verbose:
-        print(f"Converting to GGUF with quantization={args.quantization}...")
+    print(f"Converting: codec {args.outtype}{'+' + args.quantization if args.quantization else ''} "
+          f"(checkpoint {codec_src or '?'}), lm {args.lm_outtype}"
+          f"{'+' + args.lm_quantization if args.lm_quantization else ''} (checkpoint {lm_src or '?'})")
     
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

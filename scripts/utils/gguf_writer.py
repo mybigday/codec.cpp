@@ -24,6 +24,7 @@ ALIGNMENT = 32
 TENSOR_TYPE_MAP = {
     "F32": 0,
     "F16": 1,
+    "BF16": 30,
     "Q4_0": 2,
     "Q4_1": 3,
     "Q5_0": 6,
@@ -144,6 +145,15 @@ class GGUFWriter:
             else:
                 raise ValueError(f"Unsupported tensor type: {st_dtype} ({name})")
 
+        # Storage-precision policy (scripts/utils/precision.py): per-part float type,
+        # LM-part quantization, never wider than the checkpoint.
+        from .precision import get_policy
+        policy = get_policy()
+        if policy is not None:
+            resolved = policy.resolve(name, arr.shape, st_dtype, str(arr.dtype))
+            if resolved is not None:
+                st_dtype = resolved
+
         # Determine storage type
         if st_dtype is None:
             dtype_name = str(arr.dtype)
@@ -166,6 +176,10 @@ class GGUFWriter:
             if st_dtype == "F16" and arr.dtype != np.float16:
                 arr = arr.astype(np.float16)
             data = arr.tobytes(order="C")
+        elif st_dtype == "BF16":
+            bits = np.ascontiguousarray(arr, dtype=np.float32).view(np.uint32)
+            bits = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16          # round to nearest even
+            data = bits.astype(np.uint16).tobytes(order="C")
         elif st_dtype == "I32":
             data = arr.astype(np.int32).tobytes(order="C")
         else:
