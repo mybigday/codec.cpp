@@ -127,6 +127,7 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 ## Conventions / guardrails for changes
 
 - Keep encode/decode numerics stable (unit/regression tests where possible).
+- Precision tiers: the reference is the original model's algorithm and precision, and quality is guaranteed at the usual release precisions (F32/F16/BF16). Q8_0 and lower get the fastest path (native quantized `ggml_mul_mat`, no per-eval dequant) with no quality promise; smokes only check they are not broken. Per-tensor mixed precision lives in each converter's `should_quantize_tensor`.
 - Avoid introducing new CPU-only intermediate buffers; build everything as ggml tensors.
 - When touching graph execution / backend scheduler: be careful with allocation lifetimes (`eval_ctx`, scheduler reset semantics).
 - Prefer small, reviewable commits.

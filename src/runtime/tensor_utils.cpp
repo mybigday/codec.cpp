@@ -197,18 +197,19 @@ ggml_tensor * codec_graph_weight_mat(ggml_context * ctx_eval, const codec_model 
     // time (30% of compute — the matmuls themselves are tiny), see Phase-4
     // profiling.
     //
-    // Block-quantized types (Q8_0, …) are cast to F32 here on purpose.  The
-    // alternative — native quantized mul_mat — re-quantizes the F32 activation
-    // to the block type per matmul, which measurably degrades CFM parity
-    // (Q8 e2e audio corr 0.99979 -> 0.99809, below the parity gate).  Set
-    // CODEC_MAT_NATIVE_QUANT=1 to opt into the faster-but-lossy native path
-    // (~8x on Vulkan for this graph); default keeps parity.  Note an F16 GGUF
-    // on GPU is both faster than cast-Q8 and bit-parity, so Q8 is off the
-    // critical config on UMA hardware.
+    // Block-quantized types (Q8_0, …) feed ggml_mul_mat natively too: quality
+    // is only guaranteed at F32/F16/BF16, a quantized GGUF is there to be fast
+    // and small.  The native path re-quantizes the F32 activation to the block
+    // type per matmul (BlueMagpie Q8 e2e audio corr 0.99979 -> 0.99809, ~8x on
+    // Vulkan for its CFM graph).  CODEC_MAT_NATIVE_QUANT=0 casts them to F32
+    // instead, for comparing against the F16 reference.
     if (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16) {
         return w;
     }
-    static const bool native_quant = std::getenv("CODEC_MAT_NATIVE_QUANT") != nullptr;
+    static const bool native_quant = [] {
+        const char * v = std::getenv("CODEC_MAT_NATIVE_QUANT");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
     if (native_quant && ggml_is_quantized(w->type)) {
         return w;
     }
