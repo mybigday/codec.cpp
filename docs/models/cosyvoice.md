@@ -114,6 +114,7 @@ older GGUFs fall back to the defaults below.
 | `cosyvoice.flow.speed` | 1.0 | speaking rate: the flow mel is linearly resampled to `int(frames / speed)` before HiFT (`token2wav(speed=)`) |
 | `cosyvoice.flow.n_timesteps` | 10 | Euler steps |
 | `cosyvoice.flow.cfg_rate` | 0.7 | classifier-free guidance |
+| `cosyvoice.flow.max_prompt_s` | 0 (whole prompt) | flow prompt kept, in trailing seconds of the speaker's prompt tokens + mel; the LM prompt is unchanged |
 | `codec.lm.cosyvoice.sampling` | `ras` (`topk` for BreezyVoice) | `ras` or `topk` |
 | `codec.lm.cosyvoice.top_k` / `top_p` | 25 / 0.8 | nucleus sampling |
 | `codec.lm.cosyvoice.win_size` / `tau_r` | 10 / 0.1 | RAS repetition window / threshold |
@@ -151,6 +152,22 @@ cutting steps for the same speedup.
 ```bash
 tts-cli synthesize ... --override-kv cosyvoice.flow.n_timesteps=int:6
 ```
+
+The flow also runs over the whole reference prompt: a 15 s clip is ~70% of the
+CFM sequence for a 4 s sentence. `cosyvoice.flow.max_prompt_s` keeps only the
+prompt's trailing seconds (acoustic context next to the target; the x-vector
+and the LM prompt still come from the whole clip). Measured 2026-10-19 on CPU
+(8 threads), `--ref-audio` cloning with the 15 s reference clip, one zh
+sentence: decode time, Whisper CER, CAMPPlus speaker cosine of output vs
+reference clip.
+
+| `max_prompt_s` | 300M decode / spk cos | BreezyVoice | CosyVoice2 | CosyVoice3 | CER |
+|---|---|---|---|---|---|
+| 0 (whole, 15 s) | 8.1 s / 0.857 | 8.3 s / 0.848 | 6.9 s / 0.819 | 9.8 s / 0.875 | 0 |
+| 6 | 6.0 s / 0.843 | 6.6 s / 0.806 | 5.1 s / 0.790 | 8.0 s / 0.869 | 0 |
+| 4 | 5.4 s / 0.829 | 5.4 s / 0.786 | 4.0 s / 0.768 | 6.5 s / 0.881 | 0 |
+| 3 | 4.7 s / 0.797 | 4.9 s / 0.801 | 3.7 s / 0.777 | 5.6 s / 0.865 | 0 |
+| 2 | 4.1 s / 0.810 | 4.7 s / 0.781 | 3.4 s / 0.766 | 5.1 s / 0.868 | 0 |
 
 ## Runtime contract
 

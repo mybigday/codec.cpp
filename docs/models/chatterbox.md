@@ -77,13 +77,24 @@ GGUF metadata, overridable with `--override-kv KEY=TYPE:VALUE`:
 |---|---|---|
 | `chatterbox_s3g.flow.n_timesteps` | 10 (Turbo: 2) | flow steps |
 | `chatterbox_s3g.flow.cfg_rate` | 0.7 (MeanFlow: not used) | flow classifier-free guidance |
+| `chatterbox_s3g.flow.max_prompt_s` | 0 (whole prompt) | flow prompt kept, in trailing seconds of the speaker's prompt tokens + mel |
 | `codec.lm.chatterbox.sampling.temperature` | 0.8 | T3 sampling |
 | `codec.lm.chatterbox.sampling.min_p` / `top_p` / `top_k` | 0.05 / 1.0 / – (Turbo: – / 0.95 / 1000) | T3 sampling |
 | `codec.lm.chatterbox.sampling.repetition_penalty` | 1.2 | T3 sampling |
 | `codec.lm.chatterbox.sampling.cfg_weight` | 0.5 (Turbo: none) | T3 CFG |
 
 Fewer flow steps trade speaker fidelity for speed the same way as CosyVoice's
-flow; see "Faster flow decoding" in [cosyvoice.md](cosyvoice.md).
+flow; see "Faster flow decoding" in [cosyvoice.md](cosyvoice.md). So does a
+shorter flow prompt: measured 2026-10-19 on CPU (8 threads), decode time and
+CAMPPlus speaker cosine against the whole-prompt output, Whisper CER 0
+throughout:
+
+| `max_prompt_s` | Chatterbox (builtin voice) | Turbo `--ref-audio` | KittenTTS 2 |
+|---|---|---|---|
+| 0 (whole) | 5.2 s / 1 | 1.39 s / 1 | 1.46 s / 1 |
+| 4 | 4.2 s / 0.958 | 0.94 s / 0.928 | 1.03 s / 0.963 |
+| 3 | 3.7 s / 0.930 | 0.98 s / 0.926 | 0.91 s / 0.950 |
+| 2 | 3.1 s / 0.957 | 0.81 s / 0.922 | 0.92 s / 0.943 |
 
 ## Runtime contract
 
