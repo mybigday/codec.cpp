@@ -116,9 +116,10 @@ ggml_tensor * codec_op_group_norm(ggml_context * ctx, ggml_tensor * x, int32_t n
     gamma = codec_graph_cast_f32(ctx, gamma);
     beta = codec_graph_cast_f32(ctx, beta);
 
+    // Groups per batch item (x is [t, c] or [t, c, n]).
     const int64_t cpg = x->ne[1] / n_groups;
-    ggml_tensor * x3 = ggml_reshape_3d(ctx, x, x->ne[0], cpg, n_groups);
-    ggml_tensor * y = ggml_reshape_2d(ctx, ggml_group_norm(ctx, x3, n_groups, eps), x->ne[0], x->ne[1]);
+    ggml_tensor * x4 = ggml_reshape_4d(ctx, x, x->ne[0], cpg, n_groups, x->ne[2]);
+    ggml_tensor * y = ggml_reshape_3d(ctx, ggml_group_norm(ctx, x4, n_groups, eps), x->ne[0], x->ne[1], x->ne[2]);
 
     if (gamma != nullptr) {
         ggml_tensor * g2 = ggml_reshape_2d(ctx, gamma, 1, x->ne[1]);
