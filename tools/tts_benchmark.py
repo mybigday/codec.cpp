@@ -84,9 +84,22 @@ def collect_cases() -> list[dict]:
     return [c for c in cases if all(Path(a).exists() for a in c["assets"])]
 
 
-def run_case(c: dict, n_threads: int, gpu: bool, cer: bool, tmp: Path) -> dict:
+def swap_file(args: list[str], swap: str | None, flag: str = "--backbone") -> list[str]:
+    """--backbone-swap / --codec-swap DIR:TAG: use DIR/<model dir>__<stem>-<TAG>.gguf where it exists."""
+    if not swap or flag not in args:
+        return args
+    d, tag = swap.rsplit(":", 1)
+    i = args.index(flag) + 1
+    bb = Path(args[i])
+    alt = Path(d) / f"{bb.parent.name}__{bb.stem}-{tag}.gguf"
+    return args[:i] + [str(alt)] + args[i + 1:] if alt.exists() else args
+
+
+def run_case(c: dict, n_threads: int, gpu: bool, cer: bool, tmp: Path, swap: str | None = None,
+             extra: list[str] | None = None, codec_swap: str | None = None) -> dict:
     out = tmp / f"{c['name']}.wav"
-    cmd = [str(REPO / "build" / "tts-cli"), "synthesize", *c["args"],
+    args = swap_file(swap_file(c["args"], swap), codec_swap, "--model")
+    cmd = [str(REPO / "build" / "tts-cli"), "synthesize", *args, *(extra or []),
            "--output", str(out), "--n-threads", str(n_threads)]
     if gpu:
         cmd.append("--gpu")
@@ -116,7 +129,8 @@ def cmd_run(a) -> int:
         for c in cases:
             # The first run warms the page cache and graph caches of a fresh process alike;
             # keep the faster of --repeat runs (CER from the kept one).
-            runs = [run_case(c, a.n_threads, a.gpu, not a.no_cer, Path(tmp)) for _ in range(a.repeat)]
+            runs = [run_case(c, a.n_threads, a.gpu, not a.no_cer, Path(tmp), a.backbone_swap, a.extra, a.codec_swap)
+                    for _ in range(a.repeat)]
             good = [x for x in runs if x["ok"]]
             r = min(good, key=lambda x: x["synth_ms"]) if good else runs[-1]
             results[c["name"]] = r
@@ -184,6 +198,10 @@ def main() -> int:
     r.add_argument("--only")
     r.add_argument("--no-cer", action="store_true")
     r.add_argument("--repeat", type=int, default=2)
+    r.add_argument("--backbone-swap", metavar="DIR:TAG",
+                   help="run each backbone's DIR/<model dir>__<stem>-<TAG>.gguf variant where present")
+    r.add_argument("--codec-swap", metavar="DIR:TAG", help="same for the codec GGUF")
+    r.add_argument("--extra", nargs="*", default=[], help="extra tts-cli arguments for every case")
     c = sub.add_parser("compare")
     c.add_argument("before")
     c.add_argument("after")
