@@ -1694,29 +1694,29 @@ static bool detect_outetts_version(const llama_model * lmodel,
     return false;
 }
 
+// The paths that sample outside BackboneSampler (codec_lm heads, KittenTTS's
+// HF-order chain) cannot apply a user GBNF; say so instead of dropping it.
+static void warn_grammar_unused(const std::string & grammar, const char * model) {
+    if (!grammar.empty()) {
+        std::fprintf(stderr, "WARN: --grammar is not supported for %s and is ignored\n", model);
+    }
+}
+
 // Resolve the full constraint for a backbone synthesis request.
 // Resolution order (first match wins):
 //   1. Explicit user GBNF grammar.
-//   2. OuteTTS V2/V3 structured backbone → prompt-dependent grammar.
-//   3. Codec-metadata GBNF grammar (MOSS-TTSD tts_auto_grammar).
-//   4. Flat audio-token logit-bias mask for Type A direct-audio models.
+//   2. Codec-metadata GBNF grammar (MOSS-TTSD tts_auto_grammar).
+//   3. Flat audio-token logit-bias mask for Type A direct-audio models.
+// (OuteTTS and NeuTTS return before this through run_token_single_cb.)
 // Returns an empty constraint for models with no constraint (CSM / Chatterbox /
 // Qwen3-TTS / LFM2 / Realtime) — identical behaviour to before this change.
-static tts_constraint resolve_constraint(const llama_model * lmodel,
-                                         const llama_vocab * vocab,
-                                         const audio_lm_prompt_info & pi,
+static tts_constraint resolve_constraint(const audio_lm_prompt_info & pi,
                                          const std::string & user_grammar,
                                          const std::string & text,
                                          int32_t n_vocab) {
     tts_constraint c;
     // 1) explicit user grammar wins.
     if (!user_grammar.empty()) { c.grammar = user_grammar; return c; }
-    // 2) structured backbone family (OuteTTS) → prompt-dependent grammar.
-    codec_common::outetts_version ov;
-    if (detect_outetts_version(lmodel, vocab, &ov)) {
-        c.grammar = codec_common::outetts_build_grammar(ov, text);
-        return c;
-    }
     // 3a) codec-metadata grammar (MOSS-TTSD; unchanged).
     c.grammar = tts_auto_grammar(pi, text);
     if (!c.grammar.empty()) return c;
@@ -2485,10 +2485,16 @@ bool run_kitten_tts2(audio_lm_context * ctx, llama_context * lctx, const llama_v
         for (int32_t step = 0; step < budget; ++step) {
             std::memcpy(logits.data(), llama_get_logits_ith(lctx, -1), (size_t) n_vocab * sizeof(float));
             kitten_apply_penalties(c, seq, prompt.size(), logits.data());
+            // Speech is audio tokens until <speech_end> / [STOP]: mask the rest of
+            // the Qwen3 vocabulary so a quantized backbone cannot drift into text.
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                const bool audio = i >= c.audio_base && i < c.audio_base + c.n_audio;
+                if (!audio && i != c.speech_end && i != c.stop) logits[(size_t) i] = -INFINITY;
+            }
             const llama_token t = (llama_token) chain.sample(logits.data(), n_vocab);
             seq.push_back(t);
             if (t == c.speech_end || t == c.stop) { chunk_stop = "eos"; break; }
-            if (t >= c.audio_base && t < c.audio_base + c.n_audio) codes.push_back(t - c.audio_base);
+            codes.push_back(t - c.audio_base);
             if (!decode_tokens(lctx, {t}, (int32_t) seq.size() - 1, false)) {
                 out->error = "KittenTTS decode step failed";
                 return false;
@@ -2765,6 +2771,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
 
     // ── Chatterbox T3 flow (Flow 4) ───────────────────────────────────
     if (is_chatterbox) {
+        warn_grammar_unused(a.grammar, "Chatterbox");
         std::vector<int32_t> speech_codes;
         int32_t n_frames = 0;
         const char * stop_reason = "max_frames";
@@ -2805,6 +2812,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
 
     // ── CosyVoice ────────────────────────────────────────────────────────
     if (const codec_lm_cosyvoice_info * cvi = lm_handle ? codec_lm_cosyvoice_get_info(lm_handle) : nullptr) {
+        warn_grammar_unused(a.grammar, "CosyVoice");
         std::vector<int32_t> speech_codes;
         int32_t n_frames = 0;
         const char * stop_reason = "max_len";
@@ -2849,6 +2857,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // unpopulated `pi`).
     // KittenTTS 2: codec-only S3G GGUF + Qwen3 speech-LM backbone.
     if (!pi_ok && detect_kitten_tts2(vocab)) {
+        warn_grammar_unused(a.grammar, "KittenTTS");
         const bool ok = run_kitten_tts2(ctx, lctx, vocab, a, out);
         llama_free(lctx); llama_model_free(lmodel); llama_backend_free();
         audio_lm_free(ctx);
@@ -3240,7 +3249,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // Resolve the backbone constraint (grammar or logit-bias mask).
     const int32_t n_vocab_bb = llama_vocab_n_tokens(vocab);
     const tts_constraint constraint =
-        resolve_constraint(lmodel, vocab, pi, a.grammar, a.text, n_vocab_bb);
+        resolve_constraint(pi, a.grammar, a.text, n_vocab_bb);
     if (!constraint.grammar.empty()) {
         std::printf("grammar: %s (%zu bytes)\n",
                     !a.grammar.empty() ? "user-supplied" : "auto (model-derived)",
@@ -3248,6 +3257,13 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     } else if (!constraint.logit_bias.empty()) {
         std::printf("logit-bias: flat audio mask (%zu tokens masked)\n",
                     constraint.logit_bias.size());
+    }
+
+    // Only the cb0-from-backbone codebook AR (MOSS-TTSD) samples the backbone
+    // vocabulary; every other flow here samples a codec_lm head.
+    if (pi.is_continuous || pi.sequential_text_audio || pi.streaming_interleave ||
+        !pi.cb0_from_backbone) {
+        warn_grammar_unused(a.grammar, "this model (it samples a codec_lm head)");
     }
 
     const char * stop_reason = "max_frames";
