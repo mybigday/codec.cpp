@@ -2664,7 +2664,11 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // ── Backbone init ──────────────────────────────────────────────
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    // Without --gpu the backbone stays on the CPU: an empty device list, else llama.cpp
+    // would still offload batched ops to any GPU it finds.
+    static ggml_backend_dev_t no_devices[] = { nullptr };
+    mp.n_gpu_layers = a.use_gpu ? 999 : 0;
+    if (!a.use_gpu) mp.devices = no_devices;
     llama_model * lmodel = llama_model_load_from_file(a.backbone_path.c_str(), mp);
     if (!lmodel) {
         out->error = "llama_model_load_from_file failed: " + a.backbone_path;
@@ -2703,6 +2707,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // flash-attention path does not take.
     if (pi_ok && pi.host_arch == "cosyvoice") cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if (a.n_threads > 0) { cp.n_threads = a.n_threads; cp.n_threads_batch = a.n_threads; }
+    cp.op_offload = a.use_gpu;
     llama_context * lctx = llama_init_from_model(lmodel, cp);
     out->load_ms = ms_since(t0);
     if (!lctx) {

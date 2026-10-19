@@ -12,9 +12,10 @@
 # codec (→ shared ggml 0.9) + libttsbackbone.so (self-contained ggml 0.15),
 # and the two ggml instances never see each other's symbols.
 #
-# CPU-only; the backbone is a small semantic LM, GPU offload is not needed
-# for the reference host.  Set -DCODEC_TTS_BACKBONE=OFF to skip (tts-cli
-# then builds without `synthesize`, which #ifdef's out).
+# The backbone gets the Vulkan backend when codec.cpp does (GGML_VULKAN=ON),
+# so `tts-cli synthesize --gpu` offloads both, as a llama.cpp host would.
+# Set -DCODEC_TTS_BACKBONE=OFF to skip (tts-cli then builds without
+# `synthesize`, which #ifdef's out).
 
 include(ExternalProject)
 
@@ -48,6 +49,15 @@ set(_ll_archives
     "${_ll_ggmldir}/libggml-cpu.a"
     "${_ll_ggmldir}/libggml-base.a")
 
+set(_ll_vulkan OFF)
+set(_ll_link_extra "")
+if(GGML_VULKAN)
+    find_package(Vulkan REQUIRED)
+    set(_ll_vulkan ON)
+    list(INSERT _ll_archives 5 "${_ll_ggmldir}/ggml-vulkan/libggml-vulkan.a")
+    list(APPEND _ll_link_extra ${Vulkan_LIBRARY})
+endif()
+
 ExternalProject_Add(llama_static
     SOURCE_DIR      "${_ll_dir}"
     PREFIX          "${_ll_prefix}"
@@ -65,7 +75,7 @@ ExternalProject_Add(llama_static
         -DLLAMA_CURL=OFF
         -DLLAMA_OPENSSL=OFF
         -DGGML_NATIVE=ON
-        -DGGML_VULKAN=OFF
+        -DGGML_VULKAN=${_ll_vulkan}
         -DGGML_BACKEND_DL=OFF
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-common --config Release
     BUILD_BYPRODUCTS ${_ll_archives}
@@ -92,7 +102,7 @@ add_custom_command(
     COMMAND ${CMAKE_CXX_COMPILER} -shared -fPIC -o "${TTS_BACKBONE_SO}"
             -Wl,--whole-archive ${_ll_archives} -Wl,--no-whole-archive
             -Wl,--version-script=${_ll_vscript}
-            -lpthread -lm -ldl -lgomp
+            ${_ll_link_extra} -lpthread -lm -ldl -lgomp
     DEPENDS llama_static ${_ll_archives} "${_ll_vscript}"
     COMMENT "Linking isolated llama backbone → libttsbackbone.so (ggml_* hidden)"
     VERBATIM)
