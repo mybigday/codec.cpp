@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -129,7 +130,8 @@ def cmd_run(a) -> int:
         for c in cases:
             # The first run warms the page cache and graph caches of a fresh process alike;
             # keep the faster of --repeat runs (CER from the kept one).
-            runs = [run_case(c, a.n_threads, a.gpu, not a.no_cer, Path(tmp), a.backbone_swap, a.extra, a.codec_swap)
+            runs = [run_case(c, a.n_threads, a.gpu, not a.no_cer, Path(tmp), a.backbone_swap, shlex.split(a.extra),
+                             a.codec_swap)
                     for _ in range(a.repeat)]
             good = [x for x in runs if x["ok"]]
             r = min(good, key=lambda x: x["synth_ms"]) if good else runs[-1]
@@ -201,7 +203,7 @@ def main() -> int:
     r.add_argument("--backbone-swap", metavar="DIR:TAG",
                    help="run each backbone's DIR/<model dir>__<stem>-<TAG>.gguf variant where present")
     r.add_argument("--codec-swap", metavar="DIR:TAG", help="same for the codec GGUF")
-    r.add_argument("--extra", nargs="*", default=[], help="extra tts-cli arguments for every case")
+    r.add_argument("--extra", default="", help="extra tts-cli arguments for every case (one shell-quoted string)")
     c = sub.add_parser("compare")
     c.add_argument("before")
     c.add_argument("after")
