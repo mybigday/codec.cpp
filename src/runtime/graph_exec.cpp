@@ -5,6 +5,11 @@
 #include <ggml-alloc.h>
 #include <ggml.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -13,6 +18,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -213,6 +219,37 @@ static const codec_cpu_threadpool_fns & codec_cpu_threadpool_api() {
     return fns;
 }
 
+// The pool's workers inherit the CPU affinity of the thread that creates them,
+// and they live as long as the model. A caller whose mask fits the pool (an
+// embedder keeping compute on its big cores) passes it on unchanged; one pinned
+// narrower than the pool (e.g. by a strict llama.cpp threadpool) would leave
+// every worker sharing those cores, so on Linux / Android the pool is then
+// created from a fresh thread widened to every CPU. The caller's own mask is
+// never touched.
+static ggml_threadpool_t codec_make_unpinned_threadpool(const codec_cpu_threadpool_fns & api,
+                                                        struct ggml_threadpool_params tpp) {
+#if defined(__linux__)
+    cpu_set_t caller;
+    CPU_ZERO(&caller);
+    if (sched_getaffinity(0, sizeof(caller), &caller) != 0 || CPU_COUNT(&caller) >= tpp.n_threads) {
+        return api.make(&tpp);
+    }
+    ggml_threadpool_t tp = nullptr;
+    std::thread maker([&] {
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        const long n_cpu = sysconf(_SC_NPROCESSORS_CONF);
+        for (long i = 0; i < n_cpu && i < CPU_SETSIZE; ++i) CPU_SET((int) i, &all);
+        sched_setaffinity(0, sizeof(all), &all);   // best effort: the cpuset may cap it
+        tp = api.make(&tpp);
+    });
+    maker.join();
+    return tp;
+#else
+    return api.make(&tpp);
+#endif
+}
+
 // Attach the model's persistent CPU threadpool (grown to n_threads) to the
 // context's CPU backends.
 static void codec_attach_cpu_threadpool(codec_context * ctx, int32_t n_threads) {
@@ -222,8 +259,7 @@ static void codec_attach_cpu_threadpool(codec_context * ctx, int32_t n_threads) 
         return;
     }
     if (model->cpu_threadpool == nullptr || model->cpu_threadpool_n < n_threads) {
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-        ggml_threadpool_t tp = api.make(&tpp);
+        ggml_threadpool_t tp = codec_make_unpinned_threadpool(api, ggml_threadpool_params_default(n_threads));
         if (tp == nullptr) {
             return;
         }
