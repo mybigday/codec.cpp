@@ -1003,6 +1003,8 @@ bool run_codebook_ar(audio_lm_context * ctx, llama_context * lctx,
 //     configured by the CALLER via audio_lm_set_audio_token_ranges BEFORE this
 //     call, so free-gen mode MUST NOT touch audio_lm_set_audio_token_range
 //     (singular) — doing so would clobber the multi-cb range.
+//     `grammar` (GBNF, may be empty) constrains that stream instead: OuteTTS
+//     passes the prompt-derived word-block grammar (outetts_build_grammar).
 bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
                          const llama_model * lmodel, const llama_vocab * vocab,
                          const audio_lm_prompt_info & /*pi*/,
@@ -1011,7 +1013,7 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
                          int32_t max_frames, int32_t min_frames, uint32_t seed,
                          float temp, float top_p, int32_t top_k,
                          bool constrain_audio_mask, float rep_penalty,
-                         int32_t rep_last_n,
+                         int32_t rep_last_n, const std::string & grammar,
                          int32_t * out_frames, const char ** out_stop) {
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
@@ -1038,12 +1040,11 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
         }
     }
 
-    // 3) Backbone sampler with the mask attached (no grammar for Type A).
+    // 3) Backbone sampler with the mask (or the grammar) attached.
     BackboneSampler bbsmpl;
     std::string berr;
     if (!bbsmpl.build(lmodel, seed, temp, top_k, top_p, /*min_p=*/0.0f,
-                      rep_penalty, rep_last_n,
-                      /*grammar=*/std::string(), mask, &berr)) {
+                      rep_penalty, rep_last_n, grammar, mask, &berr)) {
         std::fprintf(stderr, "run_token_single_cb: sampler init failed: %s\n", berr.c_str());
         *out_stop = "grammar_error";
         return false;
@@ -1105,8 +1106,12 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
     }
     n_past += (int32_t) prompt_toks.size();
 
-    // 5) AR loop — sample → observe → feed back.
-    for (int32_t step = 0; step < max_frames; ++step) {
+    // 5) AR loop — sample → observe → feed back, until eos, `max_frames`
+    //    complete frames, or a full context (OuteTTS spends several tokens
+    //    per frame, so the step count is not the frame count).
+    const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
+    while (*out_frames < max_frames) {
+        if (n_past >= n_ctx) { *out_stop = "n_ctx"; break; }
         // Always draw from the primary sampler first so its RNG stream advances
         // every step (see the RNG-desync note above).  Under min_frames, if the
         // primary picked eos, substitute a single eos-forbidden guard draw — the
@@ -2695,11 +2700,30 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
         : a.has_cfg_weight ? a.cfg_weight : (cbx->cfg_weight >= 0.0f ? cbx->cfg_weight : 0.5f);
     const int32_t cbx_n_seq = (is_chatterbox && cbx_cfg > 0.0f) ? 2 : 1;
 
+    // OuteTTS is ALSO a codec-only backbone (get_prompt_info fails, pi_ok=false)
+    // that drives a 24kHz 2-codebook DAC purely via token ids.  Detect it here
+    // (V3 only for this path) so the deferred-pi abort below skips it too.
+    // (Chatterbox T3's backbone has no vocab at all.)
+    codec_common::outetts_version ov{};
+    const llama_vocab * bb_vocab = llama_model_get_vocab(lmodel);
+    const bool is_outetts =
+        llama_vocab_type(bb_vocab) != LLAMA_VOCAB_TYPE_NONE &&
+        detect_outetts_version(lmodel, bb_vocab, &ov) &&
+        ov == codec_common::outetts_version::V3;
+
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : 512;
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx        = (uint32_t) std::max(4096, max_frames + 512);
     cp.n_batch      = cp.n_ctx;
     cp.n_ubatch     = cp.n_ctx;
+    if (is_outetts) {
+        // An OuteTTS frame is a c1/c2 pair plus its share of the word-block
+        // tokens (~2.4 tokens), after a ~1.8k-token speaker prompt.  Without
+        // --max-frames the budget is the reference's max_length = 8192 tokens.
+        cp.n_ctx    = a.max_frames > 0 ? (uint32_t) std::max(4096, 2048 + 3 * a.max_frames) : 8192u;
+        cp.n_batch  = cp.n_ctx;
+        cp.n_ubatch = 4096;
+    }
     cp.n_seq_max    = (uint32_t) cbx_n_seq;
     cp.embeddings   = true;
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -2818,14 +2842,6 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     std::vector<llama_token> neutts_prompt_toks;
     const bool is_neutts = detect_neutts(vocab);
 
-    // OuteTTS is ALSO a codec-only backbone (get_prompt_info fails, pi_ok=false)
-    // that drives a 24kHz 2-codebook DAC purely via token ids.  Detect it here
-    // (V3 only for this path) so the deferred-pi abort below skips it too.
-    codec_common::outetts_version ov{};
-    const bool is_outetts =
-        detect_outetts_version(lmodel, vocab, &ov) &&
-        ov == codec_common::outetts_version::V3;
-
     // If get_prompt_info was deferred (codec-only gguf) but this is NEITHER a
     // NeuTTS nor an OuteTTS backbone, the model genuinely lacks a usable
     // codec_lm — abort now with the original deferred error rather than fall
@@ -2853,7 +2869,9 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // generation (no flat audio mask — that would forbid the structural tokens)
     // + a 64-token repetition window (mandated by the OuteTTS README), then let
     // the multi-cb observe accumulator strip the non-audio tokens and pack the
-    // c1/c2 pairs into the (T, n_q=2) frame layout for DAC decode.  Grammar OFF.
+    // c1/c2 pairs into the (T, n_q=2) frame layout for DAC decode.  The prompt-
+    // derived word-block grammar (as llama.rn's rn-tts) keeps the stream well
+    // formed: only the input's words, complete feature headers, c1/c2 pairs.
     // Self-contained: frees all resources on every early-return and returns.
     if (is_outetts) {
         // 1) Load the bundled default V3 speaker.  Resolve the asset relative to
@@ -2934,6 +2952,11 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
         const uint32_t ot_seed    = a.seed ? a.seed : 0xC0DEC1ABu;
         const float    ot_rep_pen = a.has_rep_penalty ? a.repetition_penalty : 1.1f;
         const int32_t  ot_rep_n   = 64;
+        const std::string ot_grammar = !a.grammar.empty()
+            ? a.grammar
+            : codec_common::outetts_build_grammar(codec_common::outetts_version::V3, a.text);
+        std::printf("[outetts] grammar: %s (%zu bytes)\n",
+                    !a.grammar.empty() ? "user-supplied" : "auto (prompt-derived)", ot_grammar.size());
 
         // 5) Free-gen multi-cb decode.  constrain_audio_mask=false ⇒ empty mask
         //    (structural tokens pass), no min-length guard, and NO singular
@@ -2942,11 +2965,12 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
         int32_t n_frames = 0;
         const char * stop_reason = "max_frames";
         bool ok = run_token_single_cb(ctx, lctx, lmodel, vocab, pi, outetts_prompt_toks,
-                                      off2[0], cnt2[0], eos_id, max_frames,
+                                      off2[0], cnt2[0], eos_id,
+                                      a.max_frames > 0 ? a.max_frames : INT32_MAX,
                                       /*min_frames=*/0, ot_seed,
                                       ot_temp, ot_top_p, ot_top_k,
                                       /*constrain_audio_mask=*/false,
-                                      ot_rep_pen, ot_rep_n,
+                                      ot_rep_pen, ot_rep_n, ot_grammar,
                                       &n_frames, &stop_reason);
         llama_free(lctx);
         llama_model_free(lmodel);
@@ -3108,7 +3132,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
                                       off, count, eos_id, max_frames, nt_min_frames, nt_seed,
                                       nt_temp, nt_top_p, nt_top_k,
                                       /*constrain_audio_mask=*/true,
-                                      /*rep_penalty=*/1.0f, /*rep_last_n=*/0,
+                                      /*rep_penalty=*/1.0f, /*rep_last_n=*/0, a.grammar,
                                       &n_frames, &stop_reason);
         llama_free(lctx);
         llama_model_free(lmodel);
