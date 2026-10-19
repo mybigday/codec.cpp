@@ -4,11 +4,15 @@
 //   step    --model <gguf> --hidden <h.npy> --logits-prefix <pfx>
 //                                            [--codes-out <c.npy>]
 //   compose --model <gguf> --codes <c.npy> --embd-out <e.npy>
+//   bench   --model <gguf> [--frames N] [--threads N] [--use-gpu]
 //
 // `step` runs codec_lm_step_begin on the given hidden state, copies each
 // codebook's logits out as <pfx>_<i>.npy, and (optionally) greedy-samples
 // to produce a codes_out.npy.  `compose` runs codec_lm_compose_audio_embd
 // on a code vector and writes the resulting hidden_dim float buffer.
+//
+// `bench` times whole step_begin .. step_finish frames (greedy) on a fixed
+// pseudo-random hidden state, for per-frame depth-decoder cost on a device.
 //
 // The Python parity test (tests/e2e/moss_ttsd_lm_smoke.py) drives both
 // against the HF reference and asserts max-abs / corr thresholds.
@@ -17,6 +21,7 @@
 #include "codec_lm.h"
 #include "utils/npy_io.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,8 +32,9 @@ static int usage(const char * me) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s step    --model <gguf> --hidden <h.npy> --logits-prefix <pfx> [--codes-out <c.npy>]\n"
-        "  %s compose --model <gguf> --codes <c.npy> --embd-out <e.npy>\n",
-        me, me);
+        "  %s compose --model <gguf> --codes <c.npy> --embd-out <e.npy>\n"
+        "  %s bench   --model <gguf> [--frames N] [--threads N] [--use-gpu]\n",
+        me, me, me);
     return 2;
 }
 
@@ -207,9 +213,58 @@ static int cmd_compose(int argc, char ** argv) {
     return 0;
 }
 
+static int cmd_bench(int argc, char ** argv) {
+    const char * model_path = nullptr;
+    int32_t frames = 20;
+    codec_model_params mp = codec_model_default_params();
+    for (int i = 2; i < argc; ++i) {
+        if      (std::strcmp(argv[i], "--model")   == 0) model_path = arg_value(argc, argv, &i);
+        else if (std::strcmp(argv[i], "--frames")  == 0) frames = std::atoi(arg_value(argc, argv, &i));
+        else if (std::strcmp(argv[i], "--threads") == 0) mp.n_threads = std::atoi(arg_value(argc, argv, &i));
+        else if (std::strcmp(argv[i], "--use-gpu") == 0) mp.use_gpu = true;
+        else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
+    }
+    if (!model_path || frames <= 0) return usage(argv[0]);
+    codec_model * codec = codec_model_load_from_file(model_path, mp);
+    if (!codec) { std::fprintf(stderr, "codec_model_load_from_file failed\n"); return 4; }
+    codec_lm * lm = codec_lm_create(codec);
+    codec_lm_state * st = lm ? codec_lm_state_new(lm) : nullptr;
+    if (!st) { std::fprintf(stderr, "codec_lm_create / state_new failed\n"); return 5; }
+    const codec_lm_info * info = codec_lm_get_info(lm);
+    std::vector<float> h((size_t) info->hidden_dim);
+    uint32_t seed = 1;
+    for (float & v : h) { seed = seed * 1664525u + 1013904223u; v = ((float) (seed >> 8) / 16777216.0f - 0.5f) * 2.0f; }
+    std::vector<int32_t> out((size_t) info->n_codebook);
+    double total_ms = 0.0;
+    for (int32_t f = 0; f <= frames; ++f) {   // frame 0 warms the graphs up
+        const auto t0 = std::chrono::steady_clock::now();
+        if (codec_lm_step_begin(st, h.data()) != CODEC_STATUS_SUCCESS) {
+            std::fprintf(stderr, "step_begin: %s\n", codec_lm_state_get_last_error(st)); return 8;
+        }
+        while (codec_lm_step_pending(st)) {
+            int32_t cb = -1, n = 0;
+            const float * lg = codec_lm_step_logits(st, &cb, &n);
+            if (!lg || n <= 0) { std::fprintf(stderr, "step_logits: %s\n", codec_lm_state_get_last_error(st)); return 9; }
+            int32_t best = 0;
+            for (int32_t i = 1; i < n; ++i) if (lg[i] > lg[best]) best = i;
+            codec_lm_step_push_code(st, best);
+        }
+        codec_lm_step_finish(st, out.data());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (f > 0) total_ms += ms;
+    }
+    std::printf("bench: %d codebooks, %.2f ms/frame over %d frames (threads %d, %s)\n", info->n_codebook,
+                total_ms / frames, frames, mp.n_threads, mp.use_gpu ? "gpu" : "cpu");
+    codec_lm_state_free(st);
+    codec_lm_free(lm);
+    codec_model_free(codec);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) return usage(argv[0]);
     if (std::strcmp(argv[1], "step")    == 0) return cmd_step(argc, argv);
+    if (std::strcmp(argv[1], "bench")   == 0) return cmd_bench(argc, argv);
     if (std::strcmp(argv[1], "compose") == 0) return cmd_compose(argc, argv);
     return usage(argv[0]);
 }
