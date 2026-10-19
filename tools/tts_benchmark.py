@@ -141,14 +141,25 @@ def cmd_compare(a) -> int:
     # frame, decode and synth per audio second.
     print(f"{'case':28s} {'synth/s before':>14s} {'after':>8s} {'x':>6s}  {'gen/fr x':>8s} {'dec/s x':>8s}  CER")
     bad = []
+
+    def norm(r):
+        # Results from before the speaker / frames columns existed.
+        r = dict(r)
+        r.setdefault("synth_ms", r["generate_ms"] + r["decode_ms"])
+        r.setdefault("frames", 0)
+        return r
+
     for name, b in before.items():
         f = after.get(name)
-        if not (b.get("ok") and f and f.get("ok")):
+        if f is None:
+            continue  # not in this run (--only)
+        if not (b.get("ok") and f.get("ok")):
             if b.get("ok"):
                 bad.append(f"{name}: failed after")
             continue
+        b, f = norm(b), norm(f)
         per_s = lambda r, k: r[k] / max(r["audio_s"], 1e-3)  # noqa: E731
-        per_fr = lambda r, k: r[k] / max(r["frames"], 1)  # noqa: E731
+        per_fr = lambda r, k: r[k] / (r["frames"] if r["frames"] > 0 else max(r["audio_s"], 1e-3))  # noqa: E731
         sx = lambda x, y: x / y if y > 0 else float("inf")  # noqa: E731
         cb, ca = b.get("cer"), f.get("cer")
         if cb is not None and ca is not None and ca > cb + CER_SLACK:
