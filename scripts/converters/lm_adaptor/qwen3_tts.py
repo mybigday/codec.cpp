@@ -142,6 +142,9 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     if "codec_eos_token_id" in tk_cfg:
         writer.add_int32 ("codec.lm.eos_code_c0", int(tk_cfg["codec_eos_token_id"]))
         writer.add_int32 ("codec.lm.eos_min_step", 0)
+    # The talker's suppress_tokens: the control tags in [vocab - 1024, vocab)
+    # other than eos are never sampled (modeling_qwen3_tts.py generate()).
+    writer.add_int32("codec.lm.cb0_suppress_from", talker_vocab - 1024)
     if "codec_bos_id" in tk_cfg:
         writer.add_int32 ("codec.lm.bos_code_c0", int(tk_cfg["codec_bos_id"]))
     if "codec_pad_id" in tk_cfg:
