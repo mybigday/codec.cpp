@@ -189,6 +189,65 @@ static void codec_backend_set_n_threads(ggml_backend_t backend, int32_t n_thread
     }
 }
 
+// The CPU registry's threadpool entry points (resolved once; null without a CPU backend).
+struct codec_cpu_threadpool_fns {
+    ggml_threadpool_t (*make)(struct ggml_threadpool_params *) = nullptr;
+    void (*destroy)(ggml_threadpool_t) = nullptr;
+    void (*attach)(ggml_backend_t, ggml_threadpool_t) = nullptr;
+};
+
+static const codec_cpu_threadpool_fns & codec_cpu_threadpool_api() {
+    static const codec_cpu_threadpool_fns fns = [] {
+        codec_cpu_threadpool_fns f;
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg != nullptr) {
+            f.make = reinterpret_cast<decltype(f.make)>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+            f.destroy = reinterpret_cast<decltype(f.destroy)>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+            f.attach = reinterpret_cast<decltype(f.attach)>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool"));
+        }
+        if (f.make == nullptr || f.destroy == nullptr || f.attach == nullptr) f = codec_cpu_threadpool_fns{};
+        return f;
+    }();
+    return fns;
+}
+
+// Attach the model's persistent CPU threadpool (grown to n_threads) to the
+// context's CPU backends.
+static void codec_attach_cpu_threadpool(codec_context * ctx, int32_t n_threads) {
+    const codec_cpu_threadpool_fns & api = codec_cpu_threadpool_api();
+    codec_model * model = ctx->model;
+    if (api.make == nullptr || model == nullptr || n_threads <= 1) {
+        return;
+    }
+    if (model->cpu_threadpool == nullptr || model->cpu_threadpool_n < n_threads) {
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+        ggml_threadpool_t tp = api.make(&tpp);
+        if (tp == nullptr) {
+            return;
+        }
+        if (model->cpu_threadpool != nullptr) {
+            api.destroy(model->cpu_threadpool);   // contexts re-attach before their next compute
+        }
+        model->cpu_threadpool = tp;
+        model->cpu_threadpool_n = n_threads;
+    }
+    for (ggml_backend_t b : {ctx->backend, ctx->cpu_backend}) {
+        if (codec_backend_is_cpu(b)) {
+            api.attach(b, model->cpu_threadpool);
+        }
+    }
+}
+
+void codec_model_free_cpu_threadpool(codec_model * model) {
+    if (model != nullptr && model->cpu_threadpool != nullptr) {
+        codec_cpu_threadpool_api().destroy(model->cpu_threadpool);
+        model->cpu_threadpool = nullptr;
+        model->cpu_threadpool_n = 0;
+    }
+}
+
 static bool codec_sched_ensure_capacity(codec_context * ctx, int32_t required, std::string * error) {
     if (ctx == nullptr || ctx->backend == nullptr) {
         if (error != nullptr) {
@@ -394,6 +453,7 @@ bool codec_graph_compute(
     if (ctx->cpu_backend != nullptr) {
         codec_backend_set_n_threads(ctx->cpu_backend, n_threads);
     }
+    codec_attach_cpu_threadpool(ctx, n_threads);
 
     if (!codec_graph_prepare_io(ctx, entry, error)) {
         return false;
