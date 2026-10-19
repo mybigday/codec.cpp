@@ -470,6 +470,9 @@ int write_result_wav(const args & a, const codec_common::tts_runner_result & r) 
     const double secs = (double) nsamp / (double) (r.sample_rate > 0 ? r.sample_rate : 1);
     std::printf("wrote %s: %d samples @ %d Hz (%.2fs, %d ch)\n",
                 a.output.c_str(), nsamp, r.sample_rate, secs, nch);
+    std::printf("timing: load %.0f ms, speaker %.0f ms, generate %.0f ms, decode %.0f ms, total %.0f ms, frames %d\n",
+                r.load_ms - r.speaker_ms, r.speaker_ms, r.total_ms - r.load_ms - r.decode_ms, r.decode_ms,
+                r.total_ms, r.n_frames);
     return 0;
 }
 
