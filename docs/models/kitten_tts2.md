@@ -26,6 +26,22 @@ cannot be loaded. Every 128-wide group is {-s, 0, +s}, so Q4_0 (d = s,
 q = 8 ± 1) stores the weights exactly; `ternary_q4_0.py` refuses any tensor that
 is not. `llama-quantize` Q4_0 is lossy here (d = max/-8 cannot hit -s).
 
+## Vulkan backbone
+
+On a Vulkan llama.cpp backbone (`tts-cli synthesize --gpu`, verified on RADV),
+the default single-token path quantizes activations to Q8_1, whose per-block
+`sum * d` is stored as fp16. This model's activations overflow it, the logits
+turn NaN after the first decoded token, and generation emits one frame.
+Disable that path with `GGML_VK_DISABLE_MMVQ=1` (or
+`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`); prefill is unaffected. With it, the
+`--gpu` synthesis matches CPU (Whisper CER 0, generation 1.0 s vs 2.1 s on
+CPU for 3.5 s of audio).
+
+```bash
+GGML_VK_DISABLE_MMVQ=1 tts-cli synthesize --gpu --model kitten_tts2.gguf \
+    --backbone kitten_tts2_backbone-q4_0.gguf --voice bruno --text "..." --output out.wav
+```
+
 ## Runtime contract (`common/tts_runner.cpp::run_kitten_tts2`)
 
 Detected from the backbone vocab (`<|a_0|>`, `<final_seg>`, `[START]`);
