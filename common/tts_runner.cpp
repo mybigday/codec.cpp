@@ -2735,10 +2735,12 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
         if (rc != 0) { out->error = "prompt decode failed"; return false; }
         n_past += n_rows;
     }
+    std::vector<float> prompt_hidden;   // needs_prompt_hidden: every prompt position
     for (int32_t i = 0; n_seq == 1 && i < c.n_chunks; ++i) {
         const codec_audio_lm_chunk & ch = c.chunks[i];
         if (ch.type == CODEC_AUDIO_LM_CHUNK_EMBD) {
             if (ch.n <= 0) continue;
+            if (c.needs_prompt_hidden) { out->error = "prompt hidden states over embedding chunks are not supported"; return false; }
             if (!decode_embed_block(lctx, ch.embd, c.n_embd, ch.n, n_past)) { out->error = "prompt decode failed"; return false; }
             n_past += ch.n;
             continue;
@@ -2753,8 +2755,17 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
             return false;
         }
         if (sp.penalize_prompt) for (llama_token t : toks) common_sampler_accept(smpl.smpl, t, /*is_generated=*/false);
-        if (!decode_tokens(lctx, toks, n_past, /*all_pos=*/false)) { out->error = "prompt decode failed"; return false; }
+        if (!decode_tokens(lctx, toks, n_past, /*all_pos=*/c.needs_prompt_hidden)) { out->error = "prompt decode failed"; return false; }
+        for (int32_t k = 0; c.needs_prompt_hidden && k < (int32_t) toks.size(); ++k) {
+            const float * hk = llama_get_embeddings_ith(lctx, k);
+            if (hk == nullptr) { out->error = "backbone returned no prompt hidden state"; return false; }
+            prompt_hidden.insert(prompt_hidden.end(), hk, hk + c.n_embd);
+        }
         n_past += (int32_t) toks.size();
+    }
+    if (c.needs_prompt_hidden &&
+        !codec_audio_lm_prefill(alm, prompt_hidden.data(), (int32_t) (prompt_hidden.size() / (size_t) c.n_embd))) {
+        return fail("prefill");
     }
 
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : c.max_frames;

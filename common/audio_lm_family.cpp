@@ -198,7 +198,8 @@ static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::stri
         if (codec_lm_cosyvoice_get_info(lm) != nullptr) return alm_family_cosyvoice(alm, lm);
         audio_lm_prompt_info pi;
         if (codec_lm_chatterbox_get_info(lm) == nullptr && codec_lm_cosyvoice_get_info(lm) == nullptr &&
-            audio_lm_get_prompt_info(alm, &pi) && !pi.is_continuous) {
+            audio_lm_get_prompt_info(alm, &pi)) {
+            if (pi.is_continuous)         return alm_family_continuous(alm);
             if (pi.streaming_interleave)  return alm_family_realtime(alm);
             if (pi.sequential_text_audio) return alm_family_lfm2(alm);
             if (pi.host_arch == "llama" && pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
