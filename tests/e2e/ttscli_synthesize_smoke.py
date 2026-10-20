@@ -98,8 +98,11 @@ def _try_cer(wav, ref, lang):
 
 def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
           require_stop=True, cer_report_only=False, dur_max=30.0,
-          audio_report_only=False, greedy=True, stop_line="AR loop done"):
+          audio_report_only=False, greedy=True, stop_line="AR loop done", cer_ref=None):
     """Drive one synthesize case.
+
+    cer_ref               → reference transcript for the CER when `text` is
+                            not plain text (NeuTTS phonemes).
 
     require_stop=False    → stop-reason is reported, not asserted (models
                             that don't reliably hit EOS free-running).
@@ -145,7 +148,7 @@ def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
             print(f"[WARN] {name}: near-silent (rms={rms:.4f})")
         else:
             print(f"[FAIL] {name}: silent (rms={rms:.4f})"); ok = False
-    cer_res = _try_cer(out, text, lang)
+    cer_res = _try_cer(out, cer_ref or text, lang)
     cer_str = ""
     if cer_res is not None:
         asr, cer = cer_res
@@ -399,347 +402,54 @@ def main():
         stop_line="AR done",
     ))
 
-    # ── NeuTTS-nano (enforced CER) ────────────────────────────────────────────
-    # NeuTTS uses phoneme-mode input: both --text and --ref-text must be
-    # pre-phonemized before being passed to tts-cli (espeak is OFF by default
-    # so the binary passes them verbatim to the runner).
-    #
-    # The model is a single-codebook AR (KIND_TOKEN_SINGLE_CB); it uses the
-    # distill_neucodec GGUF for decode (distill shares the FSQ code space and
-    # the decoder with base, so decoded audio is correct even though the
-    # backbone was trained against the base encoder).
-    #
-    # Pinned seed=1 is deterministic; nano is seed-fragile (~2/6 seeds collapse
-    # to near-silence) so we pin a known-good seed (see NeuTTS status in
-    # CLAUDE.md).  CER threshold 0.30 gives headroom over the measured 0.147
-    # (residual is a Whisper tail-hallucination, not a synthesis error).
-    _neutts_nano_codec   = REPO / "models" / "distill_neucodec" / "distill_neucodec.gguf"
-    _neutts_nano_bb      = REPO / "models" / "hf" / "neutts_nano" / "neutts-nano-q8_0.gguf"
-    _neutts_nano_refwav  = REPO / "assets" / "refs" / "jfk_en.wav"
-    _neutts_nano_reftxt  = REPO / "assets" / "refs" / "jfk_en.txt"
+    # ── NeuTTS (phoneme input; voices baked into the distill NeuCodec GGUF) ───
+    # Input is phonemized here as upstream neutts does (espeak en-us).  The
+    # codec GGUF carries upstream's samples/ voices (scripts/bake-speakers.py,
+    # docs/models/neutts.md); the _ref case derives the voice from audio with
+    # the distill encoder.  Seed 1 is pinned (nano is seed-fragile).
+    _neutts_codec = REPO / "models" / "output" / "neutts" / "neutts-codec-F16.gguf"
+    _sentence = "The birch canoe slid on the smooth planks."
+    try:
+        from phonemizer.backend import EspeakBackend
+        _g2p = EspeakBackend(language="en-us", preserve_punctuation=True, with_stress=True,
+                             words_mismatch="ignore", language_switch="remove-flags")
+        _phones = lambda t: " ".join(_g2p.phonemize([t])[0].split())
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] neutts: phonemizer unavailable ({e})")
+        _phones = None
+    if _phones is not None:
+        _nt_extra = ["--temp", "1.0", "--top-k", "50", "--seed", "1", "--max-frames", "400"]
+        for name, bb, voice, cer_max in (
+                ("neutts_nano", "neutts_nano/neutts-nano-q8_0.gguf", "jo", 0.30),
+                ("neutts_air", "neutts_air/neutts-air-q8_0.gguf", "dave", 0.15)):
+            results.append(_case(name, _neutts_codec, REPO / "models" / "hf" / bb, _phones(_sentence), "en",
+                                 want_stop="eos", cer_max=cer_max, extra=_nt_extra + ["--voice", voice],
+                                 greedy=False, stop_line="NeuTTS AR done", cer_ref=_sentence))
+        _ref_txt = REPO / "assets" / "refs" / "jfk_en.txt"
+        if _ref_txt.exists():
+            results.append(_case(
+                "neutts_air_ref", _neutts_codec, REPO / "models" / "hf" / "neutts_air" / "neutts-air-q8_0.gguf",
+                _phones(_sentence), "en", want_stop="eos", cer_max=0.15,
+                extra=_nt_extra + ["--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav"),
+                                   "--ref-text", _phones(_ref_txt.read_text().strip())],
+                greedy=False, stop_line="NeuTTS AR done", cer_ref=_sentence))
 
-    _neutts_assets_ok = (
-        _neutts_nano_codec.exists()
-        and _neutts_nano_bb.exists()
-        and _neutts_nano_refwav.exists()
-        and _neutts_nano_reftxt.exists()
-    )
-
-    if not _neutts_assets_ok:
-        missing = [p for p in [_neutts_nano_codec, _neutts_nano_bb,
-                                _neutts_nano_refwav, _neutts_nano_reftxt]
-                   if not p.exists()]
-        print(f"[skip] neutts_nano: missing assets ({', '.join(p.name for p in missing)})")
-        results.append(None)
-    else:
-        _neutts_phon_ok = False
-        try:
-            from phonemizer.backend import EspeakBackend as _EspeakBackend
-            _neutts_phon_ok = True
-        except Exception as _e:
-            print(f"[skip] neutts_nano: phonemizer unavailable ({_e})")
-            results.append(None)
-
-        if _neutts_phon_ok:
-            _g2p = _EspeakBackend(
-                language="en-us",
-                preserve_punctuation=True,
-                with_stress=True,
-                words_mismatch="ignore",
-                language_switch="remove-flags",
-            )
-
-            def _to_phones(text):
-                return " ".join(_g2p.phonemize([text])[0].split())
-
-            _original_text = "The birch canoe slid on the smooth planks."
-            _ref_raw        = _neutts_nano_reftxt.read_text().strip()
-            _phon_text      = _to_phones(_original_text)
-            _phon_ref       = _to_phones(_ref_raw)
-
-            print(f"[info] neutts_nano: original_text = {_original_text!r}")
-            print(f"[info] neutts_nano: phon_text     = {_phon_text!r}")
-            print(f"[info] neutts_nano: phon_ref      = {_phon_ref!r}")
-
-            _out_wav = Path("/tmp") / "ttscli_neutts_nano.wav"
-            if _out_wav.exists():
-                _out_wav.unlink()
-
-            _proc = _run_synth(
-                _neutts_nano_codec,
-                _neutts_nano_bb,
-                _phon_text,
-                _out_wav,
-                extra=[
-                    "--ref-audio", str(_neutts_nano_refwav),
-                    "--ref-text",  _phon_ref,
-                    "--temp",      "1.0",
-                    "--top-k",     "50",
-                    "--seed",      "1",
-                    "--max-frames", "400",
-                ],
-                greedy=False,
-            )
-
-            if _proc.returncode != 0:
-                print(f"[FAIL] neutts_nano: exit {_proc.returncode}")
-                print(_proc.stdout[-1200:])
-                print(_proc.stderr[-800:])
-                results.append(False)
-            else:
-                _stop_lines = [ln for ln in _proc.stdout.splitlines()
-                               if "NeuTTS AR done" in ln]
-                _stop = _stop_lines[0].split("stop=")[-1].strip() if _stop_lines else "?"
-                _frames_str = ""
-                if _stop_lines:
-                    import re as _re
-                    _m = _re.search(r"(\d+) frames", _stop_lines[0])
-                    if _m:
-                        _frames_str = f" frames={_m.group(1)}"
-
-                assert _out_wav.exists(), "neutts_nano: no wav written"
-                _sr, _dur, _rms = _wav_stats(_out_wav)
-
-                # CER: ASR against the plain-English original (not the phonemes).
-                _cer_res = _try_cer(_out_wav, _original_text, "en")
-                _cer_str = ""
-                _ok = True
-                if _rms < 0.005:
-                    print(f"[FAIL] neutts_nano: near-silent (rms={_rms:.4f})")
-                    _ok = False
-                if not (0.3 <= _dur <= 30.0):
-                    print(f"[FAIL] neutts_nano: duration {_dur:.2f}s out of bounds")
-                    _ok = False
-                if _cer_res is not None:
-                    _asr_txt, _cer_val = _cer_res
-                    _cer_str = f" ASR={_asr_txt!r} CER={_cer_val:.3f}"
-                    # Enforced: CER ≤ 0.30 (measured 0.147 @ seed=1; headroom
-                    # covers Whisper tail-hallucination drift).
-                    if _cer_val > 0.30:
-                        print(f"[FAIL] neutts_nano: CER {_cer_val:.3f} > 0.30")
-                        _ok = False
-                print(f"[{'PASS' if _ok else 'FAIL'}] neutts_nano: "
-                      f"stop={_stop}{_frames_str} dur={_dur:.2f}s rms={_rms:.3f}{_cer_str}")
-                results.append(_ok)
-
-    # ── NeuTTS-air (enforced CER) ─────────────────────────────────────────────
-    # NeuTTS-air (Qwen2 0.5B) is the larger sibling of neutts-nano: same
-    # phoneme-mode ICL protocol, same distill_neucodec codec, same
-    # ref-audio/ref-text convention, same token-id contract.  The backbone
-    # differs (qwen2 arch, 24 layers, hidden=896, vocab=217652) but the
-    # NeuTTS host-loop is arch-agnostic — detection is purely vocab-range.
-    #
-    # Converted via llama.cpp/convert_hf_to_gguf.py --outtype q8_0 (plain
-    # Qwen2ForCausalLM, no tensor-rename needed).  Seed=1 reused from nano
-    # (both are NeuTTS checkpoints; the EOS-at-9-frames bias at seed=42 is
-    # observed on nano; air may or may not share it, but seed=1 is safe).
-    #
-    # Pinned seed=1 is deterministic; air is robust (CER 0.000 measured).
-    # CER threshold 0.15 gives huge headroom over the measured 0.000.
-    _neutts_air_codec   = REPO / "models" / "distill_neucodec" / "distill_neucodec.gguf"
-    _neutts_air_bb      = REPO / "models" / "hf" / "neutts_air" / "neutts-air-q8_0.gguf"
-    _neutts_air_refwav  = REPO / "assets" / "refs" / "jfk_en.wav"
-    _neutts_air_reftxt  = REPO / "assets" / "refs" / "jfk_en.txt"
-
-    _neutts_air_assets_ok = (
-        _neutts_air_codec.exists()
-        and _neutts_air_bb.exists()
-        and _neutts_air_refwav.exists()
-        and _neutts_air_reftxt.exists()
-    )
-
-    if not _neutts_air_assets_ok:
-        _missing_air = [p for p in [_neutts_air_codec, _neutts_air_bb,
-                                     _neutts_air_refwav, _neutts_air_reftxt]
-                        if not p.exists()]
-        print(f"[skip] neutts_air: missing assets ({', '.join(p.name for p in _missing_air)})")
-        results.append(None)
-    else:
-        _neutts_air_phon_ok = False
-        try:
-            from phonemizer.backend import EspeakBackend as _EspeakBackendAir
-            _neutts_air_phon_ok = True
-        except Exception as _e_air:
-            print(f"[skip] neutts_air: phonemizer unavailable ({_e_air})")
-            results.append(None)
-
-        if _neutts_air_phon_ok:
-            _g2p_air = _EspeakBackendAir(
-                language="en-us",
-                preserve_punctuation=True,
-                with_stress=True,
-                words_mismatch="ignore",
-                language_switch="remove-flags",
-            )
-
-            def _to_phones_air(text):
-                return " ".join(_g2p_air.phonemize([text])[0].split())
-
-            _air_original_text = "The birch canoe slid on the smooth planks."
-            _air_ref_raw       = _neutts_air_reftxt.read_text().strip()
-            _air_phon_text     = _to_phones_air(_air_original_text)
-            _air_phon_ref      = _to_phones_air(_air_ref_raw)
-
-            print(f"[info] neutts_air: original_text = {_air_original_text!r}")
-            print(f"[info] neutts_air: phon_text     = {_air_phon_text!r}")
-            print(f"[info] neutts_air: phon_ref      = {_air_phon_ref!r}")
-
-            _air_out_wav = Path("/tmp") / "ttscli_neutts_air.wav"
-            if _air_out_wav.exists():
-                _air_out_wav.unlink()
-
-            _air_proc = _run_synth(
-                _neutts_air_codec,
-                _neutts_air_bb,
-                _air_phon_text,
-                _air_out_wav,
-                extra=[
-                    "--ref-audio", str(_neutts_air_refwav),
-                    "--ref-text",  _air_phon_ref,
-                    "--temp",      "1.0",
-                    "--top-k",     "50",
-                    "--seed",      "1",
-                    "--max-frames", "400",
-                ],
-                greedy=False,
-            )
-
-            if _air_proc.returncode != 0:
-                print(f"[FAIL] neutts_air: exit {_air_proc.returncode}")
-                print(_air_proc.stdout[-1200:])
-                print(_air_proc.stderr[-800:])
-                results.append(False)
-            else:
-                _air_stop_lines = [ln for ln in _air_proc.stdout.splitlines()
-                                   if "NeuTTS AR done" in ln]
-                _air_stop = (_air_stop_lines[0].split("stop=")[-1].strip()
-                             if _air_stop_lines else "?")
-                _air_frames_str = ""
-                if _air_stop_lines:
-                    import re as _re_air
-                    _m_air = _re_air.search(r"(\d+) frames", _air_stop_lines[0])
-                    if _m_air:
-                        _air_frames_str = f" frames={_m_air.group(1)}"
-
-                assert _air_out_wav.exists(), "neutts_air: no wav written"
-                _air_sr, _air_dur, _air_rms = _wav_stats(_air_out_wav)
-
-                # CER: ASR against the plain-English original (not the phonemes).
-                _air_cer_res = _try_cer(_air_out_wav, _air_original_text, "en")
-                _air_cer_str = ""
-                _air_ok = True
-                if _air_rms < 0.005:
-                    print(f"[FAIL] neutts_air: near-silent (rms={_air_rms:.4f})")
-                    _air_ok = False
-                if not (0.3 <= _air_dur <= 30.0):
-                    print(f"[FAIL] neutts_air: duration {_air_dur:.2f}s out of bounds")
-                    _air_ok = False
-                if _air_cer_res is not None:
-                    _air_asr_txt, _air_cer_val = _air_cer_res
-                    _air_cer_str = f" ASR={_air_asr_txt!r} CER={_air_cer_val:.3f}"
-                    # Enforced: CER ≤ 0.15 (measured 0.000 @ seed=1; robust
-                    # model, large headroom).
-                    if _air_cer_val > 0.15:
-                        print(f"[FAIL] neutts_air: CER {_air_cer_val:.3f} > 0.15")
-                        _air_ok = False
-                print(f"[{'PASS' if _air_ok else 'FAIL'}] neutts_air: "
-                      f"stop={_air_stop}{_air_frames_str} dur={_air_dur:.2f}s "
-                      f"rms={_air_rms:.3f}{_air_cer_str}")
-                results.append(_air_ok)
-
-    # ── OuteTTS 1.0-0.6B (enforced CER ≤ 0.10) ──────────────────────────────
-    # OuteTTS uses RAW text input — NO phonemization.  The bundled default
-    # speaker (assets/speakers/en-female-1-neutral.json) is auto-loaded by
-    # the runner.  Detection is vocabulary-based (V3 signature tokens) and
-    # the auto-grammar is attached automatically.
-    #
-    # Sampling regime mirrors the OuteTTS reference: temp=1.0, top-k=50,
-    # seed=1, rep-penalty=1.1.
-    #
-    # seed=1 is pinned (clean eos, CER 0.000); OuteTTS 0.6B is content-robust
-    # across seeds (CER ~0.0–0.05) but eos-emission is seed-sensitive (other
-    # seeds produce correct audio yet may stop=max_frames) — see the status
-    # note in CLAUDE.md.  CER threshold 0.10 gives headroom over measured 0.000.
-    _outetts_codec  = REPO / "models" / "output" / "ibm-research--DAC.speech-F32.gguf"
-    _outetts_bb     = REPO / "models" / "hf" / "outetts_1_0" / "OuteTTS-1.0-0.6B-Q8_0.gguf"
-    _outetts_spk    = REPO / "assets" / "speakers" / "en-female-1-neutral.json"
-
-    _outetts_assets_ok = (
-        _outetts_codec.exists()
-        and _outetts_bb.exists()
-        and _outetts_spk.exists()
-    )
-
-    if not _outetts_assets_ok:
-        _missing_oe = [p for p in [_outetts_codec, _outetts_bb, _outetts_spk]
-                       if not p.exists()]
-        print(f"[skip] outetts_1_0: missing assets ({', '.join(p.name for p in _missing_oe)})")
-        results.append(None)
-    else:
-        _outetts_text = "The birch canoe slid on the smooth planks."
-        _outetts_out  = Path("/tmp") / "ttscli_outetts_1_0.wav"
-        if _outetts_out.exists():
-            _outetts_out.unlink()
-
-        print(f"[info] outetts_1_0: text = {_outetts_text!r}")
-
-        _outetts_proc = _run_synth(
-            _outetts_codec,
-            _outetts_bb,
-            _outetts_text,
-            _outetts_out,
-            extra=[
-                "--temp",        "1.0",
-                "--top-k",       "50",
-                "--seed",        "1",
-                "--rep-penalty", "1.1",
-                "--max-frames",  "600",
-            ],
-            greedy=False,
-        )
-
-        if _outetts_proc.returncode != 0:
-            print(f"[FAIL] outetts_1_0: exit {_outetts_proc.returncode}")
-            print(_outetts_proc.stdout[-1200:])
-            print(_outetts_proc.stderr[-800:])
-            results.append(False)
-        else:
-            _oe_stop_lines = [ln for ln in _outetts_proc.stdout.splitlines()
-                              if "OuteTTS AR done" in ln]
-            _oe_stop = (_oe_stop_lines[0].split("stop=")[-1].strip()
-                        if _oe_stop_lines else "?")
-            _oe_frames_str = ""
-            if _oe_stop_lines:
-                import re as _re_oe
-                _m_oe = _re_oe.search(r"(\d+) frames", _oe_stop_lines[0])
-                if _m_oe:
-                    _oe_frames_str = f" frames={_m_oe.group(1)}"
-
-            assert _outetts_out.exists(), "outetts_1_0: no wav written"
-            _oe_sr, _oe_dur, _oe_rms = _wav_stats(_outetts_out)
-
-            # CER: ASR against the raw English text (no phoneme indirection).
-            _oe_cer_res = _try_cer(_outetts_out, _outetts_text, "en")
-            _oe_cer_str = ""
-            _oe_ok = True
-            if _oe_rms < 0.005:
-                print(f"[FAIL] outetts_1_0: near-silent (rms={_oe_rms:.4f})")
-                _oe_ok = False
-            if not (0.3 <= _oe_dur <= 30.0):
-                print(f"[FAIL] outetts_1_0: duration {_oe_dur:.2f}s out of bounds")
-                _oe_ok = False
-            if _oe_cer_res is not None:
-                _oe_asr_txt, _oe_cer_val = _oe_cer_res
-                _oe_cer_str = f" ASR={_oe_asr_txt!r} CER={_oe_cer_val:.3f}"
-                # Enforced: CER ≤ 0.10 (measured 0.000 @ seed=1; headroom
-                # covers minor Whisper transcription drift).
-                if _oe_cer_val > 0.10:
-                    print(f"[FAIL] outetts_1_0: CER {_oe_cer_val:.3f} > 0.10")
-                    _oe_ok = False
-            print(f"[{'PASS' if _oe_ok else 'FAIL'}] outetts_1_0: "
-                  f"stop={_oe_stop}{_oe_frames_str} dur={_oe_dur:.2f}s "
-                  f"rms={_oe_rms:.3f}{_oe_cer_str}")
-            results.append(_oe_ok)
+    # ── OuteTTS 0.2 / 0.3 / 1.0 (voices baked into a per-model codec GGUF) ───
+    # Raw text input; the runner detects the interface from the vocab and
+    # attaches the prompt-derived grammar.  Codec GGUFs: docs/models/outetts.md.
+    # Reference sampling defaults (1.0: temp 1.0 / top-k 50 / rep 1.1 over 64;
+    # 0.2/0.3: temp 0.1 / rep 1.1); seed 1 pinned.
+    _oute = REPO / "models" / "output" / "outetts"
+    for name, codec, bb, voice in (
+            ("outetts_1_0", "outetts-1.0-0.6b-codec-F32.gguf", "outetts_1_0/OuteTTS-1.0-0.6B-Q8_0.gguf", None),
+            ("outetts_0_2", "outetts-0.2-500m-codec.gguf", "outetts_legacy/OuteTTS-0.2-500M-Q8_0.gguf", None),
+            ("outetts_0_3", "outetts-0.3-500m-codec.gguf", "outetts_legacy/OuteTTS-0.3-500M-Q8_0.gguf",
+             "en_female_1"),
+            ("outetts_0_3_1b", "outetts-0.3-1b-codec.gguf", "outetts_legacy/OuteTTS-0.3-1B-Q8_0.gguf", None)):
+        results.append(_case(name, _oute / codec, REPO / "models" / "hf" / bb, _sentence, "en",
+                             want_stop="eos", cer_max=0.10,
+                             extra=["--seed", "1"] + (["--voice", voice] if voice else []),
+                             greedy=False, stop_line="OuteTTS AR done"))
 
     ran = [r for r in results if r is not None]
     if not ran:

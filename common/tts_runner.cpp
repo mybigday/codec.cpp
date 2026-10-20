@@ -2739,83 +2739,39 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     }
 
     if (is_neutts) {
-        if (a.ref_audio_path.empty() || a.ref_text.empty()) {
-            out->error =
-                "NeuTTS requires both --ref-audio and --ref-text for in-context learning; "
-                "re-run with a reference audio clip and its transcript.";
+        // The reference voice is the codec speaker apply_decode_speaker chose:
+        // --speaker-file, --ref-audio (codecs with the distill encoder derive
+        // `ref_codes` in-library), --voice, or the codec GGUF's default.
+        // `ref_text` holds the reference transcript as phonemes; --ref-text
+        // overrides it.
+        if (!a.ref_audio_path.empty() && a.speaker_file.empty() && !audio_lm_codec_can_speaker_from_audio(ctx)) {
+            out->error = "NeuTTS: --ref-audio needs a codec GGUF with the NeuCodec distill encoder "
+                         "(this one cannot encode); use --voice / --speaker-file or a distill_neucodec codec";
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
             return false;
         }
-        // Load reference audio (mono F32).
-        std::vector<float> ref_pcm;
-        int32_t ref_n = 0, ref_sr = 0;
-        std::string ref_err;
-        if (!load_ref_audio(a.ref_audio_path, ref_pcm, &ref_n, &ref_sr, &ref_err)) {
-            out->error = ref_err;
+        const codec_speaker * spk = audio_lm_decode_speaker(ctx);
+        codec_speaker_slot_type ty;
+        int64_t ne[4];
+        const void * data = nullptr;
+        if (spk == nullptr || !codec_speaker_get_slot(spk, "ref_codes", &ty, ne, &data) ||
+            ty != CODEC_SPEAKER_SLOT_I32) {
+            out->error = "NeuTTS needs a reference voice: a codec GGUF with builtin voices (--voice), "
+                         "--speaker-file, or --ref-audio + --ref-text with a distill_neucodec codec";
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
             return false;
         }
-        // Resample to 16000 Hz (NeuCodec encode_sample_rate; neutts-facts §Step 4).
-        const int32_t enc_sr = 16000;
-        if (ref_sr > 0 && ref_sr != enc_sr) {
-            ref_pcm = resample_mono_f32(ref_pcm, ref_sr, enc_sr);
-        }
-        ref_n = (int32_t) ref_pcm.size();
-
-        // Load the NeuCodec encoder (base variant, has_encoder=True).
-        // The encoder-capable gguf is models/neucodec/neucodec.gguf; the
-        // repo-root neucodec.gguf is decode-only and will fail here.
-        codec_model_params cmp = codec_model_default_params();
-        cmp.use_gpu   = a.use_gpu;
-        cmp.n_threads = a.n_threads > 0 ? a.n_threads : 1;
-        codec_model * cmodel = load_codec_model(a.codec_path, cmp, a.kv_overrides);
-        if (!cmodel) {
-            out->error = std::string("NeuTTS: failed to load NeuCodec model from ") + a.codec_path;
-            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
-            return false;
-        }
-        codec_context * cctx = codec_init_from_model(cmodel, codec_context_default_params());
-        if (!cctx) {
-            out->error = "NeuTTS: codec_init_from_model failed";
-            codec_model_free(cmodel);
+        const std::vector<int32_t> ref_codes(static_cast<const int32_t *>(data),
+                                             static_cast<const int32_t *>(data) + ne[0]);
+        const char * spk_text = codec_speaker_ref_text(spk);
+        const std::string ref_text = !a.ref_text.empty() ? a.ref_text : (spk_text != nullptr ? spk_text : "");
+        if (ref_text.empty()) {
+            out->error = "NeuTTS: the reference voice has no transcript; pass --ref-text (phonemes)";
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
             return false;
         }
 
-        codec_audio au;
-        au.data        = ref_pcm.data();
-        au.n_samples   = ref_n;
-        au.sample_rate = enc_sr;
-        au.n_channels  = 1;
-        au.pcm_type    = CODEC_PCM_TYPE_F32;
-
-        codec_token_buffer tb;
-        std::memset(&tb, 0, sizeof(tb));
-        const codec_status enc_status = codec_encode(cctx, &au, &tb, codec_encode_default_params());
-        if (enc_status != CODEC_STATUS_SUCCESS) {
-            out->error =
-                std::string("NeuTTS: codec_encode failed — ensure the encoder-capable gguf is "
-                            "used (models/neucodec/neucodec.gguf, has_encoder=true); "
-                            "the repo-root neucodec.gguf is decode-only.  Error: ")
-                + codec_get_last_error(cctx);
-            codec_free(cctx); codec_model_free(cmodel);
-            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
-            return false;
-        }
-
-        // Extract 1-D code vector (n_q=1; layout data[t*n_q + q]).
-        std::vector<int32_t> ref_codes;
-        ref_codes.reserve((size_t) tb.n_frames);
-        for (int32_t t = 0; t < tb.n_frames; ++t) {
-            ref_codes.push_back(tb.data[t]);   // n_q=1 so q=0 only
-        }
-        codec_token_buffer_free(&tb);
-        codec_free(cctx);
-        codec_model_free(cmodel);
-
-        // Assemble the ICL prefill token sequence.
-        // (ref_text and text pass through as-is here; espeak phonemization is Task 5.)
-        neutts_prompt_toks = build_neutts_prompt(vocab, a.ref_text, a.text, ref_codes);
+        neutts_prompt_toks = build_neutts_prompt(vocab, ref_text, a.text, ref_codes);
         if (neutts_prompt_toks.empty()) {
             out->error = "NeuTTS: build_neutts_prompt returned empty (bad vocab or out-of-range codes)";
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
