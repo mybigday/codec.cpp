@@ -162,6 +162,9 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
         sample = v.sample_backbone
     lc.llama_sampler_free(smpl)
     audio, sr = alm.decode()
+    # The exported decoder input decodes to the same audio.
+    again, _ = alm.decode_generation(alm.generation())
+    assert np.array_equal(again, audio), "decode_generation(generation()) != decode()"
     return audio, sr, frames, alm.stop_reason
 
 

@@ -390,6 +390,29 @@ class AudioLM:
             self._fail("codec_audio_lm_decode")
         return _take_pcm(buf)
 
+    def generation(self) -> np.ndarray:
+        """The generation's decoder input, a copy: int32 codes or float32 latents, [n_frames, width]."""
+        g = _ffi.codec_audio_lm_generation()
+        if not lib().codec_audio_lm_get_generation(self.ptr, ctypes.byref(g)):
+            self._fail("codec_audio_lm_get_generation")
+        ptr = g.latents if g.kind == _ffi.CODEC_AUDIO_LM_DATA_LATENTS else g.codes
+        return np.ctypeslib.as_array(ptr, shape=(g.n_frames, g.width)).copy()
+
+    def decode_generation(self, gen: np.ndarray) -> tuple[np.ndarray, int]:
+        """Audio of a generation() result (this model's), with the current decoder speaker."""
+        g = _ffi.codec_audio_lm_generation()
+        g.n_frames, g.width = int(gen.shape[0]), int(gen.shape[1])
+        if np.issubdtype(gen.dtype, np.floating):
+            arr = _f32(gen)
+            g.kind, g.latents = _ffi.CODEC_AUDIO_LM_DATA_LATENTS, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        else:
+            arr = _i32(gen)
+            g.kind, g.codes = _ffi.CODEC_AUDIO_LM_DATA_CODES, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        buf = _ffi.codec_pcm_buffer()
+        if not lib().codec_audio_lm_decode_generation(self.ptr, ctypes.byref(g), ctypes.byref(buf)):
+            self._fail("codec_audio_lm_decode_generation")
+        return _take_pcm(buf)
+
     def stream_poll(self, chunk_ms: int = 1000) -> tuple[np.ndarray, int]:
         """Audio that became final since the last poll (possibly empty); call after audio steps."""
         buf = _ffi.codec_pcm_buffer()

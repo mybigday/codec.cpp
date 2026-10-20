@@ -114,6 +114,16 @@ the right edge the decoder may still revise is held back (0.32 s), and the
 joins are crossfaded (20 ms). `codec_audio_lm_stream_finish` returns the rest.
 `decodable_frames` / `hop` / `decode_range` are the lower-level pieces.
 
+To decode later (out of order, several generations on, more than once),
+`codec_audio_lm_get_generation` returns the generation's decoder input:
+frame-major codec codes (`CODEC_AUDIO_LM_DATA_CODES`, `width` codebooks) or
+latents (`CODEC_AUDIO_LM_DATA_LATENTS`, `width` = latent dim), already in codec
+form (control codebooks dropped, delay pattern undone, trailing silence
+tokens appended). The arrays stay valid until the next call; copy them.
+`codec_audio_lm_decode_generation` decodes such a copy with the current
+decoder speaker and leaves the in-progress generation alone; for the
+generation just made it gives exactly the PCM of `codec_audio_lm_decode`.
+
 ### Voices
 
 `codec_audio_lm_tts_set_voice` takes a builtin voice name

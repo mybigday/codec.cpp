@@ -394,6 +394,20 @@ class codec_audio_lm_verdict(Structure):
     ]
 
 
+CODEC_AUDIO_LM_DATA_CODES = 0
+CODEC_AUDIO_LM_DATA_LATENTS = 1
+
+
+class codec_audio_lm_generation(Structure):
+    _fields_ = [
+        ("kind", c_int),
+        ("n_frames", c_int32),
+        ("width", c_int32),
+        ("codes", POINTER(c_int32)),
+        ("latents", POINTER(c_float)),
+    ]
+
+
 # ─── prototypes ─────────────────────────────────────────────────────
 
 _i32p = POINTER(c_int32)
@@ -536,6 +550,9 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_stop_reason": (c_char_p, [c_void_p]),
     "codec_audio_lm_generate_self_contained": (c_bool, [c_void_p]),
     "codec_audio_lm_decode": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
+    "codec_audio_lm_get_generation": (c_bool, [c_void_p, POINTER(codec_audio_lm_generation)]),
+    "codec_audio_lm_decode_generation": (c_bool, [c_void_p, POINTER(codec_audio_lm_generation),
+                                                  POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_stream_poll": (c_bool, [c_void_p, c_int32, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_stream_finish": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_decodable_frames": (c_int32, [c_void_p]),
