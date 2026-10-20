@@ -4,6 +4,8 @@
 #include "codec_tts.h"
 #include "tts_runner.h"
 
+#include "llama.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +22,12 @@ struct codec_tts {
 };
 
 static void set_str(std::string & dst, const char * src) { dst = src != nullptr ? src : ""; }
+
+// The bundled llama.cpp (and its own ggml) logs through codec_log as well,
+// so one codec_log_set callback sees the whole pipeline.
+static void llama_to_codec(enum ggml_log_level level, const char * text, void *) {
+    codec_log((enum codec_log_level) level, "%s", text);
+}
 
 extern "C" {
 
@@ -51,6 +59,7 @@ struct codec_tts * codec_tts_load(const struct codec_tts_params * params, char *
     } else if ((t = new (std::nothrow) codec_tts()) == nullptr) {
         e = "codec_tts_load: out of memory";
     } else {
+        llama_log_set(llama_to_codec, nullptr);
         tts_runner_params & p = t->load;
         p.codec_path = params->codec_path;
         set_str(p.backbone_path, params->backbone_path);

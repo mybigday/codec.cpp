@@ -53,12 +53,6 @@ enum codec_audio_lm_kind {
     CODEC_AUDIO_LM_KIND_TOKEN_SINGLE_CB     = 4,  // OuteTTS-style token LMs
 };
 
-enum codec_audio_lm_outetts_version {
-    CODEC_AUDIO_LM_OUTETTS_V1 = 0,  // OuteTTS 0.2
-    CODEC_AUDIO_LM_OUTETTS_V2 = 1,  // OuteTTS 0.3
-    CODEC_AUDIO_LM_OUTETTS_V3 = 2,  // OuteTTS 1.0
-};
-
 // ── Lifecycle ────────────────────────────────────────────────────────
 
 struct codec_audio_lm_params {
@@ -202,13 +196,11 @@ struct codec_audio_lm_prompt_info {
 
 bool codec_audio_lm_get_prompt_info(struct codec_audio_lm * ctx, struct codec_audio_lm_prompt_info * out);
 
-// Grammars, written snprintf-style: return the full length (excluding the
-// NUL); `buf` may be NULL / too small (then it is truncated).  -1 on error.
-int32_t codec_audio_lm_outetts_build_grammar(enum codec_audio_lm_outetts_version version, const char * text,
-                                             char * buf, int32_t buf_size);
-// The metadata-derived grammar for this model + text ("" when none).
-int32_t codec_audio_lm_tts_auto_grammar(struct codec_audio_lm * ctx, const char * text,
-                                        char * buf, int32_t buf_size);
+// GBNF for the backbone sampler that this model's metadata derives for
+// `text` ("" when the model has none), written snprintf-style: returns the
+// full length (excluding the NUL); `buf` may be NULL / too small (then it is
+// truncated).  -1 on error.
+int32_t codec_audio_lm_grammar(struct codec_audio_lm * ctx, const char * text, char * buf, int32_t buf_size);
 
 // ── Token-range config (token-based models) ──────────────────────────
 
@@ -257,14 +249,23 @@ bool codec_audio_lm_compose_prompt_embd     (struct codec_audio_lm * ctx, int32_
 bool codec_audio_lm_compose_audio_codes_embd(struct codec_audio_lm * ctx, const int32_t * codes, int32_t n_codes,
                                              float * out, int32_t out_dim);
 
-// Qwen3-TTS talker prompt (see codec_common.h).
-bool codec_audio_lm_talker_has_projection(const struct codec_audio_lm * ctx);
-bool codec_audio_lm_build_talker_prefix(struct codec_audio_lm * ctx, const int32_t * role_tokens, int32_t n_role,
-                                        const int32_t * text_tokens, int32_t n_text, const float * xvector,
-                                        int32_t xvec_dim, float * out_embds, int32_t out_cap_rows,
-                                        int32_t * out_n_rows, int32_t * out_text_consumed);
-bool codec_audio_lm_talker_trailing_text_embd(struct codec_audio_lm * ctx, const int32_t * text_tokens, int32_t n_text,
-                                              int32_t trailing_idx, float * out, int32_t out_dim);
+// Text-lane models: the codec side projects the text tokens itself and the
+// backbone input is the sum of a text lane and an audio / control lane.  The
+// prompt is a prefix of embedding rows built from the header tokens, the
+// text tokens and an optional speaker embedding (codec_audio_lm_build_prompt
+// speaker_emb); the text tokens the prefix did not consume are fed one per
+// AR step, added to codec_audio_lm_get_next_embed.
+bool codec_audio_lm_has_text_lane(const struct codec_audio_lm * ctx);
+// Writes out_n_rows rows (row-major, hidden floats each) into out_embds
+// (capacity out_cap_rows) and how many text tokens they consumed.
+bool codec_audio_lm_build_prefix_embd(struct codec_audio_lm * ctx, const int32_t * header_tokens, int32_t n_header,
+                                      const int32_t * text_tokens, int32_t n_text, const float * speaker_emb,
+                                      int32_t speaker_emb_dim, float * out_embds, int32_t out_cap_rows,
+                                      int32_t * out_n_rows, int32_t * out_text_consumed);
+// Text-lane row for AR step `step` (0 = the first step after the prefix);
+// past the end of the text it is the end-of-text row.
+bool codec_audio_lm_step_text_embd(struct codec_audio_lm * ctx, const int32_t * text_tokens, int32_t n_text,
+                                   int32_t step, float * out, int32_t out_dim);
 
 // ── End of sequence ──────────────────────────────────────────────────
 

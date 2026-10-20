@@ -14,10 +14,13 @@ Search order:
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 import threading
 from pathlib import Path
+
+logger = logging.getLogger("codec_cpp")
 
 _PKG_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PKG_DIR.parents[1]
@@ -62,8 +65,33 @@ def lib() -> ctypes.CDLL:
                 from . import _ffi
                 handle = ctypes.CDLL(str(library_path()))
                 _ffi.declare(handle)
+                handle.codec_log_set(_log_cb, None)
                 _lib = handle
     return _lib
+
+
+# codec.cpp's log (and its ggml backends') goes to the "codec_cpp" logger:
+# quiet below WARNING unless the application configures logging.
+_LEVELS = {1: logging.INFO, 2: logging.WARNING, 3: logging.ERROR, 4: logging.DEBUG}
+_log_state = {"level": logging.INFO, "buf": ""}
+
+
+def _on_log(level: int, text: bytes, _user) -> None:
+    try:
+        if level != 5:  # CODEC_LOG_LEVEL_CONT continues the previous message
+            _log_state["level"] = _LEVELS.get(level, logging.INFO)
+        buf = _log_state["buf"] + (text or b"").decode("utf-8", "replace")
+        *lines, _log_state["buf"] = buf.split("\n")
+        for line in lines:
+            if line:
+                logger.log(_log_state["level"], line)
+    except Exception:  # never raise into C
+        pass
+
+
+from . import _ffi as _ffi_mod  # noqa: E402
+
+_log_cb = _ffi_mod.codec_log_callback(_on_log)
 
 
 # libcodec_tts (include/codec_tts.h): the one-call TTS session, with the

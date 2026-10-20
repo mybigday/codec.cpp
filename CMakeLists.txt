@@ -53,6 +53,7 @@ set(CODEC_SOURCES
     src/runtime/graph.cpp
     src/runtime/graph_exec.cpp
     src/runtime/perf_log.cpp
+    src/runtime/log.cpp
     src/runtime/speaker.cpp
     src/ops/safe_math.cpp
     src/ops/ggml_ops.cpp

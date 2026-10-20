@@ -65,18 +65,6 @@ def _info_dict(s: _ffi.codec_audio_lm_prompt_info) -> dict:
     return out
 
 
-def outetts_grammar(version: int, text: str) -> str:
-    """GBNF for an OuteTTS backbone (version: 0 = OuteTTS 0.2, 1 = 0.3, 2 = 1.0)."""
-    L = lib()
-    t = text.encode("utf-8")
-    n = L.codec_audio_lm_outetts_build_grammar(version, t, None, 0)
-    if n < 0:
-        raise ValueError(f"bad OuteTTS version {version}")
-    buf = ctypes.create_string_buffer(n + 1)
-    L.codec_audio_lm_outetts_build_grammar(version, t, buf, n + 1)
-    return _str(buf.value)
-
-
 class AudioLM:
     """An audio-LM host context (codec_audio_lm) over a codec GGUF.
 
@@ -170,15 +158,15 @@ class AudioLM:
             self._fail("codec_audio_lm_get_prompt_info")
         return _info_dict(out)
 
-    def auto_grammar(self, text: str) -> str:
-        """Metadata-derived GBNF for the backbone sampler ("" when none)."""
+    def grammar(self, text: str) -> str:
+        """GBNF for the backbone sampler that the model derives for ``text`` ("" when none)."""
         L = lib()
         t = text.encode("utf-8")
-        n = L.codec_audio_lm_tts_auto_grammar(self.ptr, t, None, 0)
+        n = L.codec_audio_lm_grammar(self.ptr, t, None, 0)
         if n < 0:
-            self._fail("codec_audio_lm_tts_auto_grammar")
+            self._fail("codec_audio_lm_grammar")
         buf = ctypes.create_string_buffer(n + 1)
-        L.codec_audio_lm_tts_auto_grammar(self.ptr, t, buf, n + 1)
+        L.codec_audio_lm_grammar(self.ptr, t, buf, n + 1)
         return _str(buf.value)
 
     # --- decoder speaker ----------------------------------------------
@@ -438,28 +426,29 @@ class AudioLM:
         return out
 
     @property
-    def talker_has_projection(self) -> bool:
-        return bool(lib().codec_audio_lm_talker_has_projection(self.ptr))
+    def has_text_lane(self) -> bool:
+        """True when the codec projects the text itself (prefix + per-step text rows)."""
+        return bool(lib().codec_audio_lm_has_text_lane(self.ptr))
 
-    def build_talker_prefix(self, role_tokens, text_tokens, xvector=None) -> tuple[np.ndarray, int]:
-        """Qwen3-TTS talker prefix rows (rows, hidden) and how many text tokens it consumed."""
-        r, t = _i32(role_tokens).reshape(-1), _i32(text_tokens).reshape(-1)
-        x = None if xvector is None else _f32(xvector).reshape(-1)
-        cap = r.size + 5 + t.size + 1
+    def build_prefix_embd(self, header_tokens, text_tokens, speaker_emb=None) -> tuple[np.ndarray, int]:
+        """Text-lane prompt prefix rows (rows, hidden) and how many text tokens they consumed."""
+        h, t = _i32(header_tokens).reshape(-1), _i32(text_tokens).reshape(-1)
+        x = None if speaker_emb is None else _f32(speaker_emb).reshape(-1)
+        cap = h.size + 5 + t.size + 1
         out = np.zeros((cap, self.hidden_dim), np.float32)
         n_rows, used = ctypes.c_int32(), ctypes.c_int32()
-        if not lib().codec_audio_lm_build_talker_prefix(
-                self.ptr, _iptr(r), r.size, _iptr(t), t.size, _fptr(x), 0 if x is None else x.size,
+        if not lib().codec_audio_lm_build_prefix_embd(
+                self.ptr, _iptr(h), h.size, _iptr(t), t.size, _fptr(x), 0 if x is None else x.size,
                 _fptr(out), cap, ctypes.byref(n_rows), ctypes.byref(used)):
-            self._fail("build_talker_prefix")
+            self._fail("build_prefix_embd")
         return out[:n_rows.value].copy(), int(used.value)
 
-    def talker_trailing_text_embd(self, text_tokens, trailing_idx: int) -> np.ndarray:
+    def step_text_embd(self, text_tokens, step: int) -> np.ndarray:
+        """Text-lane row for AR step ``step``, added to next_embed()."""
         t = _i32(text_tokens).reshape(-1)
         out = np.zeros(self.hidden_dim, np.float32)
-        if not lib().codec_audio_lm_talker_trailing_text_embd(self.ptr, _iptr(t), t.size, int(trailing_idx),
-                                                              _fptr(out), out.size):
-            self._fail("talker_trailing_text_embd")
+        if not lib().codec_audio_lm_step_text_embd(self.ptr, _iptr(t), t.size, int(step), _fptr(out), out.size):
+            self._fail("step_text_embd")
         return out
 
     # --- end of sequence -----------------------------------------------

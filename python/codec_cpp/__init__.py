@@ -12,7 +12,7 @@ the loaded library for calls the high-level layer does not wrap.
 
 from . import _ffi as ffi
 from ._lib import lib, library_path, tts_lib
-from .audio_lm import AudioLM, Prompt, SpeakerEntry, outetts_grammar
+from .audio_lm import AudioLM, Prompt, SpeakerEntry
 from .codec import CodecError, Context, Model, Speaker, SpeakerFile
 from .lm import LM, LMInfo, LMState
 from .tts import TTS
@@ -21,5 +21,5 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AudioLM", "CodecError", "Context", "LM", "LMInfo", "LMState", "Model", "Prompt", "Speaker",
-    "SpeakerEntry", "SpeakerFile", "TTS", "ffi", "lib", "library_path", "tts_lib", "outetts_grammar",
+    "SpeakerEntry", "SpeakerFile", "TTS", "ffi", "lib", "library_path", "tts_lib",
 ]

@@ -238,13 +238,7 @@ bool codec_audio_lm_get_prompt_info(struct codec_audio_lm * w, struct codec_audi
     return true;
 }
 
-int32_t codec_audio_lm_outetts_build_grammar(enum codec_audio_lm_outetts_version version, const char * text,
-                                             char * buf, int32_t buf_size) {
-    if (version < CODEC_AUDIO_LM_OUTETTS_V1 || version > CODEC_AUDIO_LM_OUTETTS_V3) return -1;
-    return copy_str(outetts_build_grammar((outetts_version) version, text ? text : ""), buf, buf_size);
-}
-
-int32_t codec_audio_lm_tts_auto_grammar(struct codec_audio_lm * w, const char * text, char * buf, int32_t buf_size) {
+int32_t codec_audio_lm_grammar(struct codec_audio_lm * w, const char * text, char * buf, int32_t buf_size) {
     if (w == nullptr) return -1;
     audio_lm_prompt_info pi;
     if (!audio_lm_get_prompt_info(w->ctx, &pi)) return -1;
@@ -355,19 +349,19 @@ bool codec_audio_lm_compose_audio_codes_embd(struct codec_audio_lm * w, const in
     return w && audio_lm_compose_audio_codes_embd(w->ctx, codes, n_codes, out, out_dim);
 }
 
-bool codec_audio_lm_talker_has_projection(const struct codec_audio_lm * w) {
+bool codec_audio_lm_has_text_lane(const struct codec_audio_lm * w) {
     return w && audio_lm_talker_has_projection(w->ctx);
 }
-bool codec_audio_lm_build_talker_prefix(struct codec_audio_lm * w, const int32_t * role_tokens, int32_t n_role,
-                                        const int32_t * text_tokens, int32_t n_text, const float * xvector,
-                                        int32_t xvec_dim, float * out_embds, int32_t out_cap_rows,
-                                        int32_t * out_n_rows, int32_t * out_text_consumed) {
-    return w && audio_lm_build_talker_prefix(w->ctx, role_tokens, n_role, text_tokens, n_text, xvector, xvec_dim,
-                                             out_embds, out_cap_rows, out_n_rows, out_text_consumed);
+bool codec_audio_lm_build_prefix_embd(struct codec_audio_lm * w, const int32_t * header_tokens, int32_t n_header,
+                                      const int32_t * text_tokens, int32_t n_text, const float * speaker_emb,
+                                      int32_t speaker_emb_dim, float * out_embds, int32_t out_cap_rows,
+                                      int32_t * out_n_rows, int32_t * out_text_consumed) {
+    return w && audio_lm_build_talker_prefix(w->ctx, header_tokens, n_header, text_tokens, n_text, speaker_emb,
+                                             speaker_emb_dim, out_embds, out_cap_rows, out_n_rows, out_text_consumed);
 }
-bool codec_audio_lm_talker_trailing_text_embd(struct codec_audio_lm * w, const int32_t * text_tokens, int32_t n_text,
-                                              int32_t trailing_idx, float * out, int32_t out_dim) {
-    return w && audio_lm_talker_trailing_text_embd(w->ctx, text_tokens, n_text, trailing_idx, out, out_dim);
+bool codec_audio_lm_step_text_embd(struct codec_audio_lm * w, const int32_t * text_tokens, int32_t n_text,
+                                   int32_t step, float * out, int32_t out_dim) {
+    return w && audio_lm_talker_trailing_text_embd(w->ctx, text_tokens, n_text, step, out, out_dim);
 }
 
 bool codec_audio_lm_decode_audio(struct codec_audio_lm * w, struct codec_pcm_buffer * out) {

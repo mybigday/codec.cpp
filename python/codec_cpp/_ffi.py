@@ -33,6 +33,16 @@ CODEC_KV_OVERRIDE_TYPE_FLOAT = 1
 CODEC_KV_OVERRIDE_TYPE_BOOL = 2
 CODEC_KV_OVERRIDE_TYPE_STR = 3
 
+CODEC_LOG_LEVEL_NONE = 0
+CODEC_LOG_LEVEL_INFO = 1
+CODEC_LOG_LEVEL_WARN = 2
+CODEC_LOG_LEVEL_ERROR = 3
+CODEC_LOG_LEVEL_DEBUG = 4
+CODEC_LOG_LEVEL_CONT = 5
+
+# typedef void (*codec_log_callback)(enum codec_log_level, const char *, void *)
+codec_log_callback = ctypes.CFUNCTYPE(None, c_int, c_char_p, c_void_p)
+
 CODEC_SPEAKER_SLOT_F32 = 0
 CODEC_SPEAKER_SLOT_I32 = 1
 
@@ -294,10 +304,6 @@ CODEC_AUDIO_LM_KIND_PARALLEL_HEADS_DELAY = 2
 CODEC_AUDIO_LM_KIND_CONTINUOUS_CFM = 3
 CODEC_AUDIO_LM_KIND_TOKEN_SINGLE_CB = 4
 
-CODEC_AUDIO_LM_OUTETTS_V1 = 0
-CODEC_AUDIO_LM_OUTETTS_V2 = 1
-CODEC_AUDIO_LM_OUTETTS_V3 = 2
-
 
 class codec_audio_lm_params(Structure):
     _fields_ = [
@@ -516,6 +522,8 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_lm_flow_prefill": (_status, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
     "codec_lm_flow_step": (_status, [c_void_p, _f32p, _f32p, _f32p, _i32p]),
     "codec_lm_flow_denorm_latent": (_status, [c_void_p, _f32p, _f32p]),
+    # codec.h — logging (codec_log is variadic: call it as codec_log(level, b"%s", msg))
+    "codec_log_set": (None, [codec_log_callback, c_void_p]),
     # codec_audio_lm.h — lifecycle / capabilities
     "codec_audio_lm_default_params": (codec_audio_lm_params, []),
     "codec_audio_lm_init": (c_void_p, [POINTER(codec_audio_lm_params), c_char_p, c_size_t]),
@@ -548,8 +556,7 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_build_prompt": (
         c_bool, [c_void_p, POINTER(codec_audio_lm_input), POINTER(codec_audio_lm_prompt)]),
     "codec_audio_lm_get_prompt_info": (c_bool, [c_void_p, POINTER(codec_audio_lm_prompt_info)]),
-    "codec_audio_lm_outetts_build_grammar": (c_int32, [c_int, c_char_p, c_char_p, c_int32]),
-    "codec_audio_lm_tts_auto_grammar": (c_int32, [c_void_p, c_char_p, c_char_p, c_int32]),
+    "codec_audio_lm_grammar": (c_int32, [c_void_p, c_char_p, c_char_p, c_int32]),
     # codec_audio_lm.h — token ranges / accumulator
     "codec_audio_lm_set_audio_token_range": (None, [c_void_p, c_int32, c_int32, c_int32]),
     "codec_audio_lm_set_audio_token_ranges": (None, [c_void_p, _i32p, _i32p, c_int32, c_int32, c_int32]),
@@ -576,10 +583,10 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_prompt_needs_composed_embd": (c_bool, [c_void_p]),
     "codec_audio_lm_compose_prompt_embd": (c_bool, [c_void_p, c_int32, _f32p, c_int32]),
     "codec_audio_lm_compose_audio_codes_embd": (c_bool, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
-    "codec_audio_lm_talker_has_projection": (c_bool, [c_void_p]),
-    "codec_audio_lm_build_talker_prefix": (
+    "codec_audio_lm_has_text_lane": (c_bool, [c_void_p]),
+    "codec_audio_lm_build_prefix_embd": (
         c_bool, [c_void_p, _i32p, c_int32, _i32p, c_int32, _f32p, c_int32, _f32p, c_int32, _i32p, _i32p]),
-    "codec_audio_lm_talker_trailing_text_embd": (c_bool, [c_void_p, _i32p, c_int32, c_int32, _f32p, c_int32]),
+    "codec_audio_lm_step_text_embd": (c_bool, [c_void_p, _i32p, c_int32, c_int32, _f32p, c_int32]),
     # codec_audio_lm.h — end of sequence
     "codec_audio_lm_decode_audio": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_decode_latents": (c_bool, [c_void_p, _f32p, c_int32, c_int32, POINTER(codec_pcm_buffer)]),
