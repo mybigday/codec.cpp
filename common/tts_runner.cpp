@@ -2299,9 +2299,10 @@ static bool apply_decode_speaker(audio_lm_context * ctx, const tts_runner_params
     }
     if (a.speaker_file.empty() && !a.ref_audio_path.empty() &&
         audio_lm_codec_has_speakers(ctx) && !audio_lm_codec_can_speaker_from_audio(ctx)) {
-        // GGUFs converted before codec_speaker bundle no speaker encoders.
-        std::fprintf(stderr, "speaker: codec GGUF has no speaker encoders; decoder keeps the %s voice "
-                             "(re-convert the codec GGUF to clone it from --ref-audio)\n",
+        // No speaker encoders: GGUFs converted before codec_speaker, or
+        // codecs whose speakers cannot come from audio (OuteTTS).
+        std::fprintf(stderr, "speaker: this codec GGUF cannot derive a speaker from --ref-audio; keeping the %s "
+                             "voice (Chatterbox / CosyVoice GGUFs converted before codec_speaker: re-convert)\n",
                      a.voice.empty() ? "default" : a.voice.c_str());
     }
     if (!a.save_speaker.empty()) {
