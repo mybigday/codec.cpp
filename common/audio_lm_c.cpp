@@ -163,7 +163,9 @@ struct codec_audio_lm * codec_audio_lm_init(const struct codec_audio_lm_params *
             p.kv_overrides.assign(params->kv_overrides, params->kv_overrides + params->n_kv_overrides);
         }
         ctx->alm = audio_lm_init(p, &e);
-        if (ctx->alm != nullptr) ctx->family = alm_make_family(ctx->alm, &e);
+        if (ctx->alm != nullptr) {
+            ctx->family = alm_make_family(ctx->alm, params->backbone_path ? params->backbone_path : "", &e);
+        }
         if (ctx->family) return ctx.release();
     }
     if (err != nullptr && err_size > 0) std::snprintf(err, err_size, "%s", e.c_str());
@@ -407,8 +409,9 @@ bool codec_audio_lm_decode_range(struct codec_audio_lm * ctx, int32_t frame_begi
 
 namespace codec_common {
 
-struct codec_audio_lm * alm_wrap_borrowed(audio_lm_context * alm, std::string * err) {
-    auto family = alm_make_family(alm, err);
+struct codec_audio_lm * alm_wrap_borrowed(audio_lm_context * alm, const std::string & backbone_path,
+                                         std::string * err) {
+    auto family = alm_make_family(alm, backbone_path, err);
     if (!family) return nullptr;
     auto * ctx = new codec_audio_lm();
     ctx->alm = alm;

@@ -129,6 +129,7 @@ add_library(codec_audio_lm_objs OBJECT
     common/audio_lm_family_token.cpp
     common/audio_lm_family_kitten.cpp
     common/audio_lm_family_codebook.cpp
+    common/audio_lm_family_text_lane.cpp
     common/tts_segment.cpp
     common/kitten_text.cpp
 )
@@ -137,6 +138,8 @@ target_include_directories(codec_audio_lm_objs
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/common
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
 
 add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)

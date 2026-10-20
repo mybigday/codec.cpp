@@ -167,7 +167,7 @@ public:
             if (e && *e) return fail_alm("frame");
             stop_reason_ = "eos_code_c0";
             codec_log(CODEC_LOG_LEVEL_INFO, "AR loop done: %d frames, stop=eos_code_c0\n", frames_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
             return true;
         }
         ++frames_;
@@ -185,7 +185,7 @@ public:
             for (int32_t i = 0; i < hidden_; ++i) next_[(size_t) i] += tt[(size_t) i];
             ++talker_step_;
         }
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, pi_.cb0_from_backbone, true};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, pi_.cb0_from_backbone, true, -1};
         return true;
     }
 

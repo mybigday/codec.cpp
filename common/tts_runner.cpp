@@ -2759,7 +2759,7 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
         if (v.is_audio) ++frames;
         if (v.action == CODEC_AUDIO_LM_STOP) break;
         bool ok = true;
-        if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) ok = decode_tokens(lctx, {tok}, n_past, false);
+        if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) ok = decode_tokens(lctx, {v.token >= 0 ? v.token : tok}, n_past, false);
         else ok = decode_embed(lctx, codec_audio_lm_next_embd(alm, 0), c.n_embd, n_past);
         if (!ok) { out->error = "decode failed"; return false; }
         ++n_past;
@@ -2819,7 +2819,7 @@ tts_runner_session * tts_runner_load(const tts_runner_params & a, std::string * 
     audio_lm_context * ctx = s->ctx;
     {
         std::string ferr;
-        s->calm = alm_wrap_borrowed(ctx, &ferr);   // nullptr: a family still on the legacy path
+        s->calm = alm_wrap_borrowed(ctx, a.backbone_path, &ferr);   // nullptr: a family still on the legacy path
     }
 
     // audio_lm_get_prompt_info requires a codec_lm adaptor.  NeuTTS uses a

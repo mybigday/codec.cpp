@@ -98,6 +98,7 @@ struct alm_tts_voice {
 class alm_family {
 public:
     explicit alm_family(audio_lm_context * alm) : alm_(alm) {}
+    std::string backbone_path;   // set by the factory (models that read its embedding table)
     virtual ~alm_family() = default;
 
     virtual const char * name() const = 0;
@@ -152,11 +153,13 @@ protected:
 
 // Wrap an audio_lm context the caller keeps owning (tts_runner while its
 // families move behind the public API).  nullptr when no family fits.
-struct codec_audio_lm * alm_wrap_borrowed(audio_lm_context * alm, std::string * err);
+struct codec_audio_lm * alm_wrap_borrowed(audio_lm_context * alm, const std::string & backbone_path,
+                                         std::string * err);
 
 // The family for a loaded codec GGUF, or nullptr (err set) when the codec is
 // not the audio side of a supported model.
-std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string * err);
+std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, const std::string & backbone_path,
+                                            std::string * err);
 
 // Families (audio_lm_family_*.cpp).
 std::unique_ptr<alm_family> alm_family_soprano(audio_lm_context * alm);
@@ -165,6 +168,8 @@ std::unique_ptr<alm_family> alm_family_outetts(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_kitten(audio_lm_context * alm);
 bool alm_is_kitten(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_codebook(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_realtime(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_lfm2(audio_lm_context * alm);
 
 }  // namespace codec_common
 

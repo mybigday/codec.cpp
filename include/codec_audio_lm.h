@@ -33,7 +33,7 @@ extern "C" {
 //           loop until c.max_frames audio frames (or the context is full):
 //               tok = verdict.sample_backbone ? sample(backbone logits) : -1
 //               codec_audio_lm_observe(ctx, toks[], hiddens[], &verdict)
-//               STOP -> break; FEED_TOKEN -> decode tok;
+//               STOP -> break; FEED_TOKEN -> decode (verdict.token >= 0 ? verdict.token : tok);
 //               FEED_EMBD -> decode codec_audio_lm_next_embd(ctx, s) on every sequence s
 //       codec_audio_lm_decode(ctx, &pcm)       // or stream_poll / stream_finish
 //       gap = codec_audio_lm_tts_join(ctx, &pcm, i, n)   // then gap samples of silence
@@ -302,6 +302,8 @@ struct codec_audio_lm_verdict {
     enum codec_audio_lm_action action;
     bool sample_backbone;              // sample a backbone token before the next observe
     bool is_audio;                     // this step produced audio (for progress / streaming)
+    int32_t token;                     // FEED_TOKEN: the token to decode when the model picked it
+                                       // itself (-1 = the token the host sampled)
 };
 
 // Report one step: `tokens` has n_seq sampled backbone tokens (or NULL when

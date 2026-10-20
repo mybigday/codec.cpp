@@ -179,7 +179,16 @@ bool alm_family::decode(audio_lm_audio_output * out) {
 
 // ── detection ────────────────────────────────────────────────────────
 
-std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string * err) {
+static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::string * err);
+
+std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, const std::string & backbone_path,
+                                            std::string * err) {
+    auto f = make_family(alm, err);
+    if (f) f->backbone_path = backbone_path;
+    return f;
+}
+
+static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::string * err) {
     const char * arch = audio_lm_meta_str(alm, "general.architecture");
     const std::string a = arch ? arch : "";
     if (a == "soprano") return alm_family_soprano(alm);
@@ -187,8 +196,9 @@ std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string 
     if (codec_lm * lm = audio_lm_get_lm(alm)) {
         audio_lm_prompt_info pi;
         if (codec_lm_chatterbox_get_info(lm) == nullptr && codec_lm_cosyvoice_get_info(lm) == nullptr &&
-            audio_lm_get_prompt_info(alm, &pi) && !pi.is_continuous && !pi.sequential_text_audio &&
-            !pi.streaming_interleave) {
+            audio_lm_get_prompt_info(alm, &pi) && !pi.is_continuous) {
+            if (pi.streaming_interleave)  return alm_family_realtime(alm);
+            if (pi.sequential_text_audio) return alm_family_lfm2(alm);
             if (pi.host_arch == "llama" && pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
                 pi.eos_code_c0 < 0 && !pi.cb0_from_backbone) {
                 if (err) *err = "Moshi (full-duplex dialogue, no audio end) is not a one-shot TTS model";
