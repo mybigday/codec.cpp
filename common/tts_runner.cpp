@@ -1753,15 +1753,15 @@ bool neutts_audio_token_range(const llama_vocab * vocab,
     const int32_t off = vocab_piece_id(vocab, "<|speech_0|>");
     const int32_t eos = vocab_piece_id(vocab, "<|SPEECH_GENERATION_END|>");
     if (off < 0 || eos < 0) return false;
-    // Count contiguous <|speech_N|> tokens from N=0 upward.
-    // Explicit upper bound = (vocab size − off) prevents O(V²) scan on a
-    // pathological vocab where the series never breaks.
+    // Count contiguous <|speech_N|> tokens from N=0 upward, reading the
+    // piece at off + N (a name lookup per N scans the vocab 65536 times).
     const int32_t nv = llama_vocab_n_tokens(vocab);
     int32_t n = 0;
     char buf[32];
     for (; off + n < nv; ++n) {
         std::snprintf(buf, sizeof(buf), "<|speech_%d|>", n);
-        if (vocab_piece_id(vocab, buf) != off + n) break;
+        const char * t = llama_vocab_get_text(vocab, off + n);
+        if (t == nullptr || std::strcmp(t, buf) != 0) break;
     }
     *offset = off;
     *count  = n;
