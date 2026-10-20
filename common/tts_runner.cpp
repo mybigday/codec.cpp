@@ -339,6 +339,7 @@ static bool run_one(tts_runner_session * s, const tts_runner_params & a, tts_run
     // Prompt: chunk i of every sequence in one batch (sequence q on seq_id q),
     // outputs on each sequence's last row; every position's hidden state when
     // the model asks for them.
+    llama_memory_clear(llama_get_memory(lctx), true);   // every generation starts from an empty context
     const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
     int32_t n_past = 0;
     std::vector<float> prompt_hidden;

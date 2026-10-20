@@ -265,6 +265,21 @@ if(CODEC_BUILD_TTS_CLI)
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${TTS_BACKBONE_INCLUDE_DIRS})
         target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE codec-example-utils "${TTS_BACKBONE_SO}")
 
+        # libcodec_tts: the same runner behind the codec_tts C API
+        # (include/codec_tts.h), next to libcodec (Python: codec_cpp.TTS).
+        set_target_properties(codec-example-utils PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        add_library(codec_tts SHARED
+            common/tts_c.cpp
+            common/tts_runner.cpp
+            common/tts_runner_base.cpp
+        )
+        add_dependencies(codec_tts ttsbackbone)
+        target_include_directories(codec_tts PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/common ${CMAKE_CURRENT_SOURCE_DIR}/include ${TTS_BACKBONE_INCLUDE_DIRS})
+        target_link_libraries(codec_tts PRIVATE codec_shared codec-example-utils "${TTS_BACKBONE_SO}")
+        set_target_properties(codec_tts PROPERTIES
+            BUILD_RPATH "${CMAKE_BINARY_DIR};${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
+
         add_dependencies(tts-cli ttsbackbone)
         target_compile_definitions(tts-cli PRIVATE TTS_CLI_HAVE_BACKBONE=1)
         target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}")
@@ -357,7 +372,12 @@ if(NOT SKBUILD)
     install(TARGETS codec_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(FILES include/codec.h include/codec_lm.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES include/codec.h include/codec_lm.h include/codec_audio_lm.h include/codec_tts.h
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(TARGET codec_tts)
+        set_target_properties(codec_tts PROPERTIES INSTALL_RPATH "${_codec_origin}")
+        install(TARGETS codec_tts LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
 
     foreach(_tool tts-cli tts-server)
         if(TARGET ${_tool})

@@ -30,15 +30,15 @@ def _b(s) -> bytes | None:
 class TTS:
     """A loaded TTS model: a llama.cpp backbone GGUF + a codec GGUF.
 
-    ``model`` is None for self-contained models (Pocket-TTS).  Load-time
-    settings: ``use_gpu``, ``n_threads``, ``max_frames`` (0 = model default),
-    ``cfg_weight`` (Chatterbox T3 CFG; None = model default) and
-    ``kv_overrides`` (codec GGUF metadata, e.g. flow steps).  Calls are not
-    thread-safe; use one TTS per thread or serialize them.
+    ``model`` is None for self-contained models.  Load-time settings:
+    ``use_gpu``, ``n_threads``, ``max_frames`` (longest generation, sizes the
+    backbone context; 0 = model default) and ``kv_overrides`` (codec GGUF
+    metadata).  Calls are not thread-safe; use one TTS per thread or
+    serialize them.
     """
 
     def __init__(self, model: PathLike | None, codec: PathLike, *, use_gpu: bool = False,
-                 n_threads: int = 0, max_frames: int = 0, cfg_weight: float | None = None,
+                 n_threads: int = 0, max_frames: int = 0,
                  kv_overrides: Mapping[str, object] | None = None):
         L = tts_lib()
         p = L.codec_tts_default_params()
@@ -47,8 +47,6 @@ class TTS:
         p.use_gpu = bool(use_gpu)
         p.n_threads = int(n_threads)
         p.max_frames = int(max_frames)
-        if cfg_weight is not None:
-            p.cfg_weight = float(cfg_weight)
         self._kv = None
         if kv_overrides:
             self._kv = _make_kv_overrides(kv_overrides)
@@ -84,39 +82,96 @@ class TTS:
 
     @property
     def takes_instruct(self) -> bool:
-        """CosyVoice instruct models take ``instruct=``."""
+        """The model takes ``instruct=``."""
         return bool(tts_lib().codec_tts_takes_instruct(self.ptr))
 
     # --- synthesis -----------------------------------------------------
 
-    def synthesize(self, text: str, *, voice: str | None = None, ref_audio=None, ref_text: str | None = None,
-                   speaker_file: PathLike | None = None, save_speaker: PathLike | None = None,
-                   instruct: str | None = None, preset: str | None = None, grammar: str | None = None,
-                   seed: int | None = None, temperature: float | None = None, top_p: float | None = None,
-                   top_k: int | None = None, min_p: float | None = None,
-                   repetition_penalty: float | None = None, cfg: float | None = None,
-                   timesteps: int | None = None, min_len: int | None = None) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, **opts) -> tuple[np.ndarray, int]:
         """Synthesize ``text``: returns (float32 PCM, sample rate).
 
         Voice: ``speaker_file`` > ``ref_audio`` (clone; a WAV path or a
-        ``(pcm, sample_rate)`` tuple) > ``voice`` (builtin) > model default.
-        Unset sampler knobs keep the model's defaults.
+        ``(pcm, sample_rate)`` tuple, with ``ref_text`` its transcript) >
+        ``voice`` (builtin) > model default.  Other options (unset = the
+        model's default): ``instruct``, ``preset``, ``grammar``, ``seed``,
+        ``temperature``, ``top_p``, ``top_k``, ``min_p``,
+        ``repetition_penalty``, ``min_frames``, ``lm_guidance``,
+        ``flow_guidance``, ``flow_steps``, ``segment_bytes``,
+        ``save_speaker``.
         """
+        return self._run(text, opts, None, 0)
+
+    def stream(self, text: str, *, chunk_ms: int = 0, **opts):
+        """Like synthesize, but yields (float32 PCM piece, sample rate) as the
+        audio becomes final: per segment, or with ``chunk_ms`` > 0 about that
+        much audio at a time while generating (models that support it)."""
+        import queue
+        import threading
+        q: "queue.Queue" = queue.Queue(maxsize=64)
+        stop = threading.Event()
+        done = object()
+
+        def on_audio(pcm, sr):
+            q.put((pcm, sr))
+            return not stop.is_set()
+
+        def work():
+            try:
+                self._run(text, opts, on_audio, chunk_ms)
+                q.put(done)
+            except BaseException as e:  # surfaced in the consumer
+                q.put(e)
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+            while t.is_alive():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    t.join(0.05)
+
+    def _run(self, text: str, opts: dict, on_audio, chunk_ms: int) -> tuple[np.ndarray, int]:
         L = tts_lib()
         r = L.codec_tts_default_request()
         r.text = text.encode("utf-8")
-        r.voice, r.ref_text, r.instruct = _b(voice), _b(ref_text), _b(instruct)
-        r.speaker_file, r.save_speaker = _b(speaker_file), _b(save_speaker)
-        r.preset, r.grammar = _b(preset), _b(grammar)
+        opts = dict(opts)
+        ref_audio = opts.pop("ref_audio", None)
+        for name in ("voice", "ref_text", "instruct", "speaker_file", "save_speaker", "preset", "grammar"):
+            setattr(r, name, _b(opts.pop(name, None)))
+        seed = opts.pop("seed", None)
         if seed is not None:
             r.seed = int(seed) & 0xFFFFFFFF
-        for name, v in (("temperature", temperature), ("top_p", top_p), ("min_p", min_p),
-                        ("repetition_penalty", repetition_penalty), ("cfg", cfg)):
+        for name in ("temperature", "top_p", "min_p", "repetition_penalty", "lm_guidance", "flow_guidance"):
+            v = opts.pop(name, None)
             if v is not None:
                 setattr(r, name, float(v))
-        for name, v in (("top_k", top_k), ("timesteps", timesteps), ("min_len", min_len)):
+        for name in ("top_k", "min_frames", "flow_steps", "segment_bytes"):
+            v = opts.pop(name, None)
             if v is not None:
                 setattr(r, name, int(v))
+        if opts:
+            raise TypeError(f"unknown synthesis option(s): {', '.join(sorted(opts))}")
+        cb = None
+        if on_audio is not None:
+            def _cb(pcm, n, sr, nch, _ud):
+                try:
+                    x = np.ctypeslib.as_array(pcm, shape=(n * nch,)).copy()
+                    return bool(on_audio(x if nch == 1 else x.reshape(n, nch), int(sr)))
+                except Exception:
+                    return False
+            cb = _ffi.codec_tts_audio_callback(_cb)
+            r.on_audio = cb
+            r.stream_chunk_ms = int(chunk_ms)
 
         tmp = None
         try:

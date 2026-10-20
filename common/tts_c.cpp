@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+using namespace codec_common;
+
 struct codec_tts {
     tts_runner_session * session = nullptr;
     tts_runner_params    load;            // load-time fields, reused per run
@@ -33,21 +35,20 @@ extern "C" {
 
 struct codec_tts_params codec_tts_default_params(void) {
     codec_tts_params p{};
-    p.cfg_weight = -1.0f;
     return p;
 }
 
 struct codec_tts_request codec_tts_default_request(void) {
     codec_tts_request r{};
-    r.seed               = tts_runner_params().seed;
     r.temperature        = -1.0f;
     r.top_p              = -1.0f;
     r.top_k              = -1;
     r.min_p              = -1.0f;
     r.repetition_penalty = -1.0f;
-    r.cfg                = -1.0f;
-    r.timesteps          = -1;
-    r.min_len            = -1;
+    r.min_frames         = -1;
+    r.lm_guidance        = -1.0f;
+    r.flow_guidance      = -1.0f;
+    r.flow_steps         = -1;
     return r;
 }
 
@@ -69,7 +70,6 @@ struct codec_tts * codec_tts_load(const struct codec_tts_params * params, char *
         p.n_threads  = params->n_threads;
         p.use_gpu    = params->use_gpu;
         p.max_frames = params->max_frames;
-        if (params->cfg_weight >= 0.0f) { p.has_cfg_weight = true; p.cfg_weight = params->cfg_weight; }
         t->session = tts_runner_load(p, &e);
         if (t->session == nullptr) { delete t; t = nullptr; }
         else t->info = tts_runner_get_info(t->session);
@@ -107,9 +107,17 @@ bool codec_tts_run(struct codec_tts * t, const struct codec_tts_request * r,
     if (r->top_k >= 0)                 { p.has_top_k = true;       p.top_k = r->top_k; }
     if (r->min_p >= 0.0f)              { p.has_min_p = true;       p.min_p = r->min_p; }
     if (r->repetition_penalty >= 0.0f) { p.has_rep_penalty = true; p.repetition_penalty = r->repetition_penalty; }
-    if (r->cfg >= 0.0f)  p.cfg = r->cfg;
-    if (r->timesteps >= 0) p.timesteps = r->timesteps;
-    p.min_len = r->min_len;
+    if (r->lm_guidance >= 0.0f)        { p.has_cfg_weight = true;  p.cfg_weight = r->lm_guidance; }
+    if (r->flow_guidance >= 0.0f) p.cfg = r->flow_guidance;
+    if (r->flow_steps >= 0)       p.timesteps = r->flow_steps;
+    p.min_len       = r->min_frames;
+    p.segment_bytes = std::max(0, r->segment_bytes);
+    if (r->on_audio != nullptr) {
+        codec_tts_audio_callback cb = r->on_audio;
+        void * ud = r->user_data;
+        p.on_audio = [cb, ud](const float * pcm, int32_t n, int32_t sr, int32_t nch) { return cb(pcm, n, sr, nch, ud); };
+        p.stream_chunk_ms = std::max(0, r->stream_chunk_ms);
+    }
 
     tts_runner_result res;
     if (!tts_runner_run(t->session, p, &res)) {

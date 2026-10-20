@@ -217,85 +217,180 @@ class codec_lm_speaker_info(Structure):
     ]
 
 
+# ─── codec_audio_lm.h ───────────────────────────────────────────────
+
+CODEC_AUDIO_LM_INPUT_TEXT = 1 << 0
+CODEC_AUDIO_LM_INPUT_AUDIO = 1 << 1
+CODEC_AUDIO_LM_OUTPUT_TEXT = 1 << 2
+CODEC_AUDIO_LM_OUTPUT_AUDIO = 1 << 3
+
+CODEC_AUDIO_LM_CHUNK_TEXT = 0
+CODEC_AUDIO_LM_CHUNK_TOKENS = 1
+CODEC_AUDIO_LM_CHUNK_EMBD = 2
+
+CODEC_AUDIO_LM_FLOW_TOKENS = 0
+CODEC_AUDIO_LM_FLOW_CODEC_HEAD = 1
+CODEC_AUDIO_LM_FLOW_HIDDEN = 2
+CODEC_AUDIO_LM_FLOW_SELF_CONTAINED = 3
+
+CODEC_AUDIO_LM_FEED_TOKEN = 0
+CODEC_AUDIO_LM_FEED_EMBD = 1
+CODEC_AUDIO_LM_STOP = 2
+
+
 class codec_audio_lm_params(Structure):
     _fields_ = [
         ("codec_path", c_char_p),
-        ("use_gpu", c_bool),
-        ("n_threads", c_int32),
+        ("backbone_path", c_char_p),
         ("kv_overrides", POINTER(codec_model_kv_override)),
         ("n_kv_overrides", c_int32),
+        ("n_threads", c_int32),
+        ("use_gpu", c_bool),
     ]
 
 
-class codec_audio_lm_input(Structure):
+class codec_audio_lm_caps(Structure):
     _fields_ = [
+        ("modality", ctypes.c_uint32),
+        ("needs_backbone", c_bool),
+        ("needs_backbone_path", c_bool),
+        ("text_needs_phonemes", c_bool),
+        ("takes_ref_audio", c_bool),
+        ("takes_ref_text", c_bool),
+        ("takes_instruct", c_bool),
+        ("needs_voice", c_bool),
+        ("sample_rate", c_int32),
+        ("segment_bytes", c_int32),
+        ("presets", c_char_p),
+    ]
+
+
+# int32_t (*tokenize)(void *, const char *, int32_t, int32_t *, int32_t, bool, bool)
+codec_audio_lm_tokenize_fn = ctypes.CFUNCTYPE(c_int32, c_void_p, POINTER(c_char), c_int32, POINTER(c_int32),
+                                              c_int32, c_bool, c_bool)
+# int32_t (*token_to_piece)(void *, int32_t, char *, int32_t)
+codec_audio_lm_piece_fn = ctypes.CFUNCTYPE(c_int32, c_void_p, c_int32, POINTER(c_char), c_int32)
+# bool (*is_eog)(void *, int32_t)
+codec_audio_lm_is_eog_fn = ctypes.CFUNCTYPE(c_bool, c_void_p, c_int32)
+
+
+class codec_audio_lm_vocab(Structure):
+    _fields_ = [
+        ("user_data", c_void_p),
+        ("tokenize", codec_audio_lm_tokenize_fn),
+        ("token_to_piece", codec_audio_lm_piece_fn),
+        ("n_tokens", c_int32),
+        ("eos", c_int32),
+        ("is_eog", codec_audio_lm_is_eog_fn),
+    ]
+
+
+class codec_audio_lm_backbone_req(Structure):
+    _fields_ = [
+        ("n_ctx", c_int32),
+        ("n_ubatch", c_int32),
+        ("n_seq_max", c_int32),
+        ("embeddings", c_bool),
+        ("flash_attn", c_bool),
+    ]
+
+
+class codec_audio_lm_tts_voice(Structure):
+    _fields_ = [
+        ("voice", c_char_p),
+        ("speaker_file", c_char_p),
         ("ref_pcm", POINTER(c_float)),
         ("ref_n_samples", c_int32),
         ("ref_sample_rate", c_int32),
-        ("speaker_emb", POINTER(c_float)),
-        ("speaker_emb_dim", c_int32),
-        ("emotion", POINTER(c_float)),
         ("ref_text", c_char_p),
-        ("text", c_char_p),
-        ("extra_keys", POINTER(c_char_p)),
-        ("extra_values", POINTER(c_char_p)),
-        ("n_extra", c_int32),
+        ("save_speaker", c_char_p),
     ]
 
 
-class codec_audio_lm_prompt(Structure):
+class codec_audio_lm_tts_request(Structure):
     _fields_ = [
+        ("text", c_char_p),
+        ("instruct", c_char_p),
+        ("preset", c_char_p),
+        ("seed", ctypes.c_uint32),
+        ("temperature", c_float),
+        ("top_p", c_float),
+        ("top_k", c_int32),
+        ("min_p", c_float),
+        ("repetition_penalty", c_float),
+        ("min_frames", c_int32),
+        ("max_frames", c_int32),
+        ("lm_guidance", c_float),
+        ("flow_guidance", c_float),
+        ("flow_steps", c_int32),
+    ]
+
+
+class codec_audio_lm_chunk(Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("text", c_char_p),
+        ("add_special", c_bool),
+        ("parse_special", c_bool),
         ("tokens", POINTER(c_int32)),
-        ("n_tokens", c_int32),
-        ("embeds_prefix", POINTER(c_float)),
-        ("embeds_prefix_rows", c_int32),
-        ("embeds_prefix_hidden", c_int32),
-        ("embeds_uncond", POINTER(c_float)),
-        ("default_temperature", c_float),
-        ("default_top_p", c_float),
-        ("default_min_p", c_float),
-        ("default_repetition_penalty", c_float),
-        ("default_cfg_weight", c_float),
-        ("start_token", c_int32),
+        ("embd", POINTER(c_float)),
+        ("n", c_int32),
+    ]
+
+
+class codec_audio_lm_sampler(Structure):
+    _fields_ = [
+        ("seed", ctypes.c_uint32),
+        ("temp", c_float),
+        ("top_k", c_int32),
+        ("top_p", c_float),
+        ("min_p", c_float),
+        ("penalty_last_n", c_int32),
+        ("penalty_repeat", c_float),
+        ("penalty_freq", c_float),
+        ("penalty_present", c_float),
+        ("penalize_prompt", c_bool),
+        ("penalty_exempt", POINTER(c_int32)),
+        ("n_penalty_exempt", c_int32),
+        ("dry_multiplier", c_float),
+        ("dry_base", c_float),
+        ("dry_allowed_length", c_int32),
+        ("dry_penalty_last_n", c_int32),
+        ("samplers", c_char_p),
+    ]
+
+
+class codec_audio_lm_token_range(Structure):
+    _fields_ = [("begin", c_int32), ("end", c_int32)]
+
+
+class codec_audio_lm_completion(Structure):
+    _fields_ = [
+        ("flow", c_int),
+        ("n_seq", c_int32),
+        ("n_embd", c_int32),
+        ("chunks", POINTER(codec_audio_lm_chunk)),
+        ("n_chunks", c_int32),
+        ("sampler", codec_audio_lm_sampler),
+        ("grammar", c_char_p),
+        ("allowed", POINTER(codec_audio_lm_token_range)),
+        ("n_allowed", c_int32),
+        ("needs_embeddings", c_bool),
+        ("needs_prompt_hidden", c_bool),
+        ("sample_first", c_bool),
+        ("streamable", c_bool),
+        ("max_frames", c_int32),
+        ("min_frames", c_int32),
         ("stop_token", c_int32),
     ]
 
 
-class codec_audio_lm_prompt_info(Structure):
+class codec_audio_lm_verdict(Structure):
     _fields_ = [
-        ("model_kind", c_int),
-        ("host_arch", c_char_p),
-        ("prompt_prefix", c_char_p),
-        ("prompt_suffix", c_char_p),
-        ("add_bos", c_bool),
-        ("parse_special", c_bool),
-        ("cb0_from_backbone", c_bool),
-        ("audio_codebook_offset", c_int32),
-        ("is_continuous", c_bool),
-        ("n_codebook", c_int32),
-        ("hidden_dim", c_int32),
-        ("eos_code_c0", c_int32),
-        ("eos_min_step", c_int32),
-        ("default_temperature", c_float),
-        ("default_top_p", c_float),
-        ("default_top_k", c_int32),
-        ("streaming_interleave", c_bool),
-        ("text_externally_added", c_bool),
-        ("prefill_text_len", c_int32),
-        ("text_pad_id", c_int32),
-        ("audio_pad_code", c_int32),
-        ("bos_code_c0", c_int32),
-        ("default_repetition_penalty", c_float),
-        ("repetition_window", c_int32),
-        ("sequential_text_audio", c_bool),
-        ("audio_start_id", c_int32),
-        ("text_end_id", c_int32),
-        ("max_text_tokens", c_int32),
-        ("cb0_speech_range_start", c_int32),
-        ("cb0_speech_range_end", c_int32),
-        ("audio_tok_offset", c_int32),
-        ("audio_tok_count", c_int32),
-        ("audio_tok_eos", c_int32),
+        ("action", c_int),
+        ("sample_backbone", c_bool),
+        ("is_audio", c_bool),
+        ("token", c_int32),
     ]
 
 
@@ -415,6 +510,37 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
         _status, [c_void_p, _f32p, c_int32, _i32p, c_int32, _f32p, _f32p, c_int32]),
     # codec.h — logging (codec_log is variadic: call it as codec_log(level, b"%s", msg))
     "codec_log_set": (None, [codec_log_callback, c_void_p]),
+    # codec_audio_lm.h
+    "codec_audio_lm_default_params": (codec_audio_lm_params, []),
+    "codec_audio_lm_init": (c_void_p, [POINTER(codec_audio_lm_params), c_char_p, c_size_t]),
+    "codec_audio_lm_free": (None, [c_void_p]),
+    "codec_audio_lm_last_error": (c_char_p, [c_void_p]),
+    "codec_audio_lm_meta_str": (c_char_p, [c_void_p, c_char_p]),
+    "codec_audio_lm_get_caps": (None, [c_void_p, POINTER(codec_audio_lm_caps)]),
+    "codec_audio_lm_list_voices": (c_int32, [c_void_p, c_char_p]),
+    "codec_audio_lm_voice": (c_bool, [c_void_p, c_int32, POINTER(c_char_p), POINTER(c_char_p), POINTER(c_bool)]),
+    "codec_audio_lm_backbone_requirements": (
+        c_bool, [c_void_p, POINTER(codec_audio_lm_vocab), c_int32, POINTER(codec_audio_lm_backbone_req)]),
+    "codec_audio_lm_default_tts_voice": (codec_audio_lm_tts_voice, []),
+    "codec_audio_lm_tts_set_voice": (c_bool, [c_void_p, POINTER(codec_audio_lm_tts_voice)]),
+    "codec_audio_lm_default_tts_request": (codec_audio_lm_tts_request, []),
+    "codec_audio_lm_tts_prompt": (
+        c_bool, [c_void_p, POINTER(codec_audio_lm_tts_request), POINTER(codec_audio_lm_vocab)]),
+    "codec_audio_lm_tts_split": (c_int32, [c_void_p, c_char_p, c_int32]),
+    "codec_audio_lm_tts_segment": (c_char_p, [c_void_p, c_int32]),
+    "codec_audio_lm_tts_join": (c_int32, [c_void_p, POINTER(codec_pcm_buffer), c_int32, c_int32]),
+    "codec_audio_lm_get_completion": (c_bool, [c_void_p, POINTER(codec_audio_lm_completion)]),
+    "codec_audio_lm_prefill": (c_bool, [c_void_p, _f32p, c_int32]),
+    "codec_audio_lm_observe": (c_bool, [c_void_p, _i32p, _f32p, POINTER(codec_audio_lm_verdict)]),
+    "codec_audio_lm_next_embd": (_f32p, [c_void_p, c_int32]),
+    "codec_audio_lm_stop_reason": (c_char_p, [c_void_p]),
+    "codec_audio_lm_generate_self_contained": (c_bool, [c_void_p]),
+    "codec_audio_lm_decode": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
+    "codec_audio_lm_stream_poll": (c_bool, [c_void_p, c_int32, POINTER(codec_pcm_buffer)]),
+    "codec_audio_lm_stream_finish": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
+    "codec_audio_lm_decodable_frames": (c_int32, [c_void_p]),
+    "codec_audio_lm_hop": (c_int32, [c_void_p]),
+    "codec_audio_lm_decode_range": (c_bool, [c_void_p, c_int32, c_int32, POINTER(codec_pcm_buffer)]),
 }
 
 
@@ -442,8 +568,11 @@ class codec_tts_params(Structure):
         ("n_threads", c_int32),
         ("use_gpu", c_bool),
         ("max_frames", c_int32),
-        ("cfg_weight", c_float),
     ]
+
+
+# bool (*codec_tts_audio_callback)(const float *, int32_t, int32_t, int32_t, void *)
+codec_tts_audio_callback = ctypes.CFUNCTYPE(c_bool, POINTER(c_float), c_int32, c_int32, c_int32, c_void_p)
 
 
 class codec_tts_request(Structure):
@@ -463,9 +592,14 @@ class codec_tts_request(Structure):
         ("top_k", c_int32),
         ("min_p", c_float),
         ("repetition_penalty", c_float),
-        ("cfg", c_float),
-        ("timesteps", c_int32),
-        ("min_len", c_int32),
+        ("min_frames", c_int32),
+        ("lm_guidance", c_float),
+        ("flow_guidance", c_float),
+        ("flow_steps", c_int32),
+        ("segment_bytes", c_int32),
+        ("on_audio", codec_tts_audio_callback),
+        ("user_data", c_void_p),
+        ("stream_chunk_ms", c_int32),
     ]
 
 
