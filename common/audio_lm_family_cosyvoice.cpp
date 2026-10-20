@@ -70,7 +70,7 @@ public:
 
     void caps(codec_audio_lm_caps * out) const override {
         alm_family::caps(out);
-        out->takes_ref_audio = true;
+        out->takes_ref_audio = audio_lm_codec_can_speaker_from_audio(alm_);
         out->takes_ref_text  = true;
         out->takes_instruct  = true;
         out->needs_voice     = true;

@@ -48,7 +48,7 @@ public:
 
     void caps(codec_audio_lm_caps * out) const override {
         alm_family::caps(out);
-        out->takes_ref_audio = true;
+        out->takes_ref_audio = audio_lm_codec_can_speaker_from_audio(alm_);
         const char * sr = audio_lm_meta_str(alm_, "codec.sample_rate");
         out->sample_rate = sr ? std::atoi(sr) : 24000;
     }
