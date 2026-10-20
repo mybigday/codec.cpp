@@ -217,6 +217,9 @@ std::vector<std::string> tts_split_text(const std::string & text, int32_t max_by
 // A segment's edges for joining: leading / trailing silence trimmed (frames
 // of 10 ms below -45 dBFS, keeping 20 ms of margin) when `trim`, then a
 // linear fade of `fade_ms` at both ends.
+// Linear-interpolation resample of mono PCM (speaker encoders' input rates).
+std::vector<float> resample_mono_f32(const std::vector<float> & in, int32_t in_sr, int32_t out_sr);
+
 std::vector<float> tts_shape_segment(const std::vector<float> & pcm, int32_t sample_rate, bool trim, int32_t fade_ms);
 
 // Self-contained FlowLM split into open / run / free (what

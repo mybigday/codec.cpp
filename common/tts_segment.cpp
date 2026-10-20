@@ -213,4 +213,21 @@ std::vector<float> tts_shape_segment(const std::vector<float> & pcm, int32_t sam
     return w;
 }
 
+std::vector<float> resample_mono_f32(const std::vector<float> & in,
+                                     int32_t in_sr, int32_t out_sr) {
+    if (in.empty() || in_sr <= 0 || out_sr <= 0 || in_sr == out_sr) return in;
+    const int64_t n_in  = (int64_t) in.size();
+    const int64_t n_out = n_in * out_sr / in_sr;
+    std::vector<float> out((size_t) std::max<int64_t>(n_out, 1));
+    for (int64_t i = 0; i < (int64_t) out.size(); ++i) {
+        const double src = (double) i * in_sr / out_sr;
+        int64_t i0 = (int64_t) src;
+        const double f = src - (double) i0;
+        const float a0 = in[(size_t) std::min<int64_t>(i0,     n_in - 1)];
+        const float a1 = in[(size_t) std::min<int64_t>(i0 + 1, n_in - 1)];
+        out[(size_t) i] = (float) ((double) a0 * (1.0 - f) + (double) a1 * f);
+    }
+    return out;
+}
+
 }  // namespace codec_common

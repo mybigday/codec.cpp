@@ -130,6 +130,7 @@ add_library(codec_audio_lm_objs OBJECT
     common/audio_lm_family_kitten.cpp
     common/audio_lm_family_codebook.cpp
     common/audio_lm_family_text_lane.cpp
+    common/audio_lm_family_chatterbox.cpp
     common/tts_segment.cpp
     common/kitten_text.cpp
 )

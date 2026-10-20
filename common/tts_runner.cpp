@@ -399,23 +399,6 @@ struct SamplerChain {
 // Shared by every speaker-encoder path in the runner (Chatterbox VE @ 16 kHz
 // and, via audio_lm_build_prompt, the ECAPA-TDNN @ 24 kHz path).  Each
 // encoder declares its working rate; the runner feeds PCM at that rate.
-std::vector<float> resample_mono_f32(const std::vector<float> & in,
-                                     int32_t in_sr, int32_t out_sr) {
-    if (in.empty() || in_sr <= 0 || out_sr <= 0 || in_sr == out_sr) return in;
-    const int64_t n_in  = (int64_t) in.size();
-    const int64_t n_out = n_in * out_sr / in_sr;
-    std::vector<float> out((size_t) std::max<int64_t>(n_out, 1));
-    for (int64_t i = 0; i < (int64_t) out.size(); ++i) {
-        const double src = (double) i * in_sr / out_sr;
-        int64_t i0 = (int64_t) src;
-        const double f = src - (double) i0;
-        const float a0 = in[(size_t) std::min<int64_t>(i0,     n_in - 1)];
-        const float a1 = in[(size_t) std::min<int64_t>(i0 + 1, n_in - 1)];
-        out[(size_t) i] = (float) ((double) a0 * (1.0 - f) + (double) a1 * f);
-    }
-    return out;
-}
-
 // Load ref audio (mono F32) from `path` into `ref_pcm`; fills the geometry
 // out-params.  Returns true (and leaves ref_pcm empty) when path is empty.
 static double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -2662,8 +2645,9 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     }
     codec_audio_lm_completion c;
     if (!codec_audio_lm_get_completion(alm, &c)) return fail("completion");
-    if (c.n_seq != 1) {
-        out->error = "generic loop: multi-sequence completions are not wired yet";
+    const int32_t n_seq = std::max(1, c.n_seq);
+    if (n_seq > 1 && c.sample_first) {
+        out->error = "generic loop: backbone sampling over several sequences is not supported";
         return false;
     }
 
@@ -2717,9 +2701,41 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     }
 
     // Prompt: each chunk in order; logits / hidden on the last position.
+    // Several sequences decode side by side: chunk i of every sequence in one
+    // batch (sequence s on seq_id s, outputs on each one's last row).
     const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
     int32_t n_past = 0;
-    for (int32_t i = 0; i < c.n_chunks; ++i) {
+    for (int32_t i = 0; n_seq > 1 && i < c.n_chunks; ++i) {
+        int32_t total = 0, n_rows = -1;
+        for (int32_t q = 0; q < n_seq; ++q) {
+            const codec_audio_lm_chunk & ch = c.chunks[q * c.n_chunks + i];
+            if (ch.type != CODEC_AUDIO_LM_CHUNK_EMBD) { out->error = "multi-sequence prompts take embedding chunks"; return false; }
+            if (n_rows >= 0 && ch.n != n_rows) { out->error = "multi-sequence prompt chunks differ in length"; return false; }
+            n_rows = ch.n;
+            total += ch.n;
+        }
+        if (n_rows <= 0) continue;
+        if (n_past + n_rows + 1 >= n_ctx) { out->error = "the prompt does not fit the backbone context"; return false; }
+        llama_batch b = llama_batch_init(total, c.n_embd, 1);
+        b.token = nullptr;
+        b.n_tokens = total;
+        int32_t bi = 0;
+        for (int32_t q = 0; q < n_seq; ++q) {
+            const codec_audio_lm_chunk & ch = c.chunks[q * c.n_chunks + i];
+            for (int32_t r = 0; r < n_rows; ++r, ++bi) {
+                std::memcpy(b.embd + (size_t) bi * c.n_embd, ch.embd + (size_t) r * c.n_embd, (size_t) c.n_embd * sizeof(float));
+                b.pos[bi] = n_past + r;
+                b.n_seq_id[bi] = 1;
+                b.seq_id[bi][0] = q;
+                b.logits[bi] = r == n_rows - 1 ? 1 : 0;
+            }
+        }
+        const int rc = llama_decode(lctx, b);
+        llama_batch_free(b);
+        if (rc != 0) { out->error = "prompt decode failed"; return false; }
+        n_past += n_rows;
+    }
+    for (int32_t i = 0; n_seq == 1 && i < c.n_chunks; ++i) {
         const codec_audio_lm_chunk & ch = c.chunks[i];
         if (ch.type == CODEC_AUDIO_LM_CHUNK_EMBD) {
             if (ch.n <= 0) continue;
@@ -2743,12 +2759,23 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
 
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : c.max_frames;
     bool sample = c.sample_first;
+    std::vector<float> hiddens;
     int32_t frames = 0;
     const char * stop = nullptr;
     while (frames < max_frames) {
         if (n_past >= n_ctx) { stop = "n_ctx"; break; }
-        const float * h = c.needs_embeddings ? llama_get_embeddings_ith(lctx, -1) : nullptr;
-        if (c.needs_embeddings && h == nullptr) { out->error = "backbone returned no hidden state"; return false; }
+        const float * h = nullptr;
+        if (c.needs_embeddings) {
+            // n_seq rows: sequence s's last output is -(n_seq - s) from the end.
+            if (n_seq > 1) hiddens.resize((size_t) n_seq * c.n_embd);
+            for (int32_t q = 0; q < n_seq; ++q) {
+                const float * hq = llama_get_embeddings_ith(lctx, -(n_seq - q));
+                if (hq == nullptr) { out->error = "backbone returned no hidden state"; return false; }
+                if (n_seq == 1) h = hq;
+                else std::memcpy(hiddens.data() + (size_t) q * c.n_embd, hq, (size_t) c.n_embd * sizeof(float));
+            }
+            if (n_seq > 1) h = hiddens.data();
+        }
         llama_token tok = -1;
         if (sample) {
             tok = smpl.sample(lctx, -1);   // always first: its random stream advances every step
@@ -2760,7 +2787,14 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
         if (v.action == CODEC_AUDIO_LM_STOP) break;
         bool ok = true;
         if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) ok = decode_tokens(lctx, {v.token >= 0 ? v.token : tok}, n_past, false);
-        else ok = decode_embed(lctx, codec_audio_lm_next_embd(alm, 0), c.n_embd, n_past);
+        else if (n_seq == 1) ok = decode_embed(lctx, codec_audio_lm_next_embd(alm, 0), c.n_embd, n_past);
+        else {
+            std::vector<float> rows((size_t) n_seq * c.n_embd);
+            for (int32_t q = 0; q < n_seq; ++q) {
+                std::memcpy(rows.data() + (size_t) q * c.n_embd, codec_audio_lm_next_embd(alm, q), (size_t) c.n_embd * sizeof(float));
+            }
+            ok = decode_embed_batch(lctx, rows.data(), c.n_embd, n_seq, n_past);
+        }
         if (!ok) { out->error = "decode failed"; return false; }
         ++n_past;
         if (v.is_audio && c.streamable && !stream_poll(fs)) { out->error = "stream_stopped"; return false; }
