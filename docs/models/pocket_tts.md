@@ -39,14 +39,22 @@ The codec_audio_lm family (`common/audio_lm_family_flow.cpp`) follows
 it (tts-cli, `codec_cpp.TTS` / `AudioLM`, llama.rn):
 
 - `prepare_text_prompt` (strip, capitalize, trailing period), then the backbone
-  sequence `[text tokens | bos_before_voice + speaker_proj(Mimi latents of
-  --ref-audio) | per-frame input embeddings]`;
+  sequence `[text tokens | bos_before_voice + speaker_proj(voice latents) |
+  per-frame input embeddings]`;
 - per frame: the frame input (`input_linear` of `bos_emb` ending the prompt,
   then of the previous latent, fed back as an embedding) → backbone hidden →
   the EOS head (logit > −4) and the LSD flow head (latent from noise
   ~ N(0, 0.7) seeded by `--seed`);
 - after EOS, `frames_after_eos` more frames (word-count guess + 2), dropping
   the frame it stops on; `--min-len` ignores EOS before that frame.
+
+A voice is a codec speaker (docs/codec_speaker.md) with one slot, `latents`
+F32 `[n_frames, 32]`: the Mimi encoder latent of the reference, which
+`codec_speaker_from_audio` computes from the first 30 s (resampled to 24 kHz
+in-graph), as the reference server does (`get_state_for_audio_prompt(...,
+truncate=True)` → `_encode_audio`). `--save-speaker` / `--speaker-file` store
+and reuse it; files carry `pocket_mimi.spk.encoder_hash` (GGUFs converted
+before it have none, so their speakers are not hash-checked).
 
 Free-run quality depends on the noise stream (the reference too); short
 prompts can stop after a frame or two. Parity when the backbone move landed:

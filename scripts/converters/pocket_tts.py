@@ -56,6 +56,7 @@ except ImportError:
     torch = None
 
 from .base import BaseConverter
+from .speaker import encoder_hash
 from utils.gguf_writer import GGUFWriter
 
 
@@ -208,6 +209,13 @@ class PocketTTSConverter(BaseConverter):
 
         # ---- codec tensors ---------------------------------------------
         self._emit_mimi(writer, cfg, t)
+        # Voices are the encoder latent of a reference (speaker slot `latents`);
+        # speaker files carry the encoder's hash.
+        enc = [(k, _to_numpy(v)) for k, v in sd.items()
+               if k.startswith(("mimi.encoder.", "mimi.encoder_transformer.", "mimi.downsample."))]
+        writer.add_string(f"{self.architecture}.spk.encoder_hash", encoder_hash(
+            enc, "pocket_mimi.spk.v1;resample=torchaudio_sinc_hann(width=6,rolloff=0.99);"
+                 f"sample_rate={cfg['sample_rate']};max_seconds=30;slot=latents"))
 
         # ---- LM tensors + metadata (Phase 2 wiring reads these) --------
         self._emit_flow_lm(writer, cfg, t)
