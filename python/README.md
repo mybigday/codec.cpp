@@ -1,8 +1,9 @@
 # codec-cpp (Python bindings)
 
 `codec_cpp` is the Python API for codec.cpp. It wraps the public C API
-(`include/codec.h`, `include/codec_lm.h`) with ctypes. It has no compiled
-extension, and its only dependency is numpy.
+(`include/codec.h`, `codec_lm.h`, `codec_audio_lm.h`, and `codec_tts.h` from
+libcodec_tts) with ctypes. It has no compiled extension, and its only
+dependency is numpy.
 
 ## Install
 
@@ -36,7 +37,57 @@ process also uses llama-cpp-python, `import llama_cpp` before the first
 codec_cpp call. llama-cpp-python ships its own libggml, and the first one loaded
 wins.
 
-## Usage
+## Text to speech
+
+`codec_cpp.TTS` runs the whole pipeline, the same host loop as `tts-cli`: the
+backbone GGUF in the llama.cpp bundled with codec.cpp (with the architecture
+patches the models need), the codec GGUF in codec.cpp. It needs
+`libcodec_tts`, built next to libcodec when `CODEC_TTS_BACKBONE=ON` (the
+default for CMake builds; wheel builds do not include it yet).
+
+```python
+import codec_cpp
+
+tts = codec_cpp.TTS("backbone.gguf", "codec.gguf")    # use_gpu=, n_threads=, max_frames=, kv_overrides=
+audio, sr = tts.synthesize("Hello there.")
+audio, sr = tts.synthesize("Hello there.", ref_audio="me.wav", ref_text="What the clip says.")
+audio, sr = tts.synthesize("Hello there.", voice=tts.voices()[0], seed=7, temperature=0.8)
+for piece, sr in tts.stream(long_text, chunk_ms=500):   # audio as it becomes final
+    play(piece, sr)
+```
+
+Options left unset keep the model's defaults (from its GGUF): `instruct`,
+`preset`, `grammar`, `seed`, `temperature`, `top_p`, `top_k`, `min_p`,
+`repetition_penalty`, `min_frames`, `lm_guidance`, `flow_guidance`,
+`flow_steps`, `segment_bytes`, `speaker_file`, `save_speaker`.
+
+## Your own llama.cpp loop: AudioLM
+
+`codec_cpp.AudioLM` mirrors `include/codec_audio_lm.h`
+([docs/codec_common_api.md](../docs/codec_common_api.md)): codec.cpp says what
+to feed the backbone, how to sample and when to stop; your code makes every
+llama.cpp call. With llama-cpp-python (stock architectures only):
+
+```python
+import llama_cpp                                     # before codec_cpp (own libggml)
+import codec_cpp
+
+alm = codec_cpp.AudioLM("codec.gguf")                # backbone_path= for models that read its embeddings
+vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)
+req = alm.backbone_requirements(vocab, max_frames=500)   # n_ctx, n_ubatch, n_seq_max, embeddings, flash_attn
+alm.set_voice(ref_audio=(pcm, sr))
+alm.tts_prompt("Hello there.", vocab=vocab)
+c = alm.completion()      # c.chunks (TEXT / TOKENS / EMBD), c.sampler, c.allowed, c.grammar, flags
+# decode the chunks, then per step:
+v = alm.observe(tokens=[tok] if sampled else None, hiddens=last_hidden)
+# STOP -> done; FEED_TOKEN -> decode v.token (or tok); FEED_EMBD -> decode alm.next_embd(0)
+audio, sr = alm.decode()  # or alm.stream_poll() after audio steps + alm.stream_finish()
+```
+
+`tests/e2e/audio_lm_host_smoke.py` is a complete loop. `alm.split` /
+`alm.join` give the model's segmentation of long text.
+
+## Codecs
 
 ```python
 import codec_cpp

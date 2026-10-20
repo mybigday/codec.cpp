@@ -1,445 +1,178 @@
-# codec_common — generic audio-LM API
+# codec_audio_lm — running audio LMs with a llama.cpp backbone
 
-Status: landed.  Reference implementation in `common/audio_lm.cpp`,
-exercised by `tools/tts-cli` (`build/tts-cli {info,decode,synthesize}`).
-Dev-time trace/simulate-* subcommands were removed once `synthesize`
-covered every model end-to-end; the e2e smokes (`tests/e2e/`) drive the
-same paths via ctypes.
+`include/codec_audio_lm.h` describes how to run an audio LM whose backbone is
+a llama.cpp model and whose audio side is a codec.cpp GGUF. It plays the role
+of llama.cpp's `common` + MTMD: the library says **what to feed the backbone,
+how to sample, when to stop**, and turns the generation into audio. The host
+keeps every `llama_*` call: tokenization, `llama_decode`, the sampler, the KV
+cache, batching. Nothing in the API names a model; every model-specific detail
+sits behind it.
 
-A small `codec_common::` namespace in codec.cpp that wraps the
-per-model audio-LM machinery (speaker_encode, prompt prefix assembly,
-depth-AR / parallel-heads bookkeeping, codes accumulation, audio
-decode) behind one interface, in the same spirit as llama.cpp's
-`common/` layer.
+Text-to-speech is the first prompt builder (`codec_audio_lm_tts_prompt`).
+Other tasks (audio-to-audio) will add their own builders that produce the same
+completion description, so the host loop stays the same.
 
-The application (llama.rn's rn-tts, tools/tts-cli, …) keeps full
-ownership of the `llama_decode` loop, the sampler, KV management, and
-the host-side batch — `codec_common` only provides:
-  * **build-time**: ref-audio encoding + prompt-prefix construction
-  * **per-step**: a `observe_token` hook that returns what the host
-    should feed at the next step (text passthrough, audio-consumed
-    token path, audio-consumed embed-override path, or stop)
-  * **end-of-sequence**: codes → PCM decode
-
-The host's own AR loop (e.g. `rn-completion.cpp`'s `doCompletion`) does
-NOT get wrapped.  That is the explicit non-negotiable constraint —
-codec_common provides per-step hooks, not a loop replacement.
-
-## Boundary
+## Layers
 
 | Layer | Owns |
 |---|---|
-| **llama.cpp / host AR loop** | tokenize, `llama_decode`, sampler, KV cache, batch construction |
-| **codec_common (new)** | ref-audio encoding (speaker_encode), prompt prefix (cond_emb), per-step codes bookkeeping (depth-AR for residual_depth_ar, delay for parallel_heads_delay), `compose_audio_embd`, codes → PCM decode, modality detection |
-| **codec_tts_runner (optional)** | a COMPLETE reference host loop for hosts that don't own their own — backbone load, tokenize/prefill, every per-model flow, sampling, CFG pair, streaming interleave, embed injection, EOS, decode→PCM.  Links the isolated llama backbone (`libttsbackbone`); composes the codec_common per-step hooks internally.  For hosts that want a ready-made loop (tools/tts-cli, tools/tts-server via the load-once `tts_runner_session`, which also segments long input and streams PCM through `on_audio`, decoding partial output with `audio_lm_decode_audio_range` / `audio_lm_decodable_frames` / `audio_lm_codec_hop`), NOT for hosts that own the loop (llama.rn uses the hooks directly).  Built only with `CODEC_TTS_BACKBONE=ON`; the self-contained no-backbone FlowLM path (`tts_runner_synthesize_selfcontained`) lives in codec_common and is always available. |
-| **App glue (rn-tts.cpp / tools/tts-cli.cpp)** | for hook hosts (rn-tts): decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result.  For runner hosts (tts-cli): parse args → `tts_runner_synthesize(params)` → write WAV. |
+| **Host** (llama.rn, `common/tts_runner`, a Python script) | the llama.cpp model and context, tokenize / decode / sample, the loop |
+| **codec_audio_lm** (`common/audio_lm_c.cpp`, in libcodec) | capabilities, voices, context requirements, segmentation and joining, prompt chunks, sampler settings, per-step verdicts, codec-side heads and their sampling, decode and streaming |
+| **families** (`common/audio_lm_family_*.cpp`, internal) | one class per model family: the prompt format, conditioning, heads, stop rules |
+| **codec_lm / codec** (`src/`) | the adaptor graphs (heads, embeddings, speaker encoders) and the codec decoder |
 
-## Inference patterns
+## Host loop
 
-Every audio-output LM currently in scope falls into one of four
-categories.  The `observe_token` return type encodes which path the
-host should take next:
+```c
+codec_audio_lm * alm = codec_audio_lm_init(&params, err, sizeof err);
 
-| Type | Examples | Per-step shape | Next backbone input |
-|---|---|---|---|
-| **A** Token-based single-cb | OuteTTS, Orpheus | sample one token from a unified vocab where some IDs encode audio | `embd.push_back(tok)` — standard token path |
-| **B** Embed-based single-cb | Chatterbox T3 / Turbo | sample one speech token from a dedicated speech head | `speech_emb[tok] + speech_pos_emb[step]` via `inputs_embeds` |
-| **C** Residual depth-AR multi-cb | CSM, Qwen3-TTS, Moshi, LFM2-Audio | backbone samples cb0; a small depth decoder runs to sample cb1..N-1 conditioned on cb0 | `compose_audio_embd(cb0..cb_{N-1})` via `inputs_embeds` |
-| **D** Parallel heads delay multi-cb | MOSS-TTSD | backbone hidden feeds N parallel heads that sample all N codebooks in one step (delay pattern shifts emission per cb) | `compose_audio_embd(cb0..cb_{N-1})` via `inputs_embeds` |
+// Backbone: load the model, then size its context as the model asks.
+codec_audio_lm_backbone_req req;
+codec_audio_lm_backbone_requirements(alm, &vocab, max_frames, &req);
+// llama_context_params: n_ctx = req.n_ctx, n_ubatch = req.n_ubatch ?: n_ctx,
+// n_seq_max = req.n_seq_max, embeddings = req.embeddings (pooling none),
+// flash_attn_type = req.flash_attn ? auto : disabled
 
-A walks the standard token path; B/C/D need to override the next
-input with a precomputed embedding.  That is the only behavioural
-split the API needs to expose.
-
-## Public API
-
-```cpp
-// include/codec_common.h
-namespace codec_common {
-
-// ──────────────────────────────────────────────────────────────────
-// Modality
-// ──────────────────────────────────────────────────────────────────
-enum modality_flag : uint32_t {
-    INPUT_TEXT   = 1 << 0,   // model consumes text prompt
-    INPUT_AUDIO  = 1 << 1,   // model consumes ref / prompt audio
-    OUTPUT_TEXT  = 1 << 2,   // model emits text (audio chat)
-    OUTPUT_AUDIO = 1 << 3,   // model emits speech (TTS / audio chat)
-};
-
-// ──────────────────────────────────────────────────────────────────
-// Params / I/O types
-// ──────────────────────────────────────────────────────────────────
-struct audio_lm_params {
-    std::string codec_path;         // codec / codec_lm GGUF
-    bool        use_gpu   = false;
-    int32_t     n_threads = 0;
-};
-
-// Generic input descriptor — fill whatever fields the caller has;
-// model uses what it needs (declared via modality + speaker info).
-struct audio_lm_input {
-    const float * ref_pcm         = nullptr;
-    int32_t       ref_n_samples   = 0;
-    int32_t       ref_sample_rate = 0;
-
-    const float * speaker_emb     = nullptr;  // pre-computed (skip VE / ECAPA)
-    int32_t       speaker_emb_dim = 0;
-
-    const float * emotion         = nullptr;  // [0, 1] scalar
-
-    std::string   ref_text;                    // ICL voice clone
-    std::string   text;                        // synthesis target
-
-    // Model-specific knobs (language_id, speaker_id, …) — small bag.
-    std::map<std::string, std::string> extra;
-};
-
-// Built prompt: tokens (host feeds via llama_decode) + optional
-// prefix embeddings (cond_emb etc.) for the inputs_embeds path.
-struct audio_lm_prompt {
-    std::vector<llama_token> tokens;
-
-    // Optional: prefix embeddings (rows × hidden) prepended to the
-    // sequence via inputs_embeds.  Empty when the model doesn't need
-    // a prefix (Type A models).
-    std::vector<float> embeds_prefix;
-    int32_t            embeds_prefix_rows   = 0;
-    int32_t            embeds_prefix_hidden = 0;
-
-    // CFG-using models (Chatterbox): unconditional branch for the
-    // pair-decode classifier-free-guidance sampling.
-    std::vector<float> embeds_uncond;
-
-    // Sampler hints — training-time defaults; host may override.
-    float       default_temperature        = 0.0f;
-    float       default_top_p              = 0.0f;
-    float       default_min_p              = 0.0f;
-    float       default_repetition_penalty = 0.0f;
-    float       default_cfg_weight         = 0.0f;
-    llama_token start_token                = -1;
-    llama_token stop_token                 = -1;
-};
-
-struct audio_lm_audio_output {
-    std::vector<float> pcm;
-    int32_t            sample_rate = 0;
-    int32_t            n_channels  = 1;
-};
-
-// ──────────────────────────────────────────────────────────────────
-// Per-step observe action
-// ──────────────────────────────────────────────────────────────────
-enum observe_action {
-    OBSERVE_PASSTHROUGH,      // text token — host renders, embd.push_back(tok)
-    OBSERVE_CONSUMED,         // audio token (Type A) — no render, embd.push_back(tok)
-    OBSERVE_CONSUMED_EMBED,   // audio token (Type B/C/D) — no render, next step
-                              //                            uses get_next_embed()
-                              //                            via inputs_embeds path
-    OBSERVE_STOP,             // model emitted stop / codec_lm done
-};
-
-// ──────────────────────────────────────────────────────────────────
-// Lifecycle
-// ──────────────────────────────────────────────────────────────────
-struct audio_lm_context;
-
-audio_lm_context * audio_lm_init (const audio_lm_params &);
-void               audio_lm_free (audio_lm_context *);
-void               audio_lm_reset(audio_lm_context *);   // for next sequence
-
-// ──────────────────────────────────────────────────────────────────
-// Capability queries (read once at init from GGUF metadata)
-// ──────────────────────────────────────────────────────────────────
-uint32_t audio_lm_modality       (const audio_lm_context *);  // modality_flag bitmask
-bool     audio_lm_has_speaker_enc(const audio_lm_context *);
-int32_t  audio_lm_n_codebook     (const audio_lm_context *);
-int32_t  audio_lm_hidden_dim     (const audio_lm_context *);
-
-// ──────────────────────────────────────────────────────────────────
-// Prompt build (one shot, before the AR loop)
-// ──────────────────────────────────────────────────────────────────
-bool audio_lm_build_prompt(audio_lm_context *,
-                            const audio_lm_input  &,
-                            audio_lm_prompt       *);
-
-// ──────────────────────────────────────────────────────────────────
-// Per-step hook (called by host after sampling each backbone token)
-// ──────────────────────────────────────────────────────────────────
-//
-// `last_hidden` is the backbone's hidden state at the just-sampled
-// position, fetched by the host via `llama_get_embeddings_ith(-1)`.
-// codec_common needs it for Type C/D where it has to push the hidden
-// into the depth decoder before sampling cb1..N-1.  Pass nullptr for
-// Type A/B (the function will ignore it).
-//
-// The action return tells the host how to set up the NEXT
-// llama_decode call:
-//   OBSERVE_PASSTHROUGH / OBSERVE_CONSUMED:
-//     standard `embd.push_back(tok)` + `llama_batch_get_one(&tok, 1)`
-//   OBSERVE_CONSUMED_EMBED:
-//     host calls `get_next_embed()` and feeds the returned vector via
-//     `llama_batch_init(...).embd`; the audio token is NOT pushed onto
-//     `embd` for KV continuity, the embed is.
-//   OBSERVE_STOP:
-//     host breaks out of the AR loop and calls `decode_audio`.
-observe_action audio_lm_observe_token(
-        audio_lm_context *,
-        llama_token tok,
-        const float * last_hidden,    // may be nullptr for Type A/B
-        int32_t       hidden_dim);
-
-// Only valid after OBSERVE_CONSUMED_EMBED; points into audio_lm_context's
-// internal buffer; remains valid until the next observe_token / reset call.
-const float * audio_lm_get_next_embed(const audio_lm_context *,
-                                       int32_t * out_dim);
-
-// ──────────────────────────────────────────────────────────────────
-// End of sequence
-// ──────────────────────────────────────────────────────────────────
-//
-// Decode accumulated codes → PCM.  Valid only when modality has
-// OUTPUT_AUDIO and the AR loop has produced at least one audio frame.
-bool audio_lm_decode_audio(audio_lm_context *, audio_lm_audio_output *);
-
-}  // namespace codec_common
-```
-
-## `observe_action` semantics in detail
-
-```
-OBSERVE_PASSTHROUGH
-  ├─ host: render token text to user
-  ├─ host: embd.push_back(tok)
-  └─ next llama_decode: batch of {tok}, token path
-     (modality.OUTPUT_TEXT branch — text in an audio-chat reply)
-
-OBSERVE_CONSUMED
-  ├─ host: do NOT render (audio token, not human-readable)
-  ├─ host: embd.push_back(tok)   ← still needed for KV continuity
-  └─ next llama_decode: batch of {tok}, token path
-     (Type A: OuteTTS / Orpheus — audio rides on the regular token stream)
-
-OBSERVE_CONSUMED_EMBED
-  ├─ host: do NOT render
-  ├─ host: do NOT embd.push_back(tok)   ← embed replaces it
-  ├─ host: call get_next_embed() → (vec, dim)
-  └─ next llama_decode: batch with `.embd = vec, .n_tokens = 1`,
-                         inputs_embeds path
-     (Type B/C/D: codec_common already composed the right embedding
-      — for B it's `speech_emb[tok] + speech_pos_emb[step]`; for C/D
-      it's `compose_audio_embd(cb0..cb_{N-1})` from the just-completed
-      depth-AR / parallel-heads step)
-
-OBSERVE_STOP
-  ├─ host: break out of AR loop
-  └─ host: call decode_audio() → PCM
-```
-
-The `last_hidden` parameter is what makes Type C/D fit inside a single
-`observe_token` call: codec_common pushes that hidden into its own
-codec_lm step machine, samples cb1..N-1 internally, runs the depth
-decoder, and composes the next embed.  The host never sees cb1..N-1
-tokens — they live entirely inside codec_common.
-
-## Modality detection
-
-Read once at init from GGUF metadata under `codec.lm.modality.*`:
-
-```
-codec.lm.modality.input_text   = bool
-codec.lm.modality.input_audio  = bool
-codec.lm.modality.output_text  = bool
-codec.lm.modality.output_audio = bool
-```
-
-`audio_lm_modality()` returns the bitmask.  The host uses it to:
-
-* decide whether to enable the audio path at all (skip for pure text LM)
-* enable ref-audio input UI (`INPUT_AUDIO` set)
-* set up `decode_audio` at end-of-sequence (`OUTPUT_AUDIO` set)
-* honour text-output renderers (`OUTPUT_TEXT` set, e.g. audio-chat
-  models where some tokens are text and some are audio — the
-  `OBSERVE_PASSTHROUGH` path handles the text ones)
-
-Each model declares its own modality at convert time.  No host-side
-hardcoded model lists.
-
-## Per-model fit
-
-| Model | Modality | observe_action pattern | Notes |
-|---|---|---|---|
-| OuteTTS / Orpheus | `INPUT_TEXT \| OUTPUT_AUDIO` | mostly CONSUMED, STOP at EOS | Type A — token path throughout |
-| Chatterbox T3 / Turbo | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at speech_eos | Type B — `speech_emb + speech_pos_emb` override |
-| CSM | `INPUT_TEXT \| OUTPUT_AUDIO` | CONSUMED_EMBED per step (depth-AR internal), STOP at cb0=audio_eos | Type C — depth decoder hidden inside |
-| Qwen3-TTS | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at codec_eos_token_id | Type C — voice clone with x-vector prefix |
-| MOSS-TTSD | `INPUT_TEXT \| INPUT_AUDIO \| OUTPUT_AUDIO` | CONSUMED_EMBED per step, STOP at <\|end_of_speech\|> | Type D — delay-pattern multi-cb; some cb0 codes are text → may surface as PASSTHROUGH |
-| Audio-chat (Qwen2-Audio, future) | `INPUT_AUDIO \| INPUT_TEXT \| OUTPUT_TEXT` | PASSTHROUGH (text only), STOP at EOS | INPUT_AUDIO triggers ref-audio encode at build time |
-| MoshiVoice / full duplex (future) | `INPUT_AUDIO \| INPUT_TEXT \| OUTPUT_TEXT \| OUTPUT_AUDIO` | interleaved PASSTHROUGH + CONSUMED_EMBED per step | needs both branches handled in one loop |
-
-## Host integration (rn-completion shape)
-
-The application loop stays in app code.  rn-completion's `doCompletion`
-gains a small per-step branch — minimal, model-agnostic — to honour
-`observe_action`:
-
-```cpp
-// Inside the existing AR loop, after common_sampler_sample produced `tok`:
-const float * h = nullptr;
-if (audio_lm_ctx) {
-    h = llama_get_embeddings_ith(ctx, -1);
-}
-
-auto action = audio_lm_ctx
-    ? audio_lm_observe_token(audio_lm_ctx, tok, h, hidden_dim)
-    : OBSERVE_PASSTHROUGH;
-
-switch (action) {
-    case OBSERVE_PASSTHROUGH:
-        generated_text += token_text;        // existing rendering
-        embd.push_back(tok);
-        break;
-
-    case OBSERVE_CONSUMED:
-        // skip rendering; KV-continuity push remains
-        embd.push_back(tok);
-        break;
-
-    case OBSERVE_CONSUMED_EMBED: {
-        int32_t dim;
-        const float * vec = audio_lm_get_next_embed(audio_lm_ctx, &dim);
-        // Next iteration: build llama_batch via .embd path with `vec`,
-        // not via .token path.  The existing batch construction picks
-        // this up via a small flag on the completion state.
-        pending_embed_override = vec;
-        pending_embed_dim      = dim;
-        break;
+codec_audio_lm_tts_set_voice(alm, &voice);           // once per request
+int n = codec_audio_lm_tts_split(alm, text, 0);      // the model's segmentation
+for (int i = 0; i < n; ++i) {
+    req = codec_audio_lm_default_tts_request();
+    req.text = codec_audio_lm_tts_segment(alm, i);
+    codec_audio_lm_tts_prompt(alm, &req, &vocab);
+    codec_audio_lm_completion c;
+    codec_audio_lm_get_completion(alm, &c);
+    if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) {
+        codec_audio_lm_generate_self_contained(alm);
+    } else {
+        // clear the KV cache; build a sampler from c.sampler (+ c.grammar / c.allowed)
+        // decode chunks 0..n_chunks-1 of every sequence (chunk i of all sequences in one batch)
+        // if c.needs_prompt_hidden: codec_audio_lm_prefill(alm, every prompt position's hidden, n)
+        bool sample = c.sample_first;
+        for (int frames = 0; frames < c.max_frames; ) {
+            tok = sample ? sample_backbone() : -1;
+            codec_audio_lm_observe(alm, sample ? &tok : NULL, c.needs_embeddings ? hiddens : NULL, &v);
+            frames += v.is_audio;
+            if (v.action == CODEC_AUDIO_LM_STOP) break;
+            if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) decode_token(v.token >= 0 ? v.token : tok);
+            else for each sequence s: decode_embd(codec_audio_lm_next_embd(alm, s));
+            sample = v.sample_backbone;
+        }
     }
-
-    case OBSERVE_STOP:
-        has_next_token = false;
-        break;
+    codec_audio_lm_decode(alm, &pcm);                 // or stream_poll / stream_finish
+    gap = codec_audio_lm_tts_join(alm, &pcm, i, n);   // then `gap` samples of silence
 }
 ```
 
-The "small flag" + embed-path batch construction is what already exists
-in the host as the temporary audio-token patch; it gets reused, just
-now driven by codec_common's verdict instead of model-specific
-hardcoding.
+`common/tts_runner.cpp` (`run_one`) is this loop over llama.cpp in C++;
+`tests/e2e/audio_lm_host_smoke.py` is the same loop over llama-cpp-python.
 
-`tts_wrapper` / `mtmd_wrapper` in llama.rn shrink to thin shims:
+### The vocabulary
 
-| llama.rn surface | Implementation |
+Prompt builders look up the backbone's vocabulary through
+`codec_audio_lm_vocab` callbacks (`tokenize`, `token_to_piece`, `n_tokens`,
+`eos`, `is_eog`): some models recognize their backbone from it, place special
+tokens, or restrict sampling to their audio tokens. The library never decodes.
+
+### The completion
+
+| Field | Meaning for the host |
 |---|---|
-| `tts_wrapper::getTTSType()` | reads `audio_lm_modality()` |
-| `tts_wrapper::tryAddAudioToken(...)` | calls `audio_lm_observe_token(...)`, returns the action; host loop honours it |
-| `tts_wrapper::reset()` | `audio_lm_reset(...)` |
-| `mtmd_wrapper::processMedia(audio_path)` | calls `audio_lm_build_prompt(...)` with `ref_pcm`, then prepends `embeds_prefix` via the existing image-embedding inject path |
-| end-of-completion → emit WAV | `audio_lm_decode_audio(...)` |
+| `flow` | `TOKENS`: audio codes are backbone tokens. `CODEC_HEAD`: codec heads read the backbone hidden. `HIDDEN`: tokens drive, hiddens are the audio latent. `SELF_CONTAINED`: no backbone. |
+| `n_seq`, `chunks`, `n_chunks` | the prompt of each sequence: TEXT (tokenize), TOKENS or EMBD (`n_embd`-wide rows) chunks, decoded in order; chunk `i` of sequence `s` is `chunks[s * n_chunks + i]` |
+| `sampler` | backbone sampling, named after llama.cpp's `common_params_sampling` (temp, top_k, top_p, min_p, penalties, `penalty_exempt`, DRY, sampler order) |
+| `grammar` / `allowed` | GBNF, or the allowed backbone token ranges as a logit bias |
+| `needs_embeddings` | the context returns hidden states; pass the last position's hidden of every sequence to `observe` |
+| `needs_prompt_hidden` | decode the prompt with every position as output and call `codec_audio_lm_prefill` |
+| `sample_first` | the first step samples a backbone token; afterwards each verdict's `sample_backbone` says |
+| `streamable` | `codec_audio_lm_stream_poll` works during the generation |
+| `max_frames` | audio frames (`is_audio` verdicts) after which to stop |
+| `min_frames`, `stop_token` | minimum length: while fewer than `min_frames` frames exist, a sampled `stop_token` is replaced by one draw from a second sampler (same temp / top_k / top_p, no penalties, no grammar, `allowed` minus `stop_token`); sample with the primary sampler first so its random stream advances every step |
 
-## Why this satisfies the "don't wrap llama_decode" constraint
+`penalty_exempt` needs `patches/penalty-exempt-llamacpp.patch` (applied to
+the bundled llama.cpp); a stock llama.cpp ignores the list.
 
-* `audio_lm_*` never calls `llama_decode`.  All backbone forwards
-  happen in app code.
-* `audio_lm_*` never owns the AR loop control flow (`while
-  (has_next_token)`).  It's purely callback-shaped: build_prompt at
-  the start, observe_token per step, decode_audio at the end.
-* The `last_hidden` parameter is a pull from app code (`llama_get_
-  embeddings_ith`) — codec_common doesn't reach into the llama
-  context.  This keeps the dependency one-way: app pulls hidden,
-  hands it to codec_common; codec_common returns codes / next embed.
+### Verdicts
 
-The minor patches the host already applied to `rn-completion.cpp`
-(switching between token batch and embd batch based on a flag) stay —
-they become the integration surface for codec_common's
-`OBSERVE_CONSUMED_EMBED` path, just generalised so they're no longer
-model-specific.
+`codec_audio_lm_observe` takes the sampled token per sequence (or NULL) and
+the hidden state per sequence (or NULL) and answers:
 
-## Reference host: `tts-cli synthesize`
+- `FEED_TOKEN`: decode `verdict.token` when it is >= 0 (the model picked the
+  token itself), else the sampled token;
+- `FEED_EMBD`: decode `codec_audio_lm_next_embd(alm, s)` on every sequence `s`;
+- `STOP`: the generation ended; `codec_audio_lm_stop_reason` says why.
 
-`tools/tts-cli.cpp` now drives the full host AR loop against a real
-llama.cpp backbone (`--backbone LLAMA.gguf`), proving codec_common's
-per-step hooks end-to-end.  Verified E2E (whisper ASR): **CSM** (English,
-CER 0.0, stops on `eos_code_c0`) and **BlueMagpie** (continuous CFM,
-zh, stops on the diffusion stop head).  Smoke: `tests/e2e/
-ttscli_synthesize_smoke.py`.
+`is_audio` marks steps that produced audio (count them against `max_frames`,
+poll the stream after them).
 
-New codec_common surface (`audio_lm_get_prompt_info` + step-machine
-passthroughs `audio_lm_step_{set_text_context,begin,logits,push_code,
-finish}`) keeps model-specific prompt assembly + the codebook step
-machine inside codec_common, keyed on `codec.lm.host_arch` /
-`codec.lm.kind` metadata — the host stays model-agnostic (tokenizer +
-llama_decode loop only).
+### Audio
 
-Build integration: the pinned llama.cpp submodule bundles ggml 0.15
-under the SAME `libggml.so.0` soname as codec's ggml 0.9 — a runtime ABI
-collision.  `cmake/SetupTtsBackbone.cmake` builds llama.cpp + its ggml
-STATIC/PIC via ExternalProject, then wraps the archives into one
-`libttsbackbone.so` whose dynamic table exports only `llama_*` (ggml_*
-hidden via version script).  tts-cli links codec's ggml 0.9 (shared) +
-the isolated backbone; the two ggml instances never see each other.
-Gated by `-DCODEC_TTS_BACKBONE=ON` (default; CPU-only).
+`codec_audio_lm_decode` returns the generation's audio. For streaming, call
+`codec_audio_lm_stream_poll(alm, chunk_ms, &pcm)` after each audio step: it
+returns the audio that became final since the last call. Each window is
+re-decoded from the first frame (causal decoders need the whole left context),
+the right edge the decoder may still revise is held back (0.32 s), and the
+joins are crossfaded (20 ms). `codec_audio_lm_stream_finish` returns the rest.
+`decodable_frames` / `hop` / `decode_range` are the lower-level pieces.
 
-Per-model status: [model_status.md](model_status.md).
+### Voices
 
-## LFM2-Audio: sequential text→audio TTS (Flow 5)
+`codec_audio_lm_tts_set_voice` takes a builtin voice name
+(`codec_audio_lm_list_voices`), a speaker file, or a reference clip with its
+transcript, and computes the conditioning once per request. `save_speaker`
+writes the voice in use to a speaker GGUF (`docs/codec_speaker.md`).
 
-LFM2-Audio-1.5B is a *sequential* multimodal LM (`host_arch=lfm2`,
-`residual_depth_ar`, `depth_emits_c0=true`, 8 Mimi codebooks).  Unlike the
-other depth-AR models it does not start audio immediately — it first
-free-runs in TEXT modality and only switches to AUDIO_OUT when it samples
-`<|audio_start|>` (id 128).  The wiring (`run_lfm2_sequential` in
-`tts-cli.cpp` + the `lfm2` branch of `audio_lm_get_prompt_info`):
+### Segmentation and joining
 
-* **Prompt** (the flip into audio): system turn
-  `"Perform TTS. Use the US male voice."` + user turn with the text +
-  assistant open.  With this system prompt the model emits `<|audio_start|>`
-  as its very first generated token.  (`Liquid4All/liquid-audio` TTS
-  recipe; the ChatState/generate_sequential path in
-  `liquid_audio.model.lfm2_audio`.)
-* **Text logits from a tied head** — llama.cpp's `lfm2` graph omits the
-  output head when embeddings are enabled (`if (!cparams.embeddings)` in
-  `models/lfm2.cpp`), and we need embeddings for the depth decoder.  Since
-  LFM2 ties its lm_head to `token_embd`, tts-cli recomputes text logits as
-  `hidden · token_embd[v]` over the vocab (the returned embeddings are
-  already post-final-norm, matching HF's `last_hidden_state`).
-* **Audio phase** — the depth decoder emits all 8 codebooks per step; each
-  frame feeds back through `compose_audio_codes_embd`
-  (`audio_embedding(codes + codebook_offsets).sum(0)`); stop on
-  cb0 == EOAudio (2048).
-* **Sampling, not greedy** — greedy TTS is *degenerate* for this model
-  (the reference itself gets stuck on "Hello."); the reference regime is
-  `audio_temperature=0.8, audio_top_k=64`.  With sampling it stops on
-  eos_code_c0 at ~4–6 s and English ASR reproduces the input (CER 0.0 with
-  a fixed seed).  The existing F16 `lfm_backbone.gguf` is sufficient (no
-  BF16 backbone needed once sampled).
+Long text is generated one segment at a time. `codec_audio_lm_tts_split` and
+`codec_audio_lm_tts_join` give every model the same general behaviour, tuned
+by the family's parameters:
 
-## Moshi: why not in `synthesize`
+- **split**: sentences / clauses packed up to `max_bytes` UTF-8 bytes in any
+  script (`tts_split_text`); a family may pick another mode instead (KittenTTS:
+  the English sentence packing of its reference, with a minimum chunk size);
+- **join**: leading and trailing silence trimmed, 8 ms fades, a gap of
+  silence between segments (160 ms by default, per-family).
 
-Moshi is **formally out of scope** for `tts-cli synthesize`, for three
-concrete blockers:
+A family that needs something else entirely can still override both.
 
-1. **No backbone asset, no arch support.**  Moshi's backbone is Helium-7B,
-   which the pinned llama.cpp submodule does not implement (no `helium`
-   arch — grep is empty).  The converter approximates `host_arch=llama`,
-   but the real Moshi backbone is not a plain Llama and there is no local
-   backbone GGUF (`models/moshi/` ships only `moshiko.gguf` = the Mimi
-   codec + depth-decoder adaptor; `~/.cache/huggingface/.../moshiko-*` has
-   only a README).
-2. **No single-shot audio EOS.**  `moshiko.gguf` carries
-   `eos_code_c0 = None` — Moshi is a **full-duplex dialogue** model whose
-   audio stream never terminates on a cb0 sentinel.  One-shot TTS is the
-   wrong frame; the host AR loop has no stop condition to key on.
-3. **Duplex protocol needs a different host loop.**  Moshi interleaves
-   input-audio + input-text + output-text + output-audio every step
-   (the "MoshiVoice / full duplex (future)" row in *Per-model fit*); that
-   is a bidirectional loop, not the unidirectional prompt→audio flow
-   `synthesize` implements.  Kyutai's one-shot-TTS sibling is a *different*
-   model (`kyutai/dsm`, delayed-streams TTS), not Moshi.
+## Families
 
-The codec_lm side stays validated: `tests/e2e/moshi_lm_smoke.py` checks the
-`depth_decoder.* → lm.depth.*` flexible-tensor conversion + the
-`c0_input_modality=text` depth-step graph against HF Moshi (no backbone /
-no full generation).  `tts-cli synthesize` now **refuses a Moshi codec_lm
-with a clear message** (missing Helium backbone arch + duplex protocol)
-instead of running a stop-less loop against an unloadable backbone.
+| Family | Models | Flow | Notes |
+|---|---|---|---|
+| `codebook` | CSM, Qwen3-TTS, MOSS-TTSD | CODEC_HEAD | depth decoder or delayed parallel heads; MOSS-TTSD samples codebook 0 from the backbone under a grammar |
+| `realtime` | MOSS-TTS-Realtime | CODEC_HEAD | text lane from the backbone's embedding table (`params.backbone_path`) |
+| `lfm2` | LFM2-Audio | CODEC_HEAD | text warm-up from the tied embedding head (`verdict.token`), then audio frames |
+| `chatterbox` | Chatterbox T3, Turbo, Multilingual | CODEC_HEAD | guidance pair (`n_seq` 2) for T3 |
+| `cosyvoice` | CosyVoice 1/2/3, BreezyVoice | CODEC_HEAD | SFT / zero-shot / cross-lingual / instruct modes; v1 disables flash attention |
+| `continuous` | BlueMagpie | HIDDEN | prompt hiddens prime the CFM head; stop head ends it |
+| `flow` | Pocket-TTS | CODEC_HEAD | starcoder2 backbone; the BOS frame input ends the prompt |
+| `neutts`, `outetts` | NeuTTS, OuteTTS | TOKENS | audio codes are backbone tokens |
+| `kitten` | KittenTTS 2 | TOKENS | penalty exemption + DRY in the sampler, sentence-pack segmentation |
+| `soprano` | Soprano | HIDDEN | the hidden that predicts each token is the decoder input |
+
+`alm_make_family` (`common/audio_lm_family.cpp`) picks the family from the
+codec GGUF's metadata. Moshi is refused: it is a full-duplex dialogue model
+with no audio end (no one-shot stop condition) and its Helium backbone has no
+llama.cpp architecture.
+
+### Adding a model
+
+1. Write `common/audio_lm_family_<name>.cpp`: subclass `alm_family`; implement
+   `tts_prompt` (fill `alm_completion`) and `observe`; override `caps`,
+   `set_voice`, `backbone_requirements`, `segment_split` / `segment_join`,
+   `next_embd`, `decode`, `decodable_frames` where the model needs it.
+   Model-specific codec_lm helpers stay internal (`src/lm/lm_models.h`).
+2. Detect it in `alm_make_family`.
+3. Add a case to `tests/e2e/ttscli_synthesize_smoke.py`. Every host
+   (tts-cli, tts-server, `codec_cpp.TTS` / `AudioLM`, llama.rn) runs it with
+   no further change.
+
+## Ready-made hosts
+
+- **`common/tts_runner`**: the loop above over the bundled llama.cpp
+  (libttsbackbone), with segmentation, voices and streaming;
+  `tools/tts-cli` and `tools/tts-server` drive it.
+- **`include/codec_tts.h`** (`libcodec_tts`): the same runner behind a C ABI,
+  for one-call TTS; Python `codec_cpp.TTS`.
+- **Python `codec_cpp.AudioLM`**: `codec_audio_lm.h` call for call, with
+  `codec_cpp.Vocab.from_llama_cpp` for llama-cpp-python hosts.
