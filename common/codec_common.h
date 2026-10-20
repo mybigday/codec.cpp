@@ -202,6 +202,8 @@ const char * audio_lm_meta_str(const audio_lm_context * ctx, const char * key);
 // Lets a host reach model-specific helpers not wrapped by codec_common
 // (e.g. the Chatterbox T3 `codec_lm_chatterbox_*` prompt/tokenizer API).
 struct codec_lm * audio_lm_get_lm(audio_lm_context * ctx);
+// The codec context (encode / decode of the codec model itself).
+struct codec_context * audio_lm_get_codec_context(audio_lm_context * ctx);
 
 // ─────────────────────────────────────────────────────────────────────
 // Prompt build (one shot, before the AR loop)

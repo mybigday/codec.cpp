@@ -242,6 +242,7 @@ struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void) {
     r.temperature = r.top_p = r.min_p = r.repetition_penalty = -1.0f;
     r.lm_guidance = r.flow_guidance = -1.0f;
     r.top_k = r.min_frames = r.flow_steps = -1;
+    r.max_frames = 0;
     return r;
 }
 
@@ -266,8 +267,11 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_a
     r.lm_guidance = req->lm_guidance;
     r.flow_guidance = req->flow_guidance;
     r.flow_steps = req->flow_steps;
+    r.max_frames = req->max_frames;
     alm_vocab v{vocab};
-    return ctx->family->tts_prompt(r, v, &ctx->completion) || ctx->fail_family();
+    if (!ctx->family->tts_prompt(r, v, &ctx->completion)) return ctx->fail_family();
+    if (r.max_frames > 0) ctx->completion.max_frames = r.max_frames;
+    return true;
 }
 
 int32_t codec_audio_lm_tts_split(struct codec_audio_lm * ctx, const char * text, int32_t max_bytes) {
@@ -388,7 +392,7 @@ bool codec_audio_lm_stream_finish(struct codec_audio_lm * ctx, struct codec_pcm_
 }
 
 int32_t codec_audio_lm_decodable_frames(const struct codec_audio_lm * ctx) {
-    return ctx != nullptr ? audio_lm_decodable_frames(ctx->alm) : 0;
+    return ctx != nullptr ? ctx->family->decodable_frames() : 0;
 }
 
 int32_t codec_audio_lm_hop(const struct codec_audio_lm * ctx) {

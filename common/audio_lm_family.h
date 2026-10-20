@@ -75,6 +75,7 @@ struct alm_tts_request {
     float   min_p = -1.0f;
     float   repetition_penalty = -1.0f;
     int32_t min_frames = -1;
+    int32_t max_frames = 0;          // <= 0 = model default
     float   lm_guidance = -1.0f;
     float   flow_guidance = -1.0f;
     int32_t flow_steps = -1;
@@ -132,6 +133,8 @@ public:
     virtual bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) = 0;
     virtual bool prefill(const float * hiddens, int32_t n_pos);
     virtual bool observe(const int32_t * tokens, const float * hiddens, codec_audio_lm_verdict * v) = 0;
+    // Frames generated so far that decode() would turn into audio.
+    virtual int32_t decodable_frames() const { return audio_lm_decodable_frames(alm_); }
     virtual const float * next_embd(int32_t seq) const;
     // Set by observe() on STOP; "max_frames" until then.
     const std::string & stop_reason() const { return stop_reason_; }
@@ -173,6 +176,7 @@ std::unique_ptr<alm_family> alm_family_lfm2(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_chatterbox(audio_lm_context * alm, struct codec_lm * lm);
 std::unique_ptr<alm_family> alm_family_cosyvoice(audio_lm_context * alm, struct codec_lm * lm);
 std::unique_ptr<alm_family> alm_family_continuous(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_flow(audio_lm_context * alm, struct codec_lm * lm);
 
 }  // namespace codec_common
 

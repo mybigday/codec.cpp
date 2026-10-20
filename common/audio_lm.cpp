@@ -476,6 +476,10 @@ struct codec_lm * audio_lm_get_lm(audio_lm_context * ctx) {
     return ctx ? ctx->lm : nullptr;
 }
 
+struct codec_context * audio_lm_get_codec_context(audio_lm_context * ctx) {
+    return ctx ? ctx->codec_ctx : nullptr;
+}
+
 // =====================================================================
 // Prompt build
 //

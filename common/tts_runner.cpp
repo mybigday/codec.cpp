@@ -2620,8 +2620,8 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
                         frame_streamer * fs) {
     codec_audio_lm * alm  = s->calm;
     llama_context  * lctx = s->lctx;
-    const llama_vocab * vocab = llama_model_get_vocab(s->lmodel);
-    const codec_audio_lm_vocab cv = calm_vocab(vocab);
+    const llama_vocab * vocab = s->lmodel ? llama_model_get_vocab(s->lmodel) : nullptr;
+    const codec_audio_lm_vocab cv = vocab ? calm_vocab(vocab) : codec_audio_lm_vocab{};
     auto fail = [&](const std::string & what) {
         out->error = what + ": " + codec_audio_lm_last_error(alm);
         return false;
@@ -2640,11 +2640,28 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     if (a.has_cfg_weight)  req.lm_guidance = a.cfg_weight;
     req.flow_guidance = a.cfg;
     req.flow_steps    = a.timesteps;
-    if (!codec_audio_lm_tts_prompt(alm, &req, &cv)) {
+    req.max_frames    = a.max_frames;
+    if (!codec_audio_lm_tts_prompt(alm, &req, vocab ? &cv : nullptr)) {
         return fail("prompt");
     }
     codec_audio_lm_completion c;
     if (!codec_audio_lm_get_completion(alm, &c)) return fail("completion");
+    if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) {
+        if (!codec_audio_lm_generate_self_contained(alm)) return fail("generate");
+        codec_pcm_buffer buf{};
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = codec_audio_lm_decode(alm, &buf);
+        out->decode_ms += ms_since(t0);
+        if (!ok) return fail("decode");
+        audio_lm_audio_output pcm;
+        pcm.pcm.assign(buf.data, buf.data + (size_t) buf.n_samples * (size_t) buf.n_channels);
+        pcm.sample_rate = buf.sample_rate;
+        pcm.n_channels  = buf.n_channels;
+        codec_pcm_buffer_free(&buf);
+        fill_result_from_output(pcm, codec_audio_lm_decodable_frames(alm), codec_audio_lm_stop_reason(alm), out);
+        return true;
+    }
+    if (lctx == nullptr) { out->error = "this model needs a backbone"; return false; }
     const int32_t n_seq = std::max(1, c.n_seq);
     if (n_seq > 1 && c.sample_first) {
         out->error = "generic loop: backbone sampling over several sequences is not supported";
@@ -2840,17 +2857,22 @@ tts_runner_session * tts_runner_load(const tts_runner_params & a, std::string * 
         return nullptr;
     };
 
-    // Pocket-TTS FlowLM is self-contained (no backbone) — try it first; a
-    // non-zero return means it is one.
-    {
-        std::string ferr;
-        if (tts_flow_open(a, &s->flow, &ferr)) {
-            if (s->flow == nullptr) return fail(ferr);
-            return s;
-        }
-    }
+    // Self-contained models (Pocket-TTS FlowLM) run without a backbone.
     if (a.backbone_path.empty()) {
-        return fail("synthesize requires backbone_path (llama.cpp model)");
+        codec_audio_lm_params cp = codec_audio_lm_default_params();
+        cp.codec_path     = a.codec_path.c_str();
+        cp.kv_overrides   = a.kv_overrides.empty() ? nullptr : a.kv_overrides.data();
+        cp.n_kv_overrides = (int32_t) a.kv_overrides.size();
+        cp.n_threads      = a.n_threads;
+        cp.use_gpu        = a.use_gpu;
+        char cerr[512] = {0};
+        s->calm = codec_audio_lm_init(&cp, cerr, sizeof(cerr));
+        codec_audio_lm_caps caps{};
+        if (s->calm != nullptr) codec_audio_lm_get_caps(s->calm, &caps);
+        if (s->calm == nullptr || caps.needs_backbone) {
+            return fail("synthesize requires backbone_path (llama.cpp model)");
+        }
+        return s;
     }
 
     audio_lm_params p;
@@ -3163,6 +3185,7 @@ static bool tts_runner_run_impl(tts_runner_session * s, const tts_runner_params 
     audio_lm_context * ctx    = s->ctx;
     llama_model      * lmodel = s->lmodel;
     llama_context    * lctx   = s->lctx;
+    if (s->calm != nullptr) return run_generic(s, a, out, fs);
     const llama_vocab * vocab = llama_model_get_vocab(lmodel);
     audio_lm_prompt_info pi = s->pi;   // a run may retarget model_kind (OuteTTS)
     const bool pi_ok = s->pi_ok;
@@ -3181,7 +3204,6 @@ static bool tts_runner_run_impl(tts_runner_session * s, const tts_runner_params 
     audio_lm_reset(ctx);
     llama_memory_clear(llama_get_memory(lctx), true);
 
-    if (s->calm != nullptr) return run_generic(s, a, out, fs);
 
     // ── Chatterbox T3 flow (Flow 4) ───────────────────────────────────
     if (is_chatterbox) {

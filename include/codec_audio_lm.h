@@ -174,6 +174,7 @@ struct codec_audio_lm_tts_request {
     float        min_p;
     float        repetition_penalty;
     int32_t      min_frames;    // shortest generation before the stop token may end it
+    int32_t      max_frames;    // longest generation (<= 0: the model's default)
     float        lm_guidance;   // classifier-free guidance weight of the backbone pair
     float        flow_guidance; // guidance of a flow / diffusion decoder
     int32_t      flow_steps;    // steps of a flow / diffusion decoder
