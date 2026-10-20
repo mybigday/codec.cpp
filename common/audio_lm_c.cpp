@@ -1,47 +1,145 @@
-// C API over codec_common's audio-LM layer (include/codec_audio_lm.h).
-// Thin forwarding: every call maps to the codec_common:: function of the
-// same name; this file only converts types and owns the returned strings.
+// include/codec_audio_lm.h: the public C API.  Forwards to the model family
+// (audio_lm_family.h) and owns what the API hands out.
 
+#include "audio_lm_family.h"
 #include "codec_audio_lm.h"
 #include "codec_common.h"
+#include "tts_runner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
 
 using namespace codec_common;
 
-struct codec_audio_lm {
-    audio_lm_context * ctx  = nullptr;
-    bool               bare = false;
-    audio_lm_prompt                     prompt;
-    audio_lm_prompt_info                info;
-    std::vector<audio_lm_speaker_entry> speakers;
+namespace {
+
+// Frame-level streaming over the current generation: re-decodes [0, avail)
+// once enough new frames exist (causal decoders need the whole left
+// context), holds back the right edge the decoder may still revise, and
+// cross-fades the joins.
+class alm_streamer {
+public:
+    explicit alm_streamer(audio_lm_context * alm) : alm_(alm) {}
+
+    // New final audio since the last call (possibly none).
+    bool poll(int32_t chunk_ms, std::vector<float> * piece, int32_t * sr, int32_t * nch) {
+        chunk_ms_ = chunk_ms;
+        const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (spf_ == 0 ? avail < k_probe_frames : avail < committed_ + chunk_ + right_) return out(piece, sr, nch);
+        return window(avail, false, piece) && out(piece, sr, nch);
+    }
+
+    bool finish(std::vector<float> * piece, int32_t * sr, int32_t * nch) {
+        const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (avail > committed_ && !window(avail, true, piece)) return false;
+        return out(piece, sr, nch);
+    }
+
+    const std::string & error() const { return error_; }
+
+private:
+    static constexpr int32_t k_probe_frames = 8;
+    static constexpr double  k_right_s = 0.32;
+    static constexpr double  k_xfade_s = 0.02;
+
+    bool out(std::vector<float> *, int32_t * sr, int32_t * nch) const {
+        *sr = sr_;
+        *nch = nch_;
+        return true;
+    }
+
+    bool window(int32_t avail, bool final, std::vector<float> * piece) {
+        audio_lm_audio_output w;
+        if (!audio_lm_decode_audio_range(alm_, 0, avail, &w)) {
+            return fail(std::string("streaming decode failed: ") + audio_lm_last_error(alm_));
+        }
+        const int32_t nch = std::max(1, w.n_channels);
+        const int64_t len = (int64_t) (w.pcm.size() / (size_t) nch);
+        if (spf_ == 0) {
+            spf_ = audio_lm_codec_hop(alm_);
+            if (spf_ <= 0) return fail("streaming: the codec reports no hop size");
+            sr_  = w.sample_rate;
+            nch_ = nch;
+            const double frames_per_s = (double) sr_ / spf_;
+            chunk_ = std::max(1, (int32_t) std::lround(chunk_ms_ * frames_per_s / 1000.0));
+            right_ = std::max(1, (int32_t) std::lround(k_right_s * frames_per_s));
+            xfade_ = std::min((int32_t) std::lround(k_xfade_s * sr_), right_ * spf_);
+        }
+        if (nch != nch_ || std::llabs(len - (int64_t) avail * spf_) > spf_) {
+            return fail("streaming: a window of " + std::to_string(avail) + " frames decoded to " +
+                        std::to_string(len) + " samples, not about " + std::to_string((int64_t) avail * spf_));
+        }
+        const int32_t commit = final ? avail : std::max(committed_, avail - right_);
+        const size_t  base   = (size_t) committed_ * spf_;
+        if ((int64_t) base > len) return fail("streaming: decoded window too short");
+        const size_t n_new = final ? (size_t) len - base : (size_t) (commit - committed_) * spf_;
+        piece->assign(w.pcm.begin() + (ptrdiff_t) (base * nch_), w.pcm.begin() + (ptrdiff_t) ((base + n_new) * nch_));
+        const size_t nx = std::min(pending_.size() / nch_, n_new);
+        for (size_t i = 0; i < nx; ++i) {
+            const float g = (float) (i + 1) / (float) (nx + 1);
+            for (int32_t c = 0; c < nch_; ++c) {
+                float & v = (*piece)[i * nch_ + c];
+                v = g * v + (1.0f - g) * pending_[i * nch_ + c];
+            }
+        }
+        const size_t tail = base + n_new;
+        const size_t np = final ? 0 : std::min((size_t) xfade_, (size_t) len - tail);
+        pending_.assign(w.pcm.begin() + (ptrdiff_t) (tail * nch_), w.pcm.begin() + (ptrdiff_t) ((tail + np) * nch_));
+        committed_ = commit;
+        return true;
+    }
+
+    bool fail(const std::string & e) { error_ = e; return false; }
+
+    audio_lm_context * alm_;
+    int32_t chunk_ms_ = 0;
+    int32_t spf_ = 0, sr_ = 0, nch_ = 1;
+    int32_t chunk_ = 0, right_ = 0, xfade_ = 0;
+    int32_t committed_ = 0;
+    std::vector<float> pending_;
+    std::string error_;
 };
 
-static bool fill_pcm(const audio_lm_audio_output & in, codec_pcm_buffer * out) {
-    if (out == nullptr) return false;
-    out->data = static_cast<float *>(std::malloc(std::max<size_t>(1, in.pcm.size()) * sizeof(float)));
+bool fill_pcm(const float * data, size_t n_values, int32_t sr, int32_t nch, codec_pcm_buffer * out) {
+    out->data = static_cast<float *>(std::malloc(std::max<size_t>(1, n_values) * sizeof(float)));
     if (out->data == nullptr) return false;
-    if (!in.pcm.empty()) std::memcpy(out->data, in.pcm.data(), in.pcm.size() * sizeof(float));
-    out->n_channels  = in.n_channels;
-    out->n_samples   = in.n_channels > 0 ? (int32_t) (in.pcm.size() / (size_t) in.n_channels) : 0;
-    out->sample_rate = in.sample_rate;
+    if (n_values > 0) std::memcpy(out->data, data, n_values * sizeof(float));
+    out->n_channels  = std::max(1, nch);
+    out->n_samples   = (int32_t) (n_values / (size_t) out->n_channels);
+    out->sample_rate = sr;
     return true;
 }
 
-static int32_t copy_str(const std::string & s, char * buf, int32_t buf_size) {
-    if (buf != nullptr && buf_size > 0) {
-        const size_t n = std::min(s.size(), (size_t) buf_size - 1);
-        std::memcpy(buf, s.data(), n);
-        buf[n] = '\0';
+}  // namespace
+
+struct codec_audio_lm {
+    audio_lm_context *          alm = nullptr;
+    bool                        owns_alm = true;
+    std::unique_ptr<alm_family> family;
+    std::string                 error;
+
+    alm_completion                    completion;
+    std::vector<codec_audio_lm_chunk> chunks;   // views into `completion`
+    std::unique_ptr<alm_streamer>     streamer;
+
+    std::vector<audio_lm_speaker_entry> voices;
+    std::vector<std::string>            segments;
+
+    ~codec_audio_lm() {
+        family.reset();
+        if (alm && owns_alm) audio_lm_free(alm);
     }
-    return (int32_t) s.size();
-}
+
+    bool fail(const std::string & e) { error = e; return false; }
+    bool fail_family() { return fail(family->error()); }
+};
 
 extern "C" {
 
@@ -52,8 +150,11 @@ struct codec_audio_lm_params codec_audio_lm_default_params(void) {
 
 struct codec_audio_lm * codec_audio_lm_init(const struct codec_audio_lm_params * params, char * err, size_t err_size) {
     std::string e;
-    if (params == nullptr || params->codec_path == nullptr) {
-        e = "codec_audio_lm_init: codec_path is required";
+    auto ctx = std::unique_ptr<codec_audio_lm>(new (std::nothrow) codec_audio_lm());
+    if (!ctx) {
+        e = "out of memory";
+    } else if (params == nullptr || params->codec_path == nullptr) {
+        e = "codec_path is required";
     } else {
         audio_lm_params p;
         p.codec_path = params->codec_path;
@@ -62,319 +163,222 @@ struct codec_audio_lm * codec_audio_lm_init(const struct codec_audio_lm_params *
         if (params->kv_overrides != nullptr && params->n_kv_overrides > 0) {
             p.kv_overrides.assign(params->kv_overrides, params->kv_overrides + params->n_kv_overrides);
         }
-        if (audio_lm_context * ctx = audio_lm_init(p, &e)) {
-            auto * w = new (std::nothrow) codec_audio_lm();
-            if (w != nullptr) { w->ctx = ctx; return w; }
-            audio_lm_free(ctx);
-            e = "codec_audio_lm_init: out of memory";
-        }
+        ctx->alm = audio_lm_init(p, &e);
+        if (ctx->alm != nullptr) ctx->family = alm_make_family(ctx->alm, &e);
+        if (ctx->family) return ctx.release();
     }
     if (err != nullptr && err_size > 0) std::snprintf(err, err_size, "%s", e.c_str());
     return nullptr;
 }
 
-struct codec_audio_lm * codec_audio_lm_alloc_bare(void) {
-    audio_lm_context * ctx = audio_lm_alloc_bare();
-    if (ctx == nullptr) return nullptr;
-    auto * w = new (std::nothrow) codec_audio_lm();
-    if (w == nullptr) { audio_lm_free_bare(ctx); return nullptr; }
-    w->ctx = ctx;
-    w->bare = true;
-    return w;
+void codec_audio_lm_free(struct codec_audio_lm * ctx) { delete ctx; }
+
+const char * codec_audio_lm_last_error(const struct codec_audio_lm * ctx) {
+    return ctx != nullptr ? ctx->error.c_str() : "null codec_audio_lm";
 }
 
-void codec_audio_lm_free(struct codec_audio_lm * w) {
-    if (w == nullptr) return;
-    if (w->bare) audio_lm_free_bare(w->ctx);
-    else         audio_lm_free(w->ctx);
-    delete w;
+const char * codec_audio_lm_meta_str(const struct codec_audio_lm * ctx, const char * key) {
+    return ctx != nullptr ? audio_lm_meta_str(ctx->alm, key) : nullptr;
 }
 
-void codec_audio_lm_reset(struct codec_audio_lm * w) { if (w) audio_lm_reset(w->ctx); }
-
-bool codec_audio_lm_parse_kv_override(const char * spec, struct codec_model_kv_override * out) {
-    return parse_kv_override(spec, out);
+void codec_audio_lm_get_caps(const struct codec_audio_lm * ctx, struct codec_audio_lm_caps * out) {
+    if (ctx == nullptr || out == nullptr) return;
+    ctx->family->caps(out);
 }
 
-uint32_t codec_audio_lm_modality(const struct codec_audio_lm * w)        { return w ? audio_lm_modality(w->ctx) : 0; }
-bool     codec_audio_lm_has_speaker_enc(const struct codec_audio_lm * w) { return w && audio_lm_has_speaker_enc(w->ctx); }
-int32_t  codec_audio_lm_n_codebook(const struct codec_audio_lm * w)      { return w ? audio_lm_n_codebook(w->ctx) : 0; }
-int32_t  codec_audio_lm_hidden_dim(const struct codec_audio_lm * w)      { return w ? audio_lm_hidden_dim(w->ctx) : 0; }
-bool     codec_audio_lm_is_continuous(const struct codec_audio_lm * w)   { return w && audio_lm_is_continuous(w->ctx); }
-
-const char * codec_audio_lm_last_error(const struct codec_audio_lm * w) {
-    if (w == nullptr) return "null codec_audio_lm";
-    const char * e = audio_lm_last_error(w->ctx);
-    return e != nullptr ? e : "";
-}
-
-const char * codec_audio_lm_meta_str(const struct codec_audio_lm * w, const char * key) {
-    return w ? audio_lm_meta_str(w->ctx, key) : nullptr;
-}
-
-struct codec_lm * codec_audio_lm_get_lm(struct codec_audio_lm * w) { return w ? audio_lm_get_lm(w->ctx) : nullptr; }
-
-bool codec_audio_lm_codec_has_speakers(const struct codec_audio_lm * w) {
-    return w && audio_lm_codec_has_speakers(w->ctx);
-}
-bool codec_audio_lm_codec_can_speaker_from_audio(const struct codec_audio_lm * w) {
-    return w && audio_lm_codec_can_speaker_from_audio(w->ctx);
-}
-bool codec_audio_lm_set_decode_speaker(struct codec_audio_lm * w, const char * name) {
-    return w && audio_lm_set_decode_speaker(w->ctx, name);
-}
-bool codec_audio_lm_load_decode_speaker(struct codec_audio_lm * w, const char * path, const char * name) {
-    return w && audio_lm_load_decode_speaker(w->ctx, path, name);
-}
-bool codec_audio_lm_decode_speaker_from_audio(struct codec_audio_lm * w, const float * pcm, int32_t n_samples,
-                                              int32_t sample_rate, const char * ref_text) {
-    return w && audio_lm_decode_speaker_from_audio(w->ctx, pcm, n_samples, sample_rate, ref_text);
-}
-bool codec_audio_lm_save_decode_speaker(struct codec_audio_lm * w, const char * path, const char * name) {
-    return w && audio_lm_save_decode_speaker(w->ctx, path, name);
-}
-const struct codec_speaker * codec_audio_lm_decode_speaker(const struct codec_audio_lm * w) {
-    return w ? audio_lm_decode_speaker(w->ctx) : nullptr;
-}
-
-int32_t codec_audio_lm_list_codec_speakers(struct codec_audio_lm * w) {
-    if (w == nullptr) return -1;
-    w->speakers = audio_lm_list_codec_speakers(w->ctx);
-    return (int32_t) w->speakers.size();
-}
-int32_t codec_audio_lm_list_speaker_file(struct codec_audio_lm * w, const char * path) {
-    if (w == nullptr) return -1;
-    w->speakers.clear();
-    if (!audio_lm_list_speaker_file(w->ctx, path, &w->speakers)) return -1;
-    return (int32_t) w->speakers.size();
-}
-bool codec_audio_lm_listed_speaker(const struct codec_audio_lm * w, int32_t i,
-                                   const char ** name, const char ** ref_text, bool * is_default) {
-    if (w == nullptr || i < 0 || i >= (int32_t) w->speakers.size()) return false;
-    const auto & s = w->speakers[(size_t) i];
-    if (name)       *name       = s.name.c_str();
-    if (ref_text)   *ref_text   = s.ref_text.c_str();
-    if (is_default) *is_default = s.is_default;
-    return true;
-}
-
-struct codec_audio_lm_input codec_audio_lm_default_input(void) {
-    codec_audio_lm_input in{};
-    return in;
-}
-
-bool codec_audio_lm_build_prompt(struct codec_audio_lm * w, const struct codec_audio_lm_input * in,
-                                 struct codec_audio_lm_prompt * out) {
-    if (w == nullptr || in == nullptr || out == nullptr) return false;
-    audio_lm_input x;
-    x.ref_pcm         = in->ref_pcm;
-    x.ref_n_samples   = in->ref_n_samples;
-    x.ref_sample_rate = in->ref_sample_rate;
-    x.speaker_emb     = in->speaker_emb;
-    x.speaker_emb_dim = in->speaker_emb_dim;
-    x.emotion         = in->emotion;
-    if (in->ref_text) x.ref_text = in->ref_text;
-    if (in->text)     x.text     = in->text;
-    for (int32_t i = 0; i < in->n_extra; ++i) {
-        if (in->extra_keys[i] && in->extra_values[i]) x.extra[in->extra_keys[i]] = in->extra_values[i];
+int32_t codec_audio_lm_list_voices(struct codec_audio_lm * ctx, const char * speaker_file) {
+    if (ctx == nullptr) return -1;
+    ctx->voices.clear();
+    if (speaker_file == nullptr || *speaker_file == '\0') {
+        ctx->voices = audio_lm_list_codec_speakers(ctx->alm);
+    } else if (!audio_lm_list_speaker_file(ctx->alm, speaker_file, &ctx->voices)) {
+        ctx->fail(audio_lm_last_error(ctx->alm));
+        return -1;
     }
-    w->prompt = audio_lm_prompt();
-    if (!audio_lm_build_prompt(w->ctx, x, &w->prompt)) return false;
-    const audio_lm_prompt & p = w->prompt;
-    out->tokens                     = p.tokens.empty() ? nullptr : p.tokens.data();
-    out->n_tokens                   = (int32_t) p.tokens.size();
-    out->embeds_prefix              = p.embeds_prefix.empty() ? nullptr : p.embeds_prefix.data();
-    out->embeds_prefix_rows         = p.embeds_prefix_rows;
-    out->embeds_prefix_hidden       = p.embeds_prefix_hidden;
-    out->embeds_uncond              = p.embeds_uncond.empty() ? nullptr : p.embeds_uncond.data();
-    out->default_temperature        = p.default_temperature;
-    out->default_top_p              = p.default_top_p;
-    out->default_min_p              = p.default_min_p;
-    out->default_repetition_penalty = p.default_repetition_penalty;
-    out->default_cfg_weight         = p.default_cfg_weight;
-    out->start_token                = p.start_token;
-    out->stop_token                 = p.stop_token;
+    return (int32_t) ctx->voices.size();
+}
+
+bool codec_audio_lm_voice(const struct codec_audio_lm * ctx, int32_t i, const char ** name, const char ** ref_text,
+                          bool * is_default) {
+    if (ctx == nullptr || i < 0 || i >= (int32_t) ctx->voices.size()) return false;
+    const auto & v = ctx->voices[(size_t) i];
+    if (name)       *name       = v.name.c_str();
+    if (ref_text)   *ref_text   = v.ref_text.c_str();
+    if (is_default) *is_default = v.is_default;
     return true;
 }
 
-bool codec_audio_lm_get_prompt_info(struct codec_audio_lm * w, struct codec_audio_lm_prompt_info * out) {
-    if (w == nullptr || out == nullptr) return false;
-    w->info = audio_lm_prompt_info();
-    if (!audio_lm_get_prompt_info(w->ctx, &w->info)) return false;
-    const audio_lm_prompt_info & i = w->info;
-    out->model_kind                 = (enum codec_audio_lm_kind) i.model_kind;
-    out->host_arch                  = i.host_arch.c_str();
-    out->prompt_prefix              = i.prompt_prefix.c_str();
-    out->prompt_suffix              = i.prompt_suffix.c_str();
-    out->add_bos                    = i.add_bos;
-    out->parse_special              = i.parse_special;
-    out->cb0_from_backbone          = i.cb0_from_backbone;
-    out->audio_codebook_offset      = i.audio_codebook_offset;
-    out->is_continuous              = i.is_continuous;
-    out->n_codebook                 = i.n_codebook;
-    out->hidden_dim                 = i.hidden_dim;
-    out->eos_code_c0                = i.eos_code_c0;
-    out->eos_min_step               = i.eos_min_step;
-    out->default_temperature        = i.default_temperature;
-    out->default_top_p              = i.default_top_p;
-    out->default_top_k              = i.default_top_k;
-    out->streaming_interleave       = i.streaming_interleave;
-    out->text_externally_added      = i.text_externally_added;
-    out->prefill_text_len           = i.prefill_text_len;
-    out->text_pad_id                = i.text_pad_id;
-    out->audio_pad_code             = i.audio_pad_code;
-    out->bos_code_c0                = i.bos_code_c0;
-    out->default_repetition_penalty = i.default_repetition_penalty;
-    out->repetition_window          = i.repetition_window;
-    out->sequential_text_audio      = i.sequential_text_audio;
-    out->audio_start_id             = i.audio_start_id;
-    out->text_end_id                = i.text_end_id;
-    out->max_text_tokens            = i.max_text_tokens;
-    out->cb0_speech_range_start     = i.cb0_speech_range_start;
-    out->cb0_speech_range_end       = i.cb0_speech_range_end;
-    out->audio_tok_offset           = i.audio_tok_offset;
-    out->audio_tok_count            = i.audio_tok_count;
-    out->audio_tok_eos              = i.audio_tok_eos;
+bool codec_audio_lm_backbone_requirements(struct codec_audio_lm * ctx, const struct codec_audio_lm_vocab * vocab,
+                                          int32_t max_steps, struct codec_audio_lm_backbone_req * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    alm_vocab v{vocab};
+    return ctx->family->backbone_requirements(v, max_steps, out) || ctx->fail_family();
+}
+
+struct codec_audio_lm_tts_voice codec_audio_lm_default_tts_voice(void) {
+    codec_audio_lm_tts_voice v{};
+    return v;
+}
+
+bool codec_audio_lm_tts_set_voice(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_voice * voice) {
+    if (ctx == nullptr) return false;
+    alm_tts_voice v;
+    if (voice != nullptr) {
+        if (voice->voice)        v.voice = voice->voice;
+        if (voice->speaker_file) v.speaker_file = voice->speaker_file;
+        if (voice->ref_pcm && voice->ref_n_samples > 0) {
+            v.ref_pcm.assign(voice->ref_pcm, voice->ref_pcm + voice->ref_n_samples);
+            v.ref_sample_rate = voice->ref_sample_rate;
+        }
+        if (voice->ref_text)     v.ref_text = voice->ref_text;
+        if (voice->save_speaker) v.save_speaker = voice->save_speaker;
+    }
+    return ctx->family->set_voice(v) || ctx->fail_family();
+}
+
+bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const char * text, const char * instruct,
+                               const struct codec_audio_lm_vocab * vocab) {
+    if (ctx == nullptr) return false;
+    if (text == nullptr) return ctx->fail("text is required");
+    audio_lm_reset(ctx->alm);
+    ctx->streamer.reset();
+    ctx->chunks.clear();
+    alm_vocab v{vocab};
+    return ctx->family->tts_prompt(text, instruct ? instruct : "", v, &ctx->completion) || ctx->fail_family();
+}
+
+int32_t codec_audio_lm_tts_split(struct codec_audio_lm * ctx, const char * text, int32_t max_bytes) {
+    if (ctx == nullptr || text == nullptr) return -1;
+    codec_audio_lm_caps caps{};
+    ctx->family->caps(&caps);
+    const int32_t bytes = max_bytes > 0 ? max_bytes : caps.segment_bytes;
+    ctx->segments = bytes > 0 ? tts_split_text(text, bytes) : std::vector<std::string>{text};
+    return (int32_t) ctx->segments.size();
+}
+
+const char * codec_audio_lm_tts_segment(const struct codec_audio_lm * ctx, int32_t i) {
+    if (ctx == nullptr || i < 0 || i >= (int32_t) ctx->segments.size()) return nullptr;
+    return ctx->segments[(size_t) i].c_str();
+}
+
+bool codec_audio_lm_get_completion(struct codec_audio_lm * ctx, struct codec_audio_lm_completion * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    const alm_completion & c = ctx->completion;
+    size_t n_chunks = 0;
+    for (const auto & s : c.seqs) n_chunks = std::max(n_chunks, s.size());
+    ctx->chunks.assign(c.seqs.size() * n_chunks, codec_audio_lm_chunk{});
+    for (size_t s = 0; s < c.seqs.size(); ++s) {
+        for (size_t i = 0; i < c.seqs[s].size(); ++i) {
+            const alm_chunk & a = c.seqs[s][i];
+            codec_audio_lm_chunk & d = ctx->chunks[s * n_chunks + i];
+            d.type          = a.type;
+            d.text          = a.type == CODEC_AUDIO_LM_CHUNK_TEXT ? a.text.c_str() : nullptr;
+            d.add_special   = a.add_special;
+            d.parse_special = a.parse_special;
+            d.tokens        = a.tokens.empty() ? nullptr : a.tokens.data();
+            d.embd          = a.embd.empty() ? nullptr : a.embd.data();
+            d.n             = a.type == CODEC_AUDIO_LM_CHUNK_TOKENS ? (int32_t) a.tokens.size()
+                            : a.type == CODEC_AUDIO_LM_CHUNK_EMBD   ? a.n_rows : 1;
+        }
+    }
+    out->flow     = c.flow;
+    out->n_seq    = (int32_t) c.seqs.size();
+    out->n_embd   = c.n_embd;
+    out->chunks   = ctx->chunks.empty() ? nullptr : ctx->chunks.data();
+    out->n_chunks = (int32_t) n_chunks;
+    out->sampler  = c.sampler;
+    out->sampler.penalty_exempt   = c.penalty_exempt.empty() ? nullptr : c.penalty_exempt.data();
+    out->sampler.n_penalty_exempt = (int32_t) c.penalty_exempt.size();
+    out->grammar  = c.grammar.c_str();
+    out->allowed  = c.allowed.empty() ? nullptr : c.allowed.data();
+    out->n_allowed = (int32_t) c.allowed.size();
+    out->needs_embeddings    = c.needs_embeddings;
+    out->needs_prompt_hidden = c.needs_prompt_hidden;
+    out->sample_first        = c.sample_first;
+    out->streamable          = c.streamable;
+    out->max_steps           = c.max_steps;
     return true;
 }
 
-int32_t codec_audio_lm_grammar(struct codec_audio_lm * w, const char * text, char * buf, int32_t buf_size) {
-    if (w == nullptr) return -1;
-    audio_lm_prompt_info pi;
-    if (!audio_lm_get_prompt_info(w->ctx, &pi)) return -1;
-    return copy_str(tts_auto_grammar(pi, text ? text : ""), buf, buf_size);
+bool codec_audio_lm_prefill(struct codec_audio_lm * ctx, const float * hiddens, int32_t n_pos) {
+    if (ctx == nullptr) return false;
+    return ctx->family->prefill(hiddens, n_pos) || ctx->fail_family();
 }
 
-void codec_audio_lm_set_audio_token_range(struct codec_audio_lm * w, int32_t offset, int32_t count, int32_t eos_id) {
-    if (w) audio_lm_set_audio_token_range(w->ctx, offset, count, eos_id);
-}
-void codec_audio_lm_set_audio_token_ranges(struct codec_audio_lm * w, const int32_t * offsets, const int32_t * counts,
-                                           int32_t n_q, int32_t frame_sentinel_id, int32_t eos_id) {
-    if (w) audio_lm_set_audio_token_ranges(w->ctx, offsets, counts, n_q, frame_sentinel_id, eos_id);
-}
-void codec_audio_lm_get_audio_token_range(const struct codec_audio_lm * w, int32_t * offset, int32_t * count,
-                                          int32_t * eos_id) {
-    int32_t o = -1, c = 0, e = -1;
-    if (w) audio_lm_get_audio_token_range(w->ctx, &o, &c, &e);
-    if (offset) *offset = o;
-    if (count)  *count  = c;
-    if (eos_id) *eos_id = e;
+bool codec_audio_lm_observe(struct codec_audio_lm * ctx, const int32_t * tokens, const float * hiddens,
+                            struct codec_audio_lm_verdict * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    return ctx->family->observe(tokens, hiddens, out) || ctx->fail_family();
 }
 
-int32_t codec_audio_lm_codes_n_frames(const struct codec_audio_lm * w) { return w ? audio_lm_codes_n_frames(w->ctx) : 0; }
-
-const int32_t * codec_audio_lm_codes(const struct codec_audio_lm * w, int32_t * n_q, int32_t * n_frames) {
-    int32_t q = 0, t = 0;
-    const int32_t * p = w ? audio_lm_debug_codes(w->ctx, &q, &t) : nullptr;
-    if (n_q)      *n_q      = q;
-    if (n_frames) *n_frames = t;
-    return p;
+const float * codec_audio_lm_next_embd(const struct codec_audio_lm * ctx, int32_t seq) {
+    return ctx != nullptr ? ctx->family->next_embd(seq) : nullptr;
 }
 
-void codec_audio_lm_get_lm_eos(const struct codec_audio_lm * w, int32_t * eos_code_c0, int32_t * eos_min_step) {
-    int32_t c = -1, s = 0;
-    if (w) audio_lm_get_lm_eos(w->ctx, &c, &s);
-    if (eos_code_c0)  *eos_code_c0  = c;
-    if (eos_min_step) *eos_min_step = s;
+const char * codec_audio_lm_stop_reason(const struct codec_audio_lm * ctx) {
+    return ctx != nullptr ? ctx->family->stop_reason().c_str() : "";
 }
 
-void codec_audio_lm_set_uses_embed_override(struct codec_audio_lm * w, bool enabled, int32_t start_step) {
-    if (w) audio_lm_set_uses_embed_override(w->ctx, enabled, start_step);
-}
-bool codec_audio_lm_get_uses_embed_override(const struct codec_audio_lm * w) {
-    return w && audio_lm_get_uses_embed_override(w->ctx);
+bool codec_audio_lm_generate_self_contained(struct codec_audio_lm * ctx) {
+    if (ctx == nullptr) return false;
+    return ctx->family->generate_self_contained() || ctx->fail_family();
 }
 
-enum codec_audio_lm_observe codec_audio_lm_observe_token(struct codec_audio_lm * w, int32_t token,
-                                                         const float * last_hidden, int32_t hidden_dim) {
-    if (w == nullptr) return CODEC_AUDIO_LM_OBSERVE_STOP;
-    return (enum codec_audio_lm_observe) audio_lm_observe_token(w->ctx, token, last_hidden, hidden_dim);
-}
-
-const float * codec_audio_lm_get_next_embed(const struct codec_audio_lm * w, int32_t * dim) {
-    if (w == nullptr) { if (dim) *dim = 0; return nullptr; }
-    return audio_lm_get_next_embed(w->ctx, dim);
-}
-
-enum codec_audio_lm_observe codec_audio_lm_observe_hidden(struct codec_audio_lm * w, const float * hidden,
-                                                          int32_t hidden_dim, const float * noise) {
-    if (w == nullptr) return CODEC_AUDIO_LM_OBSERVE_STOP;
-    return (enum codec_audio_lm_observe) audio_lm_observe_hidden(w->ctx, hidden, hidden_dim, noise);
-}
-
-void codec_audio_lm_set_continuous_params(struct codec_audio_lm * w, float cfg_value, int32_t n_timesteps,
-                                          int32_t min_len) {
-    if (w) audio_lm_set_continuous_params(w->ctx, cfg_value, n_timesteps, min_len);
-}
-
-bool codec_audio_lm_text_prefill(struct codec_audio_lm * w, const float * hiddens, int32_t n_pos, int32_t hidden_dim) {
-    return w && audio_lm_text_prefill(w->ctx, hiddens, n_pos, hidden_dim);
-}
-
-enum codec_audio_lm_observe codec_audio_lm_observe_codes(struct codec_audio_lm * w, const int32_t * codes,
-                                                         int32_t n_codes, const float * last_hidden,
-                                                         int32_t hidden_dim) {
-    if (w == nullptr) return CODEC_AUDIO_LM_OBSERVE_STOP;
-    return (enum codec_audio_lm_observe) audio_lm_observe_codes(w->ctx, codes, n_codes, last_hidden, hidden_dim);
-}
-
-bool codec_audio_lm_push_codes(struct codec_audio_lm * w, const int32_t * codes, int32_t n_frames, int32_t n_q) {
-    return w && audio_lm_push_codes(w->ctx, codes, n_frames, n_q);
-}
-
-bool codec_audio_lm_step_set_text_context(struct codec_audio_lm * w, int32_t text_token) {
-    return w && audio_lm_step_set_text_context(w->ctx, text_token);
-}
-bool codec_audio_lm_step_begin(struct codec_audio_lm * w, const float * last_hidden, int32_t hidden_dim) {
-    return w && audio_lm_step_begin(w->ctx, last_hidden, hidden_dim);
-}
-const float * codec_audio_lm_step_logits(struct codec_audio_lm * w, int32_t * cb_idx, int32_t * n) {
-    return w ? audio_lm_step_logits(w->ctx, cb_idx, n) : nullptr;
-}
-bool codec_audio_lm_step_push_code(struct codec_audio_lm * w, int32_t code) {
-    return w && audio_lm_step_push_code(w->ctx, code);
-}
-bool codec_audio_lm_step_finish(struct codec_audio_lm * w, int32_t * codes, int32_t n_codes) {
-    return w && audio_lm_step_finish(w->ctx, codes, n_codes);
-}
-
-bool codec_audio_lm_prompt_needs_composed_embd(const struct codec_audio_lm * w) {
-    return w && audio_lm_prompt_needs_composed_embd(w->ctx);
-}
-bool codec_audio_lm_compose_prompt_embd(struct codec_audio_lm * w, int32_t text_token, float * out, int32_t out_dim) {
-    return w && audio_lm_compose_prompt_embd(w->ctx, text_token, out, out_dim);
-}
-bool codec_audio_lm_compose_audio_codes_embd(struct codec_audio_lm * w, const int32_t * codes, int32_t n_codes,
-                                             float * out, int32_t out_dim) {
-    return w && audio_lm_compose_audio_codes_embd(w->ctx, codes, n_codes, out, out_dim);
-}
-
-bool codec_audio_lm_has_text_lane(const struct codec_audio_lm * w) {
-    return w && audio_lm_talker_has_projection(w->ctx);
-}
-bool codec_audio_lm_build_prefix_embd(struct codec_audio_lm * w, const int32_t * header_tokens, int32_t n_header,
-                                      const int32_t * text_tokens, int32_t n_text, const float * speaker_emb,
-                                      int32_t speaker_emb_dim, float * out_embds, int32_t out_cap_rows,
-                                      int32_t * out_n_rows, int32_t * out_text_consumed) {
-    return w && audio_lm_build_talker_prefix(w->ctx, header_tokens, n_header, text_tokens, n_text, speaker_emb,
-                                             speaker_emb_dim, out_embds, out_cap_rows, out_n_rows, out_text_consumed);
-}
-bool codec_audio_lm_step_text_embd(struct codec_audio_lm * w, const int32_t * text_tokens, int32_t n_text,
-                                   int32_t step, float * out, int32_t out_dim) {
-    return w && audio_lm_talker_trailing_text_embd(w->ctx, text_tokens, n_text, step, out, out_dim);
-}
-
-bool codec_audio_lm_decode_audio(struct codec_audio_lm * w, struct codec_pcm_buffer * out) {
-    if (w == nullptr) return false;
+bool codec_audio_lm_decode(struct codec_audio_lm * ctx, struct codec_pcm_buffer * out) {
+    if (ctx == nullptr || out == nullptr) return false;
     audio_lm_audio_output pcm;
-    return audio_lm_decode_audio(w->ctx, &pcm) && fill_pcm(pcm, out);
+    if (!ctx->family->decode(&pcm)) return ctx->fail_family();
+    return fill_pcm(pcm.pcm.data(), pcm.pcm.size(), pcm.sample_rate, pcm.n_channels, out) || ctx->fail("out of memory");
 }
 
-bool codec_audio_lm_decode_latents(struct codec_audio_lm * w, const float * latents, int32_t n_frames, int32_t dim,
-                                   struct codec_pcm_buffer * out) {
-    if (w == nullptr) return false;
+bool codec_audio_lm_stream_poll(struct codec_audio_lm * ctx, int32_t chunk_ms, struct codec_pcm_buffer * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm);
+    std::vector<float> piece;
+    int32_t sr = 0, nch = 1;
+    if (!ctx->streamer->poll(chunk_ms, &piece, &sr, &nch)) return ctx->fail(ctx->streamer->error());
+    return fill_pcm(piece.data(), piece.size(), sr, nch, out) || ctx->fail("out of memory");
+}
+
+bool codec_audio_lm_stream_finish(struct codec_audio_lm * ctx, struct codec_pcm_buffer * out) {
+    if (ctx == nullptr || out == nullptr) return false;
+    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm);
+    std::vector<float> piece;
+    int32_t sr = 0, nch = 1;
+    if (!ctx->streamer->finish(&piece, &sr, &nch)) return ctx->fail(ctx->streamer->error());
+    return fill_pcm(piece.data(), piece.size(), sr, nch, out) || ctx->fail("out of memory");
+}
+
+int32_t codec_audio_lm_decodable_frames(const struct codec_audio_lm * ctx) {
+    return ctx != nullptr ? audio_lm_decodable_frames(ctx->alm) : 0;
+}
+
+int32_t codec_audio_lm_hop(const struct codec_audio_lm * ctx) {
+    return ctx != nullptr ? audio_lm_codec_hop(ctx->alm) : 0;
+}
+
+bool codec_audio_lm_decode_range(struct codec_audio_lm * ctx, int32_t frame_begin, int32_t frame_end,
+                                 struct codec_pcm_buffer * out) {
+    if (ctx == nullptr || out == nullptr) return false;
     audio_lm_audio_output pcm;
-    return audio_lm_decode_latents(w->ctx, latents, n_frames, dim, &pcm) && fill_pcm(pcm, out);
+    if (!audio_lm_decode_audio_range(ctx->alm, frame_begin, frame_end, &pcm)) {
+        return ctx->fail(audio_lm_last_error(ctx->alm));
+    }
+    return fill_pcm(pcm.pcm.data(), pcm.pcm.size(), pcm.sample_rate, pcm.n_channels, out) || ctx->fail("out of memory");
 }
 
 }  // extern "C"
+
+namespace codec_common {
+
+struct codec_audio_lm * alm_wrap_borrowed(audio_lm_context * alm, std::string * err) {
+    auto family = alm_make_family(alm, err);
+    if (!family) return nullptr;
+    auto * ctx = new codec_audio_lm();
+    ctx->alm = alm;
+    ctx->owns_alm = false;
+    ctx->family = std::move(family);
+    return ctx;
+}
+
+}  // namespace codec_common

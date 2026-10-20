@@ -123,6 +123,9 @@ endif()
 add_library(codec_audio_lm_objs OBJECT
     common/audio_lm.cpp
     common/audio_lm_c.cpp
+    common/audio_lm_family.cpp
+    common/audio_lm_family_soprano.cpp
+    common/tts_segment.cpp
 )
 set_target_properties(codec_audio_lm_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(codec_audio_lm_objs
@@ -187,7 +190,6 @@ add_library(codec_common STATIC
     $<TARGET_OBJECTS:codec_audio_lm_objs>
     common/kitten_text.cpp
     common/tts_runner_flow.cpp
-    common/tts_segment.cpp
 )
 target_include_directories(codec_common
     PUBLIC

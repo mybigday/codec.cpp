@@ -467,6 +467,8 @@ int32_t audio_lm_decodable_frames(const audio_lm_context * ctx);
 // Samples per decoded frame.  A window of n frames decodes to about n * hop
 // samples aligned at its start; some codecs drop a few at the end (DAC: 8).
 int32_t audio_lm_codec_hop(const audio_lm_context * ctx);
+// Width of the codec's continuous latent (codec_decode_quantized_representation).
+int32_t audio_lm_codec_latent_dim(const audio_lm_context * ctx);
 
 // Decode host-collected latents straight through the codec, in the codec's
 // own `codec_decode_quantized_representation` layout (Soprano: frame-major

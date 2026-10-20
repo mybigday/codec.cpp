@@ -1822,6 +1822,10 @@ int32_t audio_lm_codec_hop(const audio_lm_context * ctx) {
     return ctx != nullptr && ctx->model != nullptr ? codec_model_hop_size(ctx->model) : 0;
 }
 
+int32_t audio_lm_codec_latent_dim(const audio_lm_context * ctx) {
+    return ctx != nullptr && ctx->model != nullptr ? codec_model_latent_dim(ctx->model) : 0;
+}
+
 int32_t audio_lm_decodable_frames(const audio_lm_context * ctx) {
     if (ctx == nullptr) return 0;
     if (ctx->is_continuous) return ctx->latent_n_frames;
