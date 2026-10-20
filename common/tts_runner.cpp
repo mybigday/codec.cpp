@@ -1124,6 +1124,11 @@ bool run_token_single_cb(audio_lm_context * ctx, llama_context * lctx,
         }
         observe_action act =
             audio_lm_observe_token(ctx, tok, /*last_hidden=*/nullptr, /*hidden_dim=*/0);
+        if (act != OBSERVE_STOP && llama_vocab_is_eog(vocab, tok)) {
+            // End of generation without the audio-end token (e.g. a model that
+            // spelled it out of text pieces): nothing more will follow.
+            act = OBSERVE_STOP;
+        }
         if (act == OBSERVE_STOP) {
             // For Type A (uses_embed_override off, no codec_lm) observe_token
             // only returns STOP on the clean eos sentinel — the error-bearing
@@ -1623,7 +1628,7 @@ void fill_result_from_output(const audio_lm_audio_output & pcm,
     out->stop_reason  = stop;
 }
 
-// ── OuteTTS V2/V3 detection ───────────────────────────────────────────────────
+// ── OuteTTS V1/V2/V3 detection ───────────────────────────────────────────────────
 //
 // Scans the backbone vocab for signature special-token pieces that uniquely
 // identify an OuteTTS family.  Uses O(vocab) linear scan per probe — called
@@ -1671,8 +1676,10 @@ static bool detect_outetts_version(const llama_model * lmodel,
 
     // V3 signature: any of these per-word markers present.
     const bool v3 = has("<|word_start|>") || has("<|features|>") || has("<|c1_0|>");
-    // V2 signature: space + audio-end tokens, but NOT the V3 markers.
+    // V2 (0.3) signature: space + audio-end tokens, but NOT the V3 markers.
     const bool v2 = !v3 && has("<|space|>") && has("<|audio_end|>");
+    // V1 (0.2): text_sep + code_start/code_end, no <|space|>.
+    const bool v1 = !v3 && !v2 && has("<|text_sep|>") && has("<|code_start|>") && has("<|audio_end|>");
 
     // Corroborate with general.name when available (non-fatal; skip on error).
     char name[256] = {0};
@@ -1688,6 +1695,11 @@ static bool detect_outetts_version(const llama_model * lmodel,
     if (v2) {
         *out = codec_common::outetts_version::V2;
         std::printf("[tts] OuteTTS detection: V2 (general.name=\"%s\")\n", name);
+        return true;
+    }
+    if (v1) {
+        *out = codec_common::outetts_version::V1;
+        std::printf("[tts] OuteTTS detection: V1 (general.name=\"%s\")\n", name);
         return true;
     }
     std::printf("[tts] OuteTTS detection: negative — not OuteTTS (general.name=\"%s\")\n", name);
@@ -1845,430 +1857,157 @@ std::vector<llama_token> build_neutts_prompt(
     return toks;
 }
 
-// ── OuteTTS V3 speaker loader + prompt builder (public API) ──────────────────
+// ── OuteTTS prompt (speaker = codec_speaker ref_text + audio_prompt) ─────────
 //
-// Speaker JSON schema (outetts 0.4.4, outetts10-facts §Step 3):
+// The speaker's audio section is baked into the codec GGUF as the backbone's
+// token ids (`audio_prompt`, scripts/bake-speakers.py); `ref_text` is its text
+// section.  Prefill per upstream outetts/version/vN/prompt_processor.py:
 //
-//   {
-//     "text":  "<reference sentence>",
-//     "words": [
-//       { "word": "The", "duration": 0.20,
-//         "c1": [720,...], "c2": [658,...],
-//         "features": {"energy":10, "spectral_centroid":15, "pitch":45} },
-//       ...
-//     ],
-//     "global_features": {"energy":13, "spectral_centroid":20, "pitch":28},
-//     "interface_version": 3
-//   }
+//   V1 (0.2)  <|im_start|>\n<|text_start|>REF<|text_sep|>IN<|text_end|>\n<|audio_start|>\n AUDIO
+//   V2 (0.3)  <|im_start|>\n<|text_start|>REF<|space|>IN<|text_end|>\n<|audio_start|>\n AUDIO
+//   V3 (1.0)  <|im_start|>\n<|text_start|>REF␣IN<|text_end|>\n<|audio_start|>\n AUDIO <|word_start|>
 //
-// We parse this with a minimal hand-parser (no external JSON library dependency
-// needed for this fixed schema).
+// V1/V2 words are separated by the version's separator token (REF and IN are
+// space-separated words here); V3 joins the texts like merge_speaker_text.
 
 namespace {
 
-// ── Tiny JSON helpers ─────────────────────────────────────────────────────────
-// These operate on the raw file content (one std::string) and implement only
-// what the speaker JSON schema requires: string extraction, key lookup, integer
-// array parsing, and float parsing.  They do NOT handle Unicode escapes, nested
-// objects deeper than 2 levels, or arrays of objects except words[].
-
-// Advance pos past whitespace.
-static void json_skip_ws(const std::string & s, size_t & pos) {
-    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' ||
-                               s[pos] == '\r' || s[pos] == '\n'))
-        ++pos;
-}
-
-// Parse a JSON string starting at s[pos] (which must be '"').
-// Advances pos to after the closing '"'.
-static std::string json_parse_string(const std::string & s, size_t & pos) {
-    if (pos >= s.size() || s[pos] != '"') return "";
-    ++pos;  // skip opening "
-    std::string out;
-    while (pos < s.size() && s[pos] != '"') {
-        if (s[pos] == '\\' && pos + 1 < s.size()) {
-            ++pos;
-            switch (s[pos]) {
-                case '"':  out += '"';  break;
-                case '\\': out += '\\'; break;
-                case '/':  out += '/';  break;
-                case 'n':  out += '\n'; break;
-                case 't':  out += '\t'; break;
-                case 'r':  out += '\r'; break;
-                default:   out += s[pos]; break;
-            }
-        } else {
-            out += s[pos];
-        }
-        ++pos;
-    }
-    if (pos < s.size()) ++pos;  // skip closing "
-    return out;
-}
-
-// Return the position of the value after key "key" in the JSON object rooted
-// at [obj_start, obj_end).  Returns std::string::npos if not found.
-static size_t json_find_key(const std::string & s, size_t obj_start, size_t obj_end,
-                             const std::string & key) {
-    size_t pos = obj_start;
-    while (pos < obj_end) {
-        json_skip_ws(s, pos);
-        if (pos >= obj_end) break;
-        if (s[pos] != '"') { ++pos; continue; }  // skip non-key chars (commas, etc.)
-        std::string k = json_parse_string(s, pos);
-        // Skip the colon separator after the key.
-        json_skip_ws(s, pos);
-        if (pos < obj_end && s[pos] == ':') ++pos;
-        json_skip_ws(s, pos);
-        if (k == key) {
-            // pos now points at the start of the value — return it.
-            return pos;
-        }
-        // Key doesn't match: skip the value so we advance past it.
-        if (pos >= obj_end) break;
-        char c = s[pos];
-        if (c == '"') {
-            json_parse_string(s, pos);
-        } else if (c == '{' || c == '[') {
-            // Skip matched bracket (handles nested objects/arrays).
-            char open = c, close = (c == '{') ? '}' : ']';
-            int depth = 0;
-            bool in_str = false;
-            while (pos < obj_end) {
-                char ch = s[pos++];
-                if (in_str) { if (ch == '\\') { if (pos < obj_end) ++pos; }
-                              else if (ch == '"') in_str = false; }
-                else { if (ch == '"') in_str = true;
-                       else if (ch == open)  ++depth;
-                       else if (ch == close) { --depth; if (depth == 0) break; } }
-            }
-        } else {
-            // number / bool / null — advance to next comma or closing bracket.
-            while (pos < obj_end && s[pos] != ',' && s[pos] != '}' && s[pos] != ']') ++pos;
-        }
-    }
-    return std::string::npos;
-}
-
-// Parse an integer array [N, N, ...] starting at s[pos] (which must be '[').
-// Advances pos past the closing ']'.
-static std::vector<int32_t> json_parse_int_array(const std::string & s, size_t & pos) {
-    std::vector<int32_t> out;
-    if (pos >= s.size() || s[pos] != '[') return out;
-    ++pos;  // skip '['
-    while (pos < s.size()) {
-        json_skip_ws(s, pos);
-        if (pos >= s.size()) break;
-        if (s[pos] == ']') { ++pos; break; }
-        if (s[pos] == ',') { ++pos; continue; }
-        // parse integer (may be negative)
-        bool neg = (s[pos] == '-');
-        if (neg) ++pos;
-        int32_t v = 0;
-        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
-            v = v * 10 + (s[pos++] - '0');
-        }
-        out.push_back(neg ? -v : v);
+// UTF-8 codepoints of `s` (malformed bytes pass through as themselves).
+std::vector<uint32_t> utf8_codepoints(const std::string & s) {
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char b = (unsigned char) s[i];
+        size_t len = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 1;
+        if (i + len > s.size()) len = 1;
+        uint32_t cp = len == 1 ? b : (b & (0xFF >> (len + 1)));
+        for (size_t k = 1; k < len; ++k) cp = (cp << 6) | ((unsigned char) s[i + k] & 0x3F);
+        out.push_back(cp);
+        i += len;
     }
     return out;
 }
 
-// Parse a float at s[pos]; advances pos past the number.
-static float json_parse_float(const std::string & s, size_t & pos) {
-    size_t start = pos;
-    if (pos < s.size() && (s[pos] == '-' || s[pos] == '+')) ++pos;
-    while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
-    if (pos < s.size() && s[pos] == '.') {
-        ++pos;
-        while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
-    }
-    if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
-        ++pos;
-        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
-        while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) ++pos;
-    }
-    return (float) std::stod(s.substr(start, pos - start));
+std::string trim_ws(const std::string & s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
 }
 
-// Parse an integer at s[pos]; advances pos past the number.
-static int32_t json_parse_int(const std::string & s, size_t & pos) {
-    json_skip_ws(s, pos);
-    bool neg = (pos < s.size() && s[pos] == '-');
-    if (neg) ++pos;
-    int32_t v = 0;
-    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') v = v * 10 + (s[pos++] - '0');
-    return neg ? -v : v;
-}
-
-// Find the matching close bracket for the open bracket at s[open_pos].
-// Returns std::string::npos if not found.
-static size_t json_match_bracket(const std::string & s, size_t open_pos) {
-    if (open_pos >= s.size()) return std::string::npos;
-    char open = s[open_pos], close = (open == '{') ? '}' : ']';
-    int depth = 0;
-    bool in_str = false;
-    size_t pos = open_pos;
-    while (pos < s.size()) {
-        char c = s[pos++];
-        if (in_str) { if (c == '\\') { if (pos < s.size()) ++pos; } else if (c == '"') in_str = false; }
-        else { if (c == '"') in_str = true; else if (c == open) ++depth; else if (c == close) { --depth; if (depth == 0) return pos - 1; } }
+// v3 PromptProcessor.merge_speaker_text.
+std::string outetts_v3_merge(const std::string & speaker_text, const std::string & input) {
+    const std::string spk = trim_ws(speaker_text);
+    bool cjk = false, hangul = false;
+    for (uint32_t c : utf8_codepoints(spk)) {
+        if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x4E00 && c <= 0x9FFF)) cjk = true;
+        if (c >= 0xAC00 && c <= 0xD7AF) hangul = true;
     }
-    return std::string::npos;
+    (void) hangul;  // Hangul uses ". " like Latin text
+    std::string rs;
+    if (!spk.empty()) {
+        const std::vector<uint32_t> cps = utf8_codepoints(spk);
+        const uint32_t last = cps.back();
+        const bool ends = cjk ? (last == 0x3002 || last == 0xFF1F || last == 0xFF01 || last == '?' || last == '!')
+                              : (last == '.' || last == '?' || last == '!');
+        rs = !ends ? (cjk ? "\xE3\x80\x82" : ". ") : (cjk ? "" : " ");
+    }
+    return spk + rs + trim_ws(input);
 }
 
 }  // namespace
 
-// ── load_outetts_speaker ──────────────────────────────────────────────────────
-
-bool load_outetts_speaker(const std::string & json_path, OutettsSpeaker * out) {
-    if (!out) return false;
-
-    // Read entire file.
-    std::ifstream f(json_path);
-    if (!f.is_open()) {
-        std::fprintf(stderr, "[outetts] load_outetts_speaker: cannot open %s\n", json_path.c_str());
-        return false;
+static std::string outetts_input_words(codec_common::outetts_version v, const std::string & text) {
+    using codec_common::outetts_version;
+    if (v == outetts_version::V3) return trim_ws(text);
+    // V1: llama.cpp tts process_text (numbers to words is the caller's job).
+    // V2: also keeps . ! ? , " as punctuation tokens glued to their word
+    //     (TextProcessor.join_punctuation, ASCII subset).
+    std::string lower;
+    for (char c : text) {
+        const char l = (char) std::tolower((unsigned char) c);
+        lower += (l == '-' || l == '_' || l == '/' || l == '\\' || (v == outetts_version::V1 && (l == ',' || l == '.')))
+                     ? ' ' : l;
     }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    const std::string src = ss.str();
-
-    // Find top-level object boundaries.
-    size_t root = src.find('{');
-    if (root == std::string::npos) {
-        std::fprintf(stderr, "[outetts] load_outetts_speaker: no JSON object in %s\n", json_path.c_str());
-        return false;
-    }
-    size_t root_end = json_match_bracket(src, root);
-    if (root_end == std::string::npos) root_end = src.size();
-
-    // Parse "text" field.
-    {
-        size_t vp = json_find_key(src, root + 1, root_end, "text");
-        if (vp != std::string::npos && vp < src.size() && src[vp] == '"') {
-            out->text = json_parse_string(src, vp);
+    auto punct = [](char c) -> const char * {
+        switch (c) {
+            case '.': return "<|period|>";
+            case '!': return "<|exclamation_mark|>";
+            case '?': return "<|question_mark|>";
+            case ',': return "<|comma|>";
+            case '"': return "<|double_quote|>";
+            default:  return nullptr;
+        }
+    };
+    std::vector<std::string> words;
+    std::string cur, before, after;
+    auto flush = [&]() {
+        if (!cur.empty()) {
+            words.push_back(before + cur + after);
+        } else if (!words.empty()) {
+            words.back() += before + after;   // standalone punctuation joins the previous word
+        }
+        cur.clear(); before.clear(); after.clear();
+    };
+    for (size_t i = 0; i <= lower.size(); ++i) {
+        const char c = i < lower.size() ? lower[i] : ' ';
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { flush(); continue; }
+        if (c >= 'a' && c <= 'z') {
+            cur += c;
+        } else if (v == outetts_version::V2 && punct(c) != nullptr) {
+            if (i + 2 < lower.size() && c == '.' && lower[i + 1] == '.' && lower[i + 2] == '.') {
+                (cur.empty() ? before : after) += "<|ellipsis|>";
+                i += 2;
+            } else {
+                (cur.empty() ? before : after) += punct(c);
+            }
         }
     }
-
-    // Parse "words" array.
-    {
-        size_t vp = json_find_key(src, root + 1, root_end, "words");
-        if (vp == std::string::npos || vp >= src.size() || src[vp] != '[') {
-            std::fprintf(stderr, "[outetts] load_outetts_speaker: 'words' array not found in %s\n",
-                         json_path.c_str());
-            return false;
-        }
-        size_t words_end = json_match_bracket(src, vp);
-        if (words_end == std::string::npos) words_end = src.size();
-        size_t pos = vp + 1;  // skip '['
-
-        while (pos < words_end) {
-            json_skip_ws(src, pos);
-            if (pos >= words_end) break;
-            if (src[pos] == ']') break;
-            if (src[pos] != '{') { ++pos; continue; }
-
-            size_t wobj_end = json_match_bracket(src, pos);
-            if (wobj_end == std::string::npos) wobj_end = words_end;
-            size_t wstart = pos + 1;
-
-            OutettsSpeakerWord w;
-
-            // "word"
-            {
-                size_t kp = json_find_key(src, wstart, wobj_end, "word");
-                if (kp != std::string::npos && src[kp] == '"') {
-                    w.word = json_parse_string(src, kp);
-                }
-            }
-
-            // "duration"
-            {
-                size_t kp = json_find_key(src, wstart, wobj_end, "duration");
-                if (kp != std::string::npos) {
-                    w.duration = json_parse_float(src, kp);
-                }
-            }
-
-            // "c1"
-            {
-                size_t kp = json_find_key(src, wstart, wobj_end, "c1");
-                if (kp != std::string::npos && src[kp] == '[') {
-                    w.c1 = json_parse_int_array(src, kp);
-                }
-            }
-
-            // "c2"
-            {
-                size_t kp = json_find_key(src, wstart, wobj_end, "c2");
-                if (kp != std::string::npos && src[kp] == '[') {
-                    w.c2 = json_parse_int_array(src, kp);
-                }
-            }
-
-            // "features": {"energy": N, "spectral_centroid": N, "pitch": N}
-            {
-                size_t fp = json_find_key(src, wstart, wobj_end, "features");
-                if (fp != std::string::npos && src[fp] == '{') {
-                    size_t fobj_end = json_match_bracket(src, fp);
-                    if (fobj_end == std::string::npos) fobj_end = wobj_end;
-                    size_t fstart = fp + 1;
-
-                    size_t ep = json_find_key(src, fstart, fobj_end, "energy");
-                    if (ep != std::string::npos) w.energy = json_parse_int(src, ep);
-
-                    size_t sp = json_find_key(src, fstart, fobj_end, "spectral_centroid");
-                    if (sp != std::string::npos) w.spectral_centroid = json_parse_int(src, sp);
-
-                    size_t pp = json_find_key(src, fstart, fobj_end, "pitch");
-                    if (pp != std::string::npos) w.pitch = json_parse_int(src, pp);
-                }
-            }
-
-            out->words.push_back(std::move(w));
-            pos = wobj_end + 1;  // advance past '}' of word object
-        }
-    }
-
-    return !out->words.empty();
+    std::string out;
+    for (const auto & w : words) out += (out.empty() ? "" : " ") + w;
+    return out;
 }
 
-// ── build_outetts_v3_prompt ───────────────────────────────────────────────────
-//
-// Exact V3 prefill (outetts10-facts §Step 1):
-//
-//   <|im_start|>\n
-//   <|text_start|>SPEAKER_TEXT. TARGET_TEXT<|text_end|>\n
-//   <|audio_start|>\n
-//   {speaker word blocks, each ending with \n}
-//   <|word_start|>
-//
-// Each word block (from create_codes in prompt_processor.py):
-//   <|word_start|>WORD<|features|><|t_D.DD|><|energy_N|><|spectral_centroid_N|><|pitch_N|>
-//   <|code|><|c1_X|><|c2_X|>...<|word_end|>
-//
-// c1_base (0.6B) = 151669, c2_base (0.6B) = 152694 (facts §Step 2).
-// The format specials (<|...|>) are resolved via llama_tokenize(parse_special=true)
-// together with the surrounding text; code tokens are appended as raw ids.
-//
-// Guard: returns empty on null vocab, empty text, or any c1/c2 code out of [0,1024).
-
-std::vector<llama_token> build_outetts_v3_prompt(const llama_vocab    * vocab,
-                                                  const std::string   & text,
-                                                  const OutettsSpeaker& speaker) {
-    if (!vocab || text.empty()) return {};
-
-    // Validate all codes up front before we allocate anything.
-    for (const auto & w : speaker.words) {
-        for (int32_t c : w.c1) {
-            if (c < 0 || c >= 1024) {
-                std::fprintf(stderr,
-                    "[outetts] build_outetts_v3_prompt: c1 code %d out of range [0,1024)\n", c);
-                return {};
-            }
-        }
-        for (int32_t c : w.c2) {
-            if (c < 0 || c >= 1024) {
-                std::fprintf(stderr,
-                    "[outetts] build_outetts_v3_prompt: c2 code %d out of range [0,1024)\n", c);
-                return {};
-            }
-        }
-    }
-
-    // Resolve c1/c2 base ids from the vocab (facts §Step 2: look up <|c1_0|> / <|c2_0|>).
-    const int32_t c1_base = vocab_piece_id(vocab, "<|c1_0|>");
-    const int32_t c2_base = vocab_piece_id(vocab, "<|c2_0|>");
-    if (c1_base < 0 || c2_base < 0) {
-        std::fprintf(stderr,
-            "[outetts] build_outetts_v3_prompt: <|c1_0|> or <|c2_0|> not found in vocab\n");
+static std::vector<llama_token> build_outetts_prompt(const llama_vocab * vocab, codec_common::outetts_version v,
+                                                     const std::string & input_words, const codec_speaker * spk,
+                                                     std::string * err) {
+    using codec_common::outetts_version;
+    codec_speaker_slot_type ty;
+    int64_t ne[4];
+    const void * data = nullptr;
+    const char * ref_text = spk != nullptr ? codec_speaker_ref_text(spk) : nullptr;
+    if (spk == nullptr || ref_text == nullptr || !codec_speaker_get_slot(spk, "audio_prompt", &ty, ne, &data) ||
+        ty != CODEC_SPEAKER_SLOT_I32) {
+        *err = "OuteTTS needs a speaker with ref_text + audio_prompt (a codec GGUF with baked voices, "
+               "scripts/bake-speakers.py)";
         return {};
     }
-
-    // ── Build the prompt string.
-    // The string contains all special tokens in <|...|> form; llama_tokenize
-    // with parse_special=true will resolve them to their ids.  Code tokens are
-    // NOT embedded in the string — they are appended as raw ids after tokenization
-    // to avoid any piece-merging ambiguity.
-    //
-    // To interleave text and code tokens correctly (the code tokens must appear
-    // at the right position within the word block), we build the prompt in
-    // segments.  Each word produces:
-    //   text_segment: "<|word_start|>WORD<|features|><|t_D.DD|>...<|code|>"
-    //   code_ids:     [c1_base+c1[0], c2_base+c2[0], c1_base+c1[1], ...]
-    //   end_segment:  "<|word_end|>\n"
-    // After all words, we append the trailing "<|word_start|>" primer.
-
-    // Merged text: "SPEAKER_TEXT. TARGET_TEXT"
-    const std::string merged_text = speaker.text + ". " + text;
-
-    // Header segment (fully textual with specials)
-    const std::string header =
-        "<|im_start|>\n"
-        "<|text_start|>" + merged_text + "<|text_end|>\n"
-        "<|audio_start|>\n";
-
-    // We'll accumulate (text_segment, code_tokens) pairs then do one tokenize
-    // per text segment and concatenate everything.
-
-    struct Segment {
-        std::string          text_piece;   // tokenized with parse_special=true
-        std::vector<int32_t> code_ids;     // raw token ids appended after text_piece
+    if (input_words.empty()) { *err = "OuteTTS: no words in the input text"; return {}; }
+    auto sep_join = [](const std::string & words, const char * sep) {
+        std::string o;
+        for (char c : words) o += c == ' ' ? std::string(sep) : std::string(1, c);
+        return o;
     };
+    std::string text;
+    if (v == outetts_version::V1) text = sep_join(std::string(ref_text) + " " + input_words, "<|text_sep|>");
+    else if (v == outetts_version::V2) text = sep_join(std::string(ref_text) + " " + input_words, "<|space|>");
+    else text = outetts_v3_merge(ref_text, input_words);
 
-    std::vector<Segment> segments;
-    segments.push_back({header, {}});
-
-    for (const auto & w : speaker.words) {
-        // Per-word text piece (from create_codes in prompt_processor.py):
-        //   "<|word_start|>WORD<|features|><|t_D.DD|><|energy_N|><|spectral_centroid_N|><|pitch_N|><|code|>"
-        char dur_buf[16];
-        std::snprintf(dur_buf, sizeof(dur_buf), "%.2f", (double) w.duration);
-
-        std::string wp = "<|word_start|>" + w.word
-            + "<|features|>"
-            + "<|t_" + dur_buf + "|>"
-            + "<|energy_"            + std::to_string(w.energy)            + "|>"
-            + "<|spectral_centroid_" + std::to_string(w.spectral_centroid) + "|>"
-            + "<|pitch_"             + std::to_string(w.pitch)             + "|>"
-            + "<|code|>";
-
-        // Code token ids: interleaved c1/c2 pairs per frame.
-        std::vector<int32_t> code_ids;
-        const size_t n_frames = std::min(w.c1.size(), w.c2.size());
-        code_ids.reserve(n_frames * 2);
-        for (size_t i = 0; i < n_frames; ++i) {
-            code_ids.push_back(c1_base + w.c1[i]);
-            code_ids.push_back(c2_base + w.c2[i]);
+    std::vector<llama_token> toks = tokenize_str(
+        vocab, "<|im_start|>\n<|text_start|>" + text + "<|text_end|>\n<|audio_start|>\n",
+        /*add_bos=*/false, /*parse_special=*/true);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const auto * ids = static_cast<const int32_t *>(data);
+    for (int64_t i = 0; i < ne[0]; ++i) {
+        if (ids[i] < 0 || ids[i] >= n_vocab) {
+            *err = "OuteTTS: speaker audio_prompt token out of the backbone vocab (codec GGUF baked for another model?)";
+            return {};
         }
-
-        // End piece for this word (appended after the code ids).
-        segments.push_back({wp,            std::move(code_ids)});
-        segments.push_back({"<|word_end|>\n", {}});
+        toks.push_back(ids[i]);
     }
-
-    // Trailing <|word_start|> primer (primes generation of first target word).
-    segments.push_back({"<|word_start|>", {}});
-
-    // ── Assemble the full token sequence.
-    std::vector<llama_token> result;
-    for (const auto & seg : segments) {
-        if (!seg.text_piece.empty()) {
-            auto toks = tokenize_str(vocab, seg.text_piece, /*add_bos=*/false, /*parse_special=*/true);
-            if (toks.empty()) {
-                std::fprintf(stderr,
-                    "[outetts] build_outetts_v3_prompt: tokenize failed for segment: \"%s\"\n",
-                    seg.text_piece.substr(0, 80).c_str());
-                return {};
-            }
-            result.insert(result.end(), toks.begin(), toks.end());
-        }
-        for (int32_t id : seg.code_ids) {
-            result.push_back(id);
-        }
+    if (v == outetts_version::V3) {
+        const std::vector<llama_token> ws = tokenize_str(vocab, "<|word_start|>", false, true);
+        toks.insert(toks.end(), ws.begin(), ws.end());
     }
-
-    return result;
+    return toks;
 }
 
 // ── KittenTTS 2 (Flow: Qwen3 speech LM → S3 tokens → MeanFlow S3Gen) ─────
@@ -2714,8 +2453,8 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     const llama_vocab * bb_vocab = llama_model_get_vocab(lmodel);
     const bool is_outetts =
         llama_vocab_type(bb_vocab) != LLAMA_VOCAB_TYPE_NONE &&
-        detect_outetts_version(lmodel, bb_vocab, &ov) &&
-        ov == codec_common::outetts_version::V3;
+        detect_outetts_version(lmodel, bb_vocab, &ov);
+    const bool outetts_legacy = is_outetts && ov != codec_common::outetts_version::V3;
 
     const int32_t max_frames = a.max_frames > 0 ? a.max_frames : 512;
     llama_context_params cp = llama_context_default_params();
@@ -2723,10 +2462,13 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     cp.n_batch      = cp.n_ctx;
     cp.n_ubatch     = cp.n_ctx;
     if (is_outetts) {
-        // An OuteTTS frame is a c1/c2 pair plus its share of the word-block
-        // tokens (~2.4 tokens), after a ~1.8k-token speaker prompt.  Without
-        // --max-frames the budget is the reference's max_length = 8192 tokens.
-        cp.n_ctx    = a.max_frames > 0 ? (uint32_t) std::max(4096, 2048 + 3 * a.max_frames) : 8192u;
+        // An OuteTTS 1.0 frame is a c1/c2 pair plus its share of the word-block
+        // tokens (~2.4 tokens), after a ~1.8k-token speaker prompt; 0.2/0.3
+        // spend ~1.1 tokens per frame.  Without --max-frames the budget is the
+        // reference's max_length (8192 tokens for 1.0, 4096 for 0.2/0.3).
+        const int32_t tok_per_frame = outetts_legacy ? 2 : 3;
+        const uint32_t max_len = outetts_legacy ? 4096u : 8192u;
+        cp.n_ctx    = a.max_frames > 0 ? (uint32_t) std::max(4096, 2048 + tok_per_frame * a.max_frames) : max_len;
         cp.n_batch  = cp.n_ctx;
         cp.n_ubatch = 4096;
     }
@@ -2870,74 +2612,59 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
         return false;
     }
 
-    // ── OuteTTS V3 free-gen multi-cb Type A decode + DAC ────────────────────
+    // ── OuteTTS free-gen Type A decode (1.0: DAC n_q=2, 0.2/0.3: WavTokenizer) ─
     // OuteTTS (like NeuTTS) is codec-only: the backbone lm_head emits an
-    // INTERLEAVED stream of structural tokens (<|word_start|>, word text,
+    // INTERLEAVED stream of structural tokens (1.0: <|word_start|>, word text,
     // <|features|>, <|t_..|>, <|energy_N|>, <|code|>, <|c1_N|>, <|c2_N|>,
-    // <|word_end|>, ...) that ends with <|audio_end|>.  We drive it with FREE
-    // generation (no flat audio mask — that would forbid the structural tokens)
-    // + a 64-token repetition window (mandated by the OuteTTS README), then let
-    // the multi-cb observe accumulator strip the non-audio tokens and pack the
-    // c1/c2 pairs into the (T, n_q=2) frame layout for DAC decode.  The prompt-
-    // derived word-block grammar (as llama.rn's rn-tts) keeps the stream well
-    // formed: only the input's words, complete feature headers, c1/c2 pairs.
+    // <|word_end|>; 0.2/0.3: word, <|t_..|>, <|N|> codes, separators) that
+    // ends with <|audio_end|>.  We drive it with FREE generation (no flat audio
+    // mask — that would forbid the structural tokens), let the observe
+    // accumulator strip the non-audio tokens and pack the codes into frames.
+    // The prompt-derived word-block grammar (as llama.rn's rn-tts) keeps the
+    // stream well formed: only the input's words, complete headers, in-range
+    // codes.  The voice is the codec speaker (ref_text + audio_prompt).
     // Self-contained: frees all resources on every early-return and returns.
     if (is_outetts) {
-        // 1) Load the bundled default V3 speaker.  Resolve the asset relative to
-        //    a few candidate roots (cwd / repo layout), mirroring the tests.
-        static const char * kSpeakerCandidates[] = {
-            "assets/speakers/en-female-1-neutral.json",
-            "../assets/speakers/en-female-1-neutral.json",
-            "docs/superpowers/notes/outetts10-en-female-1-neutral.json",
-        };
-        std::string speaker_path;
-        for (const char * cand : kSpeakerCandidates) {
-            std::ifstream probe(cand);
-            if (probe.good()) { speaker_path = cand; break; }
-        }
-        if (speaker_path.empty()) {
-            out->error =
-                "OuteTTS: bundled default speaker not found "
-                "(assets/speakers/en-female-1-neutral.json); run tts-cli from the repo root.";
-            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
-            return false;
-        }
-        codec_common::OutettsSpeaker speaker;
-        if (!load_outetts_speaker(speaker_path, &speaker)) {
-            out->error = std::string("OuteTTS: failed to parse speaker JSON: ") + speaker_path;
-            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
-            return false;
-        }
-
-        // 2) Build the V3 prefill (header + speaker word-blocks + <|word_start|>
-        //    primer + interleaved raw c1/c2 code ids).
+        using codec_common::outetts_version;
+        const char * ver_name = ov == outetts_version::V1 ? "0.2" : ov == outetts_version::V2 ? "0.3" : "1.0";
+        const std::string in_words = outetts_input_words(ov, a.text);
+        std::string perr;
         std::vector<llama_token> outetts_prompt_toks =
-            build_outetts_v3_prompt(vocab, a.text, speaker);
+            build_outetts_prompt(vocab, ov, in_words, audio_lm_decode_speaker(ctx), &perr);
         if (outetts_prompt_toks.empty()) {
-            out->error =
-                "OuteTTS: build_outetts_v3_prompt returned empty "
-                "(empty text, bad vocab, or out-of-range speaker code)";
+            out->error = perr;
             llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
             return false;
         }
 
-        // 3) Configure the multi-cb Type A range (c1/c2 offsets + counts,
-        //    <|code|> frame sentinel, <|audio_end|> eos) BEFORE any observe.
+        // Audio-token ranges BEFORE any observe: 1.0 = c1/c2 offsets, <|code|>
+        // frame sentinel; 0.2/0.3 = <|0|>.. (WavTokenizer codebook 4096).
         int32_t off2[2] = {-1, -1}, cnt2[2] = {0, 0}, sentinel = -1, eos_id = -1;
-        if (!outetts_audio_token_ranges(vocab, off2, cnt2, &sentinel, &eos_id)) {
-            out->error =
-                "OuteTTS: outetts_audio_token_ranges failed "
-                "(<|c1_0|>/<|c2_0|>/<|code|>/<|audio_end|> missing from vocab)";
-            llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
-            return false;
+        int32_t n_q_oute = 2;
+        if (ov == outetts_version::V3) {
+            if (!outetts_audio_token_ranges(vocab, off2, cnt2, &sentinel, &eos_id)) {
+                out->error =
+                    "OuteTTS: outetts_audio_token_ranges failed "
+                    "(<|c1_0|>/<|c2_0|>/<|code|>/<|audio_end|> missing from vocab)";
+                llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+                return false;
+            }
+        } else {
+            n_q_oute = 1;
+            off2[0] = vocab_piece_id(vocab, "<|0|>");
+            cnt2[0] = 4096;
+            eos_id  = vocab_piece_id(vocab, "<|audio_end|>");
+            if (off2[0] < 0 || eos_id < 0 || vocab_piece_id(vocab, "<|4095|>") != off2[0] + 4095) {
+                out->error = "OuteTTS: <|0|>..<|4095|> / <|audio_end|> not found as a contiguous vocab range";
+                llama_free(lctx); llama_model_free(lmodel); audio_lm_free(ctx); llama_backend_free();
+                return false;
+            }
         }
-        audio_lm_set_audio_token_ranges(ctx, off2, cnt2, /*n_q=*/2, sentinel, eos_id);
-        std::printf("[outetts] V3 multi-cb range: c1=[%d,%d) c2=[%d,%d) sentinel=%d eos=%d; "
-                    "%zu prompt tokens\n",
-                    off2[0], off2[0] + cnt2[0], off2[1], off2[1] + cnt2[1],
-                    sentinel, eos_id, outetts_prompt_toks.size());
+        audio_lm_set_audio_token_ranges(ctx, off2, cnt2, n_q_oute, sentinel, eos_id);
+        std::printf("[outetts] %s: codes c1=[%d,%d)", ver_name, off2[0], off2[0] + cnt2[0]);
+        if (n_q_oute == 2) std::printf(" c2=[%d,%d)", off2[1], off2[1] + cnt2[1]);
+        std::printf(" sentinel=%d eos=%d; %zu prompt tokens\n", sentinel, eos_id, outetts_prompt_toks.size());
 
-        // 4) Type A single-cb-driver kind (the decode drives the DAC via codes).
         pi.model_kind = audio_lm_prompt_info::KIND_TOKEN_SINGLE_CB;
 
         // Validate prefill fits the backbone context.
@@ -2945,7 +2672,7 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
         if ((int32_t) outetts_prompt_toks.size() + 1 >= n_ctx) {
             char buf[192];
             std::snprintf(buf, sizeof(buf),
-                "OuteTTS: V3 prefill (%zu tokens) does not fit backbone n_ctx=%d; "
+                "OuteTTS: prefill (%zu tokens) does not fit backbone n_ctx=%d; "
                 "raise --max-frames.",
                 outetts_prompt_toks.size(), n_ctx);
             out->error = buf;
@@ -2953,17 +2680,19 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
             return false;
         }
 
-        // OuteTTS sampling defaults (README): temp 1.0, top-k 50, 64-token
-        // repetition window with penalty 1.1 (overridable via --rep-penalty).
-        const float    ot_temp    = a.has_temp  ? a.temp  : 1.0f;
+        // Sampling defaults: 1.0 (README) temp 1.0, top-k 50, 64-token window
+        // with penalty 1.1; 0.2/0.3 (GenerationConfig, HF generate) temp 0.1,
+        // top-k 50, penalty 1.1 over the whole sequence.
+        const bool     legacy     = ov != outetts_version::V3;
+        const float    ot_temp    = a.has_temp  ? a.temp  : (legacy ? 0.1f : 1.0f);
         const float    ot_top_p   = a.has_top_p ? a.top_p : 1.0f;
         const int32_t  ot_top_k   = a.has_top_k ? a.top_k : 50;
         const uint32_t ot_seed    = a.seed ? a.seed : 0xC0DEC1ABu;
         const float    ot_rep_pen = a.has_rep_penalty ? a.repetition_penalty : 1.1f;
-        const int32_t  ot_rep_n   = 64;
+        const int32_t  ot_rep_n   = legacy ? 0 : 64;   // 0 = full history
         const std::string ot_grammar = !a.grammar.empty()
             ? a.grammar
-            : codec_common::outetts_build_grammar(codec_common::outetts_version::V3, a.text);
+            : codec_common::outetts_build_grammar(ov, in_words);
         std::printf("[outetts] grammar: %s (%zu bytes)\n",
                     !a.grammar.empty() ? "user-supplied" : "auto (prompt-derived)", ot_grammar.size());
 
@@ -2996,8 +2725,8 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
             audio_lm_free(ctx);
             return false;
         }
-        // observe_token accumulated the c1/c2 codes into ctx->codes already —
-        // decode directly (DAC n_q=2, codes [1,2,n_frames]).
+        // observe_token accumulated the codes into ctx->codes already —
+        // decode directly (DAC n_q=2 / WavTokenizer n_q=1).
         audio_lm_audio_output pcm;
         if (!timed_decode_audio(ctx, &pcm, out)) {
             out->error = std::string("OuteTTS: decode_audio failed: ") + audio_lm_last_error(ctx);

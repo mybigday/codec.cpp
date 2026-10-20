@@ -22,24 +22,36 @@ static int g_fail = 0;
         }                                                                     \
     } while (0)
 
+static const char * kWavTokCode =
+    "CODE       ::= \"<|\" ( [0-9] | [1-9] [0-9] | [1-9] [0-9] [0-9] | [1-3] [0-9] [0-9] [0-9] | "
+    "\"4\" ( \"0\" [0-8] [0-9] | \"0\" \"9\" [0-5] ) ) \"|>\"\n";
+
 static void test_v2_two_ascii_words() {
     const std::string g = outetts_build_grammar(outetts_version::V2, "hello world");
     const std::string want =
-        "root       ::= NL? \"hello\" audioBlock \"world\" audioEnd NL EOS?\n"
-        "audioBlock ::= TIME CODE* space NL?\n"
-        "TEXT ::= [A-Za-z0-9 .,?!]+\n"
-        "EOS      ::= \"<|im_end|>\"\n"
-        "emotionStart ::= \"<|emotion_start|>\"\n"
-        "emotionEnd ::= \"<|emotion_end|>\"\n"
-        "audioEnd   ::= \"<|audio_end|>\"\n"
-        "space      ::= \"<|space|>\"\n"
-        "WORD       ::= \"hello\" | \"world\"\n"
+        std::string("root       ::= NL? \"hello\" audioBlock \"world\" audioBlock audioEnd NL? EOS?\n"
+        "audioBlock ::= TIME CODE{1,750} space NL?\n"
+        "EOS        ::= <|im_end|>\n"
+        "audioEnd   ::= <|audio_end|>\n"
+        "space      ::= <|space|>\n"
         "NL         ::= [\\n]\n"
-        "TIME  ::= \"<|t_\" DECIMAL \"|>\"\n"
-        "CODE    ::= \"<|\" DIGITS \"|>\"\n"
-        "DIGITS     ::= [0-9]+\n"
-        "DECIMAL    ::= [0-9]+ \".\" [0-9]+\n"
-        "punch ::= \"<|\" [a-z_]+ \"|>\"\n";
+        "TIME       ::= \"<|t_\" DECIMAL \"|>\"\n") + kWavTokCode +
+        "DECIMAL    ::= [0-9] \".\" [0-9] [0-9] | \"10.00\"\n";
+    CHECK_EQ(g, want);
+}
+
+static void test_v1_code_start_end() {
+    const std::string g = outetts_build_grammar(outetts_version::V1, "hi");
+    const std::string want =
+        std::string("root       ::= NL? \"hi\" audioBlock audioEnd NL? EOS?\n"
+        "audioBlock ::= TIME codeStart CODE{1,750} codeEnd NL?\n"
+        "EOS        ::= <|im_end|>\n"
+        "audioEnd   ::= <|audio_end|>\n"
+        "codeStart  ::= <|code_start|>\n"
+        "codeEnd    ::= <|code_end|>\n"
+        "NL         ::= [\\n]\n"
+        "TIME       ::= \"<|t_\" DECIMAL \"|>\"\n") + kWavTokCode +
+        "DECIMAL    ::= [0-9] \".\" [0-9] [0-9] | \"10.00\"\n";
     CHECK_EQ(g, want);
 }
 
@@ -50,38 +62,38 @@ static void test_v3_uses_word_alternation_and_features() {
         "leadWord ::= WORD audioBlock\n"
         "wordBlock ::= wordStart WORD audioBlock\n"
         "audioBlock ::= codeBlock wordEnd NL?\n"
-        "codeBlock ::= features TIME energy spectralCentroid pitch CODE CODES*\n"
+        "codeBlock ::= features TIME energy spectralCentroid pitch CODE CODES{1,750}\n"
         "TEXT ::= [A-Za-z0-9.,!?]+\n"
-        "EOS      ::= \"<|im_end|>\"\n"
-        "audioEnd   ::= \"<|audio_end|>\"\n"
-        "wordStart ::= \"<|word_start|>\"\n"
-        "wordEnd ::= \"<|word_end|>\"\n"
-        "features ::= \"<|features|>\"\n"
+        "EOS      ::= <|im_end|>\n"
+        "audioEnd   ::= <|audio_end|>\n"
+        "wordStart ::= <|word_start|>\n"
+        "wordEnd ::= <|word_end|>\n"
+        "features ::= <|features|>\n"
         "energy ::= \"<|energy_\" DIGITS \"|>\"\n"
         "spectralCentroid ::= \"<|spectral_centroid_\" DIGITS \"|>\"\n"
         "pitch ::= \"<|pitch_\" DIGITS \"|>\"\n"
         "WORD       ::= \"hi\" | \"there\"\n"
         "NL         ::= [\\n]\n"
         "TIME       ::= \"<|t_\" DECIMAL \"|>\"\n"
-        "CODE       ::= \"<|code|>\"\n"
+        "CODE       ::= <|code|>\n"
         "CODES      ::= CODE1 CODE2\n"
-        "CODE1      ::= \"<|c1_\" DIGITS \"|>\"\n"
-        "CODE2      ::= \"<|c2_\" DIGITS \"|>\"\n"
-        "DIGITS     ::= [0-9]+\n"
-        "DECIMAL    ::= [0-9]+ \".\" [0-9]+\n";
+        "CODE1      ::= \"<|c1_\" ( [0-9] | [1-9] [0-9] | [1-9] [0-9] [0-9] | \"1\" ( \"0\" [0-1] [0-9] | \"0\" \"2\" [0-3] ) ) \"|>\"\n"
+        "CODE2      ::= \"<|c2_\" ( [0-9] | [1-9] [0-9] | [1-9] [0-9] [0-9] | \"1\" ( \"0\" [0-1] [0-9] | \"0\" \"2\" [0-3] ) ) \"|>\"\n"
+        "DIGITS     ::= [0-9] | [1-9] [0-9] | [1-9] [0-9] [0-9] | \"1\" ( \"0\" \"0\" [0-0] )\n"
+        "DECIMAL    ::= [0-9] \".\" [0-9] [0-9] | \"10.00\"\n";
     CHECK_EQ(g, want);
 }
 
 static void test_escaping_and_non_ascii() {
     // ASCII word containing a quote → escaped (safe deviation from reference).
-    const std::string q = outetts_build_grammar(outetts_version::V2, "sa\"y");
+    const std::string q = outetts_build_grammar(outetts_version::V3, "sa\"y");
     // WORD line holds the single escaped literal.
     if (q.find("WORD       ::= \"sa\\\"y\"\n") == std::string::npos) {
         std::printf("FAIL escaping: %s\n", q.c_str()); g_fail = 1;
     }
     // Non-ASCII (CJK) word → [unique-codepoints]+ preserving first-seen order.
     // "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xBD\xA0" == U+4F60 U+597D U+4F60 (你好你)
-    const std::string c = outetts_build_grammar(outetts_version::V2,
+    const std::string c = outetts_build_grammar(outetts_version::V3,
                                                 "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xBD\xA0");
     if (c.find("WORD       ::= [\xE4\xBD\xA0\xE5\xA5\xBD]+\n") == std::string::npos) {
         std::printf("FAIL non-ascii: %s\n", c.c_str()); g_fail = 1;
@@ -143,6 +155,7 @@ static void test_flat_audio_mask_edges() {
 
 int main() {
     test_v2_two_ascii_words();
+    test_v1_code_start_end();
     test_v3_uses_word_alternation_and_features();
     test_escaping_and_non_ascii();
     test_flat_audio_mask();

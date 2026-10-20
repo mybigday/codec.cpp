@@ -594,8 +594,9 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
 // threaded through for future prompt-dependent grammars (OuteTTS-style
 // word-sequence constraints).
 
-// OuteTTS interface version — selects the grammar template family.
-enum class outetts_version { V2, V3 };
+// OuteTTS interface version (upstream outetts/version/vN): V1 = OuteTTS 0.2,
+// V2 = 0.3, V3 = 1.0. Selects the prompt format and grammar template.
+enum class outetts_version { V1, V2, V3 };
 
 // Build the prompt-dependent GBNF for an OuteTTS backbone. Pure string:
 // splits `text` on ASCII whitespace into words, converts each to a GBNF
