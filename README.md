@@ -55,6 +55,46 @@ audio, sr = ctx.decode(ctx.encode(pcm, 24000))
 
 `pip install .` builds libcodec and installs the `codec_cpp` package; see [python/README.md](python/README.md).
 
+## Text-to-speech
+
+`tts-cli` runs TTS models end to end: a text-to-speech-token model (run by the
+bundled llama.cpp) plus a codec GGUF (run by codec.cpp). Ready-made GGUFs are
+on [Hugging Face](https://huggingface.co/BricksDisplay); each model card lists
+which two files to download. Supported models: [docs/model_status.md](docs/model_status.md#tts-tts-cli-synthesize).
+
+Build (clone with `--recursive`: it fetches the llama.cpp that runs the
+text-side model; codec.cpp adds the architectures upstream llama.cpp lacks):
+
+```bash
+git clone --recursive https://github.com/mybigday/codec.cpp
+cd codec.cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # GPU: add -DGGML_CUDA=ON / -DGGML_VULKAN=ON / -DGGML_METAL=ON
+cmake --build build -j
+```
+
+Synthesize:
+
+```bash
+./build/tts-cli synthesize --backbone MODEL.gguf --model CODEC.gguf \
+    --text "Hello there." --output out.wav
+```
+
+| Option | What it does |
+|---|---|
+| `--voice NAME` | use a builtin voice; list them with `tts-cli voices --model CODEC.gguf` |
+| `--ref-audio FILE.wav` | clone the voice in a short clip (models that support it) |
+| `--ref-text TEXT` | transcript of `--ref-audio`, for models that use one |
+| `--save-speaker FILE.gguf` / `--speaker-file FILE.gguf` | save a voice once, reuse it later |
+| `--seed N` | repeatable output |
+| `--temp F`, `--top-k N`, `--top-p F` | sampling (defaults come from the model file) |
+| `--max-frames N` | cap the output length |
+| `--gpu` | run on the GPU backend the build has (CUDA / Vulkan / Metal) |
+| `--n-threads N` | CPU threads |
+| `--override-kv KEY=TYPE:VALUE` | change a setting stored in the codec file (keys are listed in [docs/models](docs/models)) |
+
+Run `./build/tts-cli` without arguments for the full list. Model-specific text
+input rules (language tags, phonemes) are on each model card.
+
 ## Build with GPU Acceleration
 
 ### CUDA (NVIDIA)

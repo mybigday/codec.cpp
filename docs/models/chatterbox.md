@@ -30,7 +30,13 @@ S3G decodes at 24 kHz.
 
 The same two commands convert `models/chatterbox` and
 `models/chatterbox_multilingual`; the T3 checkpoint file name selects the
-variant. Precision flags (`--outtype`, `--quantization`, `--lm-outtype`,
+variant (`t3_mtl23ls_v3` before `v2` before `t3_23lang`). The multilingual
+repo ships `s3gen.pt` / `ve.pt` instead of safetensors (the S3Gen weights are
+identical to English Chatterbox's) and its tokenizer as
+`grapheme_mtl_merged_expanded_v1.json` (2454 tokens, the T3 text-table size);
+the converter reads both. A `config.json` next to the checkpoint sets release
+defaults: the published multilingual codec files use
+`{"n_timesteps": 6, "cfg_rate": 0.7}`. Precision flags (`--outtype`, `--quantization`, `--lm-outtype`,
 `--lm-quantization`) are described in the top-level README.
 
 ### Quantized codec GGUFs

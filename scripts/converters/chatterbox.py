@@ -29,6 +29,17 @@ def _load_safetensors(path: Path) -> Dict[str, np.ndarray]:
     return out
 
 
+def _load_weights(path: Path) -> Dict[str, np.ndarray]:
+    """safetensors, or the torch `.pt` state dicts the multilingual repo ships
+    (s3gen.pt / ve.pt)."""
+    if path.suffix != ".pt":
+        return _load_safetensors(path)
+    import torch
+    sd = torch.load(str(path), map_location="cpu", weights_only=True)
+    return {k: v.float().numpy() if v.dtype == torch.bfloat16 else v.numpy()
+            for k, v in sd.items() if torch.is_tensor(v)}
+
+
 def _load_optional_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
@@ -44,6 +55,7 @@ def _find_s3gen_checkpoint(checkpoint_dir: Path) -> Path:
         checkpoint_dir / "s3gen_meanflow.safetensors",
         checkpoint_dir / "s3gen.safetensors",
         checkpoint_dir / "model.safetensors",
+        checkpoint_dir / "s3gen.pt",   # multilingual repo
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -86,8 +98,11 @@ def _find_voice_encoder_checkpoint(checkpoint_dir: Path) -> Path | None:
     s3gen / conds in every Chatterbox checkpoint we ship for.  Absent
     only when the user pointed at a directory that doesn't include the
     speaker-conditioning side (e.g. S3G-only test fixtures)."""
-    candidate = checkpoint_dir / "ve.safetensors"
-    return candidate if candidate.is_file() else None
+    for name in ("ve.safetensors", "ve.pt"):
+        candidate = checkpoint_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _s3t_tensor_map(state: Dict[str, np.ndarray], n_layers: int) -> list[tuple[str, str]]:
@@ -145,12 +160,7 @@ def _load_voice_encoder_state(path: Path) -> Dict[str, np.ndarray]:
     `nn.LSTM` conventions: weight_ih_l{n} = (4H, input_size),
     weight_hh_l{n} = (4H, H), bias_ih_l{n} / bias_hh_l{n} = (4H,);
     gates are concatenated in the order [i, f, g, o]."""
-    out: Dict[str, np.ndarray] = {}
-    with safe_open(str(path), framework="numpy") as f:
-        for key in f.keys():
-            arr = f.get_tensor(key)
-            out[key] = np.asarray(arr)
-    return out
+    return {k: np.asarray(v) for k, v in _load_weights(path).items()}
 
 
 def _build_mel_filter_bank() -> np.ndarray:
@@ -501,7 +511,7 @@ class ChatterboxS3TConverter(_BaseChatterboxConverter):
         cfg.update(_load_optional_json(checkpoint_dir / "config.json"))
 
         weights_path = _find_s3gen_checkpoint(checkpoint_dir)
-        state = _load_safetensors(weights_path)
+        state = _load_weights(weights_path)
         self.state_dict = {k: v for k, v in state.items() if k.startswith("tokenizer.")}
         if not self.state_dict:
             raise RuntimeError(f"{weights_path} does not contain tokenizer.* weights")
@@ -582,7 +592,7 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         cfg.update(_load_optional_json(checkpoint_dir / "config.json"))
         weights_path = _find_s3gen_checkpoint(checkpoint_dir)
         cfg["meanflow"] = bool(cfg.get("meanflow", False) or ("meanflow" in weights_path.name))
-        self.state_dict = _load_safetensors(weights_path)
+        self.state_dict = _load_weights(weights_path)
         self.conds = _load_optional_conds(checkpoint_dir / "conds.pt")
         self.config = cfg
 

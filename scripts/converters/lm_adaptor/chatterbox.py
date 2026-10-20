@@ -336,6 +336,8 @@ def _dump_tokenizer(writer, src_dir: Path, *, verbose: bool = False) -> None:
     and merge rules so the C++ side needs no HF dependency.
     """
     tok_path = src_dir / "tokenizer.json"
+    if not tok_path.is_file():   # multilingual repo
+        tok_path = src_dir / "grapheme_mtl_merged_expanded_v1.json"
     if not tok_path.is_file():
         if verbose:
             print(f"[lm_adaptor:chatterbox] no tokenizer.json at {tok_path} — skipping")
