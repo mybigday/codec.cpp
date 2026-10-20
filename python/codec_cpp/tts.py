@@ -1,0 +1,153 @@
+"""One-call text to speech (include/codec_tts.h, libcodec_tts).
+
+    tts = codec_cpp.TTS("model.gguf", "codec.gguf")
+    audio, sr = tts.synthesize("Hello there.")
+    audio, sr = tts.synthesize("Hello there.", ref_audio="me.wav")   # voice clone
+
+This is the host loop tts-cli runs: the backbone (model file) runs in the
+llama.cpp bundled with codec.cpp, the codec file in codec.cpp.  For a custom
+loop around your own llama.cpp use codec_cpp.AudioLM instead.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import tempfile
+from typing import Mapping
+
+import numpy as np
+
+from . import _ffi
+from ._lib import tts_lib
+from .codec import CodecError, PathLike, _make_kv_overrides, _str, _take_pcm
+
+
+def _b(s) -> bytes | None:
+    return None if s is None else os.fsencode(s) if isinstance(s, os.PathLike) else str(s).encode("utf-8")
+
+
+class TTS:
+    """A loaded TTS model: a llama.cpp backbone GGUF + a codec GGUF.
+
+    ``model`` is None for self-contained models (Pocket-TTS).  Load-time
+    settings: ``use_gpu``, ``n_threads``, ``max_frames`` (0 = model default),
+    ``cfg_weight`` (Chatterbox T3 CFG; None = model default) and
+    ``kv_overrides`` (codec GGUF metadata, e.g. flow steps).  Calls are not
+    thread-safe; use one TTS per thread or serialize them.
+    """
+
+    def __init__(self, model: PathLike | None, codec: PathLike, *, use_gpu: bool = False,
+                 n_threads: int = 0, max_frames: int = 0, cfg_weight: float | None = None,
+                 kv_overrides: Mapping[str, object] | None = None):
+        L = tts_lib()
+        p = L.codec_tts_default_params()
+        p.codec_path = os.fsencode(codec)
+        p.backbone_path = None if model is None else os.fsencode(model)
+        p.use_gpu = bool(use_gpu)
+        p.n_threads = int(n_threads)
+        p.max_frames = int(max_frames)
+        if cfg_weight is not None:
+            p.cfg_weight = float(cfg_weight)
+        self._kv = None
+        if kv_overrides:
+            self._kv = _make_kv_overrides(kv_overrides)
+            p.kv_overrides, p.n_kv_overrides = self._kv, len(kv_overrides)
+        err = ctypes.create_string_buffer(2048)
+        self.ptr = L.codec_tts_load(ctypes.byref(p), err, len(err))
+        if not self.ptr:
+            raise CodecError("codec_tts_load", None, _str(err.value))
+        self.last_result: dict = {}
+
+    def close(self) -> None:
+        if getattr(self, "ptr", None):
+            tts_lib().codec_tts_free(self.ptr)
+            self.ptr = None
+
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+    def __del__(self): self.close()
+
+    # --- voices --------------------------------------------------------
+
+    def voices(self, speaker_file: PathLike | None = None) -> list[str]:
+        """Names ``voice=`` accepts: the builtin voices, or those in a speaker file."""
+        L = tts_lib()
+        n = L.codec_tts_voices(self.ptr, _b(speaker_file))
+        if n < 0:
+            raise CodecError("codec_tts_voices", None, _str(L.codec_tts_last_error(self.ptr)))
+        return [_str(L.codec_tts_voice(self.ptr, i)) for i in range(n)]
+
+    @property
+    def default_voice(self) -> str:
+        return _str(tts_lib().codec_tts_default_voice(self.ptr))
+
+    @property
+    def takes_instruct(self) -> bool:
+        """CosyVoice instruct models take ``instruct=``."""
+        return bool(tts_lib().codec_tts_takes_instruct(self.ptr))
+
+    # --- synthesis -----------------------------------------------------
+
+    def synthesize(self, text: str, *, voice: str | None = None, ref_audio=None, ref_text: str | None = None,
+                   speaker_file: PathLike | None = None, save_speaker: PathLike | None = None,
+                   instruct: str | None = None, preset: str | None = None, grammar: str | None = None,
+                   seed: int | None = None, temperature: float | None = None, top_p: float | None = None,
+                   top_k: int | None = None, min_p: float | None = None,
+                   repetition_penalty: float | None = None, cfg: float | None = None,
+                   timesteps: int | None = None, min_len: int | None = None) -> tuple[np.ndarray, int]:
+        """Synthesize ``text``: returns (float32 PCM, sample rate).
+
+        Voice: ``speaker_file`` > ``ref_audio`` (clone; a WAV path or a
+        ``(pcm, sample_rate)`` tuple) > ``voice`` (builtin) > model default.
+        Unset sampler knobs keep the model's defaults.
+        """
+        L = tts_lib()
+        r = L.codec_tts_default_request()
+        r.text = text.encode("utf-8")
+        r.voice, r.ref_text, r.instruct = _b(voice), _b(ref_text), _b(instruct)
+        r.speaker_file, r.save_speaker = _b(speaker_file), _b(save_speaker)
+        r.preset, r.grammar = _b(preset), _b(grammar)
+        if seed is not None:
+            r.seed = int(seed) & 0xFFFFFFFF
+        for name, v in (("temperature", temperature), ("top_p", top_p), ("min_p", min_p),
+                        ("repetition_penalty", repetition_penalty), ("cfg", cfg)):
+            if v is not None:
+                setattr(r, name, float(v))
+        for name, v in (("top_k", top_k), ("timesteps", timesteps), ("min_len", min_len)):
+            if v is not None:
+                setattr(r, name, int(v))
+
+        tmp = None
+        try:
+            if isinstance(ref_audio, tuple):
+                from .codec import _f32
+                pcm_in, sr_in = ref_audio
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.close()
+                _write_wav(tmp.name, _f32(pcm_in), int(sr_in))
+                r.ref_audio_path = tmp.name.encode()
+            elif ref_audio is not None:
+                r.ref_audio_path = _b(ref_audio)
+            pcm = _ffi.codec_pcm_buffer()
+            res = _ffi.codec_tts_result()
+            if not L.codec_tts_run(self.ptr, ctypes.byref(r), ctypes.byref(pcm), ctypes.byref(res)):
+                raise CodecError("codec_tts_run", None, _str(L.codec_tts_last_error(self.ptr)))
+        finally:
+            if tmp is not None:
+                os.unlink(tmp.name)
+        self.last_result = {"n_frames": int(res.n_frames), "stop_reason": _str(res.stop_reason),
+                            "total_ms": float(res.total_ms), "decode_ms": float(res.decode_ms)}
+        return _take_pcm(pcm)
+
+
+def _write_wav(path: str, pcm: np.ndarray, sr: int) -> None:
+    """16-bit WAV (interleaved when pcm is (n, channels))."""
+    import wave
+    x = np.clip(pcm, -1.0, 1.0)
+    ch = 1 if x.ndim == 1 else x.shape[1]
+    with wave.open(path, "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((x * 32767.0).astype("<i2").tobytes())

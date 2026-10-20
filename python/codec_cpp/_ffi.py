@@ -1,5 +1,5 @@
 """Raw ctypes declarations mirroring include/codec.h, include/codec_lm.h and
-include/codec_audio_lm.h.
+include/codec_audio_lm.h; codec_tts.h (libcodec_tts) at the end.
 
 Struct field order must match the headers exactly; the headers follow an
 ABI-append discipline (new fields at the end), so keep the same here.
@@ -593,6 +593,77 @@ def declare(lib: ctypes.CDLL) -> None:
     i.e. the Python bindings and the built library are out of sync.
     """
     for name, (restype, argtypes) in PROTOTYPES.items():
+        fn = getattr(lib, name)
+        fn.restype = restype
+        fn.argtypes = argtypes
+
+
+# ─── codec_tts.h (libcodec_tts) ─────────────────────────────────────
+
+
+class codec_tts_params(Structure):
+    _fields_ = [
+        ("codec_path", c_char_p),
+        ("backbone_path", c_char_p),
+        ("kv_overrides", POINTER(codec_model_kv_override)),
+        ("n_kv_overrides", c_int32),
+        ("n_threads", c_int32),
+        ("use_gpu", c_bool),
+        ("max_frames", c_int32),
+        ("cfg_weight", c_float),
+    ]
+
+
+class codec_tts_request(Structure):
+    _fields_ = [
+        ("text", c_char_p),
+        ("voice", c_char_p),
+        ("speaker_file", c_char_p),
+        ("ref_audio_path", c_char_p),
+        ("ref_text", c_char_p),
+        ("save_speaker", c_char_p),
+        ("instruct", c_char_p),
+        ("preset", c_char_p),
+        ("grammar", c_char_p),
+        ("seed", ctypes.c_uint32),
+        ("temperature", c_float),
+        ("top_p", c_float),
+        ("top_k", c_int32),
+        ("min_p", c_float),
+        ("repetition_penalty", c_float),
+        ("cfg", c_float),
+        ("timesteps", c_int32),
+        ("min_len", c_int32),
+    ]
+
+
+class codec_tts_result(Structure):
+    _fields_ = [
+        ("n_frames", c_int32),
+        ("stop_reason", c_char * 32),
+        ("total_ms", c_double),
+        ("decode_ms", c_double),
+    ]
+
+
+TTS_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
+    "codec_tts_default_params": (codec_tts_params, []),
+    "codec_tts_default_request": (codec_tts_request, []),
+    "codec_tts_load": (c_void_p, [POINTER(codec_tts_params), c_char_p, c_size_t]),
+    "codec_tts_free": (None, [c_void_p]),
+    "codec_tts_run": (c_bool, [c_void_p, POINTER(codec_tts_request), POINTER(codec_pcm_buffer),
+                               POINTER(codec_tts_result)]),
+    "codec_tts_last_error": (c_char_p, [c_void_p]),
+    "codec_tts_voices": (c_int32, [c_void_p, c_char_p]),
+    "codec_tts_voice": (c_char_p, [c_void_p, c_int32]),
+    "codec_tts_default_voice": (c_char_p, [c_void_p]),
+    "codec_tts_takes_instruct": (c_bool, [c_void_p]),
+}
+
+
+def declare_tts(lib: ctypes.CDLL) -> None:
+    """declare() for libcodec_tts."""
+    for name, (restype, argtypes) in TTS_PROTOTYPES.items():
         fn = getattr(lib, name)
         fn.restype = restype
         fn.argtypes = argtypes
