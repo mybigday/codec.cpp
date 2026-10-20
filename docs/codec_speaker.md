@@ -66,6 +66,19 @@ offload. Parity vs PyTorch on a KittenTTS voice clip: tokens 100 % (F32 GGUF;
 one FSQ boundary flip in 248 with the default F16 S3T), prompt_feat max |Δ|
 4e-5, embedding cosine 0.9999998 (CPU and Vulkan).
 
+Chatterbox codec GGUFs that bundle T3's VoiceEncoder (`speaker.voice_encoder.*`,
+`codec.speaker.encoder_arch = chatterbox_voice_encoder`) add T3's
+conditioning (`prepare_conditionals`), so a speaker file carries the whole
+voice:
+
+| Slot | Shape | From audio |
+|---|---|---|
+| `t3_speaker_emb` | F32 [256] | VoiceEncoder of the clip at 16 kHz (via 24 kHz), silence-trimmed (`codec.speaker.ve.trim_top_db`) |
+| `t3_cond_tokens` | I32 [≤ N] | S3 tokens of the first N / 25 s, N = the builtin cond prompt length (150, Turbo 375) |
+
+Turbo scales the reference to `chatterbox_s3g.spk.ref_lufs` (-27 LUFS) before
+all of it. Builtin voices without these slots use the GGUF's builtin T3 conds.
+
 `chatterbox_s3g.spk.lm_encoder = "xvector_sincnet"` (KittenTTS 2) adds:
 
 | Slot | Shape | From audio |

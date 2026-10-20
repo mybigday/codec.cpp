@@ -625,7 +625,16 @@ class ChatterboxS3GConverter(_BaseChatterboxConverter):
         return []
 
     def _speaker_params(self) -> str:
-        return S3G_SPEAKER_PARAMS
+        if self.ve_state is None:
+            return S3G_SPEAKER_PARAMS
+        # T3's conditioning rides in the same speaker (prepare_conditionals):
+        # VoiceEncoder of the trimmed 16 kHz clip + S3 tokens of its first
+        # speech_cond_prompt_len / 25 s; Turbo first normalizes to -27 LUFS.
+        turbo = self.lm_source is not None and \
+            (Path(str(self.lm_source)) / "t3_turbo_v1.safetensors").is_file()
+        return (S3G_SPEAKER_PARAMS + ";t3_speaker_emb=voice_encoder(16k via 24k,trim_top_db=20)"
+                ";t3_cond_tokens=s3tokenizer_v2(16k,first speech_cond_prompt_len/25 s)"
+                + (";ref_lufs=-27(bs1770)" if turbo else ""))
 
     def _write_builtin_speakers(self, writer: GGUFWriter, enc_hash: str) -> bool:
         """Write builtin speakers + spk metadata; False = use conds.pt (default)."""

@@ -66,9 +66,19 @@ CT='hift\.up\.\d+\.w$'   # ConvTranspose kernels
 tts-cli synthesize --model chatterbox_turbo.gguf --backbone gpt2_backbone.gguf \
     --text "Hello there." --output out.wav
 
-# voice clone: --ref-audio derives the T3 VoiceEncoder row and the S3G speaker
-tts-cli synthesize ... --ref-audio ref.wav --text "Hello there."
+# voice clone: --ref-audio derives one speaker holding T3's and S3Gen's conditioning
+tts-cli synthesize ... --ref-audio ref.wav --text "Hello there." [--save-speaker voice.gguf]
 ```
+
+A cloned voice is one codec speaker computed as `prepare_conditionals` does
+(docs/codec_speaker.md): the S3Gen slots from the first 10 s, and for T3 the
+VoiceEncoder embedding of the whole clip (librosa `trim(top_db=20)` first)
+plus the S3 tokens of its first `speech_cond_prompt_len / 25` s (6 s, Turbo
+15 s). Turbo first scales the clip to -27 LUFS (pyloudnorm BS.1770 gain,
+`chatterbox_s3g.spk.ref_lufs`). Builtin voices use the GGUF's builtin T3
+conds. Against the PyTorch reference on a 5.5 s clip (Turbo, F16 S3T):
+VoiceEncoder cosine 1.00000, S3 tokens 92-93 % (FSQ boundary flips), output
+VoiceEncoder similarity to the clip 0.737 (reference 0.727, 3-6 seeds).
 
 Multilingual T3 expects the text its tokenizer would see upstream
 (`MTLTokenizer.encode` before BPE): lowercase, NFKD, the language conversion
