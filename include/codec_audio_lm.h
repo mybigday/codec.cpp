@@ -160,10 +160,23 @@ struct codec_audio_lm_tts_voice codec_audio_lm_default_tts_voice(void);
 
 bool codec_audio_lm_tts_set_voice(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_voice * voice);
 
+// Overrides of the model's defaults use "unset" sentinels: negative numbers
+// (seed 0).  They apply to every sampler of the generation, the backbone's
+// (completion.sampler) and the codec-side heads codec_audio_lm samples itself.
 struct codec_audio_lm_tts_request {
     const char * text;          // required: one text (one segment)
     const char * instruct;      // instruction text, for models that take it (may be NULL)
     const char * preset;        // a sampling preset the model defines (caps.presets; NULL = default)
+    uint32_t     seed;          // 0 = default
+    float        temperature;
+    float        top_p;
+    int32_t      top_k;
+    float        min_p;
+    float        repetition_penalty;
+    int32_t      min_frames;    // shortest generation before the stop token may end it
+    float        lm_guidance;   // classifier-free guidance weight of the backbone pair
+    float        flow_guidance; // guidance of a flow / diffusion decoder
+    int32_t      flow_steps;    // steps of a flow / diffusion decoder
 };
 
 struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void);

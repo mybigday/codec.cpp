@@ -237,6 +237,9 @@ bool codec_audio_lm_tts_set_voice(struct codec_audio_lm * ctx, const struct code
 
 struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void) {
     codec_audio_lm_tts_request r{};
+    r.temperature = r.top_p = r.min_p = r.repetition_penalty = -1.0f;
+    r.lm_guidance = r.flow_guidance = -1.0f;
+    r.top_k = r.min_frames = r.flow_steps = -1;
     return r;
 }
 
@@ -251,6 +254,16 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_a
     r.text = req->text;
     if (req->instruct) r.instruct = req->instruct;
     if (req->preset)   r.preset = req->preset;
+    r.seed = req->seed;
+    r.temperature = req->temperature;
+    r.top_p = req->top_p;
+    r.top_k = req->top_k;
+    r.min_p = req->min_p;
+    r.repetition_penalty = req->repetition_penalty;
+    r.min_frames = req->min_frames;
+    r.lm_guidance = req->lm_guidance;
+    r.flow_guidance = req->flow_guidance;
+    r.flow_steps = req->flow_steps;
     alm_vocab v{vocab};
     return ctx->family->tts_prompt(r, v, &ctx->completion) || ctx->fail_family();
 }

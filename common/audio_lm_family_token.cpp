@@ -124,6 +124,8 @@ public:
         out->stop_token = eos;
         out->max_frames = 512;
         out->streamable = true;
+        if (req.min_frames > 0) out->min_frames = req.min_frames;
+        req.apply(out->sampler);
         return true;
     }
 
@@ -333,6 +335,7 @@ public:
         out->grammar    = outetts_build_grammar(v, in_words);
         out->max_frames = INT32_MAX;   // the context bounds it
         out->streamable = true;
+        req.apply(out->sampler);
         return true;
     }
 

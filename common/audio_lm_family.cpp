@@ -81,6 +81,15 @@ alm_completion::alm_completion() {
     sampler.dry_penalty_last_n = -1;
 }
 
+void alm_tts_request::apply(codec_audio_lm_sampler & sp) const {
+    sp.seed = seed_or_default();
+    if (temperature >= 0.0f)        sp.temp = temperature;
+    if (top_p >= 0.0f)              sp.top_p = top_p;
+    if (top_k >= 0)                 sp.top_k = top_k;
+    if (min_p >= 0.0f)              sp.min_p = min_p;
+    if (repetition_penalty >= 0.0f) sp.penalty_repeat = repetition_penalty;
+}
+
 // ── alm_family defaults ─────────────────────────────────────────────
 
 bool alm_family::fail_alm(const char * what) {
@@ -160,6 +169,22 @@ std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string 
     const std::string a = arch ? arch : "";
     if (a == "soprano") return alm_family_soprano(alm);
     if (alm_is_kitten(alm)) return alm_family_kitten(alm);
+    if (codec_lm * lm = audio_lm_get_lm(alm)) {
+        audio_lm_prompt_info pi;
+        if (codec_lm_chatterbox_get_info(lm) == nullptr && codec_lm_cosyvoice_get_info(lm) == nullptr &&
+            audio_lm_get_prompt_info(alm, &pi) && !pi.is_continuous && !pi.sequential_text_audio &&
+            !pi.streaming_interleave) {
+            if (pi.host_arch == "llama" && pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
+                pi.eos_code_c0 < 0 && !pi.cb0_from_backbone) {
+                if (err) *err = "Moshi (full-duplex dialogue, no audio end) is not a one-shot TTS model";
+                return nullptr;
+            }
+            if (pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR ||
+                pi.model_kind == audio_lm_prompt_info::KIND_PARALLEL_HEADS_DELAY) {
+                return alm_family_codebook(alm);
+            }
+        }
+    }
     if (audio_lm_get_lm(alm) == nullptr) {
         // Codec-only GGUFs whose model writes codec tokens with its own vocab.
         if (a == "neucodec" || a == "distill_neucodec") return alm_family_neutts(alm);

@@ -193,6 +193,7 @@ public:
         // backbone from drifting into the Qwen3 text vocabulary.
         out->allowed = {{c.audio_base, c.audio_base + c.n_audio}, {c.speech_end, c.speech_end + 1}, {c.stop, c.stop + 1}};
         out->max_frames = budget;
+        req.apply(out->sampler);
         return true;
     }
 

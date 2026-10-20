@@ -124,9 +124,11 @@ add_library(codec_audio_lm_objs OBJECT
     common/audio_lm.cpp
     common/audio_lm_c.cpp
     common/audio_lm_family.cpp
+    common/audio_lm_sampler.cpp
     common/audio_lm_family_soprano.cpp
     common/audio_lm_family_token.cpp
     common/audio_lm_family_kitten.cpp
+    common/audio_lm_family_codebook.cpp
     common/tts_segment.cpp
     common/kitten_text.cpp
 )

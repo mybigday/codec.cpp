@@ -68,6 +68,20 @@ struct alm_tts_request {
     std::string text;
     std::string instruct;
     std::string preset;
+    uint32_t seed = 0;               // 0 = default
+    float   temperature = -1.0f;     // < 0 = model default (likewise below)
+    float   top_p = -1.0f;
+    int32_t top_k = -1;
+    float   min_p = -1.0f;
+    float   repetition_penalty = -1.0f;
+    int32_t min_frames = -1;
+    float   lm_guidance = -1.0f;
+    float   flow_guidance = -1.0f;
+    int32_t flow_steps = -1;
+
+    uint32_t seed_or_default() const { return seed ? seed : 0xC0DEC1ABu; }
+    // The request's overrides on top of a model's sampler defaults.
+    void apply(codec_audio_lm_sampler & sp) const;
 };
 
 struct alm_tts_voice {
@@ -132,6 +146,7 @@ std::unique_ptr<alm_family> alm_family_neutts(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_outetts(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_kitten(audio_lm_context * alm);
 bool alm_is_kitten(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_codebook(audio_lm_context * alm);
 
 }  // namespace codec_common
 

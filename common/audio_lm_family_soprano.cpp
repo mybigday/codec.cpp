@@ -51,6 +51,7 @@ public:
         out->needs_embeddings = true;
         out->sample_first = true;
         out->max_frames = 512;
+        req.apply(out->sampler);
         return true;
     }
 

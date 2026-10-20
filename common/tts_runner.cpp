@@ -2647,6 +2647,16 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     req.text     = a.text.c_str();
     req.instruct = a.instruct.empty() ? nullptr : a.instruct.c_str();
     req.preset   = a.preset.empty() ? nullptr : a.preset.c_str();
+    req.seed     = a.seed;
+    if (a.has_temp)        req.temperature = a.temp;
+    if (a.has_top_p)       req.top_p = a.top_p;
+    if (a.has_top_k)       req.top_k = a.top_k;
+    if (a.has_min_p)       req.min_p = a.min_p;
+    if (a.has_rep_penalty) req.repetition_penalty = a.repetition_penalty;
+    if (a.min_len > 0)     req.min_frames = a.min_len;
+    if (a.has_cfg_weight)  req.lm_guidance = a.cfg_weight;
+    req.flow_guidance = a.cfg;
+    req.flow_steps    = a.timesteps;
     if (!codec_audio_lm_tts_prompt(alm, &req, &cv)) {
         return fail("prompt");
     }
@@ -2659,12 +2669,12 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
 
     // Sampler: the completion's settings, request overrides on top.
     const codec_audio_lm_sampler & sp = c.sampler;
-    const uint32_t seed  = a.seed ? a.seed : 0xC0DEC1ABu;
-    const float    temp  = a.has_temp ? a.temp : sp.temp;
-    const float    top_p = a.has_top_p ? a.top_p : sp.top_p;
-    const int32_t  top_k = a.has_top_k ? a.top_k : sp.top_k;
-    const float    min_p = a.has_min_p ? a.min_p : sp.min_p;
-    const float    rep   = a.has_rep_penalty ? a.repetition_penalty : sp.penalty_repeat;
+    const uint32_t seed  = sp.seed;
+    const float    temp  = sp.temp;
+    const float    top_p = sp.top_p;
+    const int32_t  top_k = sp.top_k;
+    const float    min_p = sp.min_p;
+    const float    rep   = sp.penalty_repeat;
     const std::string grammar = !a.grammar.empty() ? a.grammar : (c.grammar ? c.grammar : "");
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     // Logit bias forbidding every token outside `allowed` (minus `except`).
@@ -2697,7 +2707,7 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     }
     // Minimum length: a second sampler without the stop token (and without
     // penalties / grammar) replaces a stop drawn too early.
-    const int32_t min_frames = a.min_len > 0 ? a.min_len : c.min_frames;
+    const int32_t min_frames = c.min_frames;
     BackboneSampler guard;
     const bool use_guard = min_frames > 0 && c.stop_token >= 0;
     if (use_guard && !guard.build(s->lmodel, seed, temp, top_k, top_p, 0.0f, 1.0f, 0, std::string(),
@@ -2988,7 +2998,31 @@ static bool tts_runner_run_segments(tts_runner_session * s, const tts_runner_par
         out->error = "empty text";
         return false;
     }
-    if (s->flow == nullptr) {
+    if (s->calm != nullptr) {
+        // The voice the request names (the model default when it names none).
+        codec_audio_lm_tts_voice v = codec_audio_lm_default_tts_voice();
+        std::vector<float> ref_pcm;
+        int32_t ref_n = 0, ref_sr = 0;
+        std::string lerr;
+        if (!load_ref_audio(a.ref_audio_path, ref_pcm, &ref_n, &ref_sr, &lerr)) {
+            out->error = lerr;
+            return false;
+        }
+        v.voice         = a.voice.empty() ? nullptr : a.voice.c_str();
+        v.speaker_file  = a.speaker_file.empty() ? nullptr : a.speaker_file.c_str();
+        v.ref_pcm       = ref_pcm.empty() ? nullptr : ref_pcm.data();
+        v.ref_n_samples = ref_n;
+        v.ref_sample_rate = ref_sr;
+        v.ref_text      = a.ref_text.empty() ? nullptr : a.ref_text.c_str();
+        v.save_speaker  = a.save_speaker.empty() ? nullptr : a.save_speaker.c_str();
+        const auto t_spk = std::chrono::steady_clock::now();
+        const bool spk_ok = codec_audio_lm_tts_set_voice(s->calm, &v);
+        out->speaker_ms = ms_since(t_spk);
+        if (!spk_ok) {
+            out->error = codec_audio_lm_last_error(s->calm);
+            return false;
+        }
+    } else if (s->flow == nullptr) {
         // The speaker the request names (the model default when it names none).
         audio_lm_set_decode_speaker(s->ctx, nullptr);
         std::string spk_err;
