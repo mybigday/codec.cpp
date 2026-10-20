@@ -10,7 +10,7 @@
 //     common/tts_runner (codec_tts_runner, built with CODEC_TTS_BACKBONE)
 //
 // This file is just: parse args → load → { info | decode | synthesize } →
-// write WAV.  A future server example links codec_tts_runner the same way.
+// write WAV.  examples/tts-server links codec_tts_runner the same way.
 //
 //   tts-cli info       --model X.gguf
 //        Lifecycle + capability queries (modality, n_codebook, hidden_dim,
@@ -142,7 +142,7 @@ void print_usage(const char * prog) {
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
         "             [--preset NAME] [--instruct STR]\n"
-        "             [--max-frames N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
+        "             [--max-frames N] [--segment-bytes N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
         "             [--cfg F] [--timesteps N] [--min-len N]\n"
         "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
         "             [--grammar FILE|STRING]\n"
@@ -157,6 +157,8 @@ void print_usage(const char * prog) {
         "             bundles speaker encoders) > --voice (builtin) > model default;\n"
         "             with --speaker-file, --voice picks a speaker inside the file.\n"
         "             --save-speaker writes the one in use for reuse.\n"
+        "             --segment-bytes N synthesizes long text a segment of at most\n"
+        "             N UTF-8 bytes at a time (sentence / paragraph breaks; 0 = off).\n"
         "\n"
         "  all subcommands: [--override-kv KEY=int|float|bool|str:VALUE] (repeatable)\n"
         "             overrides codec GGUF metadata at load, e.g.\n"
@@ -230,6 +232,7 @@ struct args {
     int32_t  n_threads = 0;
     bool     use_gpu   = false;
     int32_t  max_frames = 0;
+    int32_t  segment_bytes = 0;
     uint32_t seed       = 0xC0DEC1AB;
 
     // Sampler / flow knobs — has_* gates whether the value was supplied.
@@ -274,6 +277,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--n-threads")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
         else if (a == "--gpu")        { out->use_gpu = true; }
         else if (a == "--max-frames") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->max_frames)) return false; i++; }
+        else if (a == "--segment-bytes") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->segment_bytes)) return false; i++; }
         else if (a == "--seed")       { const char * v = need(); if (!v) return false; int32_t s; if (!parse_i32(v, &s)) return false; out->seed = (uint32_t) s; i++; }
         else if (a == "--temp")       { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->temp)) return false; out->has_temp = true; i++; }
         else if (a == "--top-p")      { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->top_p)) return false; out->has_top_p = true; i++; }
@@ -447,6 +451,7 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.use_gpu       = a.use_gpu;
     rp.seed          = a.seed;
     rp.max_frames    = a.max_frames;
+    rp.segment_bytes = a.segment_bytes;
     rp.has_temp = a.has_temp;   rp.temp  = a.temp;
     rp.has_top_p = a.has_top_p; rp.top_p = a.top_p;
     rp.has_top_k = a.has_top_k; rp.top_k = a.top_k;

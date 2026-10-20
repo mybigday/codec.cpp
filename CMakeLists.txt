@@ -161,6 +161,7 @@ add_library(codec_common STATIC
     common/audio_lm.cpp
     common/kitten_text.cpp
     common/tts_runner_flow.cpp
+    common/tts_segment.cpp
 )
 target_include_directories(codec_common
     PUBLIC
@@ -209,8 +210,8 @@ if(CODEC_BUILD_TTS_CLI)
 
     # Optional isolated llama.cpp backbone → enables the full `synthesize`
     # reference loop.  The loop itself lives in codec_tts_runner (common/
-    # tts_runner.*), a standalone library that links the backbone — so a
-    # future host (e.g. a server example) can link it without tts-cli.
+    # tts_runner.*), a standalone library that links the backbone — so other
+    # hosts (tts-server) link it without tts-cli.
     option(CODEC_TTS_BACKBONE "Build the isolated llama.cpp backbone for tts-cli synthesize" ON)
     if(CODEC_TTS_BACKBONE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupTtsBackbone.cmake)
@@ -239,6 +240,53 @@ if(CODEC_BUILD_TTS_CLI)
         target_include_directories(neutts-detect-test PRIVATE
             $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>
             ${TTS_BACKBONE_INCLUDE_DIRS})
+
+        # OpenAI-compatible /v1/audio/speech over the same runner.  HTTP + JSON
+        # come from llama.cpp's vendored cpp-httplib / nlohmann (compiled here:
+        # the copy inside libttsbackbone.so is hidden).  wav / pcm responses are
+        # always available; each compressed format needs its encoder library.
+        option(CODEC_TTS_SERVER "Build tts-server (OpenAI-compatible speech endpoint)" ON)
+        if(CODEC_TTS_SERVER)
+            set(_ll_vendor "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp/vendor")
+            find_package(Threads REQUIRED)
+            add_executable(tts-server
+                examples/tts-server.cpp
+                examples/utils/audio_encode.cpp
+                ${_ll_vendor}/cpp-httplib/httplib.cpp)
+            target_include_directories(tts-server PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
+            target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}" Threads::Threads)
+            add_dependencies(tts-server ttsbackbone)
+            set_target_properties(tts-server PROPERTIES
+                BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
+
+            # libraries (comma-separated);header — a format whose option is ON must be found.
+            set(_tts_enc_MP3  "mp3lame"        "lame/lame.h")
+            set(_tts_enc_OPUS "opus,ogg"       "opus/opus.h")
+            set(_tts_enc_AAC  "fdk-aac"        "fdk-aac/aacenc_lib.h")
+            set(_tts_enc_FLAC "FLAC"           "FLAC/stream_encoder.h")
+            foreach(_fmt MP3 OPUS AAC FLAC)
+                option(CODEC_TTS_SERVER_${_fmt} "tts-server: ${_fmt} responses" OFF)
+                if(CODEC_TTS_SERVER_${_fmt})
+                    list(GET _tts_enc_${_fmt} 0 _libs)
+                    list(GET _tts_enc_${_fmt} 1 _hdr)
+                    string(REPLACE "," ";" _libs "${_libs}")
+                    find_path(_hdr_dir_${_fmt} NAMES ${_hdr})
+                    if(NOT _hdr_dir_${_fmt})
+                        message(FATAL_ERROR "CODEC_TTS_SERVER_${_fmt}=ON but ${_hdr} was not found")
+                    endif()
+                    target_include_directories(tts-server PRIVATE ${_hdr_dir_${_fmt}})
+                    foreach(_lib ${_libs})
+                        find_library(_lib_${_lib} NAMES ${_lib})
+                        if(NOT _lib_${_lib})
+                            message(FATAL_ERROR "CODEC_TTS_SERVER_${_fmt}=ON but lib${_lib} was not found")
+                        endif()
+                        target_link_libraries(tts-server PRIVATE ${_lib_${_lib}})
+                    endforeach()
+                    target_compile_definitions(tts-server PRIVATE CODEC_TTS_SERVER_${_fmt}=1)
+                endif()
+            endforeach()
+        endif()
 
     endif()
 

@@ -39,10 +39,10 @@ chosen here: converters store F32 where a computation needs it.
 ### 2. Decode Audio
 
 ```bash
-./build/codec-cli decode --model mimi.gguf --codes input.npy --out output.wav
+codec-cli decode --model mimi.gguf --codes input.npy --out output.wav
 
 # With GPU acceleration (if built with CUDA/Vulkan/Metal)
-./build/codec-cli decode --model mimi.gguf --codes input.npy --out output.wav --use-gpu
+codec-cli decode --model mimi.gguf --codes input.npy --out output.wav --use-gpu
 ```
 
 ### 3. Python
@@ -75,7 +75,7 @@ cmake --build build -j
 Synthesize:
 
 ```bash
-./build/tts-cli synthesize --backbone MODEL.gguf --model CODEC.gguf \
+tts-cli synthesize --backbone MODEL.gguf --model CODEC.gguf \
     --text "Hello there." --output out.wav
 ```
 
@@ -92,8 +92,65 @@ Synthesize:
 | `--n-threads N` | CPU threads |
 | `--override-kv KEY=TYPE:VALUE` | change a setting stored in the codec file (keys are listed in [docs/models](docs/models)) |
 
-Run `./build/tts-cli` without arguments for the full list. Model-specific text
+Run `tts-cli` without arguments for the full list. Model-specific text
 input rules (language tags, phonemes) are on each model card.
+
+### OpenAI-compatible server
+
+`tts-server` loads one model pair and serves OpenAI's
+[`POST /v1/audio/speech`](https://platform.openai.com/docs/api-reference/audio/createSpeech),
+so the `openai` SDKs and other compatible clients can use it:
+
+```bash
+tts-server --backbone MODEL.gguf --model CODEC.gguf --port 8080   # also --gpu, --n-threads, --api-key KEY
+
+curl http://127.0.0.1:8080/v1/audio/speech -H 'Content-Type: application/json' \
+    -d '{"model": "tts", "input": "Hello there.", "voice": "NAME", "response_format": "wav"}' -o out.wav
+```
+
+How it differs from OpenAI's API:
+
+- `response_format` is required. `wav` and `pcm` are always available.
+  `mp3`, `opus`, `aac` and `flac` each need their encoder at build time:
+  `-DCODEC_TTS_SERVER_MP3=ON` (libmp3lame), `_OPUS` (libopus + libogg),
+  `_AAC` (libfdk-aac) or `_FLAC` (libFLAC). Asking for a format the build
+  lacks returns a 400 error.
+- `voice` takes the model's own voice names (`GET /v1/audio/voices` lists
+  them). Leave it out to get the model's default voice. Speakers saved with
+  `tts-cli --save-speaker` can be served with `--speaker-file FILE.gguf`.
+- Models that need reference audio for every request (Qwen3-TTS) do not work
+  with the server yet: the API has no field for the reference clip.
+- `instructions` works only on models with an instruct mode (CosyVoice), and
+  is passed through as the model expects it (CosyVoice-300M-Instruct: end it
+  with `<|endofprompt|>`). `speed` must be 1.0.
+- Every response is 24 kHz mono, matching OpenAI's formats (`pcm` is raw
+  16-bit little-endian). Requests run one at a time.
+
+Responses stream: audio is sent as it is generated, with chunked transfer
+encoding, or as `speech.audio.delta` / `speech.audio.done` events with
+`"stream_format": "sse"`. Two settings shape it:
+
+- `--segment-bytes N` (default 160, about 10 seconds of speech): long input
+  is synthesized a piece at a time, since TTS models get worse on long text.
+  Pieces end at sentence ends and always at blank lines; a sentence longer
+  than N is split at commas, then spaces, and kept whole if it has neither.
+  `0` sends the whole input to the model at once. (`tts-cli synthesize`
+  takes the same option, off by default.) Tags written into the text, such
+  as MOSS-TTSD's `[S1]` or CosyVoice's language tags, stay with the piece
+  they are in, so repeat them per sentence or use `0`.
+- `--stream-chunk-ms N` (default 1000): on models whose decoder can run on
+  partial output (CSM, LFM2-Audio, MOSS-TTSD, MOSS-TTS-Realtime, NeuTTS,
+  OuteTTS), audio is sent in pieces of about this length while a segment is
+  still being generated. Other models (CosyVoice, Chatterbox, KittenTTS,
+  Soprano, Pocket-TTS) send each segment when it is done. `0` sends whole
+  segments for every model. With NeuTTS, MOSS-TTSD and OuteTTS 0.2 / 0.3,
+  whose decoders look at the whole segment, the streamed audio differs
+  slightly from the non-streamed one.
+
+A request that fails before any audio is ready gets an error status as
+usual. One that fails after audio has started ends early: with an `error`
+event under SSE, or as a cut-off body otherwise. Keep `--segment-bytes` on
+when streaming: with `0`, each chunk re-decodes everything generated so far.
 
 ## Build with GPU Acceleration
 
@@ -101,7 +158,7 @@ input rules (language tags, phonemes) are on each model card.
 ```bash
 cmake -B build -DGGML_CUDA=ON
 cmake --build build -j
-./build/codec-cli --model model.gguf --codes in.npy --out out.wav --use-gpu
+codec-cli --model model.gguf --codes in.npy --out out.wav --use-gpu
 ```
 
 ### Vulkan (Cross-platform)
@@ -175,7 +232,7 @@ cmake --build build -j
 ```bash
 cmake -B build
 cmake --build build -j
-./build/codec-cli --model model.gguf --codes in.npy --out out.wav
+codec-cli --model model.gguf --codes in.npy --out out.wav
 ```
 
 ## License
