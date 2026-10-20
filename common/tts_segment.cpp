@@ -7,6 +7,8 @@
 
 #include "tts_segment.h"
 
+#include "codec.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -120,7 +122,7 @@ void split_long(const std::string & s, size_t max_bytes, std::vector<std::string
         if (!cur.empty()) split_long(cur, max_bytes, out);
         return;
     }
-    std::fprintf(stderr, "segment: %zu bytes with no punctuation or space to split at; kept whole (budget %zu)\n",
+    codec_log(CODEC_LOG_LEVEL_WARN, "segment: %zu bytes with no punctuation or space to split at; kept whole (budget %zu)\n",
                  s.size(), max_bytes);
     out->push_back(s);
 }

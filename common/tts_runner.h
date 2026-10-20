@@ -108,8 +108,8 @@ struct tts_runner_result {
 
 // Self-contained synthesize (models that need no backbone, Pocket-TTS
 // FlowLM).  Lives in the always-built codec_common library.  Returns 0 when
-// the codec GGUF needs a backbone (or cannot be opened); 1 when it handled
-// the request (out->error set on failure).
+// the codec GGUF needs a backbone; 1 when it handled the request (out->error
+// set on failure, including a codec that cannot be opened).
 int tts_runner_synthesize_selfcontained(const tts_runner_params & params,
                                         tts_runner_result * out);
 

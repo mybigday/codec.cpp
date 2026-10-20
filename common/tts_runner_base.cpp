@@ -127,7 +127,10 @@ int tts_runner_synthesize_selfcontained(const tts_runner_params & a, tts_runner_
     const auto t0 = std::chrono::steady_clock::now();
     std::string err;
     codec_audio_lm * alm = tts_runner_open_codec(a, &err);
-    if (alm == nullptr) return 0;
+    if (alm == nullptr) {
+        out->error = err;
+        return 1;
+    }
     codec_audio_lm_caps caps{};
     codec_audio_lm_get_caps(alm, &caps);
     if (caps.needs_backbone) {
