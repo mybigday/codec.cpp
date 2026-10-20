@@ -13,10 +13,10 @@ Each (model, op) combo is run with a configurable warmup + iteration count;
 we report mean / p50 / p95 / std.  The whole report is a stable JSON shape
 so two runs (baseline vs. after-optimisation) can be diffed mechanically:
 
-    python tools/benchmark.py --out before.json
+    python tools/benchmark/benchmark.py --out before.json
     # ... apply optimisation ...
-    python tools/benchmark.py --out after.json
-    python tools/benchmark.py compare before.json after.json
+    python tools/benchmark/benchmark.py --out after.json
+    python tools/benchmark/benchmark.py compare before.json after.json
 
 The comparison tool prints per-metric deltas (absolute + percent) and
 flags any regressions outside a small noise band.
@@ -63,7 +63,7 @@ import time
 import wave
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 CODEC_CLI = REPO_ROOT / "build" / "codec-cli"
 DEFAULT_INPUT = REPO_ROOT / "test.wav"
 
@@ -477,7 +477,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=False)
 
     p_run = sub.add_parser("run", help="run benchmark and write JSON report")
-    p_run.add_argument("--config", default="tools/benchmark_models.json")
+    p_run.add_argument("--config", default="tools/benchmark/benchmark_models.json")
     p_run.add_argument("--iterations", type=int, default=5)
     p_run.add_argument("--warmup", type=int, default=1)
     p_run.add_argument("--models", nargs="*", default=None,

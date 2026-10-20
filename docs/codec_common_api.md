@@ -1,7 +1,7 @@
 # codec_common — generic audio-LM API
 
 Status: landed.  Reference implementation in `common/audio_lm.cpp`,
-exercised by `examples/tts-cli` (`build/tts-cli {info,decode,synthesize}`).
+exercised by `tools/tts-cli` (`build/tts-cli {info,decode,synthesize}`).
 Dev-time trace/simulate-* subcommands were removed once `synthesize`
 covered every model end-to-end; the e2e smokes (`tests/e2e/`) drive the
 same paths via ctypes.
@@ -12,7 +12,7 @@ depth-AR / parallel-heads bookkeeping, codes accumulation, audio
 decode) behind one interface, in the same spirit as llama.cpp's
 `common/` layer.
 
-The application (llama.rn's rn-tts, examples/tts-cli, …) keeps full
+The application (llama.rn's rn-tts, tools/tts-cli, …) keeps full
 ownership of the `llama_decode` loop, the sampler, KV management, and
 the host-side batch — `codec_common` only provides:
   * **build-time**: ref-audio encoding + prompt-prefix construction
@@ -31,8 +31,8 @@ codec_common provides per-step hooks, not a loop replacement.
 |---|---|
 | **llama.cpp / host AR loop** | tokenize, `llama_decode`, sampler, KV cache, batch construction |
 | **codec_common (new)** | ref-audio encoding (speaker_encode), prompt prefix (cond_emb), per-step codes bookkeeping (depth-AR for residual_depth_ar, delay for parallel_heads_delay), `compose_audio_embd`, codes → PCM decode, modality detection |
-| **codec_tts_runner (optional)** | a COMPLETE reference host loop for hosts that don't own their own — backbone load, tokenize/prefill, every per-model flow, sampling, CFG pair, streaming interleave, embed injection, EOS, decode→PCM.  Links the isolated llama backbone (`libttsbackbone`); composes the codec_common per-step hooks internally.  For hosts that want a ready-made loop (examples/tts-cli, examples/tts-server via the load-once `tts_runner_session`, which also segments long input and streams PCM through `on_audio`, decoding partial output with `audio_lm_decode_audio_range` / `audio_lm_decodable_frames` / `audio_lm_codec_hop`), NOT for hosts that own the loop (llama.rn uses the hooks directly).  Built only with `CODEC_TTS_BACKBONE=ON`; the self-contained no-backbone FlowLM path (`tts_runner_synthesize_selfcontained`) lives in codec_common and is always available. |
-| **App glue (rn-tts.cpp / examples/tts-cli.cpp)** | for hook hosts (rn-tts): decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result.  For runner hosts (tts-cli): parse args → `tts_runner_synthesize(params)` → write WAV. |
+| **codec_tts_runner (optional)** | a COMPLETE reference host loop for hosts that don't own their own — backbone load, tokenize/prefill, every per-model flow, sampling, CFG pair, streaming interleave, embed injection, EOS, decode→PCM.  Links the isolated llama backbone (`libttsbackbone`); composes the codec_common per-step hooks internally.  For hosts that want a ready-made loop (tools/tts-cli, tools/tts-server via the load-once `tts_runner_session`, which also segments long input and streams PCM through `on_audio`, decoding partial output with `audio_lm_decode_audio_range` / `audio_lm_decodable_frames` / `audio_lm_codec_hop`), NOT for hosts that own the loop (llama.rn uses the hooks directly).  Built only with `CODEC_TTS_BACKBONE=ON`; the self-contained no-backbone FlowLM path (`tts_runner_synthesize_selfcontained`) lives in codec_common and is always available. |
+| **App glue (rn-tts.cpp / tools/tts-cli.cpp)** | for hook hosts (rn-tts): decides when to call which codec_common entry, plus minimal per-step branching on `observe_action` result.  For runner hosts (tts-cli): parse args → `tts_runner_synthesize(params)` → write WAV. |
 
 ## Inference patterns
 
@@ -357,7 +357,7 @@ model-specific.
 
 ## Reference host: `tts-cli synthesize`
 
-`examples/tts-cli.cpp` now drives the full host AR loop against a real
+`tools/tts-cli.cpp` now drives the full host AR loop against a real
 llama.cpp backbone (`--backbone LLAMA.gguf`), proving codec_common's
 per-step hooks end-to-end.  Verified E2E (whisper ASR): **CSM** (English,
 CER 0.0, stops on `eos_code_c0`) and **BlueMagpie** (continuous CFM,

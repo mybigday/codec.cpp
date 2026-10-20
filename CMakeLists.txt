@@ -32,6 +32,17 @@ option(GGML_SVE         "Enable ARM SVE"            ON)
 
 set(GGML_CPU ON)
 
+# Installed libraries find each other in their own directory (libggml loads
+# its backends, libcodec loads libggml); the tools override this below.
+if(APPLE)
+    set(_codec_origin "@loader_path")
+else()
+    set(_codec_origin "$ORIGIN")
+endif()
+if(NOT CMAKE_INSTALL_RPATH)
+    set(CMAKE_INSTALL_RPATH "${_codec_origin}")
+endif()
+
 add_subdirectory(ggml)
 
 set(CODEC_SOURCES
@@ -196,7 +207,7 @@ add_executable(codec-batch-decode
 target_include_directories(codec-batch-decode PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml ggml-cpu)
 
-option(CODEC_BUILD_TTS_CLI "Build the tts-cli example" ON)
+option(CODEC_BUILD_TTS_CLI "Build the tts-cli tool" ON)
 if(CODEC_BUILD_TTS_CLI)
     # The TTS path uses backbone archs added to the pinned llama.cpp submodule
     # (Barbet, CosyVoice v1); apply their patches (idempotent, in order, skips
@@ -204,7 +215,7 @@ if(CODEC_BUILD_TTS_CLI)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupLlamaPatches.cmake)
 
     add_executable(tts-cli
-        examples/tts-cli.cpp
+        tools/tts-cli.cpp
     )
     target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
 
@@ -250,11 +261,10 @@ if(CODEC_BUILD_TTS_CLI)
             set(_ll_vendor "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp/vendor")
             find_package(Threads REQUIRED)
             add_executable(tts-server
-                examples/tts-server.cpp
-                examples/utils/audio_encode.cpp
+                tools/tts-server.cpp
+                tools/audio_encode.cpp
                 ${_ll_vendor}/cpp-httplib/httplib.cpp)
-            target_include_directories(tts-server PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/examples ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
+            target_include_directories(tts-server PRIVATE ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
             target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}" Threads::Threads)
             add_dependencies(tts-server ttsbackbone)
             set_target_properties(tts-server PROPERTIES
@@ -314,5 +324,29 @@ if(CODEC_BUILD_TTS_CLI)
         target_compile_definitions(tts-cli PRIVATE CODEC_TTS_ESPEAK=1)
         target_include_directories(tts-cli PRIVATE ${ESPEAK_NG_INCLUDE_DIR})
         target_link_libraries(tts-cli PRIVATE ${ESPEAK_NG_LIB})
+    endif()
+endif()
+
+# Install: libcodec + headers, the TTS tools and the llama.cpp backbone they
+# load (ggml installs its own libraries).  The tools find their libraries in
+# ../lib next to bin.  Wheel builds (SKBUILD) install libcodec into the Python
+# package instead, above.
+if(NOT SKBUILD)
+    include(GNUInstallDirs)
+    file(RELATIVE_PATH _codec_bin_to_lib "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+
+    install(TARGETS codec_shared
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES include/codec.h include/codec_lm.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    foreach(_tool tts-cli tts-server)
+        if(TARGET ${_tool})
+            set_target_properties(${_tool} PROPERTIES INSTALL_RPATH "${_codec_origin}/${_codec_bin_to_lib}")
+            install(TARGETS ${_tool} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+        endif()
+    endforeach()
+    if(TARGET ttsbackbone)
+        install(FILES "${TTS_BACKBONE_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
     endif()
 endif()

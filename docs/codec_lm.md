@@ -290,7 +290,7 @@ src/lm/
 Reuses existing runtime:
 - `codec_graph_cache_get_or_build` / `codec_graph_compute` (graph build,
   galloc-based allocation, scheduler).
-- `codec_perf_log` (so `tools/benchmark.py` picks up codec_lm phases
+- `codec_perf_log` (so `tools/benchmark/benchmark.py` picks up codec_lm phases
   automatically — `lm_step_begin`, `lm_depth_step`, etc.).
 - `codec_runtime_write_tensor` / `codec_runtime_read_tensor` (input/output
   marshalling — same patterns as the codec models).

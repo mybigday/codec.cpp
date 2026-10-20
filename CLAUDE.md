@@ -32,6 +32,7 @@ The intended architecture is **llama.cpp-style**:
   standalone graphs
 - `src/batch/` — sequence-level batch container + decode loop (MVP)
 - `examples/` — demo/inspection binaries (e.g. batch decode)
+- `tools/` — installed tools: `tts-cli`, `tts-server` (OpenAI-compatible `/v1/audio/speech`) over `common/tts_runner`; `tools/benchmark/` — perf / TTS timing harnesses
 - `python/codec_cpp/` — Python API over the public C headers (ctypes; packaged by the root `pyproject.toml`). `_ffi.py` mirrors `include/*.h` by hand — update it in the same commit as any public struct/function change
 - `tests/e2e/` — E2E smokes; drive the library through `codec_cpp`, shared test helpers (assertions, WAV I/O, llama.cpp backbone driver) live in `tests/e2e/_common.py`
 - `ggml/` — ggml submodule/subproject

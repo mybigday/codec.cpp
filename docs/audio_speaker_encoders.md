@@ -18,7 +18,7 @@ KittenTTS 2) uses the separate `codec_speaker` API: see
 |---|---|
 | **codec.cpp** | audio encoder weights + forward (PCM → conditioning embedding) |
 | **llama.cpp** | LM backbone, tokenizer, prompt assembly, AR sampling |
-| **Application (llama.rn's rn-tts / examples/tts-cli / …)** | wiring: load audio → call `codec_lm_speaker_encode` (or `codec_common::audio_lm_build_prompt`) → hand resulting `(n_rows, hidden_dim)` embedding to llama.cpp as part of `inputs_embeds` |
+| **Application (llama.rn's rn-tts / tools/tts-cli / …)** | wiring: load audio → call `codec_lm_speaker_encode` (or `codec_common::audio_lm_build_prompt`) → hand resulting `(n_rows, hidden_dim)` embedding to llama.cpp as part of `inputs_embeds` |
 
 The output of `codec_lm_speaker_encode` is a plain F32 matrix of
 shape `(info.n_rows, info.hidden_dim)`, ready to be concatenated /
@@ -67,7 +67,7 @@ codec_status codec_lm_speaker_encode_from_embedding(
   entry builds the same graph without the VoiceEncoder.
 - **Parity**: `tests/e2e/chatterbox_speaker_smoke.py` — 34 rows corr =
   1.000000 vs `VoiceEncoder.embeds_from_wavs` + `T3CondEnc.forward`.
-- **Application example**: `examples/tts-cli synthesize --model
+- **Application example**: `tools/tts-cli synthesize --model
   chatterbox.gguf --ref-audio path.wav` runs the full pipeline via
   `codec_common::audio_lm_build_prompt`; callers without ref audio can
   feed a cached 256-d embedding (e.g. from `conds.pt`) through

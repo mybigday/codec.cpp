@@ -6,9 +6,9 @@ tests/e2e/cosyvoice_synthesize_smoke.py (same models, text, seeds and flags),
 runs each through tts-cli and records the `timing:` line (load / generate /
 decode / total), the audio duration and the Whisper CER.
 
-    .venv/bin/python tools/tts_benchmark.py run --out benchmarks/tts_cpu.json
-    .venv/bin/python tools/tts_benchmark.py run --gpu --out benchmarks/tts_vk.json
-    .venv/bin/python tools/tts_benchmark.py compare before.json after.json
+    .venv/bin/python tools/benchmark/tts_benchmark.py run --out benchmarks/tts_cpu.json
+    .venv/bin/python tools/benchmark/tts_benchmark.py run --gpu --out benchmarks/tts_vk.json
+    .venv/bin/python tools/benchmark/tts_benchmark.py compare before.json after.json
 
 `synth_ms` (speaker + generate + decode) is the headline; load is reported on
 its own since a host pays it once.  Each case runs `--repeat` times (default 2)
@@ -30,7 +30,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tests" / "e2e"))
 
 import ttscli_synthesize_smoke as tts_smoke  # noqa: E402

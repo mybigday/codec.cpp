@@ -10,7 +10,7 @@
 //     common/tts_runner (codec_tts_runner, built with CODEC_TTS_BACKBONE)
 //
 // This file is just: parse args → load → { info | decode | synthesize } →
-// write WAV.  examples/tts-server links codec_tts_runner the same way.
+// write WAV.  tools/tts-server links codec_tts_runner the same way.
 //
 //   tts-cli info       --model X.gguf
 //        Lifecycle + capability queries (modality, n_codebook, hidden_dim,

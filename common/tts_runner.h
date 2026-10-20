@@ -15,8 +15,8 @@
 // flow (continuous CFM, residual depth-AR, parallel-heads delay,
 // streaming interleave, sequential text→audio, Chatterbox CFG dual-seq,
 // and the self-contained Pocket-TTS FlowLM), sampling, EOS handling, and
-// codes→PCM decode.  `examples/tts-cli` (one-shot tts_runner_synthesize)
-// and `examples/tts-server` (a tts_runner_session) are thin drivers over it.
+// codes→PCM decode.  `tools/tts-cli` (one-shot tts_runner_synthesize)
+// and `tools/tts-server` (a tts_runner_session) are thin drivers over it.
 //
 // This library is built only when CODEC_TTS_BACKBONE=ON.  When it is
 // OFF, tts-cli falls back to the self-contained (no-backbone) FlowLM path
@@ -258,7 +258,7 @@ tts_runner_info      tts_runner_get_info(tts_runner_session * s, const std::stri
 // the codec_tts_runner library.
 //
 // Diagnostic progress is printed to stdout/stderr (the same lines
-// examples/tts-cli emitted); hosts that want silence can capture them.
+// tools/tts-cli emitted); hosts that want silence can capture them.
 bool tts_runner_synthesize(const tts_runner_params & params,
                            tts_runner_result * out);
 

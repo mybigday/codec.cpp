@@ -8,7 +8,7 @@
 // are unchanged and composed here; the loop-owning contract for hosts like
 // llama.rn (docs/codec_common_api.md §Boundary) is untouched.
 //
-// Ported from examples/tts-cli.cpp's cmd_synthesize + the run_* flow
+// Ported from tools/tts-cli.cpp's cmd_synthesize + the run_* flow
 // helpers; the flow bodies are verbatim, only the entry points fill a
 // tts_runner_result (PCM + stats) instead of writing WAV files.  Built only
 // when CODEC_TTS_BACKBONE=ON.

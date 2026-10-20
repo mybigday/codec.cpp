@@ -27,7 +27,7 @@
 
 #include "codec_common.h"
 #include "tts_runner.h"
-#include "utils/audio_encode.h"
+#include "audio_encode.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>

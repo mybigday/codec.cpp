@@ -6,7 +6,7 @@
 // no llama dependency, so it lives in the always-built codec_common library
 // and keeps the FlowLM path available even in CODEC_TTS_BACKBONE=OFF builds.
 //
-// Ported verbatim from examples/tts-cli.cpp's run_flow_lm_synthesize; the
+// Ported verbatim from tools/tts-cli.cpp's run_flow_lm_synthesize; the
 // only change is that it fills a tts_runner_result (PCM + stats) instead of
 // writing the WAV — the caller marshals output.
 

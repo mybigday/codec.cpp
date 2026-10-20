@@ -64,15 +64,15 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCODEC_DEBUG_TOOLS=ON
 cmake --build build -j
 
 # 2. Capture baseline before optimising
-python tools/benchmark.py --iterations 5 --warmup 1 --out benchmarks/before.json
+python tools/benchmark/benchmark.py --iterations 5 --warmup 1 --out benchmarks/before.json
 
 # 3. Apply your optimisation, rebuild
 
 # 4. Capture after
-python tools/benchmark.py --iterations 5 --warmup 1 --out benchmarks/after.json
+python tools/benchmark/benchmark.py --iterations 5 --warmup 1 --out benchmarks/after.json
 
 # 5. Diff
-python tools/benchmark.py compare benchmarks/before.json benchmarks/after.json
+python tools/benchmark/benchmark.py compare benchmarks/before.json benchmarks/after.json
 ```
 
 `compare` prints a per-model table with absolute and percent deltas for
@@ -83,7 +83,7 @@ regresses by more than ±5 % on either metric.
 
 ```bash
 # Only run two specific models, fewer iterations during dev:
-python tools/benchmark.py --models snac neucodec --iterations 3 --warmup 1 --out /tmp/dev.json
+python tools/benchmark/benchmark.py --models snac neucodec --iterations 3 --warmup 1 --out /tmp/dev.json
 ```
 
 ## C++ instrumentation contract
