@@ -116,8 +116,22 @@ option(CODEC_DEBUG_TOOLS "Compile the env-var debug/profiling hooks into libcode
 if (CODEC_DEBUG_TOOLS)
     target_compile_definitions(codec_objs PRIVATE CODEC_DEBUG_TOOLS)
 endif()
+# The audio-LM host layer (common/audio_lm.cpp) and its C API
+# (include/codec_audio_lm.h) go into libcodec.so as well, so FFI callers
+# (python/codec_cpp) reach it; the static codec_common below reuses the objects.
+add_library(codec_audio_lm_objs OBJECT
+    common/audio_lm.cpp
+    common/audio_lm_c.cpp
+)
+set_target_properties(codec_audio_lm_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(codec_audio_lm_objs
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)
-add_library(codec_shared SHARED $<TARGET_OBJECTS:codec_objs>)
+add_library(codec_shared SHARED $<TARGET_OBJECTS:codec_objs> $<TARGET_OBJECTS:codec_audio_lm_objs>)
 set_target_properties(codec_shared PROPERTIES OUTPUT_NAME codec)
 
 target_include_directories(codec_objs
@@ -169,7 +183,7 @@ target_include_directories(codec-example-utils
 # tts_runner_flow.cpp so it stays available even in CODEC_TTS_BACKBONE=OFF
 # builds; the full backbone-driven runner lives in codec_tts_runner.
 add_library(codec_common STATIC
-    common/audio_lm.cpp
+    $<TARGET_OBJECTS:codec_audio_lm_objs>
     common/kitten_text.cpp
     common/tts_runner_flow.cpp
     common/tts_segment.cpp

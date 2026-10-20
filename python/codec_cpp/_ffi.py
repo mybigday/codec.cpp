@@ -1,4 +1,5 @@
-"""Raw ctypes declarations mirroring include/codec.h and include/codec_lm.h.
+"""Raw ctypes declarations mirroring include/codec.h, include/codec_lm.h and
+include/codec_audio_lm.h.
 
 Struct field order must match the headers exactly; the headers follow an
 ABI-append discipline (new fields at the end), so keep the same here.
@@ -275,6 +276,111 @@ class codec_lm_flow_info(Structure):
     ]
 
 
+# ─── enums + structs (codec_audio_lm.h) ─────────────────────────────
+
+CODEC_AUDIO_LM_INPUT_TEXT = 1 << 0
+CODEC_AUDIO_LM_INPUT_AUDIO = 1 << 1
+CODEC_AUDIO_LM_OUTPUT_TEXT = 1 << 2
+CODEC_AUDIO_LM_OUTPUT_AUDIO = 1 << 3
+
+CODEC_AUDIO_LM_OBSERVE_PASSTHROUGH = 0
+CODEC_AUDIO_LM_OBSERVE_CONSUMED = 1
+CODEC_AUDIO_LM_OBSERVE_CONSUMED_EMBED = 2
+CODEC_AUDIO_LM_OBSERVE_STOP = 3
+
+CODEC_AUDIO_LM_KIND_UNKNOWN = 0
+CODEC_AUDIO_LM_KIND_RESIDUAL_DEPTH_AR = 1
+CODEC_AUDIO_LM_KIND_PARALLEL_HEADS_DELAY = 2
+CODEC_AUDIO_LM_KIND_CONTINUOUS_CFM = 3
+CODEC_AUDIO_LM_KIND_TOKEN_SINGLE_CB = 4
+
+CODEC_AUDIO_LM_OUTETTS_V1 = 0
+CODEC_AUDIO_LM_OUTETTS_V2 = 1
+CODEC_AUDIO_LM_OUTETTS_V3 = 2
+
+
+class codec_audio_lm_params(Structure):
+    _fields_ = [
+        ("codec_path", c_char_p),
+        ("use_gpu", c_bool),
+        ("n_threads", c_int32),
+        ("kv_overrides", POINTER(codec_model_kv_override)),
+        ("n_kv_overrides", c_int32),
+    ]
+
+
+class codec_audio_lm_input(Structure):
+    _fields_ = [
+        ("ref_pcm", POINTER(c_float)),
+        ("ref_n_samples", c_int32),
+        ("ref_sample_rate", c_int32),
+        ("speaker_emb", POINTER(c_float)),
+        ("speaker_emb_dim", c_int32),
+        ("emotion", POINTER(c_float)),
+        ("ref_text", c_char_p),
+        ("text", c_char_p),
+        ("extra_keys", POINTER(c_char_p)),
+        ("extra_values", POINTER(c_char_p)),
+        ("n_extra", c_int32),
+    ]
+
+
+class codec_audio_lm_prompt(Structure):
+    _fields_ = [
+        ("tokens", POINTER(c_int32)),
+        ("n_tokens", c_int32),
+        ("embeds_prefix", POINTER(c_float)),
+        ("embeds_prefix_rows", c_int32),
+        ("embeds_prefix_hidden", c_int32),
+        ("embeds_uncond", POINTER(c_float)),
+        ("default_temperature", c_float),
+        ("default_top_p", c_float),
+        ("default_min_p", c_float),
+        ("default_repetition_penalty", c_float),
+        ("default_cfg_weight", c_float),
+        ("start_token", c_int32),
+        ("stop_token", c_int32),
+    ]
+
+
+class codec_audio_lm_prompt_info(Structure):
+    _fields_ = [
+        ("model_kind", c_int),
+        ("host_arch", c_char_p),
+        ("prompt_prefix", c_char_p),
+        ("prompt_suffix", c_char_p),
+        ("add_bos", c_bool),
+        ("parse_special", c_bool),
+        ("cb0_from_backbone", c_bool),
+        ("audio_codebook_offset", c_int32),
+        ("is_continuous", c_bool),
+        ("n_codebook", c_int32),
+        ("hidden_dim", c_int32),
+        ("eos_code_c0", c_int32),
+        ("eos_min_step", c_int32),
+        ("default_temperature", c_float),
+        ("default_top_p", c_float),
+        ("default_top_k", c_int32),
+        ("streaming_interleave", c_bool),
+        ("text_externally_added", c_bool),
+        ("prefill_text_len", c_int32),
+        ("text_pad_id", c_int32),
+        ("audio_pad_code", c_int32),
+        ("bos_code_c0", c_int32),
+        ("default_repetition_penalty", c_float),
+        ("repetition_window", c_int32),
+        ("sequential_text_audio", c_bool),
+        ("audio_start_id", c_int32),
+        ("text_end_id", c_int32),
+        ("max_text_tokens", c_int32),
+        ("cb0_speech_range_start", c_int32),
+        ("cb0_speech_range_end", c_int32),
+        ("audio_tok_offset", c_int32),
+        ("audio_tok_count", c_int32),
+        ("audio_tok_eos", c_int32),
+    ]
+
+
 # ─── prototypes ─────────────────────────────────────────────────────
 
 _i32p = POINTER(c_int32)
@@ -410,6 +516,73 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_lm_flow_prefill": (_status, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
     "codec_lm_flow_step": (_status, [c_void_p, _f32p, _f32p, _f32p, _i32p]),
     "codec_lm_flow_denorm_latent": (_status, [c_void_p, _f32p, _f32p]),
+    # codec_audio_lm.h — lifecycle / capabilities
+    "codec_audio_lm_default_params": (codec_audio_lm_params, []),
+    "codec_audio_lm_init": (c_void_p, [POINTER(codec_audio_lm_params), c_char_p, c_size_t]),
+    "codec_audio_lm_free": (None, [c_void_p]),
+    "codec_audio_lm_reset": (None, [c_void_p]),
+    "codec_audio_lm_alloc_bare": (c_void_p, []),
+    "codec_audio_lm_parse_kv_override": (c_bool, [c_char_p, POINTER(codec_model_kv_override)]),
+    "codec_audio_lm_modality": (ctypes.c_uint32, [c_void_p]),
+    "codec_audio_lm_has_speaker_enc": (c_bool, [c_void_p]),
+    "codec_audio_lm_n_codebook": (c_int32, [c_void_p]),
+    "codec_audio_lm_hidden_dim": (c_int32, [c_void_p]),
+    "codec_audio_lm_is_continuous": (c_bool, [c_void_p]),
+    "codec_audio_lm_last_error": (c_char_p, [c_void_p]),
+    "codec_audio_lm_meta_str": (c_char_p, [c_void_p, c_char_p]),
+    "codec_audio_lm_get_lm": (c_void_p, [c_void_p]),
+    # codec_audio_lm.h — decoder speaker
+    "codec_audio_lm_codec_has_speakers": (c_bool, [c_void_p]),
+    "codec_audio_lm_codec_can_speaker_from_audio": (c_bool, [c_void_p]),
+    "codec_audio_lm_set_decode_speaker": (c_bool, [c_void_p, c_char_p]),
+    "codec_audio_lm_load_decode_speaker": (c_bool, [c_void_p, c_char_p, c_char_p]),
+    "codec_audio_lm_decode_speaker_from_audio": (c_bool, [c_void_p, _f32p, c_int32, c_int32, c_char_p]),
+    "codec_audio_lm_save_decode_speaker": (c_bool, [c_void_p, c_char_p, c_char_p]),
+    "codec_audio_lm_decode_speaker": (c_void_p, [c_void_p]),
+    "codec_audio_lm_list_codec_speakers": (c_int32, [c_void_p]),
+    "codec_audio_lm_list_speaker_file": (c_int32, [c_void_p, c_char_p]),
+    "codec_audio_lm_listed_speaker": (
+        c_bool, [c_void_p, c_int32, POINTER(c_char_p), POINTER(c_char_p), POINTER(c_bool)]),
+    # codec_audio_lm.h — prompt
+    "codec_audio_lm_default_input": (codec_audio_lm_input, []),
+    "codec_audio_lm_build_prompt": (
+        c_bool, [c_void_p, POINTER(codec_audio_lm_input), POINTER(codec_audio_lm_prompt)]),
+    "codec_audio_lm_get_prompt_info": (c_bool, [c_void_p, POINTER(codec_audio_lm_prompt_info)]),
+    "codec_audio_lm_outetts_build_grammar": (c_int32, [c_int, c_char_p, c_char_p, c_int32]),
+    "codec_audio_lm_tts_auto_grammar": (c_int32, [c_void_p, c_char_p, c_char_p, c_int32]),
+    # codec_audio_lm.h — token ranges / accumulator
+    "codec_audio_lm_set_audio_token_range": (None, [c_void_p, c_int32, c_int32, c_int32]),
+    "codec_audio_lm_set_audio_token_ranges": (None, [c_void_p, _i32p, _i32p, c_int32, c_int32, c_int32]),
+    "codec_audio_lm_get_audio_token_range": (None, [c_void_p, _i32p, _i32p, _i32p]),
+    "codec_audio_lm_codes_n_frames": (c_int32, [c_void_p]),
+    "codec_audio_lm_codes": (_i32p, [c_void_p, _i32p, _i32p]),
+    "codec_audio_lm_get_lm_eos": (None, [c_void_p, _i32p, _i32p]),
+    "codec_audio_lm_set_uses_embed_override": (None, [c_void_p, c_bool, c_int32]),
+    "codec_audio_lm_get_uses_embed_override": (c_bool, [c_void_p]),
+    # codec_audio_lm.h — per-step hooks
+    "codec_audio_lm_observe_token": (c_int, [c_void_p, c_int32, _f32p, c_int32]),
+    "codec_audio_lm_get_next_embed": (_f32p, [c_void_p, _i32p]),
+    "codec_audio_lm_observe_hidden": (c_int, [c_void_p, _f32p, c_int32, _f32p]),
+    "codec_audio_lm_set_continuous_params": (None, [c_void_p, c_float, c_int32, c_int32]),
+    "codec_audio_lm_text_prefill": (c_bool, [c_void_p, _f32p, c_int32, c_int32]),
+    "codec_audio_lm_observe_codes": (c_int, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
+    "codec_audio_lm_push_codes": (c_bool, [c_void_p, _i32p, c_int32, c_int32]),
+    "codec_audio_lm_step_set_text_context": (c_bool, [c_void_p, c_int32]),
+    "codec_audio_lm_step_begin": (c_bool, [c_void_p, _f32p, c_int32]),
+    "codec_audio_lm_step_logits": (_f32p, [c_void_p, _i32p, _i32p]),
+    "codec_audio_lm_step_push_code": (c_bool, [c_void_p, c_int32]),
+    "codec_audio_lm_step_finish": (c_bool, [c_void_p, _i32p, c_int32]),
+    # codec_audio_lm.h — embeddings
+    "codec_audio_lm_prompt_needs_composed_embd": (c_bool, [c_void_p]),
+    "codec_audio_lm_compose_prompt_embd": (c_bool, [c_void_p, c_int32, _f32p, c_int32]),
+    "codec_audio_lm_compose_audio_codes_embd": (c_bool, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
+    "codec_audio_lm_talker_has_projection": (c_bool, [c_void_p]),
+    "codec_audio_lm_build_talker_prefix": (
+        c_bool, [c_void_p, _i32p, c_int32, _i32p, c_int32, _f32p, c_int32, _f32p, c_int32, _i32p, _i32p]),
+    "codec_audio_lm_talker_trailing_text_embd": (c_bool, [c_void_p, _i32p, c_int32, c_int32, _f32p, c_int32]),
+    # codec_audio_lm.h — end of sequence
+    "codec_audio_lm_decode_audio": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
+    "codec_audio_lm_decode_latents": (c_bool, [c_void_p, _f32p, c_int32, c_int32, POINTER(codec_pcm_buffer)]),
 }
 
 

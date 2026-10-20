@@ -89,6 +89,45 @@ def write_wav_pcm16(path: Path, pcm: np.ndarray, sr: int) -> None:
 # --- llama.cpp backbone (llama-cpp-python) -----------------------------
 
 
+def asr_cer(wav, ref, lang):
+    """Best-effort Whisper transcript + CER vs `ref`: (text, cer), or None
+    when torch / transformers / the model are unavailable."""
+    try:
+        import torch  # noqa
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+    except Exception:
+        return None
+    try:
+        x, sr = read_wav_mono_f32(wav)
+        if sr != 16000:
+            import librosa
+            x = librosa.resample(x, orig_sr=sr, target_sr=16000)
+        m = "openai/whisper-large-v3-turbo"
+        proc = WhisperProcessor.from_pretrained(m)
+        model = WhisperForConditionalGeneration.from_pretrained(m)
+        inp = proc(x, sampling_rate=16000, return_tensors="pt")
+        ids = model.generate(inp.input_features, language=lang, task="transcribe")
+        txt = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
+    except Exception:
+        return None
+
+    def norm(s):
+        import unicodedata
+        return "".join(c for c in unicodedata.normalize("NFKC", s.lower()) if c.isalnum())
+
+    a, b = norm(ref), norm(txt)
+    d = np.zeros((len(a) + 1, len(b) + 1), int)
+    for i in range(len(a) + 1):
+        d[i][0] = i
+    for j in range(len(b) + 1):
+        d[0][j] = j
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                          d[i - 1][j - 1] + (a[i - 1] != b[j - 1]))
+    return txt, d[len(a)][len(b)] / max(1, len(a))
+
+
 class LlamaBackbone:
     """Embedding-in / hidden-out driver for an AR backbone GGUF.
 
@@ -152,6 +191,40 @@ class LlamaBackbone:
             lc.llama_batch_free(batch)
         self.pos += T
         return out if all_hidden else out[0]
+
+    def tokenize(self, text: str, *, add_bos: bool = False, special: bool = True) -> list[int]:
+        lc = self.lc
+        vocab = lc.llama_model_get_vocab(self.model)
+        b = text.encode("utf-8")
+        buf = (lc.llama_token * (len(b) + 16))()
+        n = lc.llama_tokenize(vocab, b, len(b), buf, len(buf), add_bos, special)
+        if n < 0:
+            raise RuntimeError(f"llama_tokenize failed ({n})")
+        return list(buf[:n])
+
+    def feed_tokens(self, tokens) -> np.ndarray:
+        """Append token ids at the current position; returns the last hidden state."""
+        lc = self.lc
+        T = len(tokens)
+        batch = lc.llama_batch_init(T, 0, 1)
+        try:
+            batch.n_tokens = T
+            for t, tok in enumerate(tokens):
+                batch.token[t] = int(tok)
+                batch.pos[t] = self.pos + t
+                batch.n_seq_id[t] = 1
+                batch.seq_id[t][0] = 0
+                batch.logits[t] = 1 if t == T - 1 else 0
+            rc = lc.llama_decode(self.ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode rc={rc}")
+            p = lc.llama_get_embeddings_ith(self.ctx, -1)
+            out = np.zeros(self.hidden, dtype=np.float32)
+            ctypes.memmove(out.ctypes.data, p, self.hidden * 4)
+        finally:
+            lc.llama_batch_free(batch)
+        self.pos += T
+        return out
 
     def close(self) -> None:
         if getattr(self, "ctx", None):

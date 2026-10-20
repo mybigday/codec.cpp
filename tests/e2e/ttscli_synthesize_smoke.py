@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import REPO, read_wav_mono_f32
+from _common import REPO, asr_cer, read_wav_mono_f32
 
 TTS_CLI = REPO / "build" / "tts-cli"
 
@@ -59,41 +59,7 @@ def _wav_stats(path):
 
 
 def _try_cer(wav, ref, lang):
-    """Best-effort ASR CER; returns None if deps/models unavailable."""
-    try:
-        import torch  # noqa
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
-    except Exception:
-        return None
-    try:
-        x, sr = read_wav_mono_f32(wav)
-        if sr != 16000:
-            import librosa
-            x = librosa.resample(x, orig_sr=sr, target_sr=16000)
-        m = "openai/whisper-large-v3-turbo"
-        proc = WhisperProcessor.from_pretrained(m)
-        model = WhisperForConditionalGeneration.from_pretrained(m)
-        inp = proc(x, sampling_rate=16000, return_tensors="pt")
-        ids = model.generate(inp.input_features, language=lang, task="transcribe")
-        txt = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
-    except Exception:
-        return None
-
-    def norm(s):
-        import unicodedata
-        return "".join(c for c in unicodedata.normalize("NFKC", s.lower()) if c.isalnum())
-
-    a, b = norm(ref), norm(txt)
-    d = np.zeros((len(a) + 1, len(b) + 1), int)
-    for i in range(len(a) + 1):
-        d[i][0] = i
-    for j in range(len(b) + 1):
-        d[0][j] = j
-    for i in range(1, len(a) + 1):
-        for j in range(1, len(b) + 1):
-            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1,
-                          d[i - 1][j - 1] + (a[i - 1] != b[j - 1]))
-    return txt, d[len(a)][len(b)] / max(1, len(a))
+    return asr_cer(wav, ref, lang)
 
 
 def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,

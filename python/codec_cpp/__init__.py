@@ -12,12 +12,13 @@ the loaded library for calls the high-level layer does not wrap.
 
 from . import _ffi as ffi
 from ._lib import lib, library_path
+from .audio_lm import AudioLM, Prompt, SpeakerEntry, outetts_grammar
 from .codec import CodecError, Context, Model, Speaker, SpeakerFile
 from .lm import LM, LMInfo, LMState
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "CodecError", "Context", "LM", "LMInfo", "LMState", "Model", "Speaker", "SpeakerFile",
-    "ffi", "lib", "library_path",
+    "AudioLM", "CodecError", "Context", "LM", "LMInfo", "LMState", "Model", "Prompt", "Speaker",
+    "SpeakerEntry", "SpeakerFile", "ffi", "lib", "library_path", "outetts_grammar",
 ]
