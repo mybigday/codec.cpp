@@ -78,8 +78,8 @@ import codec_cpp
 alm = codec_cpp.AudioLM("codec.gguf")                # backbone_path= for models that read its embeddings
 vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)
 req = alm.backbone_requirements(vocab, max_frames=500)   # n_ctx, n_ubatch, n_seq_max, embeddings, flash_attn
-alm.set_voice(ref_audio=(pcm, sr))
-alm.tts_prompt("Hello there.", vocab=vocab)
+voice = alm.create_voice(pcm, sr, ref_text)         # or alm.voice("name") / alm.load_voice(path)
+alm.tts_prompt("Hello there.", vocab=vocab, voice=voice)
 c = alm.completion()      # c.chunks (TEXT / TOKENS / EMBD), c.sampler, c.allowed, c.grammar, flags
 # decode the chunks, then per step:
 v = alm.observe(tokens=[tok] if sampled else None, hiddens=last_hidden)

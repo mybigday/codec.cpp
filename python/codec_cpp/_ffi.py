@@ -295,21 +295,10 @@ class codec_audio_lm_backbone_req(Structure):
     ]
 
 
-class codec_audio_lm_tts_voice(Structure):
-    _fields_ = [
-        ("voice", c_char_p),
-        ("speaker_file", c_char_p),
-        ("ref_pcm", POINTER(c_float)),
-        ("ref_n_samples", c_int32),
-        ("ref_sample_rate", c_int32),
-        ("ref_text", c_char_p),
-        ("save_speaker", c_char_p),
-    ]
-
-
 class codec_audio_lm_tts_request(Structure):
     _fields_ = [
         ("text", c_char_p),
+        ("voice", c_void_p),
         ("instruct", c_char_p),
         ("preset", c_char_p),
         ("seed", ctypes.c_uint32),
@@ -535,8 +524,10 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_voice": (c_bool, [c_void_p, c_int32, POINTER(c_char_p), POINTER(c_char_p), POINTER(c_bool)]),
     "codec_audio_lm_backbone_requirements": (
         c_bool, [c_void_p, POINTER(codec_audio_lm_vocab), c_int32, POINTER(codec_audio_lm_backbone_req)]),
-    "codec_audio_lm_default_tts_voice": (codec_audio_lm_tts_voice, []),
-    "codec_audio_lm_tts_set_voice": (c_bool, [c_void_p, POINTER(codec_audio_lm_tts_voice)]),
+    "codec_audio_lm_get_voice": (c_void_p, [c_void_p, c_char_p]),
+    "codec_audio_lm_create_voice": (c_void_p, [c_void_p, _f32p, c_int32, c_int32, c_char_p]),
+    "codec_audio_lm_load_voice": (c_void_p, [c_void_p, c_char_p, c_char_p]),
+    "codec_audio_lm_save_voice": (c_bool, [c_void_p, c_void_p, c_char_p, c_char_p]),
     "codec_audio_lm_default_tts_request": (codec_audio_lm_tts_request, []),
     "codec_audio_lm_tts_prompt": (
         c_bool, [c_void_p, POINTER(codec_audio_lm_tts_request), POINTER(codec_audio_lm_vocab)]),
@@ -551,7 +542,7 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_generate_self_contained": (c_bool, [c_void_p]),
     "codec_audio_lm_decode": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_get_generation": (c_bool, [c_void_p, POINTER(codec_audio_lm_generation)]),
-    "codec_audio_lm_decode_generation": (c_bool, [c_void_p, POINTER(codec_audio_lm_generation),
+    "codec_audio_lm_decode_generation": (c_bool, [c_void_p, POINTER(codec_audio_lm_generation), c_void_p,
                                                   POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_stream_poll": (c_bool, [c_void_p, c_int32, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_stream_finish": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),

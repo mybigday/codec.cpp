@@ -8,8 +8,8 @@ loop use codec_cpp.TTS instead.
 
     alm = codec_cpp.AudioLM("codec.gguf")
     vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)    # or Vocab(tokenize=..., ...)
-    alm.set_voice(voice="alice")
-    alm.tts_prompt("Hello there.", vocab=vocab)
+    voice = alm.voice("alice")                             # or alm.create_voice(pcm, sr, ref_text)
+    alm.tts_prompt("Hello there.", vocab=vocab, voice=voice)
     c = alm.completion()                                   # chunks, sampler, flags
     ...                                                    # decode c.chunks with llama.cpp
     while True:                                            # per step
@@ -32,7 +32,7 @@ import numpy as np
 
 from . import _ffi
 from ._lib import lib
-from .codec import CodecError, PathLike, _f32, _i32, _make_kv_overrides, _str, _take_pcm
+from .codec import CodecError, PathLike, Speaker, _f32, _i32, _make_kv_overrides, _str, _take_pcm
 
 
 def _b(s) -> bytes | None:
@@ -243,30 +243,49 @@ class AudioLM:
 
     # --- text to speech ---------------------------------------------------
 
-    def set_voice(self, *, voice: str | None = None, speaker_file: PathLike | None = None, ref_audio=None,
-                  ref_text: str | None = None, save_speaker: PathLike | None = None) -> None:
-        """The voice of the following prompts.  ``ref_audio`` is ``(pcm, sample_rate)`` (mono float)."""
-        L = lib()
-        v = L.codec_audio_lm_default_tts_voice()
-        v.voice, v.speaker_file, v.ref_text, v.save_speaker = _b(voice), _b(speaker_file), _b(ref_text), _b(save_speaker)
-        pcm = None
-        if ref_audio is not None:
-            pcm = _f32(ref_audio[0]).reshape(-1)
-            v.ref_pcm = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-            v.ref_n_samples, v.ref_sample_rate = pcm.size, int(ref_audio[1])
-        if not L.codec_audio_lm_tts_set_voice(self.ptr, ctypes.byref(v)):
-            self._fail("codec_audio_lm_tts_set_voice")
+    # --- voices -----------------------------------------------------------
+    # A voice is a codec_cpp.Speaker carrying all of the model's voice
+    # conditioning; pass it to tts_prompt / decode_generation.
+
+    def voice(self, name: str | None = None) -> Speaker:
+        """A builtin voice (None = the model's default), borrowed from the model."""
+        p = lib().codec_audio_lm_get_voice(self.ptr, _b(name))
+        if not p:
+            self._fail("codec_audio_lm_get_voice")
+        return Speaker(p, owner=self)
+
+    def create_voice(self, pcm, sample_rate: int, ref_text: str | None = None) -> Speaker:
+        """Clone a voice from a reference clip (mono float, any rate) and its transcript."""
+        x = _f32(pcm).reshape(-1)
+        p = lib().codec_audio_lm_create_voice(self.ptr, x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), x.size,
+                                              int(sample_rate), _b(ref_text))
+        if not p:
+            self._fail("codec_audio_lm_create_voice")
+        return Speaker(p, owned=True)
+
+    def load_voice(self, path: PathLike, name: str | None = None) -> Speaker:
+        p = lib().codec_audio_lm_load_voice(self.ptr, os.fsencode(path), _b(name))
+        if not p:
+            self._fail("codec_audio_lm_load_voice")
+        return Speaker(p, owned=True)
+
+    def save_voice(self, voice: Speaker, path: PathLike, name: str = "voice") -> None:
+        if not lib().codec_audio_lm_save_voice(self.ptr, voice.ptr, os.fsencode(path), name.encode("utf-8")):
+            self._fail("codec_audio_lm_save_voice")
 
     def tts_prompt(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
                    preset: str | None = None, seed: int = 0, temperature: float | None = None,
                    top_p: float | None = None, top_k: int | None = None, min_p: float | None = None,
                    repetition_penalty: float | None = None, min_frames: int | None = None,
                    max_frames: int | None = None, lm_guidance: float | None = None,
-                   flow_guidance: float | None = None, flow_steps: int | None = None) -> None:
-        """Prepare the prompt of one generation (unset options keep the model's defaults)."""
+                   flow_guidance: float | None = None, flow_steps: int | None = None,
+                   voice: Speaker | None = None) -> None:
+        """Prepare the prompt of one generation (unset options keep the model's defaults; voice None = default)."""
         L = lib()
         r = L.codec_audio_lm_default_tts_request()
         r.text, r.instruct, r.preset = text.encode("utf-8"), _b(instruct), _b(preset)
+        r.voice = voice.ptr if voice is not None else None
+        self._voice = voice   # the library borrows it until the generation is decoded
         r.seed = int(seed) & 0xFFFFFFFF
         for name, val, conv in (("temperature", temperature, float), ("top_p", top_p, float), ("top_k", top_k, int),
                                 ("min_p", min_p, float), ("repetition_penalty", repetition_penalty, float),
@@ -398,8 +417,8 @@ class AudioLM:
         ptr = g.latents if g.kind == _ffi.CODEC_AUDIO_LM_DATA_LATENTS else g.codes
         return np.ctypeslib.as_array(ptr, shape=(g.n_frames, g.width)).copy()
 
-    def decode_generation(self, gen: np.ndarray) -> tuple[np.ndarray, int]:
-        """Audio of a generation() result (this model's), with the current decoder speaker."""
+    def decode_generation(self, gen: np.ndarray, voice: Speaker | None = None) -> tuple[np.ndarray, int]:
+        """Audio of a generation() result (this model's), with the voice it was made with (None = default)."""
         g = _ffi.codec_audio_lm_generation()
         g.n_frames, g.width = int(gen.shape[0]), int(gen.shape[1])
         if np.issubdtype(gen.dtype, np.floating):
@@ -409,7 +428,8 @@ class AudioLM:
             arr = _i32(gen)
             g.kind, g.codes = _ffi.CODEC_AUDIO_LM_DATA_CODES, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
         buf = _ffi.codec_pcm_buffer()
-        if not lib().codec_audio_lm_decode_generation(self.ptr, ctypes.byref(g), ctypes.byref(buf)):
+        if not lib().codec_audio_lm_decode_generation(self.ptr, ctypes.byref(g), voice.ptr if voice else None,
+                                                      ctypes.byref(buf)):
             self._fail("codec_audio_lm_decode_generation")
         return _take_pcm(buf)
 

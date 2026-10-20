@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import codec_cpp  # noqa: E402
-from _common import asr_cer, write_wav_pcm16  # noqa: E402
+from _common import asr_cer, read_wav_mono_f32, write_wav_pcm16  # noqa: E402
 
 
 def make_sampler(sp: dict, allowed, n_vocab: int):
@@ -163,7 +163,7 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
     lc.llama_sampler_free(smpl)
     audio, sr = alm.decode()
     # The exported decoder input decodes to the same audio.
-    again, _ = alm.decode_generation(alm.generation())
+    again, _ = alm.decode_generation(alm.generation(), voice=req.get("voice"))
     assert np.array_equal(again, audio), "decode_generation(generation()) != decode()"
     return audio, sr, frames, alm.stop_reason
 
@@ -172,6 +172,11 @@ CASES = [
     dict(name="csm", codec=REPO / "models/csm/csm.gguf", backbone=REPO / "models/csm/llama_backbone.gguf",
          text="Hello, this is a test of the emergency broadcast system.", lang="en", stop="eos_code_c0",
          cer_max=0.2, req=dict(temperature=0)),   # greedy, as in the tts-cli smoke
+    dict(name="qwen3_tts_icl", codec=REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf",
+         backbone=REPO / "models/qwen3_tts/qwen3_tts_talker.gguf",
+         ref=(REPO / "assets/refs/jfk_en.wav", REPO / "assets/refs/jfk_en.txt"),
+         text="The birch canoe slid on the smooth planks.", lang="en", stop="eos_code_c0", cer_max=0.15,
+         req=dict(temperature=0.9, top_k=50, seed=2)),
     dict(name="moss_tts_realtime", codec=REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
          backbone=REPO / "models/moss_tts_realtime/qwen3_backbone_bf16.gguf", backbone_path=True,
          text="你好，欢迎使用语音合成。", lang="zh", stop="eos_code_c0", cer_max=0.35,
@@ -189,8 +194,16 @@ def main() -> int:
         alm = codec_cpp.AudioLM(case["codec"], backbone_path=case["backbone"] if case.get("backbone_path") else None)
         bb = Backbone(case["backbone"], alm, max_frames=400)
         try:
-            alm.set_voice()
-            audio, sr, frames, stop = synthesize(alm, bb, case["text"], **case["req"])
+            req = dict(case["req"])
+            if "ref" in case:   # a cloned voice: create, save, reload
+                wav, txt = case["ref"]
+                pcm, wsr = read_wav_mono_f32(wav)
+                voice = alm.create_voice(pcm, wsr, txt.read_text().strip())
+                with tempfile.TemporaryDirectory() as d:
+                    alm.save_voice(voice, Path(d) / "voice.gguf")
+                    voice = alm.load_voice(Path(d) / "voice.gguf")
+                req["voice"] = voice
+            audio, sr, frames, stop = synthesize(alm, bb, case["text"], **req)
         except Exception as e:
             print(f"[FAIL] {name}: {e}")
             failed += 1

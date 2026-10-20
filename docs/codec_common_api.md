@@ -33,11 +33,13 @@ codec_audio_lm_backbone_requirements(alm, &vocab, max_frames, &req);
 // n_seq_max = req.n_seq_max, embeddings = req.embeddings (pooling none),
 // flash_attn_type = req.flash_attn ? auto : disabled
 
-codec_audio_lm_tts_set_voice(alm, &voice);           // once per request
+// The voice: builtin, cloned, or loaded (NULL = the model default).
+codec_speaker * voice = codec_audio_lm_create_voice(alm, pcm, n_samples, sample_rate, ref_text);
 int n = codec_audio_lm_tts_split(alm, text, 0);      // the model's segmentation
 for (int i = 0; i < n; ++i) {
     req = codec_audio_lm_default_tts_request();
     req.text = codec_audio_lm_tts_segment(alm, i);
+    req.voice = voice;
     codec_audio_lm_tts_prompt(alm, &req, &vocab);
     codec_audio_lm_completion c;
     codec_audio_lm_get_completion(alm, &c);
@@ -120,16 +122,31 @@ frame-major codec codes (`CODEC_AUDIO_LM_DATA_CODES`, `width` codebooks) or
 latents (`CODEC_AUDIO_LM_DATA_LATENTS`, `width` = latent dim), already in codec
 form (control codebooks dropped, delay pattern undone, trailing silence
 tokens appended). The arrays stay valid until the next call; copy them.
-`codec_audio_lm_decode_generation` decodes such a copy with the current
-decoder speaker and leaves the in-progress generation alone; for the
+`codec_audio_lm_decode_generation` decodes such a copy with the voice it was
+made with (pass the request's voice) and leaves the in-progress generation alone; for the
 generation just made it gives exactly the PCM of `codec_audio_lm_decode`.
 
 ### Voices
 
-`codec_audio_lm_tts_set_voice` takes a builtin voice name
-(`codec_audio_lm_list_voices`), a speaker file, or a reference clip with its
-transcript, and computes the conditioning once per request. `save_speaker`
-writes the voice in use to a speaker GGUF (`docs/codec_speaker.md`).
+A voice is a `codec_speaker` holding all of the model's voice conditioning,
+whichever part of the model reads it: the backbone prompt (an x-vector, a
+reference's tokens / latents / transcript), the decoder (S3Gen's prompt), or
+both (Chatterbox, Qwen3-TTS ICL); see `docs/codec_speaker.md` for each
+model's slots. One structure for every model, so a host manages voices the
+same way everywhere:
+
+| Call | Voice |
+|---|---|
+| `codec_audio_lm_list_voices` / `codec_audio_lm_voice` | names of the builtin voices, or those in a speaker file |
+| `codec_audio_lm_get_voice(name)` | builtin (model-owned; NULL = the default, `<arch>.spk.default`) |
+| `codec_audio_lm_create_voice(pcm, n, sr, ref_text)` | cloned from a reference clip, all conditioning computed once (caller frees) |
+| `codec_audio_lm_load_voice(path, name)` / `codec_audio_lm_save_voice(voice, path, name)` | speaker GGUF of this model (hash-checked) |
+
+The voice goes in each request (`codec_audio_lm_tts_request.voice`) and each
+`codec_audio_lm_decode_generation`, never in the context, so one context can
+serve requests in different voices. A request borrows its voice until its
+generation is decoded. The default voice comes from the GGUF metadata;
+`--kv-override <arch>.spk.default=str:NAME` changes it.
 
 ### Segmentation and joining
 
