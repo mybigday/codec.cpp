@@ -43,7 +43,7 @@
 | NeuTTS-Nano | 🟡 | Same as Air; seed-fragile (~1/3 seeds collapse to silence) |
 | OuteTTS-1.0 (0.6B / Llama-1B) | 🟡 | Builtin voices in a per-model codec GGUF, no voice clone; see [models/outetts.md](models/outetts.md) |
 | OuteTTS-0.2 / 0.3 | 🟡 | Same; text reduced to a-z words (numbers / romanization are the caller's job) |
-| Pocket-TTS | 🟡 | Free-run quality noise-sensitive (also in reference); voice clone not validated |
+| Pocket-TTS | 🟡 | Free-run quality noise-sensitive (also in reference); voice clone not validated; see [models/pocket_tts.md](models/pocket_tts.md) |
 | MOSS-TTS-Nano-100M | 🟡 | AR loop runs in HF; codec.cpp decode only |
 | Soprano | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/soprano.md](models/soprano.md) |
 

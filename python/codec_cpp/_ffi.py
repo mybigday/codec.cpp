@@ -406,10 +406,7 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     # codec_lm.h — FlowLM
     "codec_lm_flow_get_info": (POINTER(codec_lm_flow_info), [c_void_p]),
     "codec_lm_flow_tokenize": (_status, [c_void_p, c_char_p, _i32p, c_int32, _i32p]),
-    "codec_lm_flow_speaker_rows": (_status, [c_void_p, _f32p, c_int32, _f32p, c_int32]),
-    "codec_lm_flow_prefill": (_status, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
-    "codec_lm_flow_step": (_status, [c_void_p, _f32p, _f32p, _f32p, _i32p]),
-    "codec_lm_flow_denorm_latent": (_status, [c_void_p, _f32p, _f32p]),
+    "codec_lm_flow_speaker_rows": (_status, [c_void_p, _f32p, c_int32, _f32p, c_int32, _i32p]),
 }
 
 

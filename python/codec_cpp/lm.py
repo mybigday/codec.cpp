@@ -276,22 +276,18 @@ class LM:
         return out[: n.value].copy()
 
     def flow_speaker_rows(self, mu) -> np.ndarray:
-        """Voice latent mu (ldim, n_voice) -> rows (n_voice, d_model)."""
+        """Voice latent mu (ldim, n_voice) -> prefix rows (n_rows, d_model):
+        bos_before_voice (when the model has it) + speaker_proj(mu)."""
         info = self.flow_info()
         if info is None:
             raise CodecError("codec_lm_flow_speaker_rows", _ffi.CODEC_STATUS_NOT_SUPPORTED)
         m = _f32(mu)
         n_voice = int(m.shape[1])
-        out = np.zeros((n_voice, int(info["d_model"])), np.float32)
-        self._check("codec_lm_flow_speaker_rows",
-                    lib().codec_lm_flow_speaker_rows(self.ptr, _fptr(m), n_voice, _fptr(out), n_voice))
-        return out
-
-    def flow_denorm_latent(self, latent) -> np.ndarray:
-        z = _f32(latent).reshape(-1)
-        out = np.zeros_like(z)
-        self._check("codec_lm_flow_denorm_latent", lib().codec_lm_flow_denorm_latent(self.ptr, _fptr(z), _fptr(out)))
-        return out
+        out = np.zeros((n_voice + 1, int(info["d_model"])), np.float32)
+        n = ctypes.c_int32(0)
+        self._check("codec_lm_flow_speaker_rows", lib().codec_lm_flow_speaker_rows(
+            self.ptr, _fptr(m), n_voice, _fptr(out), n_voice + 1, ctypes.byref(n)))
+        return out[: n.value].copy()
 
     def _free(self) -> None:
         # Called by Model.close(); states created from this adaptor must not
@@ -323,7 +319,6 @@ class LMState:
 
     def reset(self) -> None:
         lib().codec_lm_state_reset(self.ptr)
-        self._flow_latent = None
 
     def set_text_context(self, text_token: int) -> None:
         self._check("codec_lm_state_set_text_context",
@@ -372,7 +367,7 @@ class LMState:
             self.step_push_code(int(np.argmax(logits)))
         return self.step_finish()
 
-    # --- continuous latent (CONTINUOUS_LATENT_CFM) --------------------
+    # --- continuous latent (CONTINUOUS_LATENT_CFM, FLOW_LM) ------------
 
     def step_generate(self, h_in, *, cfg_value: float, n_timesteps: int,
                       noise=None) -> tuple[np.ndarray, bool]:
@@ -404,36 +399,6 @@ class LMState:
         p = None if patch is None else _f32(patch).reshape(-1)
         self._check("codec_lm_set_teacher_patch",
                     lib().codec_lm_set_teacher_patch(self.ptr, _fptr(p), 0 if p is None else p.size))
-
-    # --- FlowLM -------------------------------------------------------
-
-    def flow_prefill(self, token_ids, voice_rows=None) -> None:
-        ids = _i32(token_ids).reshape(-1)
-        vr = None if voice_rows is None else _f32(voice_rows)
-        n_voice = 0 if vr is None else int(vr.shape[0])
-        self._check("codec_lm_flow_prefill",
-                    lib().codec_lm_flow_prefill(self.ptr, _iptr(ids), ids.size, _fptr(vr), n_voice))
-        self._flow_latent = None
-
-    def flow_step(self, noise=None, *, prev_latent=None) -> tuple[np.ndarray, float, bool]:
-        """-> (latent (ldim,), eos logit, is_eos).
-
-        Each frame after the first consumes the previous latent; by default
-        that is the one this state produced last.  Pass ``prev_latent`` to
-        override it (teacher forcing).
-        """
-        info = self.lm.flow_info()
-        if info is None:
-            raise CodecError("codec_lm_flow_step", _ffi.CODEC_STATUS_NOT_SUPPORTED)
-        nz = None if noise is None else _f32(noise).reshape(-1)
-        prev = prev_latent if prev_latent is not None else getattr(self, "_flow_latent", None)
-        # In/out buffer: holds the previous latent on entry (non-BOS frames).
-        out = np.zeros(int(info["ldim"]), np.float32) if prev is None else np.array(prev, np.float32).reshape(-1)
-        eos_logit, is_eos = ctypes.c_float(0), ctypes.c_int32(0)
-        self._check("codec_lm_flow_step", lib().codec_lm_flow_step(
-            self.ptr, _fptr(nz), _fptr(out), ctypes.byref(eos_logit), ctypes.byref(is_eos)))
-        self._flow_latent = out.copy()
-        return out, float(eos_logit.value), bool(is_eos.value)
 
     def close(self) -> None:
         if getattr(self, "ptr", None):

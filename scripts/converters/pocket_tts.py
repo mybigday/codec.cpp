@@ -5,18 +5,15 @@ head + SentencePiece-4000 text LUT) driving a CUSTOM small Mimi (24 kHz,
 12.5 Hz frames, SEANet ratios [6,5,4], inner_dim 32 / outer 512, 2-layer
 LayerScale transformer, DummyQuantizer output_proj 32->512).
 
-This converter writes ONE gguf holding both the codec (Mimi-variant) and the
-LM (FlowLM), mirroring bluemagpie's audio-codec + lm split:
+The FlowLM transformer + out_norm (and the text LUT as its token_embd) are the
+llama.cpp backbone, written by scripts/convert-backbone-to-gguf.py as a stock
+`starcoder2` GGUF.  This converter writes the codec GGUF:
 
   codec.*        Mimi-variant hyperparams (decode/encode)
   <arch>.*       tensors for the Mimi-variant encoder/decoder
-  codec.lm.*     FlowLM hyperparams + LSD/EOS semantics
-  lm.*           FlowLM transformer + flow head + EOS head + text LUT
+  codec.lm.*     FlowLM adaptor hyperparams + LSD/EOS semantics
+  lm.*           step input projection, voice prefix, EOS head, flow head
   codec.lm.tokenizer.* SentencePiece model (base64 KV) + metadata
-
-Phase 1 delivers the foundation + the Mimi-variant decode/encode graphs.  The
-FlowLM codec_lm kind + synthesize land in Phase 2 (the lm.* tensors + metadata
-are baked here so Phase 2 only needs runtime wiring).
 
 The single english model.safetensors is the full TTSModel state dict (keys
 `mimi.*` and `flow_lm.*`), with weight-norm ALREADY folded to plain `.weight`
@@ -40,7 +37,8 @@ Key layout facts (verified against the checkpoint):
   `out_proj` (no bias).  RoPE max_period=10000, num_heads=8, head_dim=64,
   context=250.  NB: pocket_tts apply_rope is INTERLEAVED (real=x[...,0],
   imag=x[...,1] on adjacent pairs) => the runtime uses ggml NORMAL rope, NOT
-  NEOX.  The same interleaved convention applies to the FlowLM AR transformer.
+  NEOX.  The FlowLM transformer is interleaved too; the backbone converter
+  reorders its q/k rows for starcoder2's NEOX rope.
 """
 
 from __future__ import annotations
@@ -137,11 +135,6 @@ class PocketTTSConverter(BaseConverter):
             "flow_depth": 6,
             "flow_dim": 512,
             "lm_d_model": 1024,
-            "lm_heads": 16,
-            "lm_layers": 6,
-            "lm_head_dim": 1024 // 16,
-            "lm_ffn": 1024 * 4,
-            "lm_max_period": 10000.0,
             "lut_dim": 1024,
             "lut_n_bins": 4000,
             "ldim": 32,                        # latent dim (= quantizer.dimension)
@@ -336,8 +329,7 @@ class PocketTTSConverter(BaseConverter):
             if bias:
                 add_f32(out + ".b", t(src + ".bias"))
 
-        # ----- text LUT conditioner (Embedding (n_bins+1, dim)) ---------
-        add_f32("lm.text.embed.w", t("flow_lm.conditioner.embed.weight"))  # (4001, 1024)
+        # The transformer, out_norm and text LUT are the backbone GGUF's.
         add_lw("lm.input_linear.w", t("flow_lm.input_linear.weight"))      # (1024, 32)
         add_f32("lm.bos_emb", t("flow_lm.bos_emb").reshape(-1))            # (32,)
         add_f32("lm.emb_mean", t("flow_lm.emb_mean").reshape(-1))
@@ -347,26 +339,7 @@ class PocketTTSConverter(BaseConverter):
         if "flow_lm.speaker_proj_weight" in self.state_dict:
             add_lw("lm.speaker_proj.w", t("flow_lm.speaker_proj_weight"))  # (1024, 32)
 
-        # ----- AR transformer (StreamingTransformer, 6 layers) ----------
-        for i in range(cfg["lm_layers"]):
-            s = f"flow_lm.transformer.layers.{i}"
-            o = f"lm.tf.l{i}"
-            inp = t(f"{s}.self_attn.in_proj.weight")   # (3d, d)
-            q, k, v = np.split(inp, 3, axis=0)
-            add_lw(o + ".attn.q_proj.w", q)
-            add_lw(o + ".attn.k_proj.w", k)
-            add_lw(o + ".attn.v_proj.w", v)
-            add_lw(o + ".attn.o_proj.w", t(f"{s}.self_attn.out_proj.weight"))
-            add_lw(o + ".mlp.fc1.w", t(f"{s}.linear1.weight"))
-            add_lw(o + ".mlp.fc2.w", t(f"{s}.linear2.weight"))
-            add_f32(o + ".inln.w", t(f"{s}.norm1.weight"))
-            add_f32(o + ".inln.b", t(f"{s}.norm1.bias"))
-            add_f32(o + ".paln.w", t(f"{s}.norm2.weight"))
-            add_f32(o + ".paln.b", t(f"{s}.norm2.bias"))
-
-        # ----- out_norm + EOS head --------------------------------------
-        add_f32("lm.out_norm.w", t("flow_lm.out_norm.weight"))
-        add_f32("lm.out_norm.b", t("flow_lm.out_norm.bias"))
+        # ----- EOS head (on the backbone's out_norm'ed hidden) ----------
         add_lw("lm.out_eos.w", t("flow_lm.out_eos.weight"))   # (1, 1024)
         add_f32("lm.out_eos.b", t("flow_lm.out_eos.bias"))
 
@@ -397,13 +370,8 @@ class PocketTTSConverter(BaseConverter):
         # ----- LM metadata ----------------------------------------------
         writer.add_bool("codec.lm.has_adaptor", True)
         writer.add_string("codec.lm.kind", "flow_lm")
-        writer.add_string("codec.lm.host_arch", "flow_lm")
+        writer.add_string("codec.lm.host_arch", "starcoder2")
         writer.add_uint32("codec.lm.d_model", cfg["lm_d_model"])
-        writer.add_uint32("codec.lm.n_heads", cfg["lm_heads"])
-        writer.add_uint32("codec.lm.n_layers", cfg["lm_layers"])
-        writer.add_uint32("codec.lm.head_dim", cfg["lm_head_dim"])
-        writer.add_uint32("codec.lm.ffn_dim", cfg["lm_ffn"])
-        writer.add_float32("codec.lm.max_period", float(cfg["lm_max_period"]))
         writer.add_uint32("codec.lm.ldim", cfg["ldim"])
         writer.add_uint32("codec.lm.flow_depth", cfg["flow_depth"])
         writer.add_uint32("codec.lm.flow_dim", cfg["flow_dim"])
