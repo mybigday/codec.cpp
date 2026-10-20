@@ -213,6 +213,43 @@ void codec_speaker_add_slot(
     spk->slots.push_back(std::move(s));
 }
 
+bool codec_speaker_validate_token_prompt(const codec_model * /*model*/, const codec_speaker * spk, std::string * err) {
+    const codec_speaker_slot * ap = spk->slot("audio_prompt");
+    if (ap == nullptr || ap->type != GGML_TYPE_I32 || ap->nelements() != ap->ne[0] || ap->ne[0] <= 0) {
+        *err = "token-prompt speaker needs an I32 [N] audio_prompt slot";
+        return false;
+    }
+    const auto * v = reinterpret_cast<const int32_t *>(ap->data.data());
+    for (int64_t i = 0; i < ap->ne[0]; ++i) {
+        if (v[i] < 0) {
+            *err = "audio_prompt token id out of range";
+            return false;
+        }
+    }
+    if (spk->ref_text.empty()) {
+        *err = "token-prompt speaker needs ref_text";
+        return false;
+    }
+    return true;
+}
+
+bool codec_speaker_validate_ref_codes(const codec_model * model, const codec_speaker * spk, std::string * err) {
+    const codec_speaker_slot * rc = spk->slot("ref_codes");
+    if (model->n_q != 1 || rc == nullptr || rc->type != GGML_TYPE_I32 || rc->nelements() != rc->ne[0] ||
+        rc->ne[0] <= 0) {
+        *err = "speaker needs an I32 [T] ref_codes slot";
+        return false;
+    }
+    const auto * v = reinterpret_cast<const int32_t *>(rc->data.data());
+    for (int64_t i = 0; i < rc->ne[0]; ++i) {
+        if (v[i] < 0 || v[i] >= model->codebook_size) {
+            *err = "ref_codes token out of range";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool codec_model_load_speakers(codec_model * model, std::string * err) {
     const std::string & arch = model->arch_name;
     model->speaker_encoder_hash = codec_read_str_kv(model->gguf, spk_key(arch, "encoder_hash").c_str(),

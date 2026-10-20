@@ -85,6 +85,24 @@ SFT voices (`spk2info.pt`) carry only `embedding` (BreezyVoice also ships
 `prompt_token` / `prompt_feat`). The transcript (`ref_text`) selects zero-shot
 over cross-lingual prompting in the LM; see [cosyvoice.md](cosyvoice.md).
 
+## Token-codec speakers (TTS LM prompts)
+
+Some codecs only decode tokens that a TTS LM samples; their speakers condition
+the LM prompt, not the decoder. Such a codec GGUF is published for one TTS
+model, so a speaker may hold that backbone's token ids.
+
+| Codec | Slots | Model |
+|---|---|---|
+| DAC, WavTokenizer | `audio_prompt` I32 [N] (backbone token ids of the reference's audio section) + `ref_text` (text section) | OuteTTS ([outetts.md](models/outetts.md)) |
+| NeuCodec, distill NeuCodec | `ref_codes` I32 [T] (codec tokens) + `ref_text` (phonemes) | NeuTTS ([neutts.md](models/neutts.md)) |
+
+`scripts/bake-speakers.py` writes them into a copy of a codec GGUF (or a
+speaker file). OuteTTS speakers cannot be derived from audio;
+`codec_speaker_from_audio` on a distill NeuCodec runs its encoder, and its
+`encoder_hash` covers the distill encoder + DistilHuBERT weights. OuteTTS
+codec GGUFs hash the interface and backbone id instead, so speaker files do
+not cross between models.
+
 ## tts-cli
 
 Decoder speaker precedence: `--speaker-file` > `--ref-audio` (when the codec

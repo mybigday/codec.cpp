@@ -15,6 +15,7 @@ except ImportError:
     torch = None
 
 from .base import BaseConverter
+from .speaker import encoder_hash
 from utils.gguf_writer import GGUFWriter
 
 
@@ -435,6 +436,16 @@ class NeuCodecConverter(BaseConverter):
 
             # Hubert semantic model weights for distill-neucodec
             hubert_state, hubert_cfg = _load_hubert_state()
+            # codec_speaker_from_audio (NeuTTS `ref_codes`) runs exactly this
+            # encoder; speaker files carry its hash.
+            enc_prefixes = ("codec_encoder.", "SemanticEncoder_module.", "fc_prior.", "fc_sq_prior.",
+                            "generator.quantizer.project_in.")
+            enc_tensors = [(k, _to_numpy(v)) for k, v in self.state_dict.items() if k.startswith(enc_prefixes)]
+            enc_tensors += [("hubert." + k, _to_numpy(v)) for k, v in hubert_state.items()]
+            writer.add_string(f"{self.architecture}.spk.encoder_hash", encoder_hash(
+                enc_tensors,
+                "neucodec.spk.v1;encoder=distill;resample=torchaudio_sinc_hann(width=6,rolloff=0.99);"
+                "sample_rate=16000;slot=ref_codes"))
             writer.add_uint32("neucodec.hubert.hidden_size", int(hubert_cfg.hidden_size))
             writer.add_uint32("neucodec.hubert.num_heads", int(hubert_cfg.num_attention_heads))
             writer.add_uint32("neucodec.hubert.intermediate_size", int(hubert_cfg.intermediate_size))
