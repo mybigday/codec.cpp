@@ -173,126 +173,6 @@ class LM:
 
     # --- Chatterbox T3 helpers ----------------------------------------
 
-    def chatterbox_info(self) -> dict | None:
-        p = lib().codec_lm_chatterbox_get_info(self.ptr)
-        return _struct_dict(p.contents) if p else None
-
-    def chatterbox_tokenize(self, text: str, cap: int = 4096) -> np.ndarray:
-        out = np.zeros(cap, np.int32)
-        n = ctypes.c_int32(0)
-        self._check("codec_lm_chatterbox_tokenize", lib().codec_lm_chatterbox_tokenize(
-            self.ptr, text.encode("utf-8"), _iptr(out), cap, ctypes.byref(n)))
-        return out[: n.value].copy()
-
-    def chatterbox_normalize_text(self, text: str, cap: int = 0) -> str:
-        cap = cap or 4 * len(text.encode("utf-8")) + 64
-        buf = ctypes.create_string_buffer(cap)
-        self._check("codec_lm_chatterbox_normalize_text",
-                    lib().codec_lm_chatterbox_normalize_text(self.ptr, text.encode("utf-8"), buf, cap))
-        return buf.value.decode("utf-8")
-
-    def chatterbox_build_prompt(self, text_ids, *, cfg_weight: float = 0.0, speaker_emb=None,
-                                ref_speech_tokens=None, emotion: float | None = None, ref_pcm=None,
-                                ref_sample_rate: int = 0, cap_rows: int = 4096) -> np.ndarray:
-        """-> embeds (n_seq, seq_len, hidden); n_seq is 2 when CFG is active."""
-        info = self.chatterbox_info()
-        if info is None:
-            raise CodecError("codec_lm_chatterbox_build_prompt", _ffi.CODEC_STATUS_NOT_SUPPORTED)
-        ids = _i32(text_ids).reshape(-1)
-        emb = None if speaker_emb is None else _f32(speaker_emb).reshape(-1)
-        toks = None if ref_speech_tokens is None else _i32(ref_speech_tokens).reshape(-1)
-        emo = None if emotion is None else np.array([emotion], np.float32)
-        pcm = None if ref_pcm is None else _f32(ref_pcm).reshape(-1)
-        hidden = int(info["hidden_dim"])
-        out = np.zeros((cap_rows, hidden), np.float32)
-        seq_len, n_seq = ctypes.c_int32(0), ctypes.c_int32(0)
-        self._check("codec_lm_chatterbox_build_prompt", lib().codec_lm_chatterbox_build_prompt(
-            self.ptr, _iptr(ids), ids.size, float(cfg_weight),
-            _fptr(emb), 0 if emb is None else emb.size,
-            _iptr(toks), 0 if toks is None else toks.size,
-            _fptr(emo), _fptr(pcm), 0 if pcm is None else pcm.size, int(ref_sample_rate),
-            _fptr(out), cap_rows, ctypes.byref(seq_len), ctypes.byref(n_seq)))
-        return out[: n_seq.value * seq_len.value].reshape(n_seq.value, seq_len.value, hidden).copy()
-
-    def chatterbox_compose_speech_embd(self, code: int, pos: int) -> np.ndarray:
-        out = np.zeros(self.info.hidden_dim, np.float32)
-        self._check("codec_lm_chatterbox_compose_speech_embd", lib().codec_lm_chatterbox_compose_speech_embd(
-            self.ptr, int(code), int(pos), _fptr(out), out.size))
-        return out
-
-    # --- CosyVoice helpers --------------------------------------------
-
-    def cosyvoice_info(self) -> dict | None:
-        p = lib().codec_lm_cosyvoice_get_info(self.ptr)
-        if not p:
-            return None
-        d = _struct_dict(p.contents)
-        st = p.contents
-        d["silent_tokens"] = [int(st.silent_tokens[i]) for i in range(int(st.n_silent_tokens))] \
-            if st.silent_tokens else []
-        return d
-
-    def _cosy_hidden(self) -> int:
-        info = self.cosyvoice_info()
-        if info is None:
-            raise CodecError("codec_lm_cosyvoice_*", _ffi.CODEC_STATUS_NOT_SUPPORTED)
-        return int(info["hidden_dim"])
-
-    def cosyvoice_special_embd(self, which: int) -> np.ndarray:
-        out = np.zeros(self._cosy_hidden(), np.float32)
-        self._check("codec_lm_cosyvoice_special_embd",
-                    lib().codec_lm_cosyvoice_special_embd(self.ptr, int(which), _fptr(out), out.size))
-        return out
-
-    def cosyvoice_speech_embd(self, codes) -> np.ndarray:
-        c = _i32(codes).reshape(-1)
-        out = np.zeros((c.size, self._cosy_hidden()), np.float32)
-        self._check("codec_lm_cosyvoice_speech_embd",
-                    lib().codec_lm_cosyvoice_speech_embd(self.ptr, _iptr(c), c.size, _fptr(out), c.size))
-        return out
-
-    def cosyvoice_text_rows(self, text_ids, xvec=None, cap_rows: int = 0) -> np.ndarray:
-        ids = _i32(text_ids).reshape(-1)
-        xv = None if xvec is None else _f32(xvec).reshape(-1)
-        cap_rows = cap_rows or ids.size + 1
-        out = np.zeros((cap_rows, self._cosy_hidden()), np.float32)
-        rows = ctypes.c_int32(0)
-        self._check("codec_lm_cosyvoice_text_rows", lib().codec_lm_cosyvoice_text_rows(
-            self.ptr, _iptr(ids), ids.size, _fptr(xv), 0 if xv is None else xv.size,
-            _fptr(out), cap_rows, ctypes.byref(rows)))
-        return out[: rows.value].copy()
-
-    # --- FlowLM helpers -----------------------------------------------
-
-    def flow_info(self) -> dict | None:
-        p = lib().codec_lm_flow_get_info(self.ptr)
-        return _struct_dict(p.contents) if p else None
-
-    def flow_tokenize(self, text: str, cap: int = 4096) -> np.ndarray:
-        out = np.zeros(cap, np.int32)
-        n = ctypes.c_int32(0)
-        self._check("codec_lm_flow_tokenize", lib().codec_lm_flow_tokenize(
-            self.ptr, text.encode("utf-8"), _iptr(out), cap, ctypes.byref(n)))
-        return out[: n.value].copy()
-
-    def flow_speaker_rows(self, mu) -> np.ndarray:
-        """Voice latent mu (ldim, n_voice) -> rows (n_voice, d_model)."""
-        info = self.flow_info()
-        if info is None:
-            raise CodecError("codec_lm_flow_speaker_rows", _ffi.CODEC_STATUS_NOT_SUPPORTED)
-        m = _f32(mu)
-        n_voice = int(m.shape[1])
-        out = np.zeros((n_voice, int(info["d_model"])), np.float32)
-        self._check("codec_lm_flow_speaker_rows",
-                    lib().codec_lm_flow_speaker_rows(self.ptr, _fptr(m), n_voice, _fptr(out), n_voice))
-        return out
-
-    def flow_denorm_latent(self, latent) -> np.ndarray:
-        z = _f32(latent).reshape(-1)
-        out = np.zeros_like(z)
-        self._check("codec_lm_flow_denorm_latent", lib().codec_lm_flow_denorm_latent(self.ptr, _fptr(z), _fptr(out)))
-        return out
-
     def _free(self) -> None:
         # Called by Model.close(); states created from this adaptor must not
         # be used afterwards.
@@ -323,7 +203,6 @@ class LMState:
 
     def reset(self) -> None:
         lib().codec_lm_state_reset(self.ptr)
-        self._flow_latent = None
 
     def set_text_context(self, text_token: int) -> None:
         self._check("codec_lm_state_set_text_context",
@@ -406,34 +285,6 @@ class LMState:
                     lib().codec_lm_set_teacher_patch(self.ptr, _fptr(p), 0 if p is None else p.size))
 
     # --- FlowLM -------------------------------------------------------
-
-    def flow_prefill(self, token_ids, voice_rows=None) -> None:
-        ids = _i32(token_ids).reshape(-1)
-        vr = None if voice_rows is None else _f32(voice_rows)
-        n_voice = 0 if vr is None else int(vr.shape[0])
-        self._check("codec_lm_flow_prefill",
-                    lib().codec_lm_flow_prefill(self.ptr, _iptr(ids), ids.size, _fptr(vr), n_voice))
-        self._flow_latent = None
-
-    def flow_step(self, noise=None, *, prev_latent=None) -> tuple[np.ndarray, float, bool]:
-        """-> (latent (ldim,), eos logit, is_eos).
-
-        Each frame after the first consumes the previous latent; by default
-        that is the one this state produced last.  Pass ``prev_latent`` to
-        override it (teacher forcing).
-        """
-        info = self.lm.flow_info()
-        if info is None:
-            raise CodecError("codec_lm_flow_step", _ffi.CODEC_STATUS_NOT_SUPPORTED)
-        nz = None if noise is None else _f32(noise).reshape(-1)
-        prev = prev_latent if prev_latent is not None else getattr(self, "_flow_latent", None)
-        # In/out buffer: holds the previous latent on entry (non-BOS frames).
-        out = np.zeros(int(info["ldim"]), np.float32) if prev is None else np.array(prev, np.float32).reshape(-1)
-        eos_logit, is_eos = ctypes.c_float(0), ctypes.c_int32(0)
-        self._check("codec_lm_flow_step", lib().codec_lm_flow_step(
-            self.ptr, _fptr(nz), _fptr(out), ctypes.byref(eos_logit), ctypes.byref(is_eos)))
-        self._flow_latent = out.copy()
-        return out, float(eos_logit.value), bool(is_eos.value)
 
     def close(self) -> None:
         if getattr(self, "ptr", None):

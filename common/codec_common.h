@@ -198,9 +198,8 @@ bool audio_lm_list_speaker_file(audio_lm_context * ctx, const char * path,
 // Raw codec GGUF metadata value (stringified), or NULL when absent.
 const char * audio_lm_meta_str(const audio_lm_context * ctx, const char * key);
 
-// Borrowed handle to the underlying codec_lm (NULL when none loaded).
-// Lets a host reach model-specific helpers not wrapped by codec_common
-// (e.g. the Chatterbox T3 `codec_lm_chatterbox_*` prompt/tokenizer API).
+// Borrowed handle to the underlying codec_lm (NULL when none loaded); the
+// families reach their model-specific helpers (src/lm/lm_models.h) through it.
 struct codec_lm * audio_lm_get_lm(audio_lm_context * ctx);
 // The codec context (encode / decode of the codec model itself).
 struct codec_context * audio_lm_get_codec_context(audio_lm_context * ctx);

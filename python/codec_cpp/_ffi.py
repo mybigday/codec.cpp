@@ -217,94 +217,6 @@ class codec_lm_speaker_info(Structure):
     ]
 
 
-class codec_lm_chatterbox_info(Structure):
-    _fields_ = [
-        ("hidden_dim", c_int32),
-        ("text_vocab_size", c_int32),
-        ("speech_vocab_size", c_int32),
-        ("start_text_token", c_int32),
-        ("stop_text_token", c_int32),
-        ("start_speech_token", c_int32),
-        ("stop_speech_token", c_int32),
-        ("cond_rows", c_int32),
-        ("has_tokenizer", c_int32),
-        ("has_builtin_conds", c_int32),
-        ("is_multilingual", c_int32),
-        ("is_turbo", c_int32),
-        ("backbone_tokenizer", c_int32),
-        ("silence_token", c_int32),
-        ("n_trailing_silence", c_int32),
-        ("temperature", c_float),
-        ("top_k", c_int32),
-        ("top_p", c_float),
-        ("min_p", c_float),
-        ("repetition_penalty", c_float),
-        ("cfg_weight", c_float),
-    ]
-
-
-class codec_lm_cosyvoice_info(Structure):
-    _fields_ = [
-        ("version", c_int32),
-        ("hidden_dim", c_int32),
-        ("speech_token_size", c_int32),
-        ("n_vocab", c_int32),
-        ("special_in_speech_table", c_int32),
-        ("sos", c_int32),
-        ("task_id", c_int32),
-        ("stop_begin", c_int32),
-        ("stop_end", c_int32),
-        ("ignore_eos_id", c_int32),
-        ("text_in_backbone", c_int32),
-        ("has_text_encoder", c_int32),
-        ("ras_sampling", c_int32),
-        ("top_k", c_int32),
-        ("top_p", c_float),
-        ("win_size", c_int32),
-        ("tau_r", c_float),
-        ("min_token_text_ratio", c_float),
-        ("max_token_text_ratio", c_float),
-        ("n_silent_tokens", c_int32),
-        ("silent_tokens", POINTER(c_int32)),
-        ("max_silent_run", c_int32),
-        ("prompt_prefix", c_char_p),
-        ("bopomofo_frontend", c_int32),
-    ]
-
-
-class codec_lm_flow_info(Structure):
-    _fields_ = [
-        ("d_model", c_int32),
-        ("ldim", c_int32),
-        ("n_txt_bins", c_int32),
-        ("insert_bos_before_voice", c_int32),
-        ("frames_after_eos", c_int32),
-        ("temperature", c_float),
-        ("eos_threshold", c_float),
-        ("lsd_decode_steps", c_int32),
-        ("has_tokenizer", c_int32),
-    ]
-
-
-# ─── enums + structs (codec_audio_lm.h) ─────────────────────────────
-
-CODEC_AUDIO_LM_INPUT_TEXT = 1 << 0
-CODEC_AUDIO_LM_INPUT_AUDIO = 1 << 1
-CODEC_AUDIO_LM_OUTPUT_TEXT = 1 << 2
-CODEC_AUDIO_LM_OUTPUT_AUDIO = 1 << 3
-
-CODEC_AUDIO_LM_OBSERVE_PASSTHROUGH = 0
-CODEC_AUDIO_LM_OBSERVE_CONSUMED = 1
-CODEC_AUDIO_LM_OBSERVE_CONSUMED_EMBED = 2
-CODEC_AUDIO_LM_OBSERVE_STOP = 3
-
-CODEC_AUDIO_LM_KIND_UNKNOWN = 0
-CODEC_AUDIO_LM_KIND_RESIDUAL_DEPTH_AR = 1
-CODEC_AUDIO_LM_KIND_PARALLEL_HEADS_DELAY = 2
-CODEC_AUDIO_LM_KIND_CONTINUOUS_CFM = 3
-CODEC_AUDIO_LM_KIND_TOKEN_SINGLE_CB = 4
-
-
 class codec_audio_lm_params(Structure):
     _fields_ = [
         ("codec_path", c_char_p),
@@ -501,27 +413,6 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
         _status, [c_void_p, POINTER(codec_audio), _i32p, c_int32, _f32p, _f32p, c_int32]),
     "codec_lm_speaker_encode_from_embedding": (
         _status, [c_void_p, _f32p, c_int32, _i32p, c_int32, _f32p, _f32p, c_int32]),
-    # codec_lm.h — Chatterbox T3
-    "codec_lm_chatterbox_get_info": (POINTER(codec_lm_chatterbox_info), [c_void_p]),
-    "codec_lm_chatterbox_tokenize": (_status, [c_void_p, c_char_p, _i32p, c_int32, _i32p]),
-    "codec_lm_chatterbox_normalize_text": (_status, [c_void_p, c_char_p, ctypes.c_char_p, c_int32]),
-    "codec_lm_chatterbox_build_prompt": (
-        _status, [c_void_p, _i32p, c_int32, c_float, _f32p, c_int32, _i32p, c_int32, _f32p,
-                  _f32p, c_int32, c_int32, _f32p, c_int32, _i32p, _i32p]),
-    "codec_lm_chatterbox_compose_speech_embd": (_status, [c_void_p, c_int32, c_int32, _f32p, c_int32]),
-    # codec_lm.h — CosyVoice
-    "codec_lm_cosyvoice_get_info": (POINTER(codec_lm_cosyvoice_info), [c_void_p]),
-    "codec_lm_cosyvoice_special_embd": (_status, [c_void_p, c_int32, _f32p, c_int32]),
-    "codec_lm_cosyvoice_speech_embd": (_status, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
-    "codec_lm_cosyvoice_text_rows": (
-        _status, [c_void_p, _i32p, c_int32, _f32p, c_int32, _f32p, c_int32, _i32p]),
-    # codec_lm.h — FlowLM
-    "codec_lm_flow_get_info": (POINTER(codec_lm_flow_info), [c_void_p]),
-    "codec_lm_flow_tokenize": (_status, [c_void_p, c_char_p, _i32p, c_int32, _i32p]),
-    "codec_lm_flow_speaker_rows": (_status, [c_void_p, _f32p, c_int32, _f32p, c_int32]),
-    "codec_lm_flow_prefill": (_status, [c_void_p, _i32p, c_int32, _f32p, c_int32]),
-    "codec_lm_flow_step": (_status, [c_void_p, _f32p, _f32p, _f32p, _i32p]),
-    "codec_lm_flow_denorm_latent": (_status, [c_void_p, _f32p, _f32p]),
     # codec.h — logging (codec_log is variadic: call it as codec_log(level, b"%s", msg))
     "codec_log_set": (None, [codec_log_callback, c_void_p]),
 }

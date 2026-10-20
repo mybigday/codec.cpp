@@ -7,6 +7,7 @@
 // speech tokens (Turbo appends its trailing silence tokens).
 
 #include "audio_lm_family.h"
+#include "lm/lm_models.h"
 #include "audio_lm_sampler.h"
 #include "tts_segment.h"
 

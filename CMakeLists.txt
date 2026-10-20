@@ -144,6 +144,7 @@ target_include_directories(codec_audio_lm_objs
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)

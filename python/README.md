@@ -82,9 +82,9 @@ codes = st.step_greedy(hidden)             # depth decoder: one frame of codes f
 embd = lm.compose_audio_embd(codes)        # next backbone input row
 ```
 
-The family-specific helpers (`lm.chatterbox_*`, `lm.cosyvoice_*`, `lm.flow_*`,
-`st.step_generate` / `st.flow_step`) mirror their C functions one to one. The
-backbone itself runs in llama.cpp and is not part of this package.
+The other step calls (`st.step_generate` for continuous latents,
+`st.text_prefill`, ...) mirror their C functions one to one. The backbone
+itself runs in llama.cpp and is not part of this package.
 
 The high-level layer does not wrap every call. For the rest, use
 `codec_cpp.lib()` (the loaded `ctypes.CDLL`, with every prototype already

@@ -5,6 +5,7 @@
 // Reference: pocket_tts/models/tts_model.py.
 
 #include "audio_lm_family.h"
+#include "lm/lm_models.h"
 
 #include <cmath>
 #include <cstring>

@@ -14,6 +14,7 @@
 // sequence at the end.
 
 #include "audio_lm_family.h"
+#include "lm/lm_models.h"
 
 #include <algorithm>
 #include <cmath>

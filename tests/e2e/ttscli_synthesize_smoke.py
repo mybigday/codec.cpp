@@ -348,9 +348,9 @@ def main():
     # Pocket-TTS FlowLM — SELF-CONTAINED (no backbone): the AR transformer, text
     # LUT, LSD flow head and EOS head all live in the codec GGUF.  Routed on
     # codec.lm.kind="flow_lm"; tokenized by the baked SentencePiece model.  The
-    # LM math is bit-verified against the reference (tests/e2e/pocket_tts_lm_smoke.py:
-    # teacher-forced latent corr 0.9999, EOS agreement 1.0; free-run corr 0.96 with
-    # matched noise).  Here we assert the end-to-end pipeline runs, stops via the
+    # LM math was verified against the reference when it was ported (teacher-forced
+    # latent corr 0.9999, EOS agreement 1.0; free-run corr 0.96 with matched
+    # noise).  Here we assert the end-to-end pipeline runs, stops via the
     # EOS head, and writes audio.  Content is REPORT-ONLY: pocket-tts is a fragile
     # 100M short-utterance model whose free-run output quality depends on the CFM
     # noise stream (torch.randn), which C++ can't bit-reproduce — even the reference,

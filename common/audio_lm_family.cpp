@@ -1,4 +1,5 @@
 #include "audio_lm_family.h"
+#include "lm/lm_models.h"
 #include "kitten_text.h"
 #include "tts_segment.h"
 
