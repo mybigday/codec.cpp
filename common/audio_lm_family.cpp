@@ -1,4 +1,5 @@
 #include "audio_lm_family.h"
+#include "tts_runner.h"
 
 #include <cstring>
 
@@ -136,6 +137,12 @@ bool alm_family::set_voice(const alm_tts_voice & v) {
     return true;
 }
 
+std::vector<std::string> alm_family::split(const std::string & text, int32_t max_bytes) {
+    return max_bytes > 0 ? tts_split_text(text, max_bytes) : std::vector<std::string>{text};
+}
+
+int32_t alm_family::join(std::vector<float> &, int32_t, int32_t, int32_t) { return 0; }
+
 bool alm_family::prefill(const float *, int32_t) { return fail("this model takes no prompt hidden states"); }
 
 const float * alm_family::next_embd(int32_t) const { return nullptr; }
@@ -152,6 +159,7 @@ std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string 
     const char * arch = audio_lm_meta_str(alm, "general.architecture");
     const std::string a = arch ? arch : "";
     if (a == "soprano") return alm_family_soprano(alm);
+    if (alm_is_kitten(alm)) return alm_family_kitten(alm);
     if (audio_lm_get_lm(alm) == nullptr) {
         // Codec-only GGUFs whose model writes codec tokens with its own vocab.
         if (a == "neucodec" || a == "distill_neucodec") return alm_family_neutts(alm);

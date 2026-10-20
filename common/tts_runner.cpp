@@ -176,6 +176,18 @@ struct TextEmbdTable {
 // larger than any generation instead.
 static constexpr int32_t kRepPenaltyFullHistory = 1 << 16;
 
+// Sampler settings beyond the classic knobs (codec_audio_lm_sampler).
+struct BackboneSamplerExtra {
+    float   penalty_freq    = 0.0f;
+    float   penalty_present = 0.0f;
+    std::vector<llama_token> penalty_exempt;
+    float   dry_multiplier     = 0.0f;
+    float   dry_base           = 1.75f;
+    int32_t dry_allowed_length = 2;
+    int32_t dry_penalty_last_n = -1;
+    std::string samplers;   // llama.cpp --samplers order; "" = the default below
+};
+
 struct BackboneSampler {
     common_sampler * smpl = nullptr;
 
@@ -188,7 +200,7 @@ struct BackboneSampler {
                int32_t top_k, float top_p, float min_p, float rep_penalty,
                int32_t rep_last_n, const std::string & grammar,
                const std::vector<llama_logit_bias> & logit_bias,
-               std::string * err) {
+               std::string * err, const BackboneSamplerExtra * extra = nullptr) {
         common_params_sampling sp;
         sp.seed          = seed;
         sp.no_perf       = true;
@@ -210,6 +222,27 @@ struct BackboneSampler {
             COMMON_SAMPLER_TYPE_TOP_P,
             COMMON_SAMPLER_TYPE_TEMPERATURE,
         };
+        if (extra != nullptr) {
+            sp.penalty_freq    = extra->penalty_freq;
+            sp.penalty_present = extra->penalty_present;
+            sp.penalty_exempt  = extra->penalty_exempt;
+            if (sp.penalty_last_n == 0 && (sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f)) {
+                sp.penalty_last_n = rep_last_n > 0 ? rep_last_n : kRepPenaltyFullHistory;
+            }
+            sp.dry_multiplier     = extra->dry_multiplier;
+            sp.dry_base           = extra->dry_base;
+            sp.dry_allowed_length = extra->dry_allowed_length;
+            sp.dry_penalty_last_n = extra->dry_penalty_last_n;
+            sp.dry_sequence_breakers.clear();
+            if (!extra->samplers.empty()) {
+                std::vector<std::string> names;
+                std::stringstream ss(extra->samplers);
+                for (std::string n; std::getline(ss, n, ';');) if (!n.empty()) names.push_back(n);
+                sp.samplers = common_sampler_types_from_names(names);
+            } else if (sp.dry_multiplier > 0.0f) {
+                sp.samplers.insert(sp.samplers.begin() + 1, COMMON_SAMPLER_TYPE_DRY);
+            }
+        }
         if (!grammar.empty()) {
             sp.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
         }
@@ -2610,7 +2643,11 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
         out->error = what + ": " + codec_audio_lm_last_error(alm);
         return false;
     };
-    if (!codec_audio_lm_tts_prompt(alm, a.text.c_str(), a.instruct.empty() ? nullptr : a.instruct.c_str(), &cv)) {
+    codec_audio_lm_tts_request req = codec_audio_lm_default_tts_request();
+    req.text     = a.text.c_str();
+    req.instruct = a.instruct.empty() ? nullptr : a.instruct.c_str();
+    req.preset   = a.preset.empty() ? nullptr : a.preset.c_str();
+    if (!codec_audio_lm_tts_prompt(alm, &req, &cv)) {
         return fail("prompt");
     }
     codec_audio_lm_completion c;
@@ -2644,7 +2681,17 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
     };
     BackboneSampler smpl;
     std::string serr;
-    if (!smpl.build(s->lmodel, seed, temp, top_k, top_p, min_p, rep, sp.penalty_last_n, grammar, allowed_bias(-1), &serr)) {
+    BackboneSamplerExtra extra;
+    extra.penalty_freq    = sp.penalty_freq;
+    extra.penalty_present = sp.penalty_present;
+    extra.penalty_exempt.assign(sp.penalty_exempt, sp.penalty_exempt + sp.n_penalty_exempt);
+    extra.dry_multiplier     = sp.dry_multiplier;
+    extra.dry_base           = sp.dry_base;
+    extra.dry_allowed_length = sp.dry_allowed_length;
+    extra.dry_penalty_last_n = sp.dry_penalty_last_n;
+    extra.samplers = sp.samplers ? sp.samplers : "";
+    if (!smpl.build(s->lmodel, seed, temp, top_k, top_p, min_p, rep, sp.penalty_last_n, grammar, allowed_bias(-1), &serr,
+                    &extra)) {
         out->error = serr;
         return false;
     }
@@ -2929,7 +2976,14 @@ static bool tts_runner_run_impl(tts_runner_session * s, const tts_runner_params 
 static bool tts_runner_run_segments(tts_runner_session * s, const tts_runner_params & a, tts_runner_result * out) {
     tts_runner_params ra = a;
     ra.max_frames = s->max_frames;   // the context was sized for the load-time cap
-    const std::vector<std::string> segments = tts_split_text(a.text, a.segment_bytes);
+    std::vector<std::string> segments;
+    if (s->calm != nullptr) {
+        // The model's segmentation (KittenTTS splits on sentences past 380 chars).
+        const int32_t n = codec_audio_lm_tts_split(s->calm, a.text.c_str(), a.segment_bytes);
+        for (int32_t i = 0; i < n; ++i) segments.push_back(codec_audio_lm_tts_segment(s->calm, i));
+    } else {
+        segments = tts_split_text(a.text, a.segment_bytes);
+    }
     if (segments.empty()) {
         out->error = "empty text";
         return false;
@@ -2954,6 +3008,7 @@ static bool tts_runner_run_segments(tts_runner_session * s, const tts_runner_par
             std::printf("segment %zu/%zu: %zu bytes\n", i + 1, segments.size(), segments[i].size());
         }
         ra.text = segments[i];
+        if (s->calm != nullptr) ra.seed = (a.seed ? a.seed : 0xC0DEC1ABu) + (uint32_t) i;
         tts_runner_result r;
         std::unique_ptr<frame_streamer> fs;
         if (a.on_audio && a.stream_chunk_ms > 0 && s->flow == nullptr) {
@@ -2970,11 +3025,28 @@ static bool tts_runner_run_segments(tts_runner_session * s, const tts_runner_par
         out->stop_reason = r.stop_reason;
         out->sample_rate = r.sample_rate;
         out->n_channels  = r.n_channels;
+        // The model's joining: edge handling in place, then a gap of silence.
+        int32_t gap = 0;
+        if (s->calm != nullptr && !(fs && fs->used())) {
+            codec_pcm_buffer own{};
+            own.data = static_cast<float *>(std::malloc(std::max<size_t>(1, r.pcm.size()) * sizeof(float)));
+            if (!r.pcm.empty()) std::memcpy(own.data, r.pcm.data(), r.pcm.size() * sizeof(float));
+            own.n_channels  = r.n_channels;
+            own.n_samples   = (int32_t) (r.pcm.size() / (size_t) std::max(1, r.n_channels));
+            own.sample_rate = r.sample_rate;
+            gap = codec_audio_lm_tts_join(s->calm, &own, (int32_t) i, (int32_t) segments.size());
+            r.pcm.assign(own.data, own.data + (size_t) own.n_samples * (size_t) std::max(1, own.n_channels));
+            codec_pcm_buffer_free(&own);
+            gap = std::max(0, gap);
+        }
+        const std::vector<float> silence((size_t) gap * (size_t) std::max(1, r.n_channels), 0.0f);
         if (!a.on_audio) {
             out->pcm.insert(out->pcm.end(), r.pcm.begin(), r.pcm.end());
-        } else if (!(fs && fs->used()) && !r.pcm.empty() &&
-                   !a.on_audio(r.pcm.data(), (int32_t) (r.pcm.size() / std::max(1, r.n_channels)),
-                               r.sample_rate, r.n_channels)) {
+            out->pcm.insert(out->pcm.end(), silence.begin(), silence.end());
+        } else if (!(fs && fs->used()) &&
+                   ((!r.pcm.empty() && !a.on_audio(r.pcm.data(), (int32_t) (r.pcm.size() / std::max(1, r.n_channels)),
+                                                  r.sample_rate, r.n_channels)) ||
+                    (!silence.empty() && !a.on_audio(silence.data(), gap, r.sample_rate, r.n_channels)))) {
             out->error = "stopped by the caller";
             return false;
         }

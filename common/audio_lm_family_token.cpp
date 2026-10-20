@@ -80,8 +80,8 @@ public:
         return token_family::set_voice(v);
     }
 
-    bool tts_prompt(const std::string & text, const std::string &, const alm_vocab & vocab,
-                    alm_completion * out) override {
+    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
+        const std::string & text = req.text;
         if (!vocab.valid()) return fail("NeuTTS needs the backbone vocabulary");
         if (vocab.find_piece("<|TEXT_PROMPT_START|>") < 0) return fail("the backbone is not a NeuTTS model");
         begin(vocab);
@@ -249,8 +249,8 @@ public:
         return true;
     }
 
-    bool tts_prompt(const std::string & text, const std::string &, const alm_vocab & vocab,
-                    alm_completion * out) override {
+    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
+        const std::string & text = req.text;
         if (!vocab.valid()) return fail("OuteTTS needs the backbone vocabulary");
         outetts_version v{};
         if (!outetts_detect(vocab, &v)) return fail("the backbone is not an OuteTTS model");

@@ -7,6 +7,7 @@
 #   1. patches/barbet-llamacpp.patch     (BlueMagpie backbone, see barbet-llamacpp-README.md)
 #   2. patches/cosyvoice-llamacpp.patch  (CosyVoice-300M / BreezyVoice speech LM)
 #   3. patches/soprano-llamacpp.patch    (Soprano tokenizer: `tokenizer.ggml.pre = soprano`)
+#   4. patches/penalty-exempt-llamacpp.patch (penalties that skip a token list)
 #
 # Behaviour:
 #   - submodule not checked out          -> status message, skip.
@@ -26,7 +27,8 @@ set(_lp_dir  "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp")
 set(_lp_patches
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/barbet-llamacpp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/cosyvoice-llamacpp.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/soprano-llamacpp.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/soprano-llamacpp.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/penalty-exempt-llamacpp.patch")
 
 find_package(Git QUIET)
 if(NOT Git_FOUND)

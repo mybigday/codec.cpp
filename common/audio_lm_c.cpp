@@ -4,7 +4,6 @@
 #include "audio_lm_family.h"
 #include "codec_audio_lm.h"
 #include "codec_common.h"
-#include "tts_runner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -236,29 +235,52 @@ bool codec_audio_lm_tts_set_voice(struct codec_audio_lm * ctx, const struct code
     return ctx->family->set_voice(v) || ctx->fail_family();
 }
 
-bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const char * text, const char * instruct,
+struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void) {
+    codec_audio_lm_tts_request r{};
+    return r;
+}
+
+bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_request * req,
                                const struct codec_audio_lm_vocab * vocab) {
     if (ctx == nullptr) return false;
-    if (text == nullptr) return ctx->fail("text is required");
+    if (req == nullptr || req->text == nullptr) return ctx->fail("text is required");
     audio_lm_reset(ctx->alm);
     ctx->streamer.reset();
     ctx->chunks.clear();
+    alm_tts_request r;
+    r.text = req->text;
+    if (req->instruct) r.instruct = req->instruct;
+    if (req->preset)   r.preset = req->preset;
     alm_vocab v{vocab};
-    return ctx->family->tts_prompt(text, instruct ? instruct : "", v, &ctx->completion) || ctx->fail_family();
+    return ctx->family->tts_prompt(r, v, &ctx->completion) || ctx->fail_family();
 }
 
 int32_t codec_audio_lm_tts_split(struct codec_audio_lm * ctx, const char * text, int32_t max_bytes) {
     if (ctx == nullptr || text == nullptr) return -1;
     codec_audio_lm_caps caps{};
     ctx->family->caps(&caps);
-    const int32_t bytes = max_bytes > 0 ? max_bytes : caps.segment_bytes;
-    ctx->segments = bytes > 0 ? tts_split_text(text, bytes) : std::vector<std::string>{text};
+    ctx->segments = ctx->family->split(text, max_bytes > 0 ? max_bytes : caps.segment_bytes);
     return (int32_t) ctx->segments.size();
 }
 
 const char * codec_audio_lm_tts_segment(const struct codec_audio_lm * ctx, int32_t i) {
     if (ctx == nullptr || i < 0 || i >= (int32_t) ctx->segments.size()) return nullptr;
     return ctx->segments[(size_t) i].c_str();
+}
+
+int32_t codec_audio_lm_tts_join(struct codec_audio_lm * ctx, struct codec_pcm_buffer * pcm, int32_t i, int32_t n) {
+    if (ctx == nullptr || pcm == nullptr) return -1;
+    const int32_t nch = std::max(1, pcm->n_channels);
+    std::vector<float> v(pcm->data, pcm->data + (size_t) pcm->n_samples * (size_t) nch);
+    const int32_t gap = ctx->family->join(v, pcm->sample_rate, i, n);
+    if (v.size() != (size_t) pcm->n_samples * (size_t) nch) {
+        float * d = static_cast<float *>(std::realloc(pcm->data, std::max<size_t>(1, v.size()) * sizeof(float)));
+        if (d == nullptr) { ctx->fail("out of memory"); return -1; }
+        pcm->data = d;
+        pcm->n_samples = (int32_t) (v.size() / (size_t) nch);
+    }
+    if (!v.empty()) std::memcpy(pcm->data, v.data(), v.size() * sizeof(float));
+    return gap;
 }
 
 bool codec_audio_lm_get_completion(struct codec_audio_lm * ctx, struct codec_audio_lm_completion * out) {
@@ -289,6 +311,7 @@ bool codec_audio_lm_get_completion(struct codec_audio_lm * ctx, struct codec_aud
     out->sampler  = c.sampler;
     out->sampler.penalty_exempt   = c.penalty_exempt.empty() ? nullptr : c.penalty_exempt.data();
     out->sampler.n_penalty_exempt = (int32_t) c.penalty_exempt.size();
+    out->sampler.samplers         = c.samplers.c_str();
     out->grammar  = c.grammar.c_str();
     out->allowed  = c.allowed.empty() ? nullptr : c.allowed.data();
     out->n_allowed = (int32_t) c.allowed.size();

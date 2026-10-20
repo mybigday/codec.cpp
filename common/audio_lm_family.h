@@ -50,6 +50,7 @@ struct alm_completion {
     std::vector<std::vector<alm_chunk>> seqs;   // one chunk list per sequence
     codec_audio_lm_sampler sampler{};
     std::vector<int32_t> penalty_exempt;
+    std::string          samplers;   // order; "" = llama.cpp default
     std::string grammar;
     std::vector<codec_audio_lm_token_range> allowed;
     bool    needs_embeddings    = false;
@@ -61,6 +62,12 @@ struct alm_completion {
     int32_t stop_token          = -1;
 
     alm_completion();   // sampler "off" values
+};
+
+struct alm_tts_request {
+    std::string text;
+    std::string instruct;
+    std::string preset;
 };
 
 struct alm_tts_voice {
@@ -85,8 +92,11 @@ public:
                                        codec_audio_lm_backbone_req * out);
     // Default: the decoder speaker (speaker file > ref audio > voice > default).
     virtual bool set_voice(const alm_tts_voice & v);
-    virtual bool tts_prompt(const std::string & text, const std::string & instruct, const alm_vocab & vocab,
-                            alm_completion * out) = 0;
+    // Segmentation (codec_audio_lm_tts_split) and joining (tts_join).
+    // Default: tts_split_text at max_bytes (0 = whole text); no edge handling.
+    virtual std::vector<std::string> split(const std::string & text, int32_t max_bytes);
+    virtual int32_t join(std::vector<float> & pcm, int32_t sample_rate, int32_t i, int32_t n);
+    virtual bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) = 0;
     virtual bool prefill(const float * hiddens, int32_t n_pos);
     virtual bool observe(const int32_t * tokens, const float * hiddens, codec_audio_lm_verdict * v) = 0;
     virtual const float * next_embd(int32_t seq) const;
@@ -120,6 +130,8 @@ std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string 
 std::unique_ptr<alm_family> alm_family_soprano(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_neutts(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_outetts(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_kitten(audio_lm_context * alm);
+bool alm_is_kitten(audio_lm_context * alm);
 
 }  // namespace codec_common
 

@@ -24,7 +24,7 @@ extern "C" {
 //   codec_audio_lm_tts_set_voice(ctx, &voice)                  // once per request
 //   n = codec_audio_lm_tts_split(ctx, text, 0)                 // optional segmentation
 //   for each segment i (codec_audio_lm_tts_segment(ctx, i)):
-//       codec_audio_lm_tts_prompt(ctx, segment_text, instruct, &vocab)
+//       codec_audio_lm_tts_prompt(ctx, &{segment_text, instruct, preset}, &vocab)
 //       codec_audio_lm_get_completion(ctx, &c)
 //       if c.flow == SELF_CONTAINED: codec_audio_lm_generate_self_contained(ctx)
 //       else:
@@ -36,7 +36,7 @@ extern "C" {
 //               STOP -> break; FEED_TOKEN -> decode tok;
 //               FEED_EMBD -> decode codec_audio_lm_next_embd(ctx, s) on every sequence s
 //       codec_audio_lm_decode(ctx, &pcm)       // or stream_poll / stream_finish
-//       join: insert caps.segment_gap_ms of silence between segments
+//       gap = codec_audio_lm_tts_join(ctx, &pcm, i, n)   // then gap samples of silence
 //
 // Everything model-specific (prompt formats, conditioning, codec heads,
 // their sampling, stop rules) lives behind these calls; the API carries no
@@ -94,7 +94,7 @@ struct codec_audio_lm_caps {
     int32_t  sample_rate;           // output PCM rate
     int32_t  segment_bytes;         // segment size codec_audio_lm_tts_split uses by default
                                     // (0 = the model takes whole texts)
-    int32_t  segment_gap_ms;        // silence a host inserts between segments
+    const char * presets;           // sampling presets the model defines, ';'-separated ("" = none)
 };
 
 void codec_audio_lm_get_caps(const struct codec_audio_lm * ctx, struct codec_audio_lm_caps * out);
@@ -160,10 +160,17 @@ struct codec_audio_lm_tts_voice codec_audio_lm_default_tts_voice(void);
 
 bool codec_audio_lm_tts_set_voice(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_voice * voice);
 
-// Prompt for one text (one segment).  `instruct` (may be NULL) is used by
-// models that take it.  `vocab` may be NULL for self-contained models.
+struct codec_audio_lm_tts_request {
+    const char * text;          // required: one text (one segment)
+    const char * instruct;      // instruction text, for models that take it (may be NULL)
+    const char * preset;        // a sampling preset the model defines (caps.presets; NULL = default)
+};
+
+struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void);
+
+// Prompt for one request.  `vocab` may be NULL for self-contained models.
 // Resets the per-generation state; the voice stays.
-bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const char * text, const char * instruct,
+bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_request * req,
                                const struct codec_audio_lm_vocab * vocab);
 
 // ── TTS segmentation ─────────────────────────────────────────────────
@@ -173,6 +180,11 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const char * text, c
 // list; returns its size or -1.
 int32_t      codec_audio_lm_tts_split  (struct codec_audio_lm * ctx, const char * text, int32_t max_bytes);
 const char * codec_audio_lm_tts_segment(const struct codec_audio_lm * ctx, int32_t i);
+
+// Prepare segment i of n's decoded audio for joining (the model's edge
+// handling: trimming, fades), in place; returns the samples of silence to
+// insert before segment i + 1 (0 for the last), or -1.
+int32_t codec_audio_lm_tts_join(struct codec_audio_lm * ctx, struct codec_pcm_buffer * pcm, int32_t i, int32_t n);
 
 // ── Completion description (all prompt builders) ─────────────────────
 
@@ -222,6 +234,9 @@ struct codec_audio_lm_sampler {
     float    dry_base;
     int32_t  dry_allowed_length;
     int32_t  dry_penalty_last_n;   // -1: context size
+    // Sampler order, as llama.cpp's --samplers ("penalties;dry;top_k;top_p;
+    // min_p;temperature"); NULL / "" = llama.cpp's default order.
+    const char * samplers;
 };
 
 struct codec_audio_lm_token_range { int32_t begin, end; };   // [begin, end)

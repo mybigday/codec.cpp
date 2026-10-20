@@ -22,8 +22,8 @@ public:
         out->sample_rate = 32000;
     }
 
-    bool tts_prompt(const std::string & text, const std::string &, const alm_vocab & vocab,
-                    alm_completion * out) override {
+    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
+        const std::string & text = req.text;
         if (!vocab.valid()) return fail("Soprano needs the backbone vocabulary");
         hiddens_.clear();
         n_embd_ = 0;
