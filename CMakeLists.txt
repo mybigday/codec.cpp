@@ -125,6 +125,7 @@ add_library(codec_audio_lm_objs OBJECT
     common/audio_lm_c.cpp
     common/audio_lm_family.cpp
     common/audio_lm_family_soprano.cpp
+    common/audio_lm_family_token.cpp
     common/tts_segment.cpp
 )
 set_target_properties(codec_audio_lm_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)

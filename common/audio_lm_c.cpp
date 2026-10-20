@@ -209,10 +209,10 @@ bool codec_audio_lm_voice(const struct codec_audio_lm * ctx, int32_t i, const ch
 }
 
 bool codec_audio_lm_backbone_requirements(struct codec_audio_lm * ctx, const struct codec_audio_lm_vocab * vocab,
-                                          int32_t max_steps, struct codec_audio_lm_backbone_req * out) {
+                                          int32_t max_frames, struct codec_audio_lm_backbone_req * out) {
     if (ctx == nullptr || out == nullptr) return false;
     alm_vocab v{vocab};
-    return ctx->family->backbone_requirements(v, max_steps, out) || ctx->fail_family();
+    return ctx->family->backbone_requirements(v, max_frames, out) || ctx->fail_family();
 }
 
 struct codec_audio_lm_tts_voice codec_audio_lm_default_tts_voice(void) {
@@ -296,7 +296,9 @@ bool codec_audio_lm_get_completion(struct codec_audio_lm * ctx, struct codec_aud
     out->needs_prompt_hidden = c.needs_prompt_hidden;
     out->sample_first        = c.sample_first;
     out->streamable          = c.streamable;
-    out->max_steps           = c.max_steps;
+    out->max_frames          = c.max_frames;
+    out->min_frames          = c.min_frames;
+    out->stop_token          = c.stop_token;
     return true;
 }
 

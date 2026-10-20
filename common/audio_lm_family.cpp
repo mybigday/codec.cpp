@@ -94,8 +94,9 @@ void alm_family::caps(codec_audio_lm_caps * out) const {
     out->takes_ref_audio = audio_lm_codec_can_speaker_from_audio(alm_);
 }
 
-bool alm_family::backbone_requirements(const alm_vocab &, int32_t max_steps, codec_audio_lm_backbone_req * out) {
-    out->n_ctx      = std::max(4096, (max_steps > 0 ? max_steps : 512) + 512);
+bool alm_family::backbone_requirements(const alm_vocab &, int32_t max_frames, codec_audio_lm_backbone_req * out) {
+    out->n_ctx      = std::max(4096, (max_frames > 0 ? max_frames : 512) + 512);
+    out->n_ubatch   = 0;
     out->n_seq_max  = 1;
     out->embeddings = true;
     out->flash_attn = true;
@@ -149,7 +150,17 @@ bool alm_family::decode(audio_lm_audio_output * out) {
 
 std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string * err) {
     const char * arch = audio_lm_meta_str(alm, "general.architecture");
-    if (arch != nullptr && std::strcmp(arch, "soprano") == 0) return alm_family_soprano(alm);
+    const std::string a = arch ? arch : "";
+    if (a == "soprano") return alm_family_soprano(alm);
+    if (audio_lm_get_lm(alm) == nullptr) {
+        // Codec-only GGUFs whose model writes codec tokens with its own vocab.
+        if (a == "neucodec" || a == "distill_neucodec") return alm_family_neutts(alm);
+        const codec_speaker * spk = audio_lm_decode_speaker(alm);
+        codec_speaker_slot_type ty;
+        int64_t ne[4];
+        const void * data = nullptr;
+        if (spk != nullptr && codec_speaker_get_slot(spk, "audio_prompt", &ty, ne, &data)) return alm_family_outetts(alm);
+    }
     if (err) *err = std::string("no audio-LM recipe for this codec GGUF (architecture ") + (arch ? arch : "?") + ")";
     return nullptr;
 }

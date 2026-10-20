@@ -27,7 +27,7 @@ public:
         if (!vocab.valid()) return fail("Soprano needs the backbone vocabulary");
         hiddens_.clear();
         n_embd_ = 0;
-        stop_reason_ = "max_steps";
+        stop_reason_ = "max_frames";
         // The speech tokens are the contiguous pieces "[0]".."[N-1]"; the rest
         // of the vocab is the text BPE.
         int32_t off = -1, count = 0;
@@ -50,7 +50,7 @@ public:
         if (eos_ >= 0) out->allowed.push_back({eos_, eos_ + 1});
         out->needs_embeddings = true;
         out->sample_first = true;
-        out->max_steps = 512;
+        out->max_frames = 512;
         return true;
     }
 

@@ -22,6 +22,7 @@ struct alm_vocab {
     bool    valid() const { return v != nullptr && v->tokenize != nullptr && v->token_to_piece != nullptr; }
     int32_t n_tokens() const { return v ? v->n_tokens : 0; }
     int32_t eos() const { return v ? v->eos : -1; }
+    bool    is_eog(int32_t t) const { return v && (v->is_eog ? v->is_eog(v->user_data, t) : t == v->eos); }
     std::vector<int32_t> tokenize(const std::string & text, bool add_special, bool parse_special) const;
     std::string          piece(int32_t token) const;
     // Id of the token whose piece is exactly `text`, or -1.  Linear scan.
@@ -55,7 +56,9 @@ struct alm_completion {
     bool    needs_prompt_hidden = false;
     bool    sample_first        = true;
     bool    streamable          = false;
-    int32_t max_steps           = 0;
+    int32_t max_frames          = 0;
+    int32_t min_frames          = 0;
+    int32_t stop_token          = -1;
 
     alm_completion();   // sampler "off" values
 };
@@ -78,7 +81,7 @@ public:
 
     virtual const char * name() const = 0;
     virtual void caps(codec_audio_lm_caps * out) const;
-    virtual bool backbone_requirements(const alm_vocab & vocab, int32_t max_steps,
+    virtual bool backbone_requirements(const alm_vocab & vocab, int32_t max_frames,
                                        codec_audio_lm_backbone_req * out);
     // Default: the decoder speaker (speaker file > ref audio > voice > default).
     virtual bool set_voice(const alm_tts_voice & v);
@@ -87,7 +90,7 @@ public:
     virtual bool prefill(const float * hiddens, int32_t n_pos);
     virtual bool observe(const int32_t * tokens, const float * hiddens, codec_audio_lm_verdict * v) = 0;
     virtual const float * next_embd(int32_t seq) const;
-    // Set by observe() on STOP; "max_steps" until then.
+    // Set by observe() on STOP; "max_frames" until then.
     const std::string & stop_reason() const { return stop_reason_; }
     virtual bool generate_self_contained();
     // Default: audio_lm_decode_audio over the accumulated codes / latents.
@@ -102,7 +105,7 @@ protected:
     audio_lm_context * alm_;
     std::string        error_;
     alm_tts_voice      voice_;
-    std::string        stop_reason_ = "max_steps";
+    std::string        stop_reason_ = "max_frames";
 };
 
 // Wrap an audio_lm context the caller keeps owning (tts_runner while its
@@ -115,6 +118,8 @@ std::unique_ptr<alm_family> alm_make_family(audio_lm_context * alm, std::string 
 
 // Families (audio_lm_family_*.cpp).
 std::unique_ptr<alm_family> alm_family_soprano(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_neutts(audio_lm_context * alm);
+std::unique_ptr<alm_family> alm_family_outetts(audio_lm_context * alm);
 
 }  // namespace codec_common
 

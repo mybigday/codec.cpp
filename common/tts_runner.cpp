@@ -2585,6 +2585,10 @@ static int32_t calm_vocab_piece(void * ud, int32_t token, char * buf, int32_t ca
     return llama_token_to_piece((const llama_vocab *) ud, token, buf, cap, 0, true);
 }
 
+static bool calm_vocab_is_eog(void * ud, int32_t token) {
+    return llama_vocab_is_eog((const llama_vocab *) ud, token);
+}
+
 static codec_audio_lm_vocab calm_vocab(const llama_vocab * v) {
     codec_audio_lm_vocab cv{};
     cv.user_data      = (void *) v;
@@ -2592,6 +2596,7 @@ static codec_audio_lm_vocab calm_vocab(const llama_vocab * v) {
     cv.token_to_piece = calm_vocab_piece;
     cv.n_tokens       = llama_vocab_n_tokens(v);
     cv.eos            = llama_vocab_eos(v);
+    cv.is_eog         = calm_vocab_is_eog;
     return cv;
 }
 
@@ -2617,33 +2622,48 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
 
     // Sampler: the completion's settings, request overrides on top.
     const codec_audio_lm_sampler & sp = c.sampler;
-    const float   temp  = a.has_temp ? a.temp : sp.temp;
-    const float   top_p = a.has_top_p ? a.top_p : sp.top_p;
-    const int32_t top_k = a.has_top_k ? a.top_k : sp.top_k;
-    const float   min_p = a.has_min_p ? a.min_p : sp.min_p;
-    const float   rep   = a.has_rep_penalty ? a.repetition_penalty : sp.penalty_repeat;
+    const uint32_t seed  = a.seed ? a.seed : 0xC0DEC1ABu;
+    const float    temp  = a.has_temp ? a.temp : sp.temp;
+    const float    top_p = a.has_top_p ? a.top_p : sp.top_p;
+    const int32_t  top_k = a.has_top_k ? a.top_k : sp.top_k;
+    const float    min_p = a.has_min_p ? a.min_p : sp.min_p;
+    const float    rep   = a.has_rep_penalty ? a.repetition_penalty : sp.penalty_repeat;
     const std::string grammar = !a.grammar.empty() ? a.grammar : (c.grammar ? c.grammar : "");
-    std::vector<llama_logit_bias> bias;
-    if (a.grammar.empty() && c.n_allowed > 0) {
-        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    // Logit bias forbidding every token outside `allowed` (minus `except`).
+    auto allowed_bias = [&](int32_t except) {
+        std::vector<llama_logit_bias> bias;
+        if (c.n_allowed == 0) return bias;
         std::vector<char> ok((size_t) n_vocab, 0);
         for (int32_t i = 0; i < c.n_allowed; ++i) {
             for (int32_t t = std::max(0, c.allowed[i].begin); t < std::min(n_vocab, c.allowed[i].end); ++t) ok[(size_t) t] = 1;
         }
+        if (except >= 0 && except < n_vocab) ok[(size_t) except] = 0;
         for (int32_t t = 0; t < n_vocab; ++t) if (!ok[(size_t) t]) bias.push_back(llama_logit_bias{ t, -INFINITY });
-    }
+        return bias;
+    };
     BackboneSampler smpl;
     std::string serr;
-    if (!smpl.build(s->lmodel, a.seed, temp, top_k, top_p, min_p, rep, sp.penalty_last_n, grammar, bias, &serr)) {
+    if (!smpl.build(s->lmodel, seed, temp, top_k, top_p, min_p, rep, sp.penalty_last_n, grammar, allowed_bias(-1), &serr)) {
+        out->error = serr;
+        return false;
+    }
+    // Minimum length: a second sampler without the stop token (and without
+    // penalties / grammar) replaces a stop drawn too early.
+    const int32_t min_frames = a.min_len > 0 ? a.min_len : c.min_frames;
+    BackboneSampler guard;
+    const bool use_guard = min_frames > 0 && c.stop_token >= 0;
+    if (use_guard && !guard.build(s->lmodel, seed, temp, top_k, top_p, 0.0f, 1.0f, 0, std::string(),
+                                  allowed_bias(c.stop_token), &serr)) {
         out->error = serr;
         return false;
     }
 
     // Prompt: each chunk in order; logits / hidden on the last position.
+    const int32_t n_ctx = (int32_t) llama_n_ctx(lctx);
     int32_t n_past = 0;
     for (int32_t i = 0; i < c.n_chunks; ++i) {
         const codec_audio_lm_chunk & ch = c.chunks[i];
-        const bool last = i == c.n_chunks - 1;
         if (ch.type == CODEC_AUDIO_LM_CHUNK_EMBD) {
             if (ch.n <= 0) continue;
             if (!decode_embed_block(lctx, ch.embd, c.n_embd, ch.n, n_past)) { out->error = "prompt decode failed"; return false; }
@@ -2654,33 +2674,39 @@ static bool run_generic(tts_runner_session * s, const tts_runner_params & a, tts
             ? tokenize_str(vocab, ch.text, ch.add_special, ch.parse_special)
             : std::vector<llama_token>(ch.tokens, ch.tokens + ch.n);
         if (toks.empty()) continue;
+        if (n_past + (int32_t) toks.size() + 1 >= n_ctx) {
+            out->error = "the prompt (" + std::to_string(n_past + toks.size()) + " tokens) does not fit the backbone "
+                         "context (" + std::to_string(n_ctx) + "); shorten the reference or raise --max-frames";
+            return false;
+        }
         if (sp.penalize_prompt) for (llama_token t : toks) common_sampler_accept(smpl.smpl, t, /*is_generated=*/false);
         if (!decode_tokens(lctx, toks, n_past, /*all_pos=*/false)) { out->error = "prompt decode failed"; return false; }
         n_past += (int32_t) toks.size();
-        (void) last;
     }
 
-    const int32_t max_steps = a.max_frames > 0 ? a.max_frames : c.max_steps;
+    const int32_t max_frames = a.max_frames > 0 ? a.max_frames : c.max_frames;
     bool sample = c.sample_first;
     int32_t frames = 0;
     const char * stop = nullptr;
-    for (int32_t step = 0; step < max_steps; ++step) {
+    while (frames < max_frames) {
+        if (n_past >= n_ctx) { stop = "n_ctx"; break; }
         const float * h = c.needs_embeddings ? llama_get_embeddings_ith(lctx, -1) : nullptr;
         if (c.needs_embeddings && h == nullptr) { out->error = "backbone returned no hidden state"; return false; }
         llama_token tok = -1;
-        if (sample) tok = smpl.sample(lctx, -1);
+        if (sample) {
+            tok = smpl.sample(lctx, -1);   // always first: its random stream advances every step
+            if (use_guard && frames < min_frames && tok == c.stop_token) tok = guard.sample(lctx, -1);
+        }
         codec_audio_lm_verdict v{};
         if (!codec_audio_lm_observe(alm, sample ? &tok : nullptr, h, &v)) return fail("observe");
-        if (v.is_audio) {
-            ++frames;
-            if (c.streamable && !stream_poll(fs)) { stop = "stream_stopped"; break; }
-        }
+        if (v.is_audio) ++frames;
         if (v.action == CODEC_AUDIO_LM_STOP) break;
         bool ok = true;
         if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) ok = decode_tokens(lctx, {tok}, n_past, false);
         else ok = decode_embed(lctx, codec_audio_lm_next_embd(alm, 0), c.n_embd, n_past);
         if (!ok) { out->error = "decode failed"; return false; }
         ++n_past;
+        if (v.is_audio && c.streamable && !stream_poll(fs)) { out->error = "stream_stopped"; return false; }
         sample = v.sample_backbone;
     }
     if (stop == nullptr) stop = codec_audio_lm_stop_reason(alm);

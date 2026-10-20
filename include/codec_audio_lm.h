@@ -30,7 +30,7 @@ extern "C" {
 //       else:
 //           build a sampler from c.sampler (+ c.grammar), clear the KV cache
 //           for each sequence s: decode chunk 0..c.n_chunks-1 of s in order
-//           loop up to c.max_steps:
+//           loop until c.max_frames audio frames (or the context is full):
 //               tok = verdict.sample_backbone ? sample(backbone logits) : -1
 //               codec_audio_lm_observe(ctx, toks[], hiddens[], &verdict)
 //               STOP -> break; FEED_TOKEN -> decode tok;
@@ -121,6 +121,9 @@ struct codec_audio_lm_vocab {
     int32_t (*token_to_piece)(void * user_data, int32_t token, char * buf, int32_t cap);
     int32_t n_tokens;
     int32_t eos;                    // end-of-generation token (-1 = none)
+    // Optional: true for every end-of-generation token (llama_vocab_is_eog);
+    // NULL = only `eos`.
+    bool    (*is_eog)(void * user_data, int32_t token);
 };
 
 // What the backbone's llama context needs, given its vocabulary (some models
@@ -130,13 +133,14 @@ struct codec_audio_lm_vocab {
 // embeddings (pooling none) / flash_attn_type.
 struct codec_audio_lm_backbone_req {
     int32_t n_ctx;           // minimum context length
+    int32_t n_ubatch;        // physical batch (0 = n_ctx)
     int32_t n_seq_max;       // sequences decoded side by side (2: guidance pair)
     bool    embeddings;      // the context returns hidden states (no pooling)
     bool    flash_attn;      // false: the model needs flash attention disabled
 };
 
 bool codec_audio_lm_backbone_requirements(struct codec_audio_lm * ctx, const struct codec_audio_lm_vocab * vocab,
-                                          int32_t max_steps, struct codec_audio_lm_backbone_req * out);
+                                          int32_t max_frames, struct codec_audio_lm_backbone_req * out);
 
 // ── Text to speech ───────────────────────────────────────────────────
 
@@ -241,7 +245,14 @@ struct codec_audio_lm_completion {
     bool    sample_first;                  // the first step samples a backbone token
     bool    streamable;                    // stream_poll works during this generation (else
                                            // only the whole generation decodes)
-    int32_t max_steps;                     // AR step cap
+    int32_t max_frames;                    // audio frames to stop after (verdicts with is_audio)
+    // Minimum length: while fewer than min_frames audio frames exist, a
+    // sampled stop_token is replaced by one draw from a second sampler with
+    // the same temp / top_k / top_p, no penalties, no grammar, restricted to
+    // `allowed` minus stop_token (sample with the primary sampler first, so
+    // its random stream advances every step).
+    int32_t min_frames;
+    int32_t stop_token;
 };
 
 // The completion for the prepared prompt.
@@ -275,7 +286,7 @@ bool codec_audio_lm_observe(struct codec_audio_lm * ctx, const int32_t * tokens,
 const float * codec_audio_lm_next_embd(const struct codec_audio_lm * ctx, int32_t seq);
 
 // Why the generation ended ("eos", "eos_code_c0", "stop_head", ...), or
-// "max_steps" when the host's step cap ended it before a STOP verdict.
+// "max_frames" when the host's cap ended it before a STOP verdict.
 const char * codec_audio_lm_stop_reason(const struct codec_audio_lm * ctx);
 
 // Self-contained models: run the whole generation of the prepared prompt.
