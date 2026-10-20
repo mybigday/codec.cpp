@@ -89,6 +89,8 @@ bool tts_runner_make_voice(codec_audio_lm * alm, const tts_runner_params & a, tt
             out->use = codec_audio_lm_get_voice(alm, name);
             if (out->use == nullptr) { *err = codec_audio_lm_last_error(alm); return false; }
             codec_log(CODEC_LOG_LEVEL_INFO, "voice: %s\n", name);
+        } else {
+            out->use = a.voice_spk;
         }
     }
     if (out->owned != nullptr) out->use = out->owned;

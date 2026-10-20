@@ -32,7 +32,13 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <condition_variable>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <random>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +60,8 @@ struct args {
     std::string model;
     std::string backbone;
     std::string speaker_file;
+    std::string voice_dir;      // custom voices: stored here (*.gguf + *.json), served by id
+    bool        allow_voice_create = false;   // POST /v1/audio/voices (needs voice_dir)
     std::string model_id;       // `id` reported by /v1/models
     std::string host = "127.0.0.1";
     int32_t     port = 8080;
@@ -69,6 +77,7 @@ struct args {
 void print_usage(const char * argv0) {
     std::fprintf(stderr,
         "usage: %s --model CODEC.gguf [--backbone LLAMA.gguf] [--speaker-file SPK.gguf]\n"
+        "          [--voice-dir DIR [--allow-voice-create]]\n"
         "          [--host 127.0.0.1] [--port 8080] [--api-key KEY] [--model-id NAME]\n"
         "          [--gpu] [--n-threads N] [--max-frames N] [--override-kv KEY=TYPE:VALUE]\n"
         "          [--segment-bytes N (160; 0 = whole input)] [--stream-chunk-ms N (1000; 0 = per segment)]\n"
@@ -89,6 +98,8 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--backbone")     { if (!(v = need())) return false; out->backbone = v; }
         else if (a == "--speaker-file") { if (!(v = need())) return false; out->speaker_file = v; }
         else if (a == "--model-id")     { if (!(v = need())) return false; out->model_id = v; }
+        else if (a == "--voice-dir")    { if (!(v = need())) return false; out->voice_dir = v; }
+        else if (a == "--allow-voice-create") { out->allow_voice_create = true; }
         else if (a == "--host")         { if (!(v = need())) return false; out->host = v; }
         else if (a == "--port")         { if (!(v = need())) return false; out->port = std::atoi(v); }
         else if (a == "--api-key")      { if (!(v = need())) return false; out->api_key = v; }
@@ -113,7 +124,62 @@ bool parse_args(int argc, char ** argv, args * out) {
         if (base.size() > 5 && base.compare(base.size() - 5, 5, ".gguf") == 0) base.resize(base.size() - 5);
         out->model_id = base;
     }
+    if (out->allow_voice_create && out->voice_dir.empty()) {
+        std::fprintf(stderr, "--allow-voice-create needs --voice-dir\n");
+        return false;
+    }
     return !out->model.empty();
+}
+
+// Custom voices (OpenAI custom voices: POST /v1/audio/voices, then
+// "voice": {"id": ...}): codec speakers cloned from an uploaded sample, saved
+// as <dir>/<id>.gguf (the voice) + <dir>/<id>.json (name, created_at) and
+// loaded back at start.
+struct custom_voice {
+    std::string     id, name;
+    int64_t         created_at = 0;
+    codec_speaker * spk = nullptr;
+};
+
+struct voice_store {
+    std::map<std::string, custom_voice> voices;
+    ~voice_store() { for (auto & kv : voices) codec_speaker_free(kv.second.spk); }
+
+    json describe(const custom_voice & v) const {
+        return { { "object", "audio.voice" }, { "id", v.id }, { "name", v.name }, { "created_at", v.created_at } };
+    }
+    void load(codec_audio_lm * alm, const std::string & dir) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        for (const auto & e : std::filesystem::directory_iterator(dir, ec)) {
+            if (e.path().extension() != ".json") continue;
+            std::ifstream f(e.path());
+            const json meta = json::parse(f, nullptr, /*allow_exceptions=*/false);
+            if (!meta.is_object() || !meta.contains("id") || !meta["id"].is_string()) continue;
+            custom_voice v;
+            v.id = meta["id"].get<std::string>();
+            v.name = meta.value("name", v.id);
+            v.created_at = meta.value("created_at", (int64_t) 0);
+            const std::string gguf = (std::filesystem::path(dir) / (v.id + ".gguf")).string();
+            v.spk = codec_audio_lm_load_voice(alm, gguf.c_str(), nullptr);
+            if (v.spk == nullptr) {
+                std::fprintf(stderr, "voice %s skipped: %s\n", v.id.c_str(), codec_audio_lm_last_error(alm));
+                continue;
+            }
+            voices[v.id] = v;
+        }
+    }
+    const codec_speaker * find(const std::string & id) const {
+        const auto it = voices.find(id);
+        return it == voices.end() ? nullptr : it->second.spk;
+    }
+};
+
+std::string new_voice_id() {
+    static std::mt19937_64 rng(std::random_device{}() ^ (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count());
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "voice_%016llx", (unsigned long long) rng());
+    return buf;
 }
 
 json error_json(const std::string & message, const char * type, const char * param) {
@@ -243,6 +309,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::mutex run_mutex;
+    voice_store custom;
+    if (!a.voice_dir.empty()) {
+        custom.load(codec_common::tts_runner_audio_lm(session), a.voice_dir);
+        std::fprintf(stderr, "tts-server: %zu custom voices in %s%s\n", custom.voices.size(), a.voice_dir.c_str(),
+                     a.allow_voice_create ? " (creation enabled)" : "");
+    }
 
     httplib::Server svr;
     svr.set_pre_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
@@ -266,7 +338,64 @@ int main(int argc, char ** argv) {
     svr.Get("/v1/audio/voices", [&](const httplib::Request &, httplib::Response & res) {
         json j = { { "voices", info.voices } };
         j["default"] = info.default_voice.empty() ? json(nullptr) : json(info.default_voice);
+        json list = json::array();
+        {
+            std::lock_guard<std::mutex> lock(run_mutex);
+            for (const auto & kv : custom.voices) list.push_back(custom.describe(kv.second));
+        }
+        j["custom"] = list;
         res.set_content(j.dump(), "application/json");
+    });
+
+    // Create a voice from a recording: multipart `name` + `audio_sample`
+    // (WAV, at most 30 s); `ref_text`, the sample's transcript, is a
+    // codec.cpp extension models that prompt with it use. OpenAI's `consent`
+    // is not checked here.
+    svr.Post("/v1/audio/voices", [&](const httplib::Request & req, httplib::Response & res) {
+        if (a.voice_dir.empty() || !a.allow_voice_create) {
+            send_error(res, 403, "voice creation is disabled (start the server with --voice-dir DIR --allow-voice-create)");
+            return;
+        }
+        if (!req.is_multipart_form_data() || !req.form.has_field("name") || !req.form.has_file("audio_sample")) {
+            send_error(res, 400, "multipart 'name' and 'audio_sample' are required");
+            return;
+        }
+        const std::string name = req.form.get_field("name");
+        const std::string ref_text = req.form.has_field("ref_text") ? req.form.get_field("ref_text") : "";
+        const std::string id = new_voice_id();
+        const std::filesystem::path dir(a.voice_dir);
+        const std::string upload = (dir / ("." + id + ".wav")).string();
+        {
+            std::ofstream f(upload, std::ios::binary);
+            const std::string & bytes = req.form.get_file("audio_sample").content;
+            f.write(bytes.data(), (std::streamsize) bytes.size());
+        }
+        std::vector<float> pcm;
+        int32_t n = 0, sr = 0;
+        std::string err;
+        const bool read = codec_common::load_ref_audio(upload, pcm, &n, &sr, &err);
+        std::error_code ec;
+        std::filesystem::remove(upload, ec);
+        if (!read || n <= 0) { send_error(res, 400, "audio_sample is not a PCM16 WAV file", "invalid_request_error", "audio_sample"); return; }
+        if (n > (int64_t) 30 * sr) { send_error(res, 400, "audio_sample is longer than 30 seconds", "invalid_request_error", "audio_sample"); return; }
+
+        std::lock_guard<std::mutex> lock(run_mutex);
+        codec_audio_lm * alm = codec_common::tts_runner_audio_lm(session);
+        custom_voice v;
+        v.id = id;
+        v.name = name;
+        v.created_at = (int64_t) std::time(nullptr);
+        v.spk = codec_audio_lm_create_voice(alm, pcm.data(), n, sr, ref_text.empty() ? nullptr : ref_text.c_str());
+        if (v.spk == nullptr) { send_error(res, 400, codec_audio_lm_last_error(alm), "invalid_request_error", "audio_sample"); return; }
+        if (!codec_audio_lm_save_voice(alm, v.spk, (dir / (id + ".gguf")).string().c_str(), id.c_str())) {
+            codec_speaker_free(v.spk);
+            send_error(res, 500, codec_audio_lm_last_error(alm), "server_error");
+            return;
+        }
+        std::ofstream((dir / (id + ".json")).string()) << json{ { "id", id }, { "name", name }, { "created_at", v.created_at } }.dump();
+        custom.voices[id] = v;
+        std::fprintf(stderr, "voice %s (%s): %.1fs reference\n", id.c_str(), name.c_str(), (double) n / sr);
+        res.set_content(custom.describe(v).dump(), "application/json");
     });
 
     svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
@@ -279,6 +408,20 @@ int main(int argc, char ** argv) {
             return true;
         };
         std::string model, input, voice, instructions, format, stream_format;
+        const codec_speaker * custom_spk = nullptr;
+        if (body.contains("voice") && body["voice"].is_object()) {
+            // A custom voice: {"id": "voice_..."}.
+            const json & vid = body["voice"]["id"];
+            {
+                std::lock_guard<std::mutex> lock(run_mutex);
+                custom_spk = vid.is_string() ? custom.find(vid.get<std::string>()) : nullptr;
+            }
+            if (custom_spk == nullptr) {
+                send_error(res, 400, "unknown custom voice id", "invalid_request_error", "voice");
+                return;
+            }
+            body.erase("voice");
+        }
         if (!str_field("model", &model) || !str_field("input", &input) || !str_field("voice", &voice) ||
             !str_field("instructions", &instructions) || !str_field("response_format", &format) ||
             !str_field("stream_format", &stream_format)) {
@@ -314,6 +457,11 @@ int main(int argc, char ** argv) {
             send_error(res, 400, "this model takes no 'instructions'", "invalid_request_error", "instructions");
             return;
         }
+        if (!voice.empty() && custom_spk == nullptr) {
+            std::lock_guard<std::mutex> lock(run_mutex);
+            custom_spk = custom.find(voice);   // a custom voice's id given as a string
+            if (custom_spk != nullptr) voice.clear();
+        }
         if (!voice.empty()) {
             bool known = false;
             for (const auto & v : info.voices) known = known || v == voice;
@@ -343,7 +491,8 @@ int main(int argc, char ** argv) {
         codec_common::tts_runner_params rp = lp;
         rp.text         = input;
         rp.voice        = voice;
-        rp.speaker_file = a.speaker_file;
+        rp.speaker_file = custom_spk ? "" : a.speaker_file;
+        rp.voice_spk    = custom_spk;
         rp.instruct     = instructions;
         const bool sse  = stream_format == "sse";
 

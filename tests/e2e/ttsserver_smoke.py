@@ -3,6 +3,9 @@
 Starts the built server on KittenTTS 2 (builtin voices, backbone-driven) and
 asserts over HTTP:
 
+  * custom voices: POST /v1/audio/voices only with --voice-dir +
+    --allow-voice-create (403 otherwise), listed under `custom`, used with
+    "voice": {"id": ...}, and reloaded identically after a restart,
   * request validation: response_format required, unknown voice / format,
     speed != 1.0, instructions on a model without an instruct mode → 400 in
     OpenAI's error shape; a wrong API key → 401,
@@ -143,6 +146,55 @@ class Server:
             self.dump()
 
 
+def post_multipart(url, fields, files, key=KEY):
+    boundary = "codeccppboundary7f3a"
+    body = b""
+    for k, v in fields.items():
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    for k, (fname, data) in files.items():
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{fname}"\r\n'
+                 f"Content-Type: audio/wav\r\n\r\n").encode() + data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    r = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}", "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(r, timeout=600) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def custom_voices() -> None:
+    """OpenAI custom voices: create from a sample (only with --voice-dir and
+    --allow-voice-create), list, speak with {"id": ...}, reload after a restart."""
+    ref = REPO / "input_audio" / "10_2_24k.wav"
+    if not ref.exists():
+        print("[SKIP] custom voices: reference clip missing")
+        return
+    body = {"input": TEXT, "response_format": "wav"}
+    with tempfile.TemporaryDirectory() as d:
+        with Server() as srv:
+            code, data = post_multipart(srv.base + "/v1/audio/voices", {"name": "x"}, {"audio_sample": ("r.wav", ref.read_bytes())})
+            must(code == 403, f"voice creation without --voice-dir: {code} {data[:200]}")
+        with Server("--voice-dir", d, "--allow-voice-create") as srv:
+            code, data = post_multipart(srv.base + "/v1/audio/voices", {"name": "narrator"},
+                                        {"audio_sample": ("ref.wav", ref.read_bytes())})
+            must(code == 200, f"create voice: {code} {data[:300]}")
+            v = json.loads(data)
+            must(v["object"] == "audio.voice" and v["name"] == "narrator" and v["id"].startswith("voice_"), f"voice: {v}")
+            listed = get(srv.base + "/v1/audio/voices")["custom"]
+            must([x["id"] for x in listed] == [v["id"]], f"custom list: {listed}")
+            code, _, cloned = post(srv.base + "/v1/audio/speech", {**body, "voice": {"id": v["id"]}})
+            code2, _, default = post(srv.base + "/v1/audio/speech", body)
+            must(code == 200 and code2 == 200 and cloned != default, "the custom voice did not change the audio")
+        with Server("--voice-dir", d) as srv:   # stored voices are served without creation rights
+            code, _, again = post(srv.base + "/v1/audio/speech", {**body, "voice": {"id": v["id"]}})
+            must(code == 200 and again == cloned, "the stored voice did not reload identically")
+            code, _ = post_multipart(srv.base + "/v1/audio/voices", {"name": "y"}, {"audio_sample": ("r.wav", ref.read_bytes())})
+            must(code == 403, f"creation without --allow-voice-create: {code}")
+    print("[PASS] custom voices: gated create, list, speak by id, reload after restart")
+
+
 def main() -> int:
     if not SERVER.exists():
         print(f"[SKIP] {SERVER} not built")
@@ -150,6 +202,8 @@ def main() -> int:
     if not CODEC.exists() or not BACKBONE.exists():
         print(f"[SKIP] KittenTTS 2 assets missing under {KT}")
         return 0
+
+    custom_voices()
 
     with Server() as srv:
         base = srv.base

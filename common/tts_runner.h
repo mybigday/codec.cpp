@@ -123,7 +123,8 @@ codec_audio_lm * tts_runner_open_codec(const tts_runner_params & params, std::st
 // The request's codec_audio_lm_tts_request (pointers into `params`).
 codec_audio_lm_tts_request tts_runner_request(const tts_runner_params & params);
 // The request's voice: speaker_file > ref_audio (+ ref_text, when the model
-// can clone) > the builtin `voice` > the model default; save_speaker writes it.
+// can clone) > the builtin `voice` > `voice_spk` > the model default;
+// save_speaker writes it.
 struct tts_runner_voice {
     codec_speaker *       owned = nullptr;
     const codec_speaker * use   = nullptr;   // NULL: the model default
@@ -160,6 +161,8 @@ tts_runner_session * tts_runner_load(const tts_runner_params & params, std::stri
 bool                 tts_runner_run (tts_runner_session * s, const tts_runner_params & params,
                                      tts_runner_result * out);
 void                 tts_runner_free(tts_runner_session * s);
+// The session's codec_audio_lm, e.g. to create / load voices (serialize with the runs).
+codec_audio_lm *     tts_runner_audio_lm(tts_runner_session * s);
 // Voices are the codec GGUF's builtin speakers, or those in `speaker_file`
 // when the runs pass one.
 tts_runner_info      tts_runner_get_info(tts_runner_session * s, const std::string & speaker_file = "");

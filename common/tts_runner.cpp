@@ -495,6 +495,8 @@ tts_runner_session * tts_runner_load(const tts_runner_params & a, std::string * 
     return s;
 }
 
+codec_audio_lm * tts_runner_audio_lm(tts_runner_session * s) { return s ? s->alm : nullptr; }
+
 void tts_runner_free(tts_runner_session * s) { delete s; }
 
 tts_runner_info tts_runner_get_info(tts_runner_session * s, const std::string & speaker_file) {

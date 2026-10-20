@@ -116,10 +116,19 @@ How it differs from OpenAI's API:
   `_AAC` (libfdk-aac) or `_FLAC` (libFLAC). Asking for a format the build
   lacks returns a 400 error.
 - `voice` takes the model's own voice names (`GET /v1/audio/voices` lists
-  them). Leave it out to get the model's default voice. Speakers saved with
+  them). Leave it out to get the model's default voice; `--override-kv
+  <arch>.spk.default=str:NAME` changes the default. Speakers saved with
   `tts-cli --save-speaker` can be served with `--speaker-file FILE.gguf`.
-- Models that need reference audio for every request (Qwen3-TTS) do not work
-  with the server yet: the API has no field for the reference clip.
+- Custom voices, as in OpenAI's
+  [custom voices](https://developers.openai.com/api/docs/guides/custom-voices),
+  for models that clone (`--ref-audio` in tts-cli). With `--voice-dir DIR`
+  the server serves the voices stored there; adding `--allow-voice-create`
+  also enables `POST /v1/audio/voices` (multipart `name` + `audio_sample`, a
+  WAV of at most 30 s, plus an optional `ref_text` transcript, which models
+  such as Qwen3-TTS and CosyVoice use). It answers
+  `{"object": "audio.voice", "id": "voice_...", ...}`, stores the voice as
+  `DIR/<id>.gguf`, and requests use it with `"voice": {"id": "voice_..."}`.
+  `GET /v1/audio/voices` lists them under `custom`. `consent` is not checked.
 - `instructions` works only on models with an instruct mode (CosyVoice), and
   is passed through as the model expects it (CosyVoice-300M-Instruct: end it
   with `<|endofprompt|>`). `speed` must be 1.0.
