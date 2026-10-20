@@ -31,7 +31,7 @@
 | Chatterbox (Llama T3) | ✅ | See [models/chatterbox.md](models/chatterbox.md) |
 | BlueMagpie | ✅ | |
 | MOSS-TTS-Realtime | ✅ | |
-| Qwen3-TTS | ✅ | Base model requires reference audio |
+| Qwen3-TTS | ✅ | 0.6B Base needs reference audio; 0.6B / 1.7B CustomVoice builtin voices ([notes](models/qwen3_tts.md)) |
 | LFM2-Audio | ✅ | Must sample (greedy degenerates, as in reference) |
 | Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); CPU and Vulkan verified; see [models/chatterbox.md](models/chatterbox.md) |
 | CosyVoice-300M (base / SFT / Instruct) | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/cosyvoice.md](models/cosyvoice.md) |
@@ -43,7 +43,7 @@
 | NeuTTS-Nano | 🟡 | Same as Air; seed-fragile (~1/3 seeds collapse to silence) |
 | OuteTTS-1.0 (0.6B / Llama-1B) | 🟡 | Builtin voices in a per-model codec GGUF, no voice clone; see [models/outetts.md](models/outetts.md) |
 | OuteTTS-0.2 / 0.3 | 🟡 | Same; text reduced to a-z words (numbers / romanization are the caller's job) |
-| Pocket-TTS | 🟡 | Free-run quality noise-sensitive (also in reference); voice clone not validated |
+| Pocket-TTS | 🟡 | Free-run quality noise-sensitive (also in reference); voice clone not validated; see [models/pocket_tts.md](models/pocket_tts.md) |
 | MOSS-TTS-Nano-100M | 🟡 | AR loop runs in HF; codec.cpp decode only |
 | Soprano | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/soprano.md](models/soprano.md) |
 

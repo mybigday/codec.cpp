@@ -84,19 +84,18 @@ extern "C" {
 //                                       step_feedback_embd entry points instead
 //                                       of the codebook step machine.
 //                                       Models: BlueMagpie-TTS, VoxCPM2.
-// CODEC_LM_KIND_FLOW_LM             — Kyutai Pocket-TTS.  A SELF-CONTAINED
-//                                     continuous-latent AR model: the AR
-//                                     transformer, text LUT, flow head (LSD
-//                                     SimpleMLPAdaLN) and EOS head all live in
-//                                     the codec GGUF (no external llama.cpp
-//                                     backbone).  The sequence is
-//                                     [text LUT embeds | voice rows | AR latent
-//                                     embeds]; each step runs the transformer
-//                                     over its KV cache, emits an EOS logit and
-//                                     an LSD-decoded 32-d latent, then feeds that
-//                                     latent back as the next input.  Hosts run
-//                                     it through codec_audio_lm (self-contained
-//                                     completion), not the codebook / CFM steps.
+// CODEC_LM_KIND_FLOW_LM             — Kyutai Pocket-TTS.  Continuous-latent
+//                                     AR: the FlowLM transformer runs in
+//                                     llama.cpp (stock `starcoder2`, text LUT
+//                                     as token_embd); this adaptor owns the
+//                                     voice prefix rows, the step input
+//                                     embedding (input_linear of BOS / the
+//                                     previous latent), the EOS head and the
+//                                     LSD flow head.  Drives the continuous
+//                                     step machine (step_generate: one 32-d
+//                                     latent per step, patch_size 1;
+//                                     step_feedback_embd) plus the
+//                                     internal codec_lm_flow_* prompt helpers.
 //                                     Models: pocket-tts (english_2026-04 etc.).
 enum codec_lm_kind {
     CODEC_LM_KIND_UNKNOWN               = 0,
@@ -408,7 +407,8 @@ enum codec_status codec_lm_step_is_eos(
     int32_t *               out_is_eos);
 
 // ─────────────────────────────────────────────────────────────────────
-// Continuous-latent step machine (CONTINUOUS_LATENT_CFM kind only).
+// Continuous-latent step machine (CONTINUOUS_LATENT_CFM; FLOW_LM — see the
+// FlowLM section of src/lm/lm_models.h for its semantics).
 //
 // Replaces the codebook step machine.  One call runs the whole generation
 // step internally — tslm_adapter + FSQ + RALM step + LocDiT CFM diffusion —
@@ -486,7 +486,8 @@ enum codec_status codec_lm_set_continuous_min_len(
 // exactly and every emitted patch stays comparable to the reference (free-
 // running feedback diverges chaotically after a few steps under F16).  The
 // patch the graph emits is still codec's own.  Consumed once per step; re-arm
-// before each step.  Pass NULL to disarm.  CONTINUOUS_LATENT_CFM only.
+// before each step.  Pass NULL to disarm.  CONTINUOUS_LATENT_CFM; FLOW_LM
+// takes one denormalized [ldim] latent as the next step's input source.
 enum codec_status codec_lm_set_teacher_patch(
     struct codec_lm_state * st,
     const float *           patch,

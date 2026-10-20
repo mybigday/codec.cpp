@@ -323,6 +323,25 @@ def main():
             require_stop=True, cer_report_only=False,
         ))
 
+    # Qwen3-TTS CustomVoice — builtin voices from the codec GGUF: the talker's
+    # speaker row is codec_embedding[spk_id]; dialect voices (dylan = Beijing)
+    # also switch the control stream to the think + language-tag form.  1.7B
+    # takes --instruct (and has the talker→depth in_proj).
+    q3cv = REPO / "models" / "output" / "release"
+    for name, size, voice, text, lang, extra in [
+        ("qwen3_tts_cv_ryan", "0.6B", "ryan", "The birch canoe slid on the smooth planks.", "en", []),
+        ("qwen3_tts_cv_dylan", "0.6B", "dylan", "你好，欢迎使用语音合成。", "zh", []),
+        ("qwen3_tts_cv17_instruct", "1.7B", "vivian", "你好，欢迎使用语音合成。", "zh",
+         ["--instruct", "用特别开心的语气说"]),
+    ]:
+        d = q3cv / f"Qwen3-TTS-12Hz-{size}-CustomVoice"
+        results.append(_case(
+            name, d / "codec-q8_0.gguf", d / f"qwen3-tts-{size.lower()}-customvoice-q8_0.gguf",
+            text, lang, want_stop="eos_code_c0", cer_max=0.3,
+            extra=["--voice", voice, "--seed", "42", "--max-frames", "300"] + extra,
+            require_stop=True, cer_report_only=False, greedy=False,
+        ))
+
     # LFM2-Audio-1.5B — sequential text→audio TTS (residual depth-AR, 8 Mimi
     # codebooks).  The backbone (lfm2 arch) first free-runs in TEXT modality
     # off its tied-embedding lm_head; the "Perform TTS. Use the US male voice."
@@ -345,12 +364,11 @@ def main():
         greedy=False, require_stop=True,
     ))
 
-    # Pocket-TTS FlowLM — SELF-CONTAINED (no backbone): the AR transformer, text
-    # LUT, LSD flow head and EOS head all live in the codec GGUF.  Routed on
-    # codec.lm.kind="flow_lm"; tokenized by the baked SentencePiece model.  The
-    # LM math was verified against the reference when it was ported (teacher-forced
-    # latent corr 0.9999, EOS agreement 1.0; free-run corr 0.96 with matched
-    # noise).  Here we assert the end-to-end pipeline runs, stops via the
+    # Pocket-TTS FlowLM: the transformer is a stock starcoder2 backbone (text
+    # LUT as token_embd); codec_lm runs the step input projection, EOS head and
+    # LSD flow head.  The LM math was verified against the reference when it
+    # was ported (teacher-forced latent corr 0.99999, EOS agreement 1.0).  Here
+    # we assert the end-to-end pipeline runs, stops via the
     # EOS head, and writes audio.  Content is REPORT-ONLY: pocket-tts is a fragile
     # 100M short-utterance model whose free-run output quality depends on the CFM
     # noise stream (torch.randn), which C++ can't bit-reproduce — even the reference,
@@ -359,13 +377,13 @@ def main():
     results.append(_case(
         "pocket_tts",
         REPO / "models" / "pocket_tts" / "pocket_tts_en.gguf",
-        None,   # self-contained, no backbone
+        REPO / "models" / "pocket_tts" / "backbone-f16.gguf",
         "Hello world. This is a small text to speech model.",
         "en", want_stop="eos_head", cer_max=1.0,
         extra=["--seed", "11", "--max-frames", "80", "--min-len", "24"],
         greedy=False, require_stop=False,
         cer_report_only=True, audio_report_only=True,
-        stop_line="AR done",
+        stop_line="pocket AR done",
     ))
 
     # Soprano: Qwen3 backbone (tokenizer.ggml.pre = soprano) whose final-norm

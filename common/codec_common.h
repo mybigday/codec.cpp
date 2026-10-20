@@ -478,6 +478,13 @@ int32_t audio_lm_codec_latent_dim(const audio_lm_context * ctx);
 bool audio_lm_decode_latents(audio_lm_context * ctx, const float * latents,
                              int32_t n_frames, int32_t dim, audio_lm_audio_output * out);
 
+// Encode mono F32 PCM (any rate; resampled linearly to the codec's) to its continuous
+// latent, channel-major [dim, n_frames] (latent[d*n_frames + t]) — the input
+// codec_lm_flow_speaker_rows takes for Pocket-TTS voice conditioning.
+bool audio_lm_encode_latent(audio_lm_context * ctx, const float * pcm, int32_t n_samples,
+                            int32_t sample_rate, std::vector<float> * latent,
+                            int32_t * n_frames, int32_t * dim);
+
 // ═════════════════════════════════════════════════════════════════════
 // Host-driven AR (Phase B): prompt assembly + codebook step machine
 //

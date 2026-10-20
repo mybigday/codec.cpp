@@ -155,7 +155,6 @@ Classify every transformer in a new TTS / audio-LM model before writing code:
 - **Backbone = the main AR generator's transformer stack** (the model that emits audio tokens / latents step by step from text). It **always runs in llama.cpp** — even when its arch is non-stock (relative-position attention, cross-attention, custom norms). Missing arch → add a llama.cpp patch under `patches/<model>-llamacpp/`; never build a parallel AR runtime for it in codec.cpp. llama.cpp runs it embd-in / hidden-out (`docs/codec_lm.md`).
 - **codec_lm (codec.cpp)** = the adaptor between backbone and codec: audio embedding tables / compose, logit heads, and small transformers **downstream of the backbone** — per-step depth decoders (CSM / Qwen3-TTS / Moshi), flow/CFM heads, etc. Not generators in their own right.
 - **Run-once encoders upstream of the backbone** (speaker encoders, `cond_enc`, ViT-style prompt encoders) live in codec.cpp and hand the backbone prefill embeddings, as llama.cpp's MTMD does for vision encoders.
-- Self-contained exceptions (Pocket-TTS FlowLM) predate this rule; don't cite them as precedent.
 
 ### Lessons from prior model integrations
 

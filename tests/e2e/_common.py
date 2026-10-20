@@ -163,16 +163,28 @@ class LlamaBackbone:
         Returns the last row's hidden state (hidden,), or every row's
         (T, hidden) when ``all_hidden``.
         """
-        lc = self.lc
         embeds = np.ascontiguousarray(embeds, dtype=np.float32)
-        T = int(embeds.shape[0])
         if embeds.shape[1] != self.hidden:
             raise ValueError(f"feed_embeds: width {embeds.shape[1]} != model n_embd {self.hidden}")
-        batch = lc.llama_batch_init(T, self.hidden, 1)
+        return self._decode(int(embeds.shape[0]), embeds, all_hidden)
+
+    def feed_tokens(self, tokens, *, all_hidden: bool = False) -> np.ndarray:
+        """Append token ids (looked up in the backbone's token_embd); returns
+        hidden states as ``feed_embeds`` does."""
+        tokens = np.asarray(tokens, dtype=np.int32).reshape(-1)
+        return self._decode(int(tokens.size), tokens, all_hidden)
+
+    def _decode(self, T: int, rows: np.ndarray, all_hidden: bool) -> np.ndarray:
+        lc = self.lc
+        is_embd = rows.dtype == np.float32
+        batch = lc.llama_batch_init(T, self.hidden if is_embd else 0, 1)
         try:
             batch.n_tokens = T
-            ctypes.memmove(batch.embd, embeds.ctypes.data, embeds.nbytes)
+            if is_embd:
+                ctypes.memmove(batch.embd, rows.ctypes.data, rows.nbytes)
             for t in range(T):
+                if not is_embd:
+                    batch.token[t] = int(rows[t])
                 batch.pos[t] = self.pos + t
                 batch.n_seq_id[t] = 1
                 batch.seq_id[t][0] = 0
@@ -180,9 +192,9 @@ class LlamaBackbone:
             rc = lc.llama_decode(self.ctx, batch)
             if rc != 0:
                 raise RuntimeError(f"llama_decode rc={rc}")
-            rows = range(T) if all_hidden else (T - 1,)
-            out = np.zeros((len(rows), self.hidden), dtype=np.float32)
-            for i, t in enumerate(rows):
+            idx = range(T) if all_hidden else (T - 1,)
+            out = np.zeros((len(idx), self.hidden), dtype=np.float32)
+            for i, t in enumerate(idx):
                 p = lc.llama_get_embeddings_ith(self.ctx, t if all_hidden else -1)
                 if not p:
                     raise RuntimeError(f"llama_get_embeddings_ith({t}) returned NULL")

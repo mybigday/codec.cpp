@@ -189,19 +189,26 @@ enum codec_status codec_lm_cosyvoice_text_rows(
     const float * xvec, int32_t xvec_dim,
     float * out, int32_t out_cap_rows, int32_t * out_rows);
 
-// ─── Pocket-TTS FlowLM host-orchestration helpers (CODEC_LM_KIND_FLOW_LM) ───
-// FlowLM is self-contained: the AR transformer, text LUT, LSD flow head and EOS
-// head all live in the codec GGUF, so there is no llama.cpp backbone.  The host
-// drives generation entirely through these helpers.  All return
-// CODEC_STATUS_NOT_SUPPORTED when the model is not a FlowLM adaptor.
+// ─── Pocket-TTS FlowLM prompt helpers (CODEC_LM_KIND_FLOW_LM) ───
+// The backbone sequence is
+//   [ text tokens (b.token, backbone token_embd = text LUT) | voice prefix rows
+//     (b.embd) | per-frame input embeddings (b.embd) ]
+// Per frame: codec_lm_step_feedback_embd gives the next input embedding
+// (input_linear(bos_emb) before the first frame), the backbone's hidden goes
+// to codec_lm_step_generate, which writes the denormalized latent (what the
+// codec decodes) and sets out_stop when the EOS head fires — the host then runs
+// frames_after_eos more frames and drops the frame on which it stops, as the
+// reference does.  codec_lm_set_teacher_patch(latent) makes the next input
+// embedding come from a reference latent (parity tests).
+// All helpers return CODEC_STATUS_NOT_SUPPORTED when the model is not FlowLM.
 
 // Static config surfaced from `codec.lm.*` metadata.
 struct codec_lm_flow_info {
-    int32_t d_model;                 // AR transformer hidden (1024)
+    int32_t d_model;                 // backbone hidden (1024)
     int32_t ldim;                    // continuous latent dim (32)
     int32_t n_txt_bins;              // SentencePiece vocab (4000)
     int32_t insert_bos_before_voice; // 1 if a learned BOS row precedes voice rows
-    int32_t frames_after_eos;        // -1 = derive from word count (1-3), else fixed
+    int32_t frames_after_eos;        // -1 = derive from word count, else fixed
     float   temperature;             // LSD init-noise variance (0.7)
     float   eos_threshold;           // EOS fires when out_eos logit > this (-4.0)
     int32_t lsd_decode_steps;        // LSD Euler steps (1)
@@ -212,9 +219,9 @@ struct codec_lm_flow_info {
 const struct codec_lm_flow_info * codec_lm_flow_get_info(struct codec_lm * lm);
 
 // Tokenize `text` with the baked SentencePiece unigram model (identity
-// normalizer, add_dummy_prefix, byte fallback).  Writes ids into `out_ids`
-// (capacity `cap`); sets `*n_out`.  Does NOT prepend/append BOS/EOS.  Returns
-// NOT_SUPPORTED if no tokenizer is baked.
+// normalizer, add_dummy_prefix, byte fallback) into backbone token ids.
+// Writes ids into `out_ids` (capacity `cap`); sets `*n_out`.  Does NOT
+// prepend/append BOS/EOS.  Returns NOT_SUPPORTED if no tokenizer is baked.
 enum codec_status codec_lm_flow_tokenize(
     struct codec_lm * lm,
     const char *      text,
@@ -222,51 +229,19 @@ enum codec_status codec_lm_flow_tokenize(
     int32_t           cap,
     int32_t *         n_out);
 
-// Project a Mimi voice-conditioning latent `mu` [ldim × n_voice] (channel-major,
-// mu[d*n_voice + t]) through `speaker_proj` into `out` [n_voice × d_model] rows
-// (row-major, out[t*d_model + c]).  Used to build the voice-cloning rows for
-// codec_lm_flow_prefill.  Returns NOT_SUPPORTED if the model has no speaker_proj.
+// Voice prefix rows from a Mimi voice-conditioning latent `mu` [ldim × n_voice]
+// (channel-major, mu[d*n_voice + t]): the learned bos_before_voice row (when
+// insert_bos_before_voice) followed by speaker_proj(mu), written to `out`
+// [*n_out × d_model] row-major (capacity `out_cap_rows` rows, n_voice + 1
+// suffices).  Fed to the backbone right after the text tokens.  Returns
+// NOT_SUPPORTED if the model has no speaker_proj.
 enum codec_status codec_lm_flow_speaker_rows(
     struct codec_lm * lm,
     const float *     mu,
     int32_t           n_voice,
     float *           out,
-    int32_t           out_cap_rows);
-
-// Prefill the AR transformer KV cache over the prompt prefix:
-//   [ text LUT embeds (n_tok) | (bos_before_voice) | voice rows (n_voice) ]
-// `voice_rows` is [n_voice × d_model] row-major or NULL (text-only / default
-// voice).  Resets any prior generation state.  After this the state is primed
-// for codec_lm_flow_step.
-enum codec_status codec_lm_flow_prefill(
-    struct codec_lm_state * st,
-    const int32_t *         token_ids,
-    int32_t                 n_tok,
-    const float *           voice_rows,   // NULL = no voice conditioning
-    int32_t                 n_voice);
-
-// Advance one AR frame.  Runs the transformer step over the KV cache, computes
-// the EOS logit, samples LSD init noise (or uses `noise` [ldim] when non-NULL
-// for deterministic / parity runs), LSD-decodes the next latent, appends its
-// input embedding to the KV cache, and writes:
-//   out_latent   : [ldim] the generated latent (pre-denormalization).
-//   out_eos_logit: the raw out_eos scalar (optional; may be NULL).
-//   out_is_eos   : 1 if out_eos_logit > eos_threshold, else 0 (optional).
-// Feed successive frames until the EOS + frames_after_eos policy stops (host).
-enum codec_status codec_lm_flow_step(
-    struct codec_lm_state * st,
-    const float *           noise,          // [ldim] or NULL to sample
-    float *                 out_latent,     // [ldim]
-    float *                 out_eos_logit,  // scalar, optional
-    int32_t *               out_is_eos);    // optional
-
-// Denormalize a generated latent for Mimi decode: out = latent * emb_std +
-// emb_mean, elementwise over ldim.  (The FlowLM predicts normalized latents;
-// Mimi consumes the denormalized ones.)
-enum codec_status codec_lm_flow_denorm_latent(
-    struct codec_lm * lm,
-    const float *     latent,     // [ldim]
-    float *           out);       // [ldim]
+    int32_t           out_cap_rows,
+    int32_t *         n_out);
 
 #ifdef __cplusplus
 }

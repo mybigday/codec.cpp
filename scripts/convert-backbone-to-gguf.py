@@ -923,6 +923,100 @@ def write_cosyvoice1_backbone(src: Path, output: Path, outtype: str) -> None:
     w.close()
 
 
+def pocket_tts_checkpoint(src: Path) -> Path | None:
+    """kyutai/pocket-tts `model.safetensors` (local dir, or the HF repo's
+    languages/english/), or None when `src` is not a Pocket-TTS checkpoint."""
+    for st in (src / "model.safetensors", src / "languages" / "english" / "model.safetensors"):
+        if st.is_file():
+            from safetensors import safe_open
+            with safe_open(str(st), "np") as f:
+                if "flow_lm.transformer.layers.0.self_attn.in_proj.weight" in f.keys():
+                    return st
+    return None
+
+
+def write_pocket_tts_backbone(st_path: Path, output: Path, outtype: str) -> None:
+    """Pocket-TTS FlowLM transformer (`flow_lm.transformer.*` + `out_norm`) →
+    stock GGUF arch `starcoder2`: pre-LN affine LayerNorm, separate q/k/v,
+    non-gated GELU FFN, final LayerNorm.  The checkpoint has no linear biases;
+    starcoder2 requires them (q/k/v only in older llama.cpp), so they are zeros.
+    pocket_tts rotates interleaved pairs (2i, 2i+1); starcoder2 is NEOX
+    (i, i + d/2), so each head's q/k rows are reordered to [even, odd] — the
+    same permutation on q and k leaves q·k unchanged.  The text LUT
+    (`conditioner.embed`, n_bins + 1 rows) is `token_embd`: text positions are
+    fed as `b.token`; latent / voice positions as `b.embd` (codec_lm side)."""
+    import gguf
+    from safetensors import safe_open
+    sd = {}
+    with safe_open(str(st_path), "pt") as f:
+        for k in f.keys():
+            if k.startswith(("flow_lm.transformer.", "flow_lm.out_norm.")) or k == "flow_lm.conditioner.embed.weight":
+                sd[k[len("flow_lm."):]] = f.get_tensor(k).float().numpy()
+    # Fixed for every pocket-tts release (pocket_tts/config/*.yaml flow_lm.transformer).
+    n_head, max_period = 16, 10000.0
+    n_embd = sd["out_norm.weight"].shape[0]
+    n_layer = 1 + max(int(k.split(".")[2]) for k in sd if k.startswith("transformer.layers."))
+    n_ff = sd["transformer.layers.0.linear1.weight"].shape[0]
+    n_vocab = sd["conditioner.embed.weight"].shape[0]
+    head_dim = n_embd // n_head
+    # The checkpoint is BF16: f32 is capped at bf16 (never wider than the source).
+    qtype = {"f16": gguf.GGMLQuantizationType.F16, "bf16": gguf.GGMLQuantizationType.BF16,
+             "f32": gguf.GGMLQuantizationType.BF16}[outtype]
+
+    w = gguf.GGUFWriter(str(output), "starcoder2")
+    w.add_name("Pocket-TTS FlowLM")
+    w.add_context_length(8192)
+    w.add_embedding_length(n_embd)
+    w.add_block_count(n_layer)
+    w.add_feed_forward_length(n_ff)
+    w.add_head_count(n_head)
+    w.add_head_count_kv(n_head)
+    w.add_rope_freq_base(max_period)
+    w.add_layer_norm_eps(1e-5)
+    w.add_vocab_size(n_vocab)
+    w.add_file_type(gguf.LlamaFileType.MOSTLY_BF16 if qtype == gguf.GGMLQuantizationType.BF16
+                    else gguf.LlamaFileType.MOSTLY_F16)
+    w.add_tokenizer_model("none")   # tokenized by codec_lm's SentencePiece model
+
+    def add(name: str, arr) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if arr.ndim >= 2:
+            w.add_tensor(name, gguf.quants.quantize(arr, qtype), raw_dtype=qtype)
+        else:
+            w.add_tensor(name, arr)
+
+    def neox_rows(m: np.ndarray) -> np.ndarray:
+        m = m.reshape(n_head, head_dim // 2, 2, n_embd)
+        return m.transpose(0, 2, 1, 3).reshape(n_embd, n_embd)
+
+    add("token_embd.weight", sd["conditioner.embed.weight"])
+    add("output_norm.weight", sd["out_norm.weight"])
+    add("output_norm.bias", sd["out_norm.bias"])
+    zero = np.zeros(n_embd, dtype=np.float32)
+    for i in range(n_layer):
+        p, d = f"transformer.layers.{i}.", f"blk.{i}."
+        q, k, v = np.split(sd[p + "self_attn.in_proj.weight"], 3, axis=0)
+        add(d + "attn_norm.weight", sd[p + "norm1.weight"])
+        add(d + "attn_norm.bias", sd[p + "norm1.bias"])
+        add(d + "attn_q.weight", neox_rows(q))
+        add(d + "attn_k.weight", neox_rows(k))
+        add(d + "attn_v.weight", v)
+        for b in ("attn_q", "attn_k", "attn_v"):   # optional in current llama.cpp, required by older builds
+            add(d + b + ".bias", zero)
+        add(d + "attn_output.weight", sd[p + "self_attn.out_proj.weight"])
+        add(d + "attn_output.bias", zero)
+        add(d + "ffn_norm.weight", sd[p + "norm2.weight"])
+        add(d + "ffn_norm.bias", sd[p + "norm2.bias"])
+        add(d + "ffn_up.weight", sd[p + "linear1.weight"])
+        add(d + "ffn_up.bias", np.zeros(n_ff, dtype=np.float32))
+        add(d + "ffn_down.weight", sd[p + "linear2.weight"])
+        add(d + "ffn_down.bias", zero)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 # ---------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------
@@ -1029,6 +1123,12 @@ def main() -> int:
     if (src / "cosyvoice.yaml").is_file():   # CosyVoice v1: custom arch, written directly
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_cosyvoice1_backbone(src, args.output, args.outtype)
+        print(f"[bb] wrote {args.output}", flush=True)
+        return 0
+    pocket = pocket_tts_checkpoint(src)
+    if pocket is not None:                    # Pocket-TTS: stock starcoder2, written directly
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        write_pocket_tts_backbone(pocket, args.output, args.outtype)
         print(f"[bb] wrote {args.output}", flush=True)
         return 0
     if chatterbox_layout_detected(src):

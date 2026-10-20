@@ -55,6 +55,7 @@ set(CODEC_SOURCES
     src/runtime/perf_log.cpp
     src/runtime/log.cpp
     src/runtime/speaker.cpp
+    src/runtime/unicode_class.cpp
     src/ops/safe_math.cpp
     src/ops/ggml_ops.cpp
     src/ops/lm_attn.cpp
