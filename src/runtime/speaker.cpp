@@ -294,6 +294,18 @@ enum codec_status codec_speaker_from_audio(
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INVALID_ARG;
     }
+    // codec_prepare_mono_f32 keeps the channels interleaved; a speaker is
+    // always derived from the channel mean.
+    if (ref->n_channels > 1) {
+        const size_t n_ch = (size_t) ref->n_channels;
+        const size_t n = (size_t) ref->n_samples;
+        for (size_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (size_t c = 0; c < n_ch; ++c) acc += mono[i * n_ch + c];
+            mono[i] = acc / (float) n_ch;
+        }
+        mono.resize(n);
+    }
     auto spk = std::make_unique<codec_speaker>();
     spk->arch = model->arch_name;
     spk->encoder_hash = model->speaker_encoder_hash;
