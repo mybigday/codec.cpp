@@ -84,7 +84,7 @@ def _audio_struct(pcm, sample_rate: int) -> tuple[_ffi.codec_audio, np.ndarray]:
 def _take_pcm(pcm: _ffi.codec_pcm_buffer) -> tuple[np.ndarray, int]:
     try:
         n, nc = int(pcm.n_samples), max(1, int(pcm.n_channels))
-        out = np.ctypeslib.as_array(pcm.data, shape=(n,)).copy() if n else np.zeros(0, np.float32)
+        out = np.ctypeslib.as_array(pcm.data, shape=(n * nc,)).copy() if n else np.zeros(0, np.float32)
         if nc > 1:
             out = out.reshape(-1, nc)
         return out, int(pcm.sample_rate)
