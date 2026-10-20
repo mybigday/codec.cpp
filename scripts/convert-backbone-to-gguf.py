@@ -724,6 +724,23 @@ def prep_kitten_tts2(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
     return []
 
 
+# ---- Soprano (Qwen3 LM next to a Vocos decoder.pth) ----------------------
+
+def prep_soprano(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]:
+    """Soprano is a stock Qwen3ForCausalLM, but its tokenizer (lowercase +
+    whitespace collapse, per-digit split, raw-UTF-8 BPE) is no llama.cpp
+    pre-tokenizer: tag it `soprano`, which patches/soprano-llamacpp.patch
+    implements.  The decoder.pth half is the codec GGUF (--model-type soprano)."""
+    shutil.copy(src / "config.json", dst / "config.json")
+    _save_state_dict(load_state_dict(src), dst)
+    _copy_tokenizer(src, dst)
+    _write_generation_config(dst, bos=cfg.get("bos_token_id"), eos=cfg.get("eos_token_id"))
+    return [(
+        'raise NotImplementedError("BPE pre-tokenizer was not recognized - update get_vocab_base_pre()")',
+        'res = "soprano"  # patches/soprano-llamacpp.patch',
+    )]
+
+
 # ---- CosyVoice2 / CosyVoice3 (Qwen2-0.5B inside llm.pt) -------------------
 
 def _cosyvoice_special_tokens(version: int) -> list[str]:
@@ -921,6 +938,7 @@ PREPARERS: Dict[str, Callable[[Path, Path, dict], list[tuple[str, str]]]] = {
     "ChatterboxT3":                   prep_chatterbox_t3,
     "KittenTTS2":                     prep_kitten_tts2,
     "CosyVoice":                      prep_cosyvoice,
+    "Soprano":                        prep_soprano,
 }
 
 
@@ -1022,6 +1040,8 @@ def main() -> int:
         cfg = load_config(src)
         if cfg.get("type") == "KITTEN2":   # kittenml repo layout: LM under lm/
             cfg["architectures"] = ["KittenTTS2"]
+        elif (src / "decoder.pth").is_file() and cfg.get("model_type") == "qwen3":   # Soprano
+            cfg["architectures"] = ["Soprano"]
     arch = detect_arch(cfg)
     print(f"[bb] arch: {arch}", flush=True)
 

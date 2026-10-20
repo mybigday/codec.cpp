@@ -1753,6 +1753,28 @@ bool audio_lm_talker_trailing_text_embd(audio_lm_context * ctx,
     return true;
 }
 
+bool audio_lm_decode_latents(audio_lm_context * ctx, const float * latents,
+                             int32_t n_frames, int32_t dim, audio_lm_audio_output * out) {
+    if (ctx == nullptr || latents == nullptr || out == nullptr) return false;
+    if (n_frames <= 0) {
+        ctx->last_error = "audio_lm_decode_latents: no latents";
+        return false;
+    }
+    codec_pcm_buffer pcm = {};
+    const enum codec_status rc = codec_decode_quantized_representation(
+        ctx->codec_ctx, latents, dim, n_frames, &pcm, codec_decode_default_params());
+    if (rc != CODEC_STATUS_SUCCESS) {
+        const char * raw = codec_get_last_error(ctx->codec_ctx);
+        ctx->last_error = std::string("audio_lm_decode_latents: ") + (raw ? raw : "?");
+        return false;
+    }
+    out->pcm.assign(pcm.data, pcm.data + (size_t) pcm.n_samples * (size_t) pcm.n_channels);
+    out->sample_rate = pcm.sample_rate;
+    out->n_channels  = pcm.n_channels;
+    codec_pcm_buffer_free(&pcm);
+    return true;
+}
+
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out) {
     if (ctx == nullptr || out == nullptr) return false;
 

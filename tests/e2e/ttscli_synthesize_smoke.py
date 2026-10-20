@@ -402,6 +402,17 @@ def main():
         stop_line="AR done",
     ))
 
+    # Soprano: Qwen3 backbone (tokenizer.ggml.pre = soprano) whose final-norm
+    # hidden states feed the Vocos decoder directly; greedy, stops on [STOP].
+    results.append(_case(
+        "soprano",
+        REPO / "models" / "soprano" / "soprano.gguf",
+        REPO / "models" / "soprano" / "backbone-f16.gguf",
+        "The birch canoe slid on the smooth planks.",
+        "en", want_stop="eos", cer_max=0.10,
+        greedy=False, stop_line="soprano AR done",
+    ))
+
     # ── NeuTTS (phoneme input; voices baked into the distill NeuCodec GGUF) ───
     # Input is phonemized here as upstream neutts does (espeak en-us).  The
     # codec GGUF carries upstream's samples/ voices (scripts/bake-speakers.py,

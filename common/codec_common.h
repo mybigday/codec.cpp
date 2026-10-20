@@ -454,6 +454,13 @@ bool audio_lm_push_codes(audio_lm_context * ctx,
 // ─────────────────────────────────────────────────────────────────────
 bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out);
 
+// Decode host-collected latents straight through the codec, in the codec's
+// own `codec_decode_quantized_representation` layout (Soprano: frame-major
+// [n_frames, dim] backbone hidden states).  For codec-only continuous models
+// that have no codec_lm adaptor.
+bool audio_lm_decode_latents(audio_lm_context * ctx, const float * latents,
+                             int32_t n_frames, int32_t dim, audio_lm_audio_output * out);
+
 // ═════════════════════════════════════════════════════════════════════
 // Host-driven AR (Phase B): prompt assembly + codebook step machine
 //

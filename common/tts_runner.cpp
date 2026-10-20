@@ -2267,6 +2267,87 @@ bool run_kitten_tts2(audio_lm_context * ctx, llama_context * lctx, const llama_v
     return true;
 }
 
+// ── Soprano (codec-only Vocos decoder + Qwen3 backbone) ─────────────────────
+// Reference: soprano/tts.py + backends/transformers.py.  The prompt is
+// `[STOP][TEXT]{text}[START]`; the backbone generates until [STOP] (its eos)
+// and the decoder input is the final-norm hidden state that PREDICTS each
+// non-eos token (the first comes from the prompt's last position).  Sampling
+// defaults: temperature 0 (greedy), top-p 0.95, repetition penalty 1.2 over
+// prompt + generated ids, at most 512 new tokens.  The decoder output is
+// (n-1)*2048 samples, which is what the reference keeps.
+bool detect_soprano(audio_lm_context * ctx) {
+    const char * arch = audio_lm_meta_str(ctx, "general.architecture");
+    return arch != nullptr && std::strcmp(arch, "soprano") == 0;
+}
+
+bool run_soprano(audio_lm_context * ctx, llama_context * lctx, const llama_vocab * vocab,
+                 const tts_runner_params & a, tts_runner_result * out) {
+    const llama_model * lmodel = llama_get_model(lctx);
+    const int32_t n_embd = llama_model_n_embd(lmodel);
+    const llama_token eos = llama_vocab_eos(vocab);
+    const std::vector<llama_token> prompt =
+        tokenize_str(vocab, "[STOP][TEXT]" + a.text + "[START]", /*add_bos=*/false, /*parse_special=*/true);
+    if (prompt.size() < 3) { out->error = "Soprano: empty prompt"; return false; }
+
+    // The speech tokens are the contiguous pieces "[0]".."[N-1]"; the rest of
+    // the vocab is the text BPE.  Mask the stream to speech tokens + [STOP].
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    int32_t off = -1, count = 0;
+    char piece[32];
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        const int32_t n = llama_token_to_piece(vocab, id, piece, sizeof(piece) - 1, 0, true);
+        if (n <= 0) { if (off >= 0) break; continue; }
+        piece[n] = '\0';
+        char want[32];
+        std::snprintf(want, sizeof(want), "[%d]", count);
+        if (std::strcmp(piece, want) == 0) { if (off < 0) off = id; ++count; }
+        else if (off >= 0) break;
+    }
+    if (off < 0 || count == 0) { out->error = "Soprano: no [N] speech tokens in the backbone vocab"; return false; }
+
+    const float temp  = a.has_temp ? a.temp : 0.0f;
+    const float top_p = a.has_top_p ? a.top_p : 0.95f;
+    const float rep   = a.has_rep_penalty ? a.repetition_penalty : 1.2f;
+    const int32_t max_new = a.max_frames > 0 ? a.max_frames : 512;
+    BackboneSampler smpl;
+    std::string err;
+    if (!smpl.build(lmodel, a.seed, temp, a.has_top_k ? a.top_k : 0, top_p, /*min_p=*/0.0f, rep,
+                    /*rep_last_n=*/0, a.grammar,
+                    a.grammar.empty() ? build_flat_audio_mask(off, count, eos, n_vocab) : std::vector<llama_logit_bias>{},
+                    &err)) {
+        out->error = "Soprano: " + err;
+        return false;
+    }
+    for (llama_token t : prompt) common_sampler_accept(smpl.smpl, t, /*is_generated=*/false);
+    std::printf("soprano: %zu prompt tokens, temp=%.2f top_p=%.2f rep=%.2f\n", prompt.size(), temp, top_p, rep);
+
+    if (!decode_tokens(lctx, prompt, 0, /*all_pos=*/false)) { out->error = "Soprano: prompt decode failed"; return false; }
+    int32_t n_past = (int32_t) prompt.size();
+    std::vector<float> hiddens;
+    const char * stop_reason = "max_frames";
+    for (int32_t step = 0; step < max_new; ++step) {
+        const float * h = llama_get_embeddings_ith(lctx, -1);
+        if (h == nullptr) { out->error = "Soprano: backbone returned no hidden state"; return false; }
+        const llama_token tok = smpl.sample(lctx, -1);
+        if (tok == eos) { stop_reason = "eos"; break; }
+        hiddens.insert(hiddens.end(), h, h + n_embd);
+        if (!decode_tokens(lctx, {tok}, n_past++, false)) { out->error = "Soprano: decode failed"; return false; }
+    }
+    const int32_t n_frames = (int32_t) (hiddens.size() / (size_t) n_embd);
+    std::printf("soprano AR done: %d frames, stop=%s\n", n_frames, stop_reason);
+    if (n_frames < 2) { out->error = "Soprano: the model produced no speech"; return false; }
+
+    audio_lm_audio_output pcm;
+    const auto t_dec = std::chrono::steady_clock::now();
+    if (!audio_lm_decode_latents(ctx, hiddens.data(), n_frames, n_embd, &pcm)) {
+        out->error = audio_lm_last_error(ctx);
+        return false;
+    }
+    out->decode_ms = ms_since(t_dec);
+    fill_result_from_output(pcm, n_frames, stop_reason, out);
+    return true;
+}
+
 // Selects the codec decoder speaker for every flow: --speaker-file, else a
 // speaker derived from --ref-audio when the codec bundles the encoders, else
 // --voice, else the model default.  Optionally saves it (--save-speaker).
@@ -2598,6 +2679,14 @@ static bool tts_runner_synthesize_impl(const tts_runner_params & a, tts_runner_r
     // codec_lm — abort now with the original deferred error rather than fall
     // through to the codec_lm-backed flows (which would dereference an
     // unpopulated `pi`).
+    // Soprano: codec-only Vocos decoder fed the backbone's hidden states.
+    if (!pi_ok && detect_soprano(ctx)) {
+        const bool ok = run_soprano(ctx, lctx, vocab, a, out);
+        llama_free(lctx); llama_model_free(lmodel); llama_backend_free();
+        audio_lm_free(ctx);
+        return ok;
+    }
+
     // KittenTTS 2: codec-only S3G GGUF + Qwen3 speech-LM backbone.
     if (!pi_ok && detect_kitten_tts2(vocab)) {
         warn_grammar_unused(a.grammar, "KittenTTS");

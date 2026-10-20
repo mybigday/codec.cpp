@@ -45,6 +45,6 @@
 | OuteTTS-0.2 / 0.3 | 🟡 | Same; text reduced to a-z words (numbers / romanization are the caller's job) |
 | Pocket-TTS | 🟡 | Free-run quality noise-sensitive (also in reference); voice clone not validated |
 | MOSS-TTS-Nano-100M | 🟡 | AR loop runs in HF; codec.cpp decode only |
-| Soprano | 🚧 | Continuous hidden → Vocos path not wired into tts-cli |
+| Soprano | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/soprano.md](models/soprano.md) |
 
 Moshi is out of scope for `synthesize` (full-duplex, no Helium arch in llama.cpp); tts-cli refuses it.
