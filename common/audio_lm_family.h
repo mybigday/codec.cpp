@@ -171,6 +171,7 @@ std::unique_ptr<alm_family> alm_family_codebook(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_realtime(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_lfm2(audio_lm_context * alm);
 std::unique_ptr<alm_family> alm_family_chatterbox(audio_lm_context * alm, struct codec_lm * lm);
+std::unique_ptr<alm_family> alm_family_cosyvoice(audio_lm_context * alm, struct codec_lm * lm);
 
 }  // namespace codec_common
 

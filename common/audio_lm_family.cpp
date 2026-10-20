@@ -195,6 +195,7 @@ static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::stri
     if (alm_is_kitten(alm)) return alm_family_kitten(alm);
     if (codec_lm * lm = audio_lm_get_lm(alm)) {
         if (codec_lm_chatterbox_get_info(lm) != nullptr) return alm_family_chatterbox(alm, lm);
+        if (codec_lm_cosyvoice_get_info(lm) != nullptr) return alm_family_cosyvoice(alm, lm);
         audio_lm_prompt_info pi;
         if (codec_lm_chatterbox_get_info(lm) == nullptr && codec_lm_cosyvoice_get_info(lm) == nullptr &&
             audio_lm_get_prompt_info(alm, &pi) && !pi.is_continuous) {
