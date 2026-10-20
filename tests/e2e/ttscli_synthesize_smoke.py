@@ -291,6 +291,23 @@ def main():
         require_stop=True, cer_report_only=False,
     ))
 
+    # Qwen3-TTS Base, in-context voice prompt (upstream's default ICL mode):
+    # the reference's transcript and codes ride ahead of the text, and the
+    # decode prepends the reference's codes and cuts their share of the audio.
+    _jfk_txt = REPO / "assets" / "refs" / "jfk_en.txt"
+    if _jfk_txt.exists():
+        results.append(_case(
+            "qwen3_tts_icl",
+            REPO / "models" / "qwen3_tts" / "qwen3_tts_06b_base.gguf",
+            REPO / "models" / "qwen3_tts" / "qwen3_tts_talker.gguf",
+            "The birch canoe slid on the smooth planks.",
+            "en", want_stop="eos_code_c0", cer_max=0.15, dur_max=6.0,
+            extra=["--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav"),
+                   "--ref-text", _jfk_txt.read_text().strip(),
+                   "--temp", "0.9", "--top-k", "50", "--seed", "2", "--max-frames", "300"],
+            greedy=False, require_stop=True,
+        ))
+
     # Qwen3-TTS with a 48 kHz reference clip.  The ECAPA-TDNN speaker encoder
     # works at 24 kHz (codec.speaker.ref_sample_rate); arbitrary --ref-audio
     # rates (24k/44.1k/48k) must be resampled to that rate before the encode

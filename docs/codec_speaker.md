@@ -110,6 +110,7 @@ model, so a speaker may hold that backbone's token ids.
 | NeuCodec, distill NeuCodec | `ref_codes` I32 [T] (codec tokens) + `ref_text` (phonemes) | NeuTTS ([neutts.md](models/neutts.md)) |
 | Pocket-Mimi | `latents` F32 [T, 32] (Mimi encoder latent of the first 30 s; the FlowLM applies `speaker_proj`) | Pocket-TTS ([pocket_tts.md](models/pocket_tts.md)) |
 | Qwen3-TTS-Tokenizer | `spk_id` I32 [1] (talker codec-vocab row used as the speaker row) + optional `language_id` I32 [1] (dialect tag) | Qwen3-TTS CustomVoice ([qwen3_tts.md](models/qwen3_tts.md)) |
+| Qwen3-TTS-Tokenizer + ECAPA-TDNN | `xvector` F32 [hidden] (speaker row) + `ref_codes` I32 [16, T] + `ref_text` (in-context prompt) | Qwen3-TTS Base, cloned |
 
 `scripts/bake-speakers.py` writes them into a copy of a codec GGUF (or a
 speaker file). OuteTTS speakers cannot be derived from audio;
@@ -118,7 +119,7 @@ speaker file). OuteTTS speakers cannot be derived from audio;
 codec GGUFs hash the interface and backbone id instead, so speaker files do
 not cross between models. Qwen3-TTS CustomVoice voices come from the
 checkpoint's `talker_config.spk_id` at conversion; their hash covers the
-talker codec_embedding table the ids index. Pocket-TTS hashes the Mimi encoder (SEANet, encoder transformer, downsample).
+talker codec_embedding table the ids index; Base GGUFs hash the ECAPA weights. Pocket-TTS hashes the Mimi encoder (SEANet, encoder transformer, downsample).
 
 ## tts-cli
 

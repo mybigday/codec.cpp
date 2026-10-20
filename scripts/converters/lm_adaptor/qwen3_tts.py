@@ -548,6 +548,16 @@ def _dump_qwen3_tts_speaker_encoder(writer, sd, cfg, *, verbose=False):
     writer.add_uint32 ("codec.speaker.ecapa.fmax", fmax)
     writer.add_bool   ("codec.speaker.ecapa.center", center)
 
+    # Cloned voices (codec speaker_from_audio) are the x-vector + the
+    # reference's codes from the bundled Qwen3-TTS-Tokenizer encoder; the
+    # hash covers the ECAPA weights and names that tokenizer.
+    from ..speaker import encoder_hash
+    arch = writer.kv[0][2]
+    enc = [(k, v) for k, v in sd.items() if k.startswith("speaker_encoder.")]
+    writer.add_string(f"{arch}.spk.encoder_hash", encoder_hash(
+        enc, "qwen3_tts.spk.v2;resample=torchaudio_sinc_hann(width=6,rolloff=0.99);sample_rate=24000;"
+             "slot=xvector,ref_codes;ref_codes=Qwen3-TTS-Tokenizer-12Hz encoder"))
+
     if verbose:
         print(f"[lm_adaptor:qwen3_tts] speaker_encoder ECAPA-TDNN: "
               f"mel_dim={mel_dim} enc_dim={enc_dim} "

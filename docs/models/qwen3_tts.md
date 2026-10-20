@@ -7,7 +7,7 @@ for codebooks 1..15, and the Qwen3-TTS-Tokenizer-12Hz codec.
 
 | Model | Speaker | Instruct |
 |---|---|---|
-| 0.6B Base | `--ref-audio` (ECAPA-TDNN x-vector, bundled in the codec GGUF) | no |
+| 0.6B Base | cloned: `--ref-audio` (+ `--ref-text` for the in-context prompt) | no |
 | 0.6B / 1.7B CustomVoice | builtin voices (`--voice`) | 1.7B only |
 
 The codec GGUF holds the codec plus that model's adaptor (talker codec
@@ -29,6 +29,27 @@ python scripts/convert-backbone-to-gguf.py --model-id Qwen/Qwen3-TTS-12Hz-0.6B-C
 with codec control tags, `[nothink, think_bos, think_eos, SPEAKER, pad, bos]`
 for the auto language. The speaker row is the Base x-vector, or for
 CustomVoice `codec_embedding[spk_id]`.
+
+## Cloned voices (Base)
+
+A Base voice is a codec speaker (docs/codec_speaker.md) made by
+`codec_speaker_from_audio` in one graph, as `create_voice_clone_prompt` does:
+the reference resampled to 24 kHz gives `xvector` F32 [hidden] (the bundled
+ECAPA-TDNN, `extract_speaker_embedding`) and `ref_codes` I32 [16, T] (the
+codec's own encoder, `speech_tokenizer.encode`); `--ref-text` is stored as
+the speaker's ref_text. `--save-speaker` / `--speaker-file` keep and reuse it.
+
+- No ref_text: `x_vector_only_mode` — the x-vector is the SPEAKER row.
+- With ref_text: upstream's default ICL mode (`generate_icl_prompt`, streaming
+  text). The text lane is `ref_text` followed by the text; after `codec_bos`
+  the next T rows add the reference frames' summed codebook embeddings to it;
+  the rest of the text then rides one token per step, `tts_eos` after it and
+  `tts_pad` from then on. The decode prepends `ref_codes` to the generated
+  codes and cuts their share of the audio (`generate_voice_clone`).
+
+Against `qwen_tts` on a 5.5 s clip: x-vector cosine 1.000000, ref_codes 98 %
+(codebook 0 100 %); output speaker similarity (VoiceEncoder, 3 seeds) 0.80
+x-vector-only / 0.83 ICL, the reference 0.79 / 0.83.
 
 ## CustomVoice voices
 

@@ -1772,13 +1772,13 @@ bool audio_lm_talker_trailing_text_embd(audio_lm_context * ctx,
         ctx->last_error = "talker_trailing_text_embd: out buffer too small";
         return false;
     }
-    // trailing_idx counts from the first *trailing* token (text[1]).  Once
-    // the text is exhausted, feed tts_eos (matches the reference's
-    // trailing_text_hidden = proj(text[1:]) ++ tts_eos).
+    // trailing_idx counts from the first *trailing* token (text[1]): the
+    // reference's trailing_text_hidden = proj(text[1:]) ++ tts_eos, and
+    // tts_pad on every step after it (Qwen3TTSTalker generation step).
     const int32_t tok_pos = trailing_idx + 1;   // maps to text_tokens[tok_pos]
-    const int32_t tok = (tok_pos < n_text && text_tokens)
-                      ? text_tokens[tok_pos]
-                      : ctx->q3_tts_eos_id;
+    const int32_t tok = (tok_pos < n_text && text_tokens) ? text_tokens[tok_pos]
+                      : tok_pos == n_text ? ctx->q3_tts_eos_id
+                      : ctx->q3_tts_pad_id;
     if (!codec_lm_project_text(ctx->lm, tok, out_embd, out_dim)) {
         const char * raw = codec_lm_get_last_error(ctx->lm);
         ctx->last_error = std::string("talker_trailing_text_embd: project failed (")
