@@ -390,3 +390,12 @@ if(NOT SKBUILD)
         install(FILES "${TTS_BACKBONE_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
     endif()
 endif()
+# Wheels: libcodec_tts and the backbone it loads go next to libcodec in the
+# package (codec_cpp.TTS).
+if(SKBUILD AND TARGET codec_tts)
+    set_target_properties(codec_tts PROPERTIES INSTALL_RPATH "${_codec_origin}")
+    install(TARGETS codec_tts
+        LIBRARY DESTINATION codec_cpp/lib COMPONENT python
+        RUNTIME DESTINATION codec_cpp/lib COMPONENT python)
+    install(FILES "${TTS_BACKBONE_SO}" DESTINATION codec_cpp/lib COMPONENT python)
+endif()

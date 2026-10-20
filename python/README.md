@@ -18,9 +18,12 @@ pip install . -C cmake.define.GGML_VULKAN=ON       # any ggml backend flag works
 uv build --wheel                                   # wheel file for another machine
 ```
 
-Wheel builds link ggml statically, so `codec_cpp/lib/libcodec.so` is the only
-native file. ggml is built with `GGML_NATIVE` on, so the wheel is tuned to the
-machine that builds it.
+Wheel builds link ggml statically. `codec_cpp/lib/` holds `libcodec.so`,
+`libcodec_tts.so` (`codec_cpp.TTS`) and `libttsbackbone.so`, the bundled
+llama.cpp with codec.cpp's architecture patches, which the build applies to
+the llama.cpp submodule (clone with `--recursive`, or pip a git URL, which
+fetches submodules). ggml is built with `GGML_NATIVE` on, so the wheel is
+tuned to the machine that builds it.
 
 **From a source checkout, with no install.** Build the library the usual way
 (`cmake --build build -j`) and put `python/` on `sys.path`. The loader finds
@@ -41,9 +44,9 @@ wins.
 
 `codec_cpp.TTS` runs the whole pipeline, the same host loop as `tts-cli`: the
 backbone GGUF in the llama.cpp bundled with codec.cpp (with the architecture
-patches the models need), the codec GGUF in codec.cpp. It needs
-`libcodec_tts`, built next to libcodec when `CODEC_TTS_BACKBONE=ON` (the
-default for CMake builds; wheel builds do not include it yet).
+patches the models need), the codec GGUF in codec.cpp. It loads
+`libcodec_tts`, which wheels bundle and CMake builds put next to libcodec
+(`CODEC_TTS_BACKBONE=ON`, the default).
 
 ```python
 import codec_cpp
