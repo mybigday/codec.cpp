@@ -1,0 +1,63 @@
+# Qwen3-TTS (12 Hz)
+
+[Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts) speech LMs:
+a Qwen3 talker (the backbone, run by llama.cpp as plain `qwen3`) that
+emits codebook 0, a 5-layer depth decoder (codec_lm `residual_depth_ar`)
+for codebooks 1..15, and the Qwen3-TTS-Tokenizer-12Hz codec.
+
+| Model | Speaker | Instruct |
+|---|---|---|
+| 0.6B Base | `--ref-audio` (ECAPA-TDNN x-vector, bundled in the codec GGUF) | no |
+| 0.6B / 1.7B CustomVoice | builtin voices (`--voice`) | 1.7B only |
+
+The codec GGUF holds the codec plus that model's adaptor (talker codec
+embeddings, text projection, depth decoder, speaker encoder or voices), so
+it is converted once per model:
+
+```bash
+python scripts/convert-to-gguf.py --model-id Qwen/Qwen3-TTS-Tokenizer-12Hz \
+    --lm-source Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --outtype F16 --quantization Q8_0 --lm-outtype F16 -o codec-q8_0.gguf
+python scripts/convert-backbone-to-gguf.py --model-id Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --output qwen3-tts-0.6b-customvoice-f16.gguf --outtype f16
+```
+
+## Talker prompt
+
+`audio_lm_build_talker_prefix` assembles upstream's two-lane prefix
+(`Qwen3TTSForConditionalGeneration.generate`): projected text tokens summed
+with codec control tags, `[nothink, think_bos, think_eos, SPEAKER, pad, bos]`
+for the auto language. The speaker row is the Base x-vector, or for
+CustomVoice `codec_embedding[spk_id]`.
+
+## CustomVoice voices
+
+The converter writes `talker_config.spk_id` as builtin speakers
+(docs/codec_speaker.md): `spk.<name>.spk_id` I32 [1], plus
+`spk.<name>.language_id` I32 [1] for the dialect voices, whose language tag
+upstream uses when the language is auto (control stream
+`[think, think_bos, LANG, think_eos, SPEAKER, pad, bos]`):
+
+| Voice | Native language |
+|---|---|
+| `vivian` (default), `serena`, `uncle_fu` | Chinese |
+| `dylan` | Chinese, Beijing dialect |
+| `eric` | Chinese, Sichuan dialect |
+| `ryan`, `aiden` | English |
+| `ono_anna` | Japanese |
+| `sohee` | Korean |
+
+`vivian` is upstream's README example; `generate_custom_voice` itself has
+no default. `--instruct` (e.g. `用特别愤怒的语气说`) is prepended as a
+`<|im_start|>user` turn on 1.7B (`codec.lm.qwen3tts.takes_instruct`);
+0.6B ignores it, as upstream does.
+
+```bash
+tts-cli synthesize --backbone qwen3-tts-1.7b-customvoice-q8_0.gguf --model codec-q8_0.gguf \
+    --voice vivian --instruct "用特别愤怒的语气说" \
+    --text "其实我真的有发现，我是一个特别善于观察别人情绪的人。" --output out.wav
+```
+
+1.7B differs from 0.6B in widths only: the talker (2048) is wider than the
+depth decoder (1024), so the depth inputs (talker-width embeddings) go
+through `small_to_mtp_projection` (`lm.depth.in_proj`).

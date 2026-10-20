@@ -31,7 +31,7 @@
 | Chatterbox (Llama T3) | ✅ | See [models/chatterbox.md](models/chatterbox.md) |
 | BlueMagpie | ✅ | |
 | MOSS-TTS-Realtime | ✅ | |
-| Qwen3-TTS | ✅ | Base model requires reference audio |
+| Qwen3-TTS | ✅ | 0.6B Base needs reference audio; 0.6B / 1.7B CustomVoice builtin voices ([notes](models/qwen3_tts.md)) |
 | LFM2-Audio | ✅ | Must sample (greedy degenerates, as in reference) |
 | Chatterbox Turbo | ✅ | `--ref-audio` clones the voice (T3 VE row + S3G speaker); CPU and Vulkan verified; see [models/chatterbox.md](models/chatterbox.md) |
 | CosyVoice-300M (base / SFT / Instruct) | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/cosyvoice.md](models/cosyvoice.md) |

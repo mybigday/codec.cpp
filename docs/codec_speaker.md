@@ -95,13 +95,16 @@ model, so a speaker may hold that backbone's token ids.
 |---|---|---|
 | DAC, WavTokenizer | `audio_prompt` I32 [N] (backbone token ids of the reference's audio section) + `ref_text` (text section) | OuteTTS ([outetts.md](models/outetts.md)) |
 | NeuCodec, distill NeuCodec | `ref_codes` I32 [T] (codec tokens) + `ref_text` (phonemes) | NeuTTS ([neutts.md](models/neutts.md)) |
+| Qwen3-TTS-Tokenizer | `spk_id` I32 [1] (talker codec-vocab row used as the speaker row) + optional `language_id` I32 [1] (dialect tag) | Qwen3-TTS CustomVoice ([qwen3_tts.md](models/qwen3_tts.md)) |
 
 `scripts/bake-speakers.py` writes them into a copy of a codec GGUF (or a
 speaker file). OuteTTS speakers cannot be derived from audio;
 `codec_speaker_from_audio` on a distill NeuCodec runs its encoder, and its
 `encoder_hash` covers the distill encoder + DistilHuBERT weights. OuteTTS
 codec GGUFs hash the interface and backbone id instead, so speaker files do
-not cross between models.
+not cross between models. Qwen3-TTS CustomVoice voices come from the
+checkpoint's `talker_config.spk_id` at conversion; their hash covers the
+talker codec_embedding table the ids index.
 
 ## tts-cli
 

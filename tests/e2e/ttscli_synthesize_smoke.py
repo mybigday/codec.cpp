@@ -357,6 +357,25 @@ def main():
             require_stop=True, cer_report_only=False,
         ))
 
+    # Qwen3-TTS CustomVoice — builtin voices from the codec GGUF: the talker's
+    # speaker row is codec_embedding[spk_id]; dialect voices (dylan = Beijing)
+    # also switch the control stream to the think + language-tag form.  1.7B
+    # takes --instruct (and has the talker→depth in_proj).
+    q3cv = REPO / "models" / "output" / "release"
+    for name, size, voice, text, lang, extra in [
+        ("qwen3_tts_cv_ryan", "0.6B", "ryan", "The birch canoe slid on the smooth planks.", "en", []),
+        ("qwen3_tts_cv_dylan", "0.6B", "dylan", "你好，欢迎使用语音合成。", "zh", []),
+        ("qwen3_tts_cv17_instruct", "1.7B", "vivian", "你好，欢迎使用语音合成。", "zh",
+         ["--instruct", "用特别开心的语气说"]),
+    ]:
+        d = q3cv / f"Qwen3-TTS-12Hz-{size}-CustomVoice"
+        results.append(_case(
+            name, d / "codec-q8_0.gguf", d / f"qwen3-tts-{size.lower()}-customvoice-q8_0.gguf",
+            text, lang, want_stop="eos_code_c0", cer_max=0.3,
+            extra=["--voice", voice, "--seed", "42", "--max-frames", "300"] + extra,
+            require_stop=True, cer_report_only=False, greedy=False,
+        ))
+
     # LFM2-Audio-1.5B — sequential text→audio TTS (residual depth-AR, 8 Mimi
     # codebooks).  The backbone (lfm2 arch) first free-runs in TEXT modality
     # off its tied-embedding lm_head; the "Perform TTS. Use the US male voice."

@@ -353,6 +353,7 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     # Bundled only if the HF checkpoint exposed it (some Qwen3-TTS
     # variants are zero-shot — no x-vector speaker encoder).
     _dump_qwen3_tts_speaker_encoder(writer, sd, cfg, verbose=verbose)
+    _dump_qwen3_tts_builtin_voices(writer, sd, cfg, verbose=verbose)
 
     if verbose:
         print(f"[lm_adaptor:qwen3_tts] residual_depth_ar: "
@@ -361,6 +362,46 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
               f"{depth_hidden}h, {depth_nh}q/{depth_nkvh}kv heads, "
               f"head_dim={depth_hd}, ffn={depth_inter}, "
               f"rope_theta={depth_rope}, has_in_proj={has_in_proj})")
+
+
+# Upstream's README example voice; generate_custom_voice itself has no default.
+_CUSTOM_VOICE_DEFAULT = "vivian"
+
+
+def _dump_qwen3_tts_builtin_voices(writer, sd, cfg, *, verbose=False):
+    """CustomVoice: `talker_config.spk_id` as builtin speakers.
+
+    Each voice is the codec-vocab row the talker embeds in place of the
+    x-vector (`spk.<name>.spk_id` I32 [1]); dialect voices (`spk_is_dialect`)
+    also carry the language tag used when the language is auto
+    (`spk.<name>.language_id`), as Qwen3TTSForConditionalGeneration.generate
+    does.  The encoder hash covers the codec_embedding table the ids index.
+    Instruct text is taken by the CustomVoice / VoiceDesign 1.7B models only
+    (`generate_custom_voice` drops it for 0.6B).
+    """
+    from ..speaker import encoder_hash, speaker_name, write_speaker, write_speaker_meta
+
+    tk_cfg = cfg["talker_config"]
+    model_type = cfg.get("tts_model_type", "")
+    writer.add_bool("codec.lm.qwen3tts.takes_instruct",
+                    model_type in ("custom_voice", "voice_design") and cfg.get("tts_model_size") != "0b6")
+    spk_ids = tk_cfg.get("spk_id") or {}
+    if model_type != "custom_voice" or not spk_ids:
+        return
+    arch = writer.kv[0][2]
+    lang_map = tk_cfg.get("codec_language_id") or {}
+    dialect = tk_cfg.get("spk_is_dialect") or {}
+    for raw, tag in spk_ids.items():
+        slots = {"spk_id": np.asarray([int(tag)], dtype=np.int32)}
+        if dialect.get(raw):
+            slots["language_id"] = np.asarray([int(lang_map[dialect[raw]])], dtype=np.int32)
+        write_speaker(writer, arch, speaker_name(raw), slots)
+    default = _CUSTOM_VOICE_DEFAULT if _CUSTOM_VOICE_DEFAULT in spk_ids else speaker_name(next(iter(spk_ids)))
+    enc = encoder_hash([("talker.model.codec_embedding.weight", sd["talker.model.codec_embedding.weight"])],
+                       "qwen3_tts.spk.v1;slot=spk_id,language_id")
+    write_speaker_meta(writer, arch, default=default, enc_hash=enc)
+    if verbose:
+        print(f"[lm_adaptor:qwen3_tts] builtin voices: {sorted(spk_ids)} (default {default})")
 
 
 def _dump_qwen3_tts_speaker_encoder(writer, sd, cfg, *, verbose=False):
