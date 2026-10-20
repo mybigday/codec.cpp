@@ -1,4 +1,5 @@
 #include "kitten_text.h"
+#include "tts_runner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -214,16 +215,7 @@ std::vector<std::string> kitten_split_for_synthesis(const std::string & text, in
 }
 
 std::vector<float> kitten_shape_chunk(const std::vector<float> & wav, int sample_rate) {
-    const int fade = std::max(1, (int) (sample_rate * 0.008));
-    std::vector<float> w = trim_silence(wav, sample_rate);
-    if ((int) w.size() > 2 * fade) {
-        for (int k = 0; k < fade; ++k) {
-            const float g = fade > 1 ? (float) k / (float) (fade - 1) : 1.0f;
-            w[(size_t) k] *= g;
-            w[w.size() - 1 - (size_t) k] *= g;
-        }
-    }
-    return w;
+    return tts_shape_segment(wav, sample_rate, /*trim=*/true, /*fade_ms=*/8);
 }
 
 std::vector<float> kitten_join_chunks(const std::vector<std::vector<float>> & wavs, int sample_rate, float gap_s) {

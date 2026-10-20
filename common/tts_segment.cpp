@@ -7,6 +7,8 @@
 
 #include "tts_runner.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -173,6 +175,42 @@ std::vector<std::string> tts_split_text(const std::string & text, int32_t max_by
         flush();
     }
     return segments;
+}
+
+std::vector<float> tts_shape_segment(const std::vector<float> & pcm, int32_t sample_rate, bool trim, int32_t fade_ms) {
+    std::vector<float> w = pcm;
+    const int sr = sample_rate;
+    if (trim && (int) pcm.size() >= (int) (sr * 0.05)) {
+        const int hop = std::max(1, (int) (sr * 0.01));
+        const int n_frames = (int) pcm.size() / hop;
+        const float thresh = std::pow(10.0f, -45.0f / 20.0f);
+        int first = -1, last = -1;
+        for (int f = 0; f < n_frames; ++f) {
+            double e = 0.0;
+            for (int i = 0; i < hop; ++i) e += (double) pcm[(size_t) (f * hop + i)] * pcm[(size_t) (f * hop + i)];
+            if (std::sqrt(e / hop + 1e-12) > thresh) {
+                if (first < 0) first = f;
+                last = f;
+            }
+        }
+        if (first >= 0) {
+            const int keep = (int) (sr * 0.02);
+            const size_t start = (size_t) std::max(0, first * hop - keep);
+            const size_t end = std::min(pcm.size(), (size_t) ((last + 1) * hop + keep));
+            w.assign(pcm.begin() + (long) start, pcm.begin() + (long) end);
+        }
+    }
+    if (fade_ms > 0) {
+        const int fade = std::max(1, (int) (sr * (fade_ms / 1000.0)));
+        if ((int) w.size() > 2 * fade) {
+            for (int k = 0; k < fade; ++k) {
+                const float g = fade > 1 ? (float) k / (float) (fade - 1) : 1.0f;
+                w[(size_t) k] *= g;
+                w[w.size() - 1 - (size_t) k] *= g;
+            }
+        }
+    }
+    return w;
 }
 
 }  // namespace codec_common

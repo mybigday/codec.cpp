@@ -9,6 +9,7 @@
 #include "kitten_text.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 namespace codec_common {
@@ -85,25 +86,24 @@ public:
         alm_family::caps(out);
         out->takes_ref_text = true;
         out->sample_rate    = 24000;
-        out->segment_bytes  = cfg_.chunk_chars;
         out->presets        = cfg_.presets.c_str();
     }
 
     // Text > chunk_chars is split on sentences (min chunk_min_chars), each
-    // chunk generated with a fresh context (text.py split_for_synthesis).
-    std::vector<std::string> split(const std::string & text, int32_t max_bytes) override {
-        full_has_tag_ = kitten_has_expression_tag(text);
-        segments_ = kitten_split_for_synthesis(kitten_prepare_text(text), max_bytes > 0 ? max_bytes : cfg_.chunk_chars,
-                                               cfg_.chunk_min_chars);
-        n_segments_ = (int32_t) segments_.size();
-        return segments_;
+    // chunk generated with a fresh context (text.py split_for_synthesis);
+    // joined the general way (trimmed edges, 8 ms fades, chunk_gap_s apart).
+    split_params segment_split() const override {
+        return {split_mode::sentence_pack, cfg_.chunk_chars, cfg_.chunk_min_chars};
+    }
+    join_params segment_join() const override {
+        return {true, 8, (int32_t) std::lround(cfg_.chunk_gap_s * 1000.0f)};
     }
 
-    // join_chunks: edge silence trimmed, 8 ms fades, chunk_gap_s between chunks.
-    int32_t join(std::vector<float> & pcm, int32_t sample_rate, int32_t i, int32_t n) override {
-        if (n <= 1) return 0;
-        pcm = kitten_shape_chunk(pcm, sample_rate);
-        return i + 1 < n ? (int32_t) (sample_rate * cfg_.chunk_gap_s) : 0;
+    std::vector<std::string> split(const std::string & text, int32_t max_bytes) override {
+        full_has_tag_ = kitten_has_expression_tag(text);
+        segments_ = alm_family::split(kitten_prepare_text(text), max_bytes);
+        n_segments_ = (int32_t) segments_.size();
+        return segments_;
     }
 
     bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {

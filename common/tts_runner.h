@@ -214,6 +214,11 @@ int tts_runner_synthesize_selfcontained(const tts_runner_params & params,
 // max_bytes <= 0 returns the trimmed text as one segment.
 std::vector<std::string> tts_split_text(const std::string & text, int32_t max_bytes);
 
+// A segment's edges for joining: leading / trailing silence trimmed (frames
+// of 10 ms below -45 dBFS, keeping 20 ms of margin) when `trim`, then a
+// linear fade of `fade_ms` at both ends.
+std::vector<float> tts_shape_segment(const std::vector<float> & pcm, int32_t sample_rate, bool trim, int32_t fade_ms);
+
 // Self-contained FlowLM split into open / run / free (what
 // tts_runner_synthesize_selfcontained composes).  tts_flow_open returns 0
 // when the codec GGUF is not a FlowLM, 1 otherwise; *out is NULL (and *err

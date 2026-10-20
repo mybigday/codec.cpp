@@ -1,4 +1,5 @@
 #include "audio_lm_family.h"
+#include "kitten_text.h"
 #include "tts_runner.h"
 
 #include <cstring>
@@ -102,6 +103,7 @@ void alm_family::caps(codec_audio_lm_caps * out) const {
     out->modality       = audio_lm_modality(alm_);
     out->needs_backbone = true;
     out->takes_ref_audio = audio_lm_codec_can_speaker_from_audio(alm_);
+    out->segment_bytes   = segment_split().max_bytes;
 }
 
 bool alm_family::backbone_requirements(const alm_vocab &, int32_t max_frames, codec_audio_lm_backbone_req * out) {
@@ -147,10 +149,23 @@ bool alm_family::set_voice(const alm_tts_voice & v) {
 }
 
 std::vector<std::string> alm_family::split(const std::string & text, int32_t max_bytes) {
-    return max_bytes > 0 ? tts_split_text(text, max_bytes) : std::vector<std::string>{text};
+    split_params p = segment_split();
+    if (max_bytes > 0) p.max_bytes = max_bytes;
+    switch (p.mode) {
+        case split_mode::sentence_pack:
+            return kitten_split_for_synthesis(text, p.max_bytes, p.min_bytes);
+        case split_mode::clause:
+        default:
+            return tts_split_text(text, p.max_bytes);
+    }
 }
 
-int32_t alm_family::join(std::vector<float> &, int32_t, int32_t, int32_t) { return 0; }
+int32_t alm_family::join(std::vector<float> & pcm, int32_t sample_rate, int32_t i, int32_t n) {
+    if (n <= 1) return 0;
+    const join_params p = segment_join();
+    pcm = tts_shape_segment(pcm, sample_rate, p.trim, p.fade_ms);
+    return i + 1 < n ? (int32_t) (sample_rate * (p.gap_ms / 1000.0)) : 0;
+}
 
 bool alm_family::prefill(const float *, int32_t) { return fail("this model takes no prompt hidden states"); }
 

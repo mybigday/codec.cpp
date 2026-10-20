@@ -106,8 +106,26 @@ public:
                                        codec_audio_lm_backbone_req * out);
     // Default: the decoder speaker (speaker file > ref audio > voice > default).
     virtual bool set_voice(const alm_tts_voice & v);
-    // Segmentation (codec_audio_lm_tts_split) and joining (tts_join).
-    // Default: tts_split_text at max_bytes (0 = whole text); no edge handling.
+    // Segmentation (codec_audio_lm_tts_split) and joining (tts_join): one
+    // general behaviour every model gets, tuned by the family's parameters;
+    // a model that needs a different method picks another mode (or, in the
+    // last resort, overrides split / join).
+    enum class split_mode {
+        clause,          // tts_split_text: sentences / clauses by UTF-8 bytes, any script
+        sentence_pack,   // kittentts2 text.py: English sentences packed to max, merged up to min
+    };
+    struct split_params {
+        split_mode mode      = split_mode::clause;
+        int32_t    max_bytes = 0;     // 0: the whole text unless the host asks for a size
+        int32_t    min_bytes = 0;     // sentence_pack: merge shorter chunks into a neighbour
+    };
+    struct join_params {
+        bool    trim    = true;       // drop leading / trailing silence
+        int32_t fade_ms = 8;          // fade both ends
+        int32_t gap_ms  = 160;        // silence between segments
+    };
+    virtual split_params segment_split() const { return {}; }
+    virtual join_params  segment_join() const { return {}; }
     virtual std::vector<std::string> split(const std::string & text, int32_t max_bytes);
     virtual int32_t join(std::vector<float> & pcm, int32_t sample_rate, int32_t i, int32_t n);
     virtual bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) = 0;

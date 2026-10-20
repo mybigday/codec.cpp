@@ -270,9 +270,7 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_a
 
 int32_t codec_audio_lm_tts_split(struct codec_audio_lm * ctx, const char * text, int32_t max_bytes) {
     if (ctx == nullptr || text == nullptr) return -1;
-    codec_audio_lm_caps caps{};
-    ctx->family->caps(&caps);
-    ctx->segments = ctx->family->split(text, max_bytes > 0 ? max_bytes : caps.segment_bytes);
+    ctx->segments = ctx->family->split(text, max_bytes);
     return (int32_t) ctx->segments.size();
 }
 
