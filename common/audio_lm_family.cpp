@@ -1,6 +1,6 @@
 #include "audio_lm_family.h"
 #include "kitten_text.h"
-#include "tts_runner.h"
+#include "tts_segment.h"
 
 #include <cstring>
 

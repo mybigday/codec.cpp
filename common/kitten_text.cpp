@@ -1,5 +1,5 @@
 #include "kitten_text.h"
-#include "tts_runner.h"
+#include "tts_segment.h"
 
 #include <algorithm>
 #include <cctype>

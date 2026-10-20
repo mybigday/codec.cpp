@@ -77,6 +77,15 @@ public:
         out->sample_rate = sr ? std::atoi(sr) : (ci_->version == 1 ? 22050 : 24000);
     }
 
+    bool backbone_requirements(const alm_vocab & vocab, int32_t max_frames, codec_audio_lm_backbone_req * out) override {
+        alm_family::backbone_requirements(vocab, max_frames, out);
+        // CosyVoice v1's relative-position term is a KQ bias, which the
+        // flash-attention path does not take.
+        audio_lm_prompt_info pi;
+        if (audio_lm_get_prompt_info(alm_, &pi) && pi.host_arch == "cosyvoice") out->flash_attn = false;
+        return true;
+    }
+
     bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
         const codec_speaker * spk = audio_lm_decode_speaker(alm_);
         if (spk == nullptr) return fail("CosyVoice needs a speaker (reference audio, a voice or a speaker file)");

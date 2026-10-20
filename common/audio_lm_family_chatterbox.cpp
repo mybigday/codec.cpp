@@ -8,7 +8,7 @@
 
 #include "audio_lm_family.h"
 #include "audio_lm_sampler.h"
-#include "tts_runner.h"
+#include "tts_segment.h"
 
 #include <cstring>
 

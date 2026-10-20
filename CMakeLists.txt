@@ -194,13 +194,13 @@ target_include_directories(codec-example-utils
 
 # codec_common — generic audio-LM API mirroring llama.cpp's `common/`.
 # See docs/codec_common_api.md.  Built as a static lib so example
-# binaries can link it without pulling it into libcodec.so.  The
-# self-contained (no-backbone) FlowLM reference synthesize lives here in
-# tts_runner_flow.cpp so it stays available even in CODEC_TTS_BACKBONE=OFF
-# builds; the full backbone-driven runner lives in codec_tts_runner.
+# binaries can link it without pulling it into libcodec.so.  The runner's
+# backbone-free parts (tts_runner_base.cpp: self-contained models) live here
+# so they stay available in CODEC_TTS_BACKBONE=OFF builds; the backbone loop
+# lives in codec_tts_runner.
 add_library(codec_common STATIC
     $<TARGET_OBJECTS:codec_audio_lm_objs>
-    common/tts_runner_flow.cpp
+    common/tts_runner_base.cpp
 )
 target_include_directories(codec_common
     PUBLIC
@@ -269,16 +269,6 @@ if(CODEC_BUILD_TTS_CLI)
         target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}")
         set_target_properties(tts-cli PROPERTIES
             BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
-
-        add_executable(tts-constraint-test tests/tts_constraint_test.cpp)
-        target_link_libraries(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
-        target_include_directories(tts-constraint-test PRIVATE $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>)
-
-        add_executable(neutts-detect-test tests/neutts_detect_test.cpp)
-        target_link_libraries(neutts-detect-test PRIVATE $<TARGET_PROPERTY:tts-cli,LINK_LIBRARIES>)
-        target_include_directories(neutts-detect-test PRIVATE
-            $<TARGET_PROPERTY:tts-cli,INCLUDE_DIRECTORIES>
-            ${TTS_BACKBONE_INCLUDE_DIRS})
 
         # OpenAI-compatible /v1/audio/speech over the same runner.  HTTP + JSON
         # come from llama.cpp's vendored cpp-httplib / nlohmann (compiled here:

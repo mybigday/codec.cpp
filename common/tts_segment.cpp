@@ -5,7 +5,7 @@
 // budget is in UTF-8 bytes, which tracks speaking time across scripts (a CJK
 // character is 3 bytes and takes about as long to say as 3 Latin letters).
 
-#include "tts_runner.h"
+#include "tts_segment.h"
 
 #include <algorithm>
 #include <cmath>
