@@ -209,32 +209,36 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_tensor("lm.audio_embd_0.weight",
                       talker_embd.astype(np.float32), st_dtype="F16")
 
-    # audio_embd_{i+1} = code_predictor.codec_embedding[i] (V=depth_vocab, H_d).
-    # ModuleList has n_codebook - 1 entries.
+    # audio_embd_{i+1} = code_predictor.codec_embedding[i] (V=depth_vocab, H_t):
+    # talker-width rows, which small_to_mtp_projection (in_proj) maps to the
+    # depth width when the two differ (1.7B).  ModuleList has n_codebook - 1
+    # entries.
     for i in range(n_codebook - 1):
         key = f"talker.code_predictor.model.codec_embedding.{i}.weight"
         if key not in sd:
             raise RuntimeError(f"missing tensor: {key}")
         arr = sd[key]
-        if arr.shape != (depth_vocab, depth_hidden):
+        if arr.shape != (depth_vocab, talker_hidden):
             raise RuntimeError(
-                f"{key} shape {arr.shape} != ({depth_vocab}, {depth_hidden})"
+                f"{key} shape {arr.shape} != ({depth_vocab}, {talker_hidden})"
             )
         writer.add_tensor(f"lm.audio_embd_{i+1}.weight",
                           arr.astype(np.float32), st_dtype="F16")
 
     # --- talker text projection + text embedding ------------------------
     # The talker prompt projects backbone/text-vocab embeds (2048) into
-    # talker hidden (1024) via a 2-layer SiLU MLP (Qwen3TTSTalkerResizeMLP:
-    # linear_fc2(silu(linear_fc1(x))), bias=True), then sums them with the
-    # codec-tag lane.  Both the projection weights and the talker's own text
-    # embedding table (151936 x 2048) are needed runtime-side, so bake them.
+    # talker hidden via a 2-layer SiLU MLP (Qwen3TTSTalkerResizeMLP(text_hidden,
+    # text_hidden, hidden): linear_fc2(silu(linear_fc1(x))), bias=True), then
+    # sums them with the codec-tag lane.  Both the projection weights and the
+    # talker's own text embedding table (151936 x text_hidden) are needed
+    # runtime-side, so bake them.
+    text_hidden = int(tk_cfg.get("text_hidden_size", 2048))
     for src, dst, expect in [
         ("talker.text_projection.linear_fc1.weight", "lm.text_projection.fc1.weight",
-         (talker_hidden * 2, 2048)),
+         (text_hidden, text_hidden)),
         ("talker.text_projection.linear_fc1.bias",   "lm.text_projection.fc1.bias",   None),
         ("talker.text_projection.linear_fc2.weight", "lm.text_projection.fc2.weight",
-         (talker_hidden, talker_hidden * 2)),
+         (talker_hidden, text_hidden)),
         ("talker.text_projection.linear_fc2.bias",   "lm.text_projection.fc2.bias",   None),
     ]:
         if src not in sd:
