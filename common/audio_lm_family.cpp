@@ -204,8 +204,10 @@ static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::stri
             if (pi.is_continuous)         return alm_family_continuous(alm);
             if (pi.streaming_interleave)  return alm_family_realtime(alm);
             if (pi.sequential_text_audio) return alm_family_lfm2(alm);
-            if (pi.host_arch == "llama" && pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR &&
-                pi.eos_code_c0 < 0 && !pi.cb0_from_backbone) {
+            // Moshi's codebook 0 is its text stream; CSM's is audio.
+            const char * c0mod = audio_lm_meta_str(alm, "codec.lm.residual.c0_input_modality");
+            if (pi.model_kind == audio_lm_prompt_info::KIND_RESIDUAL_DEPTH_AR && c0mod &&
+                std::strcmp(c0mod, "text") == 0) {
                 if (err) *err = "Moshi (full-duplex dialogue, no audio end) is not a one-shot TTS model";
                 return nullptr;
             }
