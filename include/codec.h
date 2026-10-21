@@ -260,7 +260,7 @@ typedef void (*codec_log_callback)(enum codec_log_level level, const char * text
 void codec_log_set(codec_log_callback callback, void * user_data);
 
 // Emit through the current callback (printf-style); for hosts and the
-// layers above libcodec (codec_audio_lm, codec_tts) so one callback sees all.
+// layers above libcodec (codec_audio_lm, the TTS runners) so one callback sees all.
 void codec_log(enum codec_log_level level, const char * fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 2, 3)))

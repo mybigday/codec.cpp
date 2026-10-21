@@ -23,7 +23,7 @@ Repository = "https://github.com/mybigday/codec.cpp"
 minimum-version = "build-system.requires"
 wheel.packages = ["python/codec_cpp"]
 wheel.py-api = "py3"  # ctypes only: one wheel per platform, any CPython
-build.targets = ["codec_shared", "codec_tts"]
+build.targets = ["codec_shared", "ttsbackbone"]
 install.components = ["python"]
 # Anchored to the repo root ("models/" alone would also drop src/models/).
 sdist.exclude = ["/models/", "/build*/", "/.venv/", "/.model-src/", "/input_audio/", "/benchmarks/",

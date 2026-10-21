@@ -1,6 +1,6 @@
 """Raw ctypes declarations mirroring include/codec.h, include/codec_speaker.h,
-include/codec_lm.h and include/codec_audio_lm.h; common/codec_tts.h (libcodec_tts) at
-the end.
+include/codec_lm.h and include/codec_audio_lm.h; the subset of the bundled
+llama.cpp's llama.h that codec_cpp.TTS drives at the end.
 
 Struct field order must match the headers exactly; the headers follow an
 ABI-append discipline (new fields at the end), so keep the same here.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import (POINTER, Structure, Union, c_bool, c_char, c_char_p, c_double,
-                    c_float, c_int, c_int32, c_int64, c_size_t, c_void_p)
+                    c_float, c_int, c_int32, c_int64, c_size_t, c_uint32, c_void_p)
 
 # ─── enums (codec.h) ────────────────────────────────────────────────
 
@@ -565,80 +565,151 @@ def declare(lib: ctypes.CDLL) -> None:
         fn.argtypes = argtypes
 
 
-# ─── codec_tts.h (libcodec_tts) ─────────────────────────────────────
+# ─── llama.h (the bundled llama.cpp, libttsbackbone) ─────────────────
+# The subset codec_cpp.TTS drives, mirroring the pinned
+# common/third-party/llama.cpp/include/llama.h (with codec.cpp's patches);
+# update it with the submodule.
+
+llama_token = c_int32
 
 
-class codec_tts_params(Structure):
+class llama_model_params(Structure):
     _fields_ = [
-        ("codec_path", c_char_p),
-        ("backbone_path", c_char_p),
-        ("kv_overrides", POINTER(codec_model_kv_override)),
-        ("n_kv_overrides", c_int32),
+        ("devices", c_void_p),
+        ("tensor_buft_overrides", c_void_p),
+        ("n_gpu_layers", c_int32),
+        ("split_mode", c_int),
+        ("main_gpu", c_int32),
+        ("tensor_split", c_void_p),
+        ("progress_callback", c_void_p),
+        ("progress_callback_user_data", c_void_p),
+        ("kv_overrides", c_void_p),
+        ("vocab_only", c_bool),
+        ("use_mmap", c_bool),
+        ("use_direct_io", c_bool),
+        ("use_mlock", c_bool),
+        ("check_tensors", c_bool),
+        ("use_extra_bufts", c_bool),
+        ("no_host", c_bool),
+        ("no_alloc", c_bool),
+    ]
+
+
+LLAMA_POOLING_TYPE_NONE = 0
+LLAMA_FLASH_ATTN_TYPE_DISABLED = 0
+
+
+class llama_context_params(Structure):
+    _fields_ = [
+        ("n_ctx", c_uint32),
+        ("n_batch", c_uint32),
+        ("n_ubatch", c_uint32),
+        ("n_seq_max", c_uint32),
+        ("n_rs_seq", c_uint32),
+        ("n_outputs_max", c_uint32),
         ("n_threads", c_int32),
-        ("use_gpu", c_bool),
-        ("max_frames", c_int32),
+        ("n_threads_batch", c_int32),
+        ("ctx_type", c_int),
+        ("rope_scaling_type", c_int),
+        ("pooling_type", c_int),
+        ("attention_type", c_int),
+        ("flash_attn_type", c_int),
+        ("rope_freq_base", c_float),
+        ("rope_freq_scale", c_float),
+        ("yarn_ext_factor", c_float),
+        ("yarn_attn_factor", c_float),
+        ("yarn_beta_fast", c_float),
+        ("yarn_beta_slow", c_float),
+        ("yarn_orig_ctx", c_uint32),
+        ("defrag_thold", c_float),
+        ("cb_eval", c_void_p),
+        ("cb_eval_user_data", c_void_p),
+        ("type_k", c_int),
+        ("type_v", c_int),
+        ("abort_callback", c_void_p),
+        ("abort_callback_data", c_void_p),
+        ("embeddings", c_bool),
+        ("offload_kqv", c_bool),
+        ("no_perf", c_bool),
+        ("op_offload", c_bool),
+        ("swa_full", c_bool),
+        ("kv_unified", c_bool),
+        ("samplers", c_void_p),
+        ("n_samplers", c_size_t),
+        ("ctx_other", c_void_p),
     ]
 
 
-# bool (*codec_tts_audio_callback)(const float *, int32_t, int32_t, int32_t, void *)
-codec_tts_audio_callback = ctypes.CFUNCTYPE(c_bool, POINTER(c_float), c_int32, c_int32, c_int32, c_void_p)
-
-
-class codec_tts_request(Structure):
+class llama_batch(Structure):
     _fields_ = [
-        ("text", c_char_p),
-        ("voice", c_char_p),
-        ("speaker_file", c_char_p),
-        ("ref_audio_path", c_char_p),
-        ("ref_text", c_char_p),
-        ("save_speaker", c_char_p),
-        ("instruct", c_char_p),
-        ("preset", c_char_p),
-        ("grammar", c_char_p),
-        ("seed", ctypes.c_uint32),
-        ("temperature", c_float),
-        ("top_p", c_float),
-        ("top_k", c_int32),
-        ("min_p", c_float),
-        ("repetition_penalty", c_float),
-        ("min_frames", c_int32),
-        ("lm_guidance", c_float),
-        ("flow_guidance", c_float),
-        ("flow_steps", c_int32),
-        ("segment_bytes", c_int32),
-        ("on_audio", codec_tts_audio_callback),
-        ("user_data", c_void_p),
-        ("stream_chunk_ms", c_int32),
+        ("n_tokens", c_int32),
+        ("token", POINTER(llama_token)),
+        ("embd", POINTER(c_float)),
+        ("pos", POINTER(c_int32)),
+        ("n_seq_id", POINTER(c_int32)),
+        ("seq_id", POINTER(POINTER(c_int32))),
+        ("logits", POINTER(ctypes.c_int8)),
     ]
 
 
-class codec_tts_result(Structure):
-    _fields_ = [
-        ("n_frames", c_int32),
-        ("stop_reason", c_char * 32),
-        ("total_ms", c_double),
-        ("decode_ms", c_double),
-    ]
+class llama_sampler_chain_params(Structure):
+    _fields_ = [("no_perf", c_bool)]
 
 
-TTS_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
-    "codec_tts_default_params": (codec_tts_params, []),
-    "codec_tts_default_request": (codec_tts_request, []),
-    "codec_tts_load": (c_void_p, [POINTER(codec_tts_params), c_char_p, c_size_t]),
-    "codec_tts_free": (None, [c_void_p]),
-    "codec_tts_run": (c_bool, [c_void_p, POINTER(codec_tts_request), POINTER(codec_pcm_buffer),
-                               POINTER(codec_tts_result)]),
-    "codec_tts_last_error": (c_char_p, [c_void_p]),
-    "codec_tts_voices": (c_int32, [c_void_p, c_char_p]),
-    "codec_tts_voice": (c_char_p, [c_void_p, c_int32]),
-    "codec_tts_default_voice": (c_char_p, [c_void_p]),
-    "codec_tts_takes_instruct": (c_bool, [c_void_p]),
+class llama_logit_bias(Structure):
+    _fields_ = [("token", llama_token), ("bias", c_float)]
+
+
+_P = c_void_p
+LLAMA_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
+    "llama_backend_init": (None, []),
+    "llama_log_set": (None, [codec_log_callback, c_void_p]),
+    "llama_model_default_params": (llama_model_params, []),
+    "llama_model_load_from_file": (_P, [c_char_p, llama_model_params]),
+    "llama_model_free": (None, [_P]),
+    "llama_model_get_vocab": (_P, [_P]),
+    "llama_model_n_embd": (c_int32, [_P]),
+    "llama_model_n_ctx_train": (c_int32, [_P]),
+    "llama_context_default_params": (llama_context_params, []),
+    "llama_init_from_model": (_P, [_P, llama_context_params]),
+    "llama_free": (None, [_P]),
+    "llama_n_ctx": (c_uint32, [_P]),
+    "llama_get_memory": (_P, [_P]),
+    "llama_memory_clear": (None, [_P, c_bool]),
+    "llama_batch_init": (llama_batch, [c_int32, c_int32, c_int32]),
+    "llama_batch_free": (None, [llama_batch]),
+    "llama_decode": (c_int32, [_P, llama_batch]),
+    "llama_get_embeddings_ith": (POINTER(c_float), [_P, c_int32]),
+    "llama_tokenize": (c_int32, [_P, c_char_p, c_int32, POINTER(llama_token), c_int32, c_bool, c_bool]),
+    "llama_token_to_piece": (c_int32, [_P, llama_token, c_char_p, c_int32, c_int32, c_bool]),
+    "llama_vocab_n_tokens": (c_int32, [_P]),
+    "llama_vocab_eos": (llama_token, [_P]),
+    "llama_vocab_is_eog": (c_bool, [_P, llama_token]),
+    "llama_sampler_chain_default_params": (llama_sampler_chain_params, []),
+    "llama_sampler_chain_init": (_P, [llama_sampler_chain_params]),
+    "llama_sampler_chain_add": (None, [_P, _P]),
+    "llama_sampler_chain_get": (_P, [_P, c_int32]),
+    "llama_sampler_init_logit_bias": (_P, [c_int32, c_int32, POINTER(llama_logit_bias)]),
+    "llama_sampler_init_grammar": (_P, [_P, c_char_p, c_char_p]),
+    "llama_sampler_init_penalties_exempt": (_P, [c_int32, c_float, c_float, c_float, POINTER(llama_token),
+                                                 c_size_t]),
+    "llama_sampler_init_dry": (_P, [_P, c_int32, c_float, c_float, c_int32, c_int32, POINTER(c_char_p),
+                                    c_size_t]),
+    "llama_sampler_init_top_k": (_P, [c_int32]),
+    "llama_sampler_init_top_p": (_P, [c_float, c_size_t]),
+    "llama_sampler_init_min_p": (_P, [c_float, c_size_t]),
+    "llama_sampler_init_typical": (_P, [c_float, c_size_t]),
+    "llama_sampler_init_temp_ext": (_P, [c_float, c_float, c_float]),
+    "llama_sampler_init_dist": (_P, [c_uint32]),
+    "llama_sampler_sample": (llama_token, [_P, _P, c_int32]),
+    "llama_sampler_accept": (None, [_P, llama_token]),
+    "llama_sampler_free": (None, [_P]),
 }
 
 
-def declare_tts(lib: ctypes.CDLL) -> None:
-    """declare() for libcodec_tts."""
-    for name, (restype, argtypes) in TTS_PROTOTYPES.items():
+def declare_llama(lib: ctypes.CDLL) -> None:
+    """declare() for the bundled llama.cpp."""
+    for name, (restype, argtypes) in LLAMA_PROTOTYPES.items():
         fn = getattr(lib, name)
         fn.restype = restype
         fn.argtypes = argtypes

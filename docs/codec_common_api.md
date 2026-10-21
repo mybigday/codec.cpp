@@ -199,7 +199,7 @@ llama.cpp architecture.
 - **`common/tts_runner`**: the loop above over the bundled llama.cpp
   (libttsbackbone), with segmentation, voices and streaming;
   `tools/tts-cli` and `tools/tts-server` drive it.
-- **`common/codec_tts.h`** (`libcodec_tts`): the same runner behind a C ABI,
-  for one-call TTS; Python `codec_cpp.TTS`.
+- **Python `codec_cpp.TTS`**: the same loop in Python, over `codec_cpp.AudioLM`
+  and the bundled llama.cpp's C API (ctypes on libttsbackbone).
 - **Python `codec_cpp.AudioLM`**: `codec_audio_lm.h` call for call, with
   `codec_cpp.Vocab.from_llama_cpp` for llama-cpp-python hosts.

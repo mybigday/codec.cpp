@@ -94,43 +94,41 @@ from . import _ffi as _ffi_mod  # noqa: E402
 _log_cb = _ffi_mod.codec_log_callback(_on_log)
 
 
-# libcodec_tts (common/codec_tts.h): the one-call TTS session, with the
-# bundled llama.cpp backbone.  Separate from libcodec so codec-only users
-# never load llama.cpp; looked up next to libcodec.
-if sys.platform == "darwin":
-    _TTS_LIB_NAMES = ("libcodec_tts.dylib",)
-elif sys.platform == "win32":
-    _TTS_LIB_NAMES = ("codec_tts.dll", "libcodec_tts.dll")
-else:
-    _TTS_LIB_NAMES = ("libcodec_tts.so",)
+# libttsbackbone: the llama.cpp bundled with codec.cpp (its architecture /
+# tokenizer patches applied, its ggml hidden), for codec_cpp.TTS.  Separate
+# from libcodec so codec-only users never load llama.cpp; looked up next to
+# libcodec.
+_BACKBONE_LIB_NAMES = ("libttsbackbone.so",)
 
-_tts_lib: ctypes.CDLL | None = None
+_backbone_lib: ctypes.CDLL | None = None
 
 
-def tts_library_path() -> Path:
-    env = os.environ.get("CODEC_CPP_TTS_LIBRARY")
-    dirs = [Path(env).parent] if env else []
+def backbone_library_path() -> Path:
+    env = os.environ.get("CODEC_CPP_BACKBONE_LIBRARY")
     if env and Path(env).is_file():
         return Path(env)
-    dirs += [library_path().parent, _PKG_DIR / "lib", _REPO_ROOT / "build"]
+    dirs = [library_path().parent, library_path().parent / "ttsbackbone", _PKG_DIR / "lib",
+            _REPO_ROOT / "build" / "ttsbackbone"]
     for d in dirs:
-        for n in _TTS_LIB_NAMES:
+        for n in _BACKBONE_LIB_NAMES:
             if (d / n).is_file():
                 return d / n
     raise FileNotFoundError(
-        "libcodec_tts not found; build codec.cpp with CODEC_TTS_BACKBONE=ON (the default) "
-        "or set CODEC_CPP_TTS_LIBRARY.")
+        "libttsbackbone not found; build codec.cpp with CODEC_TTS_BACKBONE=ON (the default) "
+        "or set CODEC_CPP_BACKBONE_LIBRARY.")
 
 
-def tts_lib() -> ctypes.CDLL:
-    """Return the loaded libcodec_tts with its prototypes declared."""
-    global _tts_lib
-    if _tts_lib is None:
-        lib()  # libcodec first: libcodec_tts resolves codec symbols against it
+def backbone_lib() -> ctypes.CDLL:
+    """Return the loaded bundled llama.cpp with the prototypes codec_cpp.TTS uses."""
+    global _backbone_lib
+    if _backbone_lib is None:
+        lib()  # libcodec first: its log callback is reused for llama.cpp's log
         with _lock:
-            if _tts_lib is None:
+            if _backbone_lib is None:
                 from . import _ffi
-                handle = ctypes.CDLL(str(tts_library_path()))
-                _ffi.declare_tts(handle)
-                _tts_lib = handle
-    return _tts_lib
+                handle = ctypes.CDLL(str(backbone_library_path()))
+                _ffi.declare_llama(handle)
+                handle.llama_log_set(_log_cb, None)
+                handle.llama_backend_init()
+                _backbone_lib = handle
+    return _backbone_lib

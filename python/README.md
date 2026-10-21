@@ -1,9 +1,10 @@
 # codec-cpp (Python bindings)
 
 `codec_cpp` is the Python API for codec.cpp. It wraps the public C API
-(`include/codec.h`, `codec_speaker.h`, `codec_lm.h`, `codec_audio_lm.h`, and `common/codec_tts.h`
-from libcodec_tts) with ctypes. It has no compiled extension, and its only
-dependency is numpy.
+(`include/codec.h`, `codec_speaker.h`, `codec_lm.h` and `codec_audio_lm.h`)
+with ctypes, and drives the bundled llama.cpp's C API (`llama.h`) the same
+way for `codec_cpp.TTS`. It has no compiled extension, and its only dependency
+is numpy.
 
 ## Install
 
@@ -18,9 +19,8 @@ pip install . -C cmake.define.GGML_VULKAN=ON       # any ggml backend flag works
 uv build --wheel                                   # wheel file for another machine
 ```
 
-Wheel builds link ggml statically. `codec_cpp/lib/` holds `libcodec.so`,
-`libcodec_tts.so` (`codec_cpp.TTS`) and `libttsbackbone.so`, the bundled
-llama.cpp with codec.cpp's architecture patches, which the build applies to
+Wheel builds link ggml statically. `codec_cpp/lib/` holds `libcodec.so`
+and `libttsbackbone.so` (`codec_cpp.TTS`), the bundled llama.cpp with codec.cpp's architecture patches, which the build applies to
 the llama.cpp submodule (clone with `--recursive`, or pip a git URL, which
 fetches submodules). ggml is built with `GGML_NATIVE` on, so the wheel is
 tuned to the machine that builds it.
@@ -42,11 +42,14 @@ wins.
 
 ## Text to speech
 
-`codec_cpp.TTS` runs the whole pipeline, the same host loop as `tts-cli`: the
+`codec_cpp.TTS` runs the whole pipeline: the host loop of `tts-cli`
+(`common/tts_runner.cpp`) written in Python over `codec_cpp.AudioLM`, with the
 backbone GGUF in the llama.cpp bundled with codec.cpp (with the architecture
-patches the models need), the codec GGUF in codec.cpp. It loads
-`libcodec_tts`, which wheels bundle and CMake builds put next to libcodec
-(`CODEC_TTS_BACKBONE=ON`, the default).
+patches the models need) and the codec GGUF in codec.cpp. Same seed and
+options give the same audio as `tts-cli` (`tests/e2e/python_tts_smoke.py`).
+It loads `libttsbackbone`, which wheels bundle and CMake builds put in
+`build/ttsbackbone/` (`CODEC_TTS_BACKBONE=ON`, the default;
+`$CODEC_CPP_BACKBONE_LIBRARY` overrides). Linux only for now.
 
 ```python
 import codec_cpp
@@ -55,6 +58,8 @@ tts = codec_cpp.TTS("backbone.gguf", "codec.gguf")    # use_gpu=, n_threads=, ma
 audio, sr = tts.synthesize("Hello there.")
 audio, sr = tts.synthesize("Hello there.", ref_audio="me.wav", ref_text="What the clip says.")
 audio, sr = tts.synthesize("Hello there.", voice=tts.voices()[0], seed=7, temperature=0.8)
+voice = tts.audio_lm.create_voice(pcm, sr, "What the clip says.")   # a codec_cpp.Speaker: reuse / save it
+audio, sr = tts.synthesize("Hello there.", voice=voice)
 for piece, sr in tts.stream(long_text, chunk_ms=500):   # audio as it becomes final
     play(piece, sr)
 ```
