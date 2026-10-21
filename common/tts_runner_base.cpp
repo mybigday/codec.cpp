@@ -135,7 +135,10 @@ bool tts_runner_take_pcm(codec_pcm_buffer * buf, tts_runner_result * out) {
 
 bool tts_runner_generate_self_contained(codec_audio_lm * alm, const tts_runner_params & a, tts_runner_result * out) {
     const codec_audio_lm_tts_request req = tts_runner_request(a);
-    if (!codec_audio_lm_tts_prompt(alm, &req, nullptr) || !codec_audio_lm_set_seed(alm, a.sampling.seed) ||
+    codec_audio_lm_format f;
+    codec_audio_lm_completion c;
+    if (!codec_audio_lm_tts_format(alm, &req, nullptr, &f) || !codec_audio_lm_tts_build(alm, &req, f.prompt, nullptr, &c) ||
+        !codec_audio_lm_set_seed(alm, a.sampling.seed) ||
         !codec_audio_lm_generate_self_contained(alm)) {
         out->error = codec_audio_lm_last_error(alm);
         return false;

@@ -87,14 +87,15 @@ alm = codec_cpp.AudioLM("codec.gguf")                # backbone_path= for models
 vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)
 req = alm.backbone_requirements(vocab, max_frames=500)   # n_ctx, n_ubatch, n_seq_max, embeddings, flash_attn
 voice = alm.create_voice(pcm, sr, ref_text)         # or alm.voice("name") / alm.load_voice(path)
-alm.tts_prompt("Hello there.", vocab=vocab, voice=voice)
-c = alm.completion()      # c.chunks (TEXT / TOKENS / EMBD), c.allowed / c.grammar / c.penalty_exempt, c.head_groups, flags
+f = alm.tts_format("Hello there.", vocab=vocab, voice=voice)   # f.prompt: text with <__voice__> / <__codec:…__> markers
+c = alm.tts_build("Hello there.", f.prompt, vocab=vocab, voice=voice)
+# c.chunks (TOKENS / EMBD), c.allowed / c.grammar / c.penalty_exempt, c.head_groups, flags
 # decode the chunks, then per step:
 v = alm.observe(tokens=[tok] if sampled else None, hiddens=last_hidden)
 while v.action == codec_cpp.AudioLM.SAMPLE_HEAD:     # codec-side heads: your llama.cpp sampler draws
     v = alm.head_token(draw(c.head_groups[v.head_group], alm.head_logits(v.n_vocab)))
 # STOP -> done; FEED_TOKEN -> decode v.token (or tok); FEED_EMBD -> decode alm.next_embd(0)
-audio, sr = alm.decode()  # or alm.stream_poll() after audio steps + alm.stream_finish()
+audio, sr = alm.decode()  # or alm.stream_poll() after frame_done steps + alm.stream_finish()
 ```
 
 `tests/e2e/audio_lm_host_smoke.py` is a complete loop. `alm.split` /

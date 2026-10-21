@@ -110,10 +110,30 @@ public:
     using text_lane_family::text_lane_family;
     const char * name() const override { return "realtime"; }
 
-    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
+    // Prompt: {the GGUF's context}<__codec:text__>{text} (BOS added; the text
+    // streams into the assistant turn, one token per frame).
+    bool tts_format(const alm_tts_request & req, const alm_vocab & vocab, alm_format * out) override {
+        if (!vocab.valid()) return fail("this model needs the backbone vocabulary");
+        audio_lm_prompt_info pi;
+        if (!audio_lm_get_prompt_info(alm_, &pi)) return fail_alm("prompt info");
+        out->prompt = pi.prompt_prefix + pi.prompt_suffix + alm_codec_marker("text") + req.text;
+        alm_completion & d = out->desc;
+        d.flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
+        d.n_embd = audio_lm_hidden_dim(alm_);
+        // One head group per codebook, each with its own penalty history.
+        d.head_groups.assign((size_t) audio_lm_n_codebook(alm_), alm_head_group{true, {}, {}});
+        d.needs_embeddings = true;
+        d.sample_first     = false;
+        d.streamable       = true;
+        d.max_frames       = 512;
+        return true;
+    }
+
+    bool tts_build(const alm_tts_request & req, alm_prompt & prompt, const alm_vocab & vocab, alm_completion * out) override {
         if (!begin(req, vocab)) return false;
-        const std::vector<int32_t> ctx_toks = vocab.tokenize(pi_.prompt_prefix + pi_.prompt_suffix, pi_.add_bos, pi_.parse_special);
-        text_ = vocab.tokenize(req.text, false, false);
+        const std::vector<int32_t> ctx_toks = vocab.tokenize(prompt.text(), pi_.add_bos, pi_.parse_special);
+        if (!prompt.codec("text")) return fail("this model's prompt has <__codec:text__> before the text");
+        text_ = vocab.tokenize(prompt.text(), false, false);
         if (ctx_toks.empty() || text_.empty()) return fail("empty context or text tokens");
         const int32_t prefill_n = std::min<int32_t>(pi_.prefill_text_len, (int32_t) text_.size());
         const std::vector<int32_t> pad((size_t) n_cb_, pi_.audio_pad_code);
@@ -128,17 +148,7 @@ public:
             if (!compose(text_[(size_t) i], codes.data(), rows.data() + r++ * hidden_)) return false;
         }
         text_idx_ = prefill_n;
-
-        *out = alm_completion();
-        out->flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
-        out->n_embd = hidden_;
-        out->seqs   = {{alm_chunk::of_embd(std::move(rows), (int32_t) r)}};
-        // One head group per codebook, each with its own penalty history.
-        out->head_groups.assign((size_t) n_cb_, alm_head_group{true, {}, {}});
-        out->needs_embeddings = true;
-        out->sample_first     = false;
-        out->streamable       = true;
-        out->max_frames       = 512;
+        out->seqs = {{alm_chunk::of_embd(std::move(rows), (int32_t) r)}};
         return true;
     }
 
@@ -180,24 +190,34 @@ public:
     using text_lane_family::text_lane_family;
     const char * name() const override { return "lfm2"; }
 
-    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
+    // Prompt: {the GGUF's prefix}{text}{suffix} (BOS added).
+    bool tts_format(const alm_tts_request & req, const alm_vocab & vocab, alm_format * out) override {
+        if (!vocab.valid()) return fail("this model needs the backbone vocabulary");
+        audio_lm_prompt_info pi;
+        if (!audio_lm_get_prompt_info(alm_, &pi)) return fail_alm("prompt info");
+        out->prompt = pi.prompt_prefix + req.text + pi.prompt_suffix;
+        alm_completion & d = out->desc;
+        d.flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
+        d.n_embd = audio_lm_hidden_dim(alm_);
+        // One head group (one random stream) for the text warm-up and the audio
+        // codebooks, without penalties (their histories would mix).
+        d.head_groups = {alm_head_group{false, {}, {}}};
+        d.needs_embeddings = true;
+        d.sample_first     = false;
+        d.streamable       = true;
+        d.max_frames       = 512;
+        return true;
+    }
+
+    bool tts_build(const alm_tts_request & req, alm_prompt & prompt, const alm_vocab & vocab, alm_completion * out) override {
         if (!begin(req, vocab)) return false;
-        const std::vector<int32_t> toks = vocab.tokenize(pi_.prompt_prefix + req.text + pi_.prompt_suffix,
-                                                         pi_.add_bos, pi_.parse_special);
+        std::string text;
+        if (!prompt.rest_text(&text)) return fail("this model's prompt takes no markers");
+        const std::vector<int32_t> toks = vocab.tokenize(text, pi_.add_bos, pi_.parse_special);
         if (toks.empty()) return fail("empty prompt after tokenize");
         audio_ = false;
         text_steps_ = 0;
-        *out = alm_completion();
-        out->flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
-        out->n_embd = hidden_;
-        out->seqs   = {{alm_chunk::of_tokens(toks)}};
-        // One head group (one random stream) for the text warm-up and the audio
-        // codebooks, without penalties (their histories would mix).
-        out->head_groups = {alm_head_group{false, {}, {}}};
-        out->needs_embeddings = true;
-        out->sample_first     = false;
-        out->streamable       = true;
-        out->max_frames       = 512;
+        out->seqs = {{alm_chunk::of_tokens(toks)}};
         return true;
     }
 

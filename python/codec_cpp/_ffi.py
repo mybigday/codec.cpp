@@ -360,6 +360,24 @@ class codec_audio_lm_completion(Structure):
     ]
 
 
+class codec_audio_lm_format(Structure):
+    _fields_ = [
+        ("prompt", c_char_p),
+        ("flow", c_int),
+        ("n_seq", c_int32),
+        ("grammar", c_char_p),
+        ("penalty_exempt", POINTER(c_int32)),
+        ("n_penalty_exempt", c_int32),
+        ("allowed", POINTER(codec_audio_lm_token_range)),
+        ("n_allowed", c_int32),
+        ("needs_embeddings", c_bool),
+        ("needs_prompt_hidden", c_bool),
+        ("sample_first", c_bool),
+        ("streamable", c_bool),
+        ("max_frames", c_int32),
+    ]
+
+
 class codec_audio_lm_verdict(Structure):
     _fields_ = [
         ("action", c_int),
@@ -514,8 +532,12 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_load_voice": (c_void_p, [c_void_p, c_char_p, c_char_p]),
     "codec_audio_lm_save_voice": (c_bool, [c_void_p, c_void_p, c_char_p, c_char_p]),
     "codec_audio_lm_default_tts_request": (codec_audio_lm_tts_request, []),
-    "codec_audio_lm_tts_prompt": (
-        c_bool, [c_void_p, POINTER(codec_audio_lm_tts_request), POINTER(codec_audio_lm_vocab)]),
+    "codec_audio_lm_tts_format": (
+        c_bool, [c_void_p, POINTER(codec_audio_lm_tts_request), POINTER(codec_audio_lm_vocab),
+                 POINTER(codec_audio_lm_format)]),
+    "codec_audio_lm_tts_build": (
+        c_bool, [c_void_p, POINTER(codec_audio_lm_tts_request), c_char_p, POINTER(codec_audio_lm_vocab),
+                 POINTER(codec_audio_lm_completion)]),
     "codec_audio_lm_tts_split": (c_int32, [c_void_p, c_char_p, c_int32]),
     "codec_audio_lm_tts_segment": (c_char_p, [c_void_p, c_int32]),
     "codec_audio_lm_tts_join": (c_int32, [c_void_p, POINTER(codec_pcm_buffer), c_int32, c_int32]),

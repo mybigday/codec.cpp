@@ -396,10 +396,11 @@ class TTS:
         for i, seg in enumerate(segments):
             if base_seed != _ffi.CODEC_AUDIO_LM_DEFAULT_SEED:   # a random seed stays random
                 sampling["seed"] = (base_seed + i) & 0xFFFFFFFF
-            alm.tts_prompt(seg, vocab=self._bb.vocab if self._bb else None, voice=spk,
-                           max_frames=self.max_frames or None, **opts)
+            req = dict(vocab=self._bb.vocab if self._bb else None, voice=spk, max_frames=self.max_frames or None, **opts)
+            c = alm.tts_build(seg, alm.tts_format(seg, **req).prompt, **req)
             alm.set_seed(sampling["seed"])   # the model's own noise follows the user's seed too
-            c = None if self._bb is None else alm.completion()
+            if self._bb is None:
+                c = None
             if c is None or c.flow == AudioLM.FLOW_SELF_CONTAINED:
                 alm.generate_self_contained()
                 frames, streamed = alm.decodable_frames, None

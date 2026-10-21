@@ -327,10 +327,11 @@ static bool run_one(tts_runner_session * s, const tts_runner_params & a, tts_run
         return false;
     };
     const codec_audio_lm_tts_request req = tts_runner_request(a);
-    if (!codec_audio_lm_tts_prompt(alm, &req, &cv)) return fail("prompt");
-    codec_audio_lm_set_seed(alm, a.sampling.seed);   // the model's own noise follows the user's seed too
+    codec_audio_lm_format f;
+    if (!codec_audio_lm_tts_format(alm, &req, &cv, &f)) return fail("prompt");
     codec_audio_lm_completion c;
-    if (!codec_audio_lm_get_completion(alm, &c)) return fail("completion");
+    if (!codec_audio_lm_tts_build(alm, &req, f.prompt, &cv, &c)) return fail("prompt");
+    codec_audio_lm_set_seed(alm, a.sampling.seed);   // the model's own noise follows the user's seed too
     if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) return tts_runner_generate_self_contained(alm, a, out);
     const int32_t n_seq = std::max(1, c.n_seq);
     if (n_seq > 1 && c.sample_first) {

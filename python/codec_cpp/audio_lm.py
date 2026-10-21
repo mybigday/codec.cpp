@@ -10,8 +10,8 @@ llama.cpp call and samples every token, so any llama.cpp binding works
     alm = codec_cpp.AudioLM("codec.gguf")
     vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)    # or Vocab(tokenize=..., ...)
     voice = alm.voice("alice")                             # or alm.create_voice(pcm, sr, ref_text)
-    alm.tts_prompt("Hello there.", vocab=vocab, voice=voice)
-    c = alm.completion()                                   # chunks, constraints, head groups, flags
+    f = alm.tts_format("Hello there.", vocab=vocab, voice=voice)   # the prompt as text (+ constraints)
+    c = alm.tts_build("Hello there.", f.prompt, vocab=vocab, voice=voice)   # chunks, head groups, flags
     ...                                                    # decode c.chunks with llama.cpp
     while True:                                            # per step
         v = alm.observe(tokens=[tok] if sampled else None, hiddens=hidden)
@@ -124,6 +124,22 @@ class Chunk:
     parse_special: bool = False
     tokens: np.ndarray | None = None   # int32 (n,)
     embd: np.ndarray | None = None     # float32 (n_rows, n_embd)
+
+
+@dataclass
+class Format:
+    """A formatted prompt and what the completion needs before it is built (codec_audio_lm_format)."""
+    prompt: str                     # text with <__voice__> / <__codec:NAME__> markers
+    flow: int
+    n_seq: int
+    grammar: str
+    penalty_exempt: list[int]
+    allowed: list[tuple[int, int]]
+    needs_embeddings: bool
+    needs_prompt_hidden: bool
+    sample_first: bool
+    streamable: bool
+    max_frames: int
 
 
 @dataclass
@@ -249,7 +265,7 @@ class AudioLM:
 
     # --- voices -----------------------------------------------------------
     # A voice is a codec_cpp.Speaker carrying all of the model's voice
-    # conditioning; pass it to tts_prompt / decode_generation.
+    # conditioning; pass it to tts_format / tts_build / decode_generation.
 
     def voice(self, name: str | None = None) -> Speaker:
         """A builtin voice (None = the model's default), borrowed from the model."""
@@ -277,30 +293,51 @@ class AudioLM:
         if not lib().codec_audio_lm_save_voice(self.ptr, voice.ptr, os.fsencode(path), name.encode("utf-8")):
             self._fail("codec_audio_lm_save_voice")
 
-    def tts_prompt(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
-                   min_frames: int | None = None, max_frames: int | None = None,
-                   lm_guidance: float | None = None, flow_guidance: float | None = None,
-                   flow_steps: int | None = None, voice: Speaker | None = None) -> None:
-        """Prepare the prompt of one generation.  Sampling is the host's (every
-        token, codec-side heads included); set_seed() seeds the model's own
-        randomness (flow init noise).  Decoder settings left None are the GGUF's;
-        voice None = default."""
+    def _request(self, text: str, instruct: str | None, voice: Speaker | None, **settings):
         L = lib()
         r = L.codec_audio_lm_default_tts_request()
         r.text, r.instruct = text.encode("utf-8"), _b(instruct)
         r.voice = voice.ptr if voice is not None else None
+        for name, conv in (("min_frames", int), ("max_frames", int), ("lm_guidance", float),
+                           ("flow_guidance", float), ("flow_steps", int)):
+            if settings.get(name) is not None:
+                setattr(r, name, conv(settings[name]))
+        return r
+
+    def tts_format(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
+                   voice: Speaker | None = None, **settings) -> Format:
+        """The prompt of one generation as text (the model's template, the normalized text,
+        markers where the backbone takes embeddings) and its sampling constraints.
+        settings: min_frames, max_frames, lm_guidance, flow_guidance, flow_steps (None = the GGUF's)."""
+        L = lib()
+        r = self._request(text, instruct, voice, **settings)
+        f = _ffi.codec_audio_lm_format()
+        if not L.codec_audio_lm_tts_format(self.ptr, ctypes.byref(r), ctypes.byref(vocab.struct) if vocab else None,
+                                           ctypes.byref(f)):
+            self._fail("codec_audio_lm_tts_format")
+        ids = lambda p, n: [p[i] for i in range(n)] if n else []
+        return Format(_str(f.prompt), int(f.flow), int(f.n_seq), _str(f.grammar) if f.grammar else "",
+                      ids(f.penalty_exempt, f.n_penalty_exempt),
+                      [(f.allowed[i].begin, f.allowed[i].end) for i in range(f.n_allowed)],
+                      f.needs_embeddings, f.needs_prompt_hidden, f.sample_first, f.streamable, int(f.max_frames))
+
+    def tts_build(self, text: str, prompt: str, *, vocab: Vocab | None = None, instruct: str | None = None,
+                  voice: Speaker | None = None, **settings) -> Completion:
+        """Build `prompt` (tts_format's, or an edit of it) for the request it was formatted from:
+        prepares the generation and returns its completion.  Sampling is the host's (every token,
+        codec-side heads included); set_seed() seeds the model's own randomness (flow init noise)."""
+        L = lib()
+        r = self._request(text, instruct, voice, **settings)
         self._voice = voice   # the library borrows it until the generation is decoded
-        for name, val, conv in (("min_frames", min_frames, int), ("max_frames", max_frames, int),
-                                ("lm_guidance", lm_guidance, float), ("flow_guidance", flow_guidance, float),
-                                ("flow_steps", flow_steps, int)):
-            if val is not None:
-                setattr(r, name, conv(val))
-        if not L.codec_audio_lm_tts_prompt(self.ptr, ctypes.byref(r), ctypes.byref(vocab.struct) if vocab else None):
-            self._fail("codec_audio_lm_tts_prompt")
+        c = _ffi.codec_audio_lm_completion()
+        if not L.codec_audio_lm_tts_build(self.ptr, ctypes.byref(r), prompt.encode("utf-8"),
+                                          ctypes.byref(vocab.struct) if vocab else None, ctypes.byref(c)):
+            self._fail("codec_audio_lm_tts_build")
+        return self.completion()
 
     def set_seed(self, seed: int) -> None:
         """Seed the model's own noise (Pocket-TTS / BlueMagpie flow init noise) of the
-        prepared generation; call after tts_prompt.  Unset = random."""
+        prepared generation; call after tts_build.  Unset = random."""
         if not lib().codec_audio_lm_set_seed(self.ptr, int(seed) & 0xFFFFFFFF):
             self._fail("codec_audio_lm_set_seed")
 

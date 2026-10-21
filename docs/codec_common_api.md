@@ -8,8 +8,8 @@ keeps every `llama_*` call: tokenization, `llama_decode`, the sampler, the KV
 cache, batching. Nothing in the API names a model; every model-specific detail
 sits behind it.
 
-Text-to-speech is the first prompt builder (`codec_audio_lm_tts_prompt`).
-Other tasks (audio-to-audio) will add their own builders that produce the same
+Text-to-speech is the first prompt builder (`codec_audio_lm_tts_format` /
+`codec_audio_lm_tts_build`). Other tasks (audio-to-audio) will add their own builders that produce the same
 completion description, so the host loop stays the same.
 
 ## Layers
@@ -40,9 +40,10 @@ for (int i = 0; i < n; ++i) {
     req = codec_audio_lm_default_tts_request();
     req.text = codec_audio_lm_tts_segment(alm, i);
     req.voice = voice;
-    codec_audio_lm_tts_prompt(alm, &req, &vocab);
+    codec_audio_lm_format f;
+    codec_audio_lm_tts_format(alm, &req, &vocab, &f);         // the prompt as text
     codec_audio_lm_completion c;
-    codec_audio_lm_get_completion(alm, &c);
+    codec_audio_lm_tts_build(alm, &req, f.prompt, &vocab, &c); // its chunks
     if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) {
         codec_audio_lm_generate_self_contained(alm);
     } else {
@@ -70,6 +71,39 @@ for (int i = 0; i < n; ++i) {
 
 `common/tts_runner.cpp` (`run_one`) is this loop over llama.cpp in C++;
 `tests/e2e/audio_lm_host_smoke.py` is the same loop over llama-cpp-python.
+
+### The prompt
+
+As in llama.cpp's MTMD, the prompt is text: `codec_audio_lm_tts_format`
+returns the model's template with the request filled in (roles, instruction,
+the normalized text, text-form voices written as their vocab pieces) and the
+completion's constraints and flags, with no generation state, so a host can
+show or edit it. `codec_audio_lm_tts_build` turns that text (the format's or
+the host's edit) into the completion: text is tokenized by the backbone vocab
+with parse_special, and markers stand where the backbone takes input the vocab
+cannot spell:
+
+- `<__voice__>`: the voice's embedding-form conditioning;
+- `<__codec:NAME__>`: a model row (an embedding row, or a token without a
+  piece), or `<__codec:text__>`: the text to speak starts here (models that
+  tokenize it apart from what precedes).
+
+Language tags (`[en]`), phonemes and script conversions stay the caller's;
+format only applies the model's deterministic normalization.
+
+| Model | Prompt |
+|---|---|
+| Soprano | `[STOP][TEXT]{text}[START]` |
+| NeuTTS | `user: Convert the text to speech:<\|TEXT_PROMPT_START\|>{ref phonemes} {phonemes}<\|TEXT_PROMPT_END\|>\nassistant:<\|SPEECH_GENERATION_START\|>` + the reference codes as `<\|speech_N\|>` |
+| OuteTTS | `<\|im_start\|>\n<\|text_start\|>{speaker text + words}<\|text_end\|>\n<\|audio_start\|>\n` + the speaker's audio section as pieces (+ `<\|word_start\|>` for 1.0) |
+| KittenTTS 2 | `<__voice__>` (lm_cond row) + `<__codec:ref_text_start__>{transcript}<__codec:ref_text_end__><__codec:ref_speech_start__><\|a_N\|>…<__codec:ref_speech_end__>` + `[{emo: 1}]<\|text_start\|>{text}<final_seg><\|speech_start\|>` |
+| Pocket-TTS | `{prepared text}<__voice__><__codec:bos__>` |
+| BlueMagpie, LFM2-Audio | `{the GGUF's prefix}{text}{suffix}` (BOS added) |
+| CSM, MOSS-TTSD | `[<__voice__>]{prefix}{text}{suffix}` (MOSS-TTSD: `[S1]` → `<speaker1>`) |
+| Qwen3-TTS | `[<\|im_start\|>user\n{instruct}<\|im_end\|>\n]<\|im_start\|>assistant\n<__voice__>[{reference transcript}]<__codec:text__>{text}` |
+| MOSS-TTS-Realtime | `{the GGUF's context}<__codec:text__>{text}` |
+| Chatterbox | `<__voice__>{punc_norm'd text}` (T3: ' ' as `[SPACE]`) |
+| CosyVoice | `<__codec:sos__>[<__voice__> (v1 x-vector)]{prompt text}<__codec:text__>{text}<__codec:task__>[<__voice__> (zero-shot reference tokens)]` |
 
 ### The vocabulary
 
@@ -118,7 +152,7 @@ A model's recommended settings ship in its **backbone** GGUF as llama.cpp's
 freq / presence / DRY), read the way llama.cpp's
 `common_init_sampler_from_model` does. The model's own randomness (the init
 noise of a codec-side flow / CFM head: Pocket-TTS, BlueMagpie) is not token
-sampling: `codec_audio_lm_set_seed` seeds it after `tts_prompt` (unset =
+sampling: `codec_audio_lm_set_seed` seeds it after `tts_build` (unset =
 random), and hosts pass the seed the user gave the completion. Decoders are
 deterministic (Chatterbox S3G / CosyVoice use a fixed noise seed). Decoder settings
 (`lm_guidance`, `flow_guidance`, `flow_steps`) are not sampling: < 0 takes the
@@ -222,7 +256,9 @@ llama.cpp architecture.
 ### Adding a model
 
 1. Write `common/audio_lm_family_<name>.cpp`: subclass `alm_family`; implement
-   `tts_prompt` (fill `alm_completion`) and `observe`; override `caps`,
+   `tts_format` (the prompt text and `alm_completion`'s constraints) and
+   `tts_build` (read the prompt, fill the chunks, set up the generation) and
+   `observe`; override `caps`,
    `set_voice`, `backbone_requirements`, `segment_split` / `segment_join`,
    `next_embd`, `decode`, `decodable_frames` where the model needs it.
    Model-specific codec_lm helpers stay internal (`src/lm/lm_models.h`).
