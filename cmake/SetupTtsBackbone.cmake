@@ -12,8 +12,9 @@
 # codec (→ shared ggml 0.9) + libttsbackbone.so (self-contained ggml 0.15),
 # and the two ggml instances never see each other's symbols.
 #
-# The backbone gets the Vulkan backend when codec.cpp does (GGML_VULKAN=ON),
-# so `tts-cli synthesize --gpu` offloads both, as a llama.cpp host would.
+# The backbone gets the Vulkan / CUDA backend when codec.cpp does
+# (GGML_VULKAN=ON / GGML_CUDA=ON), so `tts-cli synthesize --gpu` offloads
+# both, as a llama.cpp host would.
 # Set -DCODEC_TTS_BACKBONE=OFF to skip (tts-cli then builds without
 # `synthesize`, which #ifdef's out).
 
@@ -58,6 +59,21 @@ if(GGML_VULKAN)
     list(APPEND _ll_link_extra ${Vulkan_LIBRARY})
 endif()
 
+# Likewise CUDA (GGML_CUDA=ON): the backbone links the CUDA runtime + cuBLAS
+# shared, and the driver (libcuda.so.1) at run time.
+set(_ll_cuda OFF)
+set(_ll_cuda_args "")
+if(GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(_ll_cuda ON)
+    list(INSERT _ll_archives 5 "${_ll_ggmldir}/ggml-cuda/libggml-cuda.a")
+    list(APPEND _ll_link_extra "-L${CUDAToolkit_LIBRARY_DIR}" "-L${CUDAToolkit_LIBRARY_DIR}/stubs"
+         -lcudart -lcublas -lcublasLt -lcuda)
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        list(APPEND _ll_cuda_args "-DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+endif()
+
 # The backbone's ggml gets the same CPU tuning as codec.cpp's: GGML_NATIVE=OFF
 # (portable builds, e.g. wheels) must reach it too, with the ISA options.
 set(_ll_cpu_args "-DGGML_NATIVE=${GGML_NATIVE}")
@@ -85,6 +101,8 @@ ExternalProject_Add(llama_static
         -DLLAMA_OPENSSL=OFF
         ${_ll_cpu_args}
         -DGGML_VULKAN=${_ll_vulkan}
+        -DGGML_CUDA=${_ll_cuda}
+        ${_ll_cuda_args}
         -DGGML_BACKEND_DL=OFF
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-common --config Release
     # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
