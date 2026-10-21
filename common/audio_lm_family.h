@@ -72,6 +72,10 @@ struct alm_tts_request {
     std::string text;
     std::string instruct;
     const codec_speaker * voice = nullptr;   // resolved: the request's, else the model's default (may be null)
+    // false: a build without the request's text (the host kept only the
+    // prompt); format then skips what depends on the text (its grammar,
+    // length estimates) and must not fail on the empty text.
+    bool text_known = true;
     int32_t min_frames = -1;         // < 0 = the model's own minimum
     int32_t max_frames = 0;          // <= 0 = model default
     float   lm_guidance = -1.0f;     // < 0 = the model's (likewise below)

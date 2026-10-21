@@ -331,7 +331,10 @@ bool codec_audio_lm_tts_format(struct codec_audio_lm * ctx, const struct codec_a
 
 // Build a formatted prompt (format's, or the host's edit of it) for `req`, the
 // request it was formatted from: its chunks, sampling plan and the generation
-// state.  Resets the per-generation state: a context holds one built prompt.
+// state.  Everything the generation needs comes from the prompt, the voice and
+// the decoder settings; req->text / instruct may be NULL (a host that kept only
+// the prompt), and then the completion leaves out the constraints that depend
+// on the text (the format's grammar; take that one from the format).  Resets the per-generation state: a context holds one built prompt.
 // `out` is what codec_audio_lm_get_completion returns.
 bool codec_audio_lm_tts_build(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_request * req,
                               const char * prompt, const struct codec_audio_lm_vocab * vocab,

@@ -267,7 +267,7 @@ public:
         outetts_version v{};
         if (!outetts_detect(vocab, &v)) return fail("the backbone is not an OuteTTS model");
         const std::string in_words = outetts_input_words(v, text);
-        if (in_words.empty()) return fail("OuteTTS: no words in the input text");
+        if (in_words.empty() && req.text_known) return fail("OuteTTS: no words in the input text");
 
         // Speaker: ref_text (text section) + audio_prompt (this model's token
         // ids for the audio section), baked into the codec GGUF.
@@ -304,7 +304,7 @@ public:
         // Free generation (word blocks interleave with the codes) kept well
         // formed by the prompt-derived grammar: only the input's words,
         // complete headers, in-range codes.
-        d.grammar    = outetts_build_grammar(v, in_words);
+        if (req.text_known) d.grammar = outetts_build_grammar(v, in_words);
         d.max_frames = INT32_MAX;   // the context bounds it
         d.streamable = true;
         return true;

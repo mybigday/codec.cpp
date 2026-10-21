@@ -108,23 +108,15 @@ public:
             prompt += alm_codec_marker("ref_speech_end");
         }
         const std::string spoken = strip_copy(kitten_prepare_text(req.text));
-        if (spoken.empty()) return fail("no text to speak");
+        if (spoken.empty() && req.text_known) return fail("no text to speak");
         // A segment of the last split takes the whole text's settings; any
         // other text stands alone.
         const bool of_split = std::find(segments_.begin(), segments_.end(), req.text) != segments_.end();
-        const int32_t n_segments = of_split ? n_segments_ : 1;
         if (of_split ? full_has_tag_ : kitten_has_expression_tag(req.text)) prompt += c.emotion_control;
         prompt += vocab.piece(c.text_start) + spoken;
         if (c.final_seg) prompt += vocab.piece(c.final_seg);
         prompt += vocab.piece(c.speech_start);
         out->prompt = std::move(prompt);
-
-        // Per-chunk budget sized from the chunk's length (model.py::_chunk_budget).
-        int32_t budget = c.max_new_tokens;
-        if (n_segments > 1) {
-            const int32_t expected = (int32_t) ((double) spoken.size() / 20.0 * 25.0 * 1.8);
-            budget = std::max(200, std::min(c.max_new_tokens, expected));
-        }
         alm_completion & d = out->desc;
         d.flow   = CODEC_AUDIO_LM_FLOW_TOKENS;
         d.n_embd = n_embd;
@@ -133,8 +125,18 @@ public:
         // Speech is audio tokens until <speech_end> / [STOP]: keep a quantized
         // backbone from drifting into the Qwen3 text vocabulary.
         d.allowed = {{c.audio_base, c.audio_base + c.n_audio}, {c.speech_end, c.speech_end + 1}, {c.stop, c.stop + 1}};
-        d.max_frames = budget;
+        d.max_frames = budget(spoken);
         return true;
+    }
+
+    // Per-chunk budget sized from the chunk's length (model.py::_chunk_budget)
+    // when the text is one segment of the last split.
+    int32_t budget(const std::string & spoken) const {
+        bool of_split = false;
+        for (const std::string & s : segments_) of_split = of_split || strip_copy(kitten_prepare_text(s)) == spoken;
+        if (!of_split || n_segments_ <= 1) return cfg_.max_new_tokens;
+        const int32_t expected = (int32_t) ((double) spoken.size() / 20.0 * 25.0 * 1.8);
+        return std::max(200, std::min(cfg_.max_new_tokens, expected));
     }
 
     bool tts_build(const alm_tts_request & req, alm_prompt & prompt, const alm_vocab & vocab, alm_completion * out) override {
@@ -154,9 +156,11 @@ public:
         const std::pair<const char *, int32_t> rows[] = {{"ref_text_start", c.ref_text_start}, {"ref_text_end", c.ref_text_end},
                                                          {"ref_speech_start", c.ref_speech_start}, {"ref_speech_end", c.ref_speech_end}};
         std::vector<int32_t> toks;   // after position 0
+        std::string last_text;
         while (!prompt.done()) {
             const std::string t = prompt.text();
             if (!t.empty()) {
+                last_text = t;
                 const auto ids = vocab.tokenize(t, false, true);
                 toks.insert(toks.end(), ids.begin(), ids.end());
                 continue;
@@ -167,6 +171,11 @@ public:
             }
             if (!known) break;   // the caller reports the unexpected marker
         }
+        // The spoken text: between <|text_start|> and <final_seg> / <|speech_start|>.
+        const std::string ts = vocab.piece(c.text_start), te = vocab.piece(c.final_seg ? c.final_seg : c.speech_start);
+        const size_t a = last_text.rfind(ts);
+        const size_t e = a == std::string::npos ? std::string::npos : last_text.find(te, a + ts.size());
+        out->max_frames = budget(e == std::string::npos ? "" : last_text.substr(a + ts.size(), e - a - ts.size()));
         codec_log(CODEC_LOG_LEVEL_INFO, "kitten: voice=%s\n", codec_speaker_name(spk));
         out->seqs = {{alm_chunk::of_embd(std::vector<float>(lm_cond, lm_cond + out->n_embd), 1),
                       alm_chunk::of_tokens(std::move(toks))}};

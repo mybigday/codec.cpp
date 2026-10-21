@@ -59,16 +59,20 @@ public:
         std::string text = req.text;
         flow_prepare_text(text);
         std::vector<int32_t> ids;
-        if (!tokenize(text, vocab, &ids)) return false;
+        if (req.text_known && !tokenize(text, vocab, &ids)) return false;
         out->prompt = text + CODEC_AUDIO_LM_MARKER_VOICE + alm_codec_marker("bos");
         alm_completion & d = out->desc;
         d.flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
         d.n_embd = fi_->d_model;
         d.needs_embeddings = true;
         d.sample_first     = false;
-        // _estimate_max_gen_len: 12.5 frames/s for ~3 tokens/s + 2 s.
-        d.max_frames = std::max(8, (int32_t) std::ceil(((double) ids.size() / 3.0 + 2.0) * 12.5));
+        d.max_frames = max_frames_for(ids);
         return true;
+    }
+
+    // _estimate_max_gen_len: 12.5 frames/s for ~3 tokens/s + 2 s.
+    static int32_t max_frames_for(const std::vector<int32_t> & ids) {
+        return std::max(8, (int32_t) std::ceil(((double) ids.size() / 3.0 + 2.0) * 12.5));
     }
 
     bool tts_build(const alm_tts_request & req, alm_prompt & prompt, const alm_vocab & vocab, alm_completion * out) override {
@@ -120,6 +124,7 @@ public:
         latents_.clear();
         n_frames_ = 0;
         stop_reason_ = "max_frames";
+        out->max_frames = max_frames_for(ids);
         out->seqs = {{alm_chunk::of_tokens(ids), alm_chunk::of_embd(std::move(rows), n_rows),
                       alm_chunk::of_embd(std::move(first), 1)}};
         return true;

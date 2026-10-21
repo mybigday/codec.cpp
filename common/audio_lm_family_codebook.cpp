@@ -81,7 +81,7 @@ public:
         else                      d.head_groups = {alm_head_group{true, {}, {}}, alm_head_group{false, {}, {}}};
         if (pi.cb0_from_backbone) {
             // Codebook 0 is a backbone token: keep it to the speech range + end.
-            d.grammar = tts_auto_grammar(pi, req.text);
+            if (req.text_known) d.grammar = tts_auto_grammar(pi, req.text);
             if (d.grammar.empty() && pi.audio_tok_offset >= 0) {
                 d.allowed = {{pi.audio_tok_offset, pi.audio_tok_offset + pi.audio_tok_count}};
                 if (pi.audio_tok_eos >= 0) d.allowed.push_back({pi.audio_tok_eos, pi.audio_tok_eos + 1});

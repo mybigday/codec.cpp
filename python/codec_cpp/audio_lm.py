@@ -293,10 +293,10 @@ class AudioLM:
         if not lib().codec_audio_lm_save_voice(self.ptr, voice.ptr, os.fsencode(path), name.encode("utf-8")):
             self._fail("codec_audio_lm_save_voice")
 
-    def _request(self, text: str, instruct: str | None, voice: Speaker | None, **settings):
+    def _request(self, text: str | None, instruct: str | None, voice: Speaker | None, **settings):
         L = lib()
         r = L.codec_audio_lm_default_tts_request()
-        r.text, r.instruct = text.encode("utf-8"), _b(instruct)
+        r.text, r.instruct = _b(text), _b(instruct)
         r.voice = voice.ptr if voice is not None else None
         for name, conv in (("min_frames", int), ("max_frames", int), ("lm_guidance", float),
                            ("flow_guidance", float), ("flow_steps", int)):
@@ -321,10 +321,11 @@ class AudioLM:
                       [(f.allowed[i].begin, f.allowed[i].end) for i in range(f.n_allowed)],
                       f.needs_embeddings, f.needs_prompt_hidden, f.sample_first, f.streamable, int(f.max_frames))
 
-    def tts_build(self, text: str, prompt: str, *, vocab: Vocab | None = None, instruct: str | None = None,
+    def tts_build(self, text: str | None, prompt: str, *, vocab: Vocab | None = None, instruct: str | None = None,
                   voice: Speaker | None = None, **settings) -> Completion:
         """Build `prompt` (tts_format's, or an edit of it) for the request it was formatted from:
-        prepares the generation and returns its completion.  Sampling is the host's (every token,
+        prepares the generation and returns its completion.  text / instruct may be None (only
+        the prompt kept): the completion then leaves out the text-dependent grammar.  Sampling is the host's (every token,
         codec-side heads included); set_seed() seeds the model's own randomness (flow init noise)."""
         L = lib()
         r = self._request(text, instruct, voice, **settings)

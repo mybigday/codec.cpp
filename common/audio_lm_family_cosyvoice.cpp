@@ -86,7 +86,7 @@ public:
                       alm_codec_marker("text") + tts_text + alm_codec_marker("task") +
                       (llm_tokens ? CODEC_AUDIO_LM_MARKER_VOICE : "");
         const int32_t text_len = (int32_t) vocab.tokenize(tts_text, false, true).size();
-        if (text_len == 0) return fail("empty text");
+        if (text_len == 0 && req.text_known) return fail("empty text");
         alm_completion & d = out->desc;
         d.flow   = CODEC_AUDIO_LM_FLOW_CODEC_HEAD;
         d.n_embd = audio_lm_hidden_dim(alm_);
@@ -155,6 +155,7 @@ public:
         }
         chunks.push_back(alm_chunk::of_embd(std::move(tail), n_tail));
         out->seqs = {std::move(chunks)};
+        out->max_frames = max_len_ + 1;   // the text-length bound stops first
         return true;
     }
 
