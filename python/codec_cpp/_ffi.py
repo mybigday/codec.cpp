@@ -502,7 +502,6 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_lm_step_feedback_embd": (_status, [c_void_p, _f32p]),
     "codec_lm_text_prefill": (_status, [c_void_p, _f32p, c_int32, c_int32]),
     "codec_lm_set_continuous_min_len": (_status, [c_void_p, c_int32]),
-    "codec_lm_set_teacher_patch": (_status, [c_void_p, _f32p, c_int32]),
     # codec_lm.h — speaker encoder
     "codec_lm_speaker_get_info": (POINTER(codec_lm_speaker_info), [c_void_p]),
     "codec_lm_speaker_encode": (

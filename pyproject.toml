@@ -30,7 +30,6 @@ sdist.exclude = ["/models/", "/build*/", "/.venv/", "/.model-src/", "/input_audi
                  "/common/third-party/llama.cpp/models/", "/common/third-party/llama.cpp/docs/",
                  "/common/third-party/llama.cpp/examples/", "/docs/", "/tests/", "/scripts/",
                  "/assets/", "/.claude/", "/.agents/", "*.gguf", "*.wav", "*.npy", "*.ckpt"]
-sdist.include = ["/tests/outetts_observe_test.cpp"]
 
 [tool.scikit-build.cmake.define]
 BUILD_SHARED_LIBS = "OFF"

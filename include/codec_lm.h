@@ -467,20 +467,6 @@ enum codec_status codec_lm_set_continuous_min_len(
     struct codec_lm_state * st,
     int32_t                 min_len);
 
-// Teacher-force the NEXT codec_lm_step_generate's trajectory (parity testing).
-// The supplied reference latent `patch` [patch_size*latent_dim] replaces the
-// codec's own generated patch as the cond for the next step AND as the LocEnc
-// feedback source for THIS step — so codec replays the reference trajectory
-// exactly and every emitted patch stays comparable to the reference (free-
-// running feedback diverges chaotically after a few steps under F16).  The
-// patch the graph emits is still codec's own.  Consumed once per step; re-arm
-// before each step.  Pass NULL to disarm.  CONTINUOUS_LATENT_CFM; FLOW_LM
-// takes one denormalized [ldim] latent as the next step's input source.
-enum codec_status codec_lm_set_teacher_patch(
-    struct codec_lm_state * st,
-    const float *           patch,
-    int32_t                 n);
-
 // =====================================================================
 // Speaker-conditioning encoder.
 //

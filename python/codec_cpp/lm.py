@@ -273,11 +273,6 @@ class LMState:
     def set_continuous_min_len(self, min_len: int) -> None:
         self._check("codec_lm_set_continuous_min_len", lib().codec_lm_set_continuous_min_len(self.ptr, int(min_len)))
 
-    def set_teacher_patch(self, patch) -> None:
-        p = None if patch is None else _f32(patch).reshape(-1)
-        self._check("codec_lm_set_teacher_patch",
-                    lib().codec_lm_set_teacher_patch(self.ptr, _fptr(p), 0 if p is None else p.size))
-
     # --- FlowLM -------------------------------------------------------
 
     def close(self) -> None:

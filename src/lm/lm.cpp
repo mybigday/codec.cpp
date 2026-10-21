@@ -788,17 +788,6 @@ enum codec_status codec_lm_set_continuous_min_len(struct codec_lm_state * st, in
     return st->lm->vtable->set_min_len(st, min_len);
 }
 
-enum codec_status codec_lm_set_teacher_patch(struct codec_lm_state * st, const float * patch, int32_t n) {
-    if (st == nullptr || st->lm == nullptr) {
-        return CODEC_STATUS_INVALID_ARG;
-    }
-    if (st->lm->vtable == nullptr || st->lm->vtable->set_teacher_patch == nullptr) {
-        st->last_error = "codec_lm_set_teacher_patch not supported for this kind";
-        return CODEC_STATUS_NOT_SUPPORTED;
-    }
-    return st->lm->vtable->set_teacher_patch(st, patch, n);
-}
-
 // ---------------------------------------------------------------------
 // speaker encoder — delegate to vtable
 // ---------------------------------------------------------------------

@@ -198,8 +198,7 @@ enum codec_status codec_lm_cosyvoice_text_rows(
 // to codec_lm_step_generate, which writes the denormalized latent (what the
 // codec decodes) and sets out_stop when the EOS head fires — the host then runs
 // frames_after_eos more frames and drops the frame on which it stops, as the
-// reference does.  codec_lm_set_teacher_patch(latent) makes the next input
-// embedding come from a reference latent (parity tests).
+// reference does.
 // All helpers return CODEC_STATUS_NOT_SUPPORTED when the model is not FlowLM.
 
 // Static config surfaced from `codec.lm.*` metadata.

@@ -272,25 +272,6 @@ void audio_lm_set_audio_token_ranges(
 int32_t audio_lm_codes_n_frames(const audio_lm_context * ctx);
 
 // ─────────────────────────────────────────────────────────────────────
-// Bare-context allocation (unit-test / model-less use)
-//
-// Allocates a zeroed audio_lm_context without loading any model.
-// Only the accumulator and Type A range state are functional; all
-// model-dependent paths (observe_codes, decode_audio, etc.) will fail
-// gracefully.  Free with audio_lm_free_bare (NOT audio_lm_free).
-// ─────────────────────────────────────────────────────────────────────
-audio_lm_context * audio_lm_alloc_bare();
-void               audio_lm_free_bare(audio_lm_context * ctx);
-
-// Debug accessor: returns a pointer to the raw accumulated codes vector
-// and writes the number of codebooks + frames into *out_n_q / *out_n_frames.
-// Valid until the next mutating call (observe_token, reset, free).
-// Returns nullptr when ctx is null or no codes have been accumulated.
-const int32_t * audio_lm_debug_codes(const audio_lm_context * ctx,
-                                      int32_t * out_n_q,
-                                      int32_t * out_n_frames);
-
-// ─────────────────────────────────────────────────────────────────────
 // Type B embed-override flag
 //
 // When `true`, observe_token treats audio-range tokens as Type B

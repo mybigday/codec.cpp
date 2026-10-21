@@ -405,31 +405,8 @@ void audio_lm_free(audio_lm_context * ctx) {
     delete ctx;
 }
 
-// Bare-context allocation for unit-test / model-less use.
-// The context is zeroed (all pointers null); only the accumulator +
-// Type A range state are functional.
-audio_lm_context * audio_lm_alloc_bare() {
-    return new (std::nothrow) audio_lm_context();
-}
-
-void audio_lm_free_bare(audio_lm_context * ctx) {
-    // Model / state pointers are all null in a bare context — safe to delete.
-    delete ctx;
-}
-
 int32_t audio_lm_codes_n_frames(const audio_lm_context * ctx) {
     return ctx ? ctx->codes_n_frames : 0;
-}
-
-const int32_t * audio_lm_debug_codes(const audio_lm_context * ctx,
-                                      int32_t * out_n_q,
-                                      int32_t * out_n_frames) {
-    if (out_n_q)      *out_n_q      = 0;
-    if (out_n_frames) *out_n_frames = 0;
-    if (ctx == nullptr || ctx->codes.empty()) return nullptr;
-    if (out_n_q)      *out_n_q      = ctx->n_cb > 0 ? ctx->n_cb : 1;
-    if (out_n_frames) *out_n_frames = ctx->codes_n_frames;
-    return ctx->codes.data();
 }
 
 void audio_lm_reset(audio_lm_context * ctx) {
