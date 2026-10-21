@@ -116,20 +116,13 @@ class KittenTTS2Converter(ChatterboxS3GConverter):
         self._write_lm_contract(writer)
 
     def _write_lm_contract(self, writer: GGUFWriter) -> None:
-        """Prompt layout + sampling the host runner needs (kittenml defaults)."""
+        """Prompt layout the host runner needs (kittenml defaults); the sampling
+        (decode presets, repetition / token-run penalties) is the backbone GGUF's."""
         cfg = self.kitten_cfg
         p = "codec.lm.kitten."
         for key, val in cfg["token_map"].items():
             writer.add_uint32(p + "token." + key, int(val))
         gen = cfg.get("generation", {})
-        writer.add_string(p + "default_preset", cfg.get("default_preset", "stable"))
-        for name, preset in cfg.get("decode_presets", {}).items():
-            for k in ("temperature", "top_p", "top_k", "min_p"):
-                writer.add_float32(f"{p}preset.{name}.{k}", float(preset.get(k, 0.0)))
-        writer.add_float32(p + "repetition_penalty", 1.1)
-        writer.add_uint32(p + "repetition_window", int(gen.get("repetition_window", 50)))
-        writer.add_float32(p + "token_run_penalty", 1.3)
-        writer.add_uint32(p + "token_run_grace", 10)
         writer.add_uint32(p + "silence_token", 4299)
         writer.add_uint32(p + "n_trailing_silence", 3)
         writer.add_bool(p + "use_reference_prompt", bool(gen.get("use_reference_prompt", True)))

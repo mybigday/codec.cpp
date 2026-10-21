@@ -141,7 +141,6 @@ class PocketTTSConverter(BaseConverter):
             "ldim": 32,                        # latent dim (= quantizer.dimension)
             # LSD / EOS decode defaults (default_parameters.py)
             "lsd_decode_steps": 1,
-            "temperature": 0.7,
             "eos_threshold": -4.0,
             "noise_clamp": 0.0,                # None -> 0 sentinel (unused = no clamp)
             "frames_after_eos": -1,            # DEFAULT_FRAMES_AFTER_EOS = None -> -1
@@ -388,7 +387,6 @@ class PocketTTSConverter(BaseConverter):
         writer.add_bool("codec.lm.insert_bos_before_voice", bool(cfg["insert_bos_before_voice"]))
         # LSD / EOS defaults + semantics.
         writer.add_uint32("codec.lm.lsd_decode_steps", cfg["lsd_decode_steps"])
-        writer.add_float32("codec.lm.temperature", float(cfg["temperature"]))
         writer.add_float32("codec.lm.eos_threshold", float(cfg["eos_threshold"]))
         writer.add_float32("codec.lm.noise_clamp", float(cfg["noise_clamp"]))
         writer.add_int32("codec.lm.frames_after_eos", int(cfg["frames_after_eos"]))

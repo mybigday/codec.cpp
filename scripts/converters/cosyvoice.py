@@ -421,7 +421,6 @@ class CosyVoiceConverter(BaseConverter):
         cfg["mel_fmax"] = float(fmax) if fmax not in (None, "null") else cfg["sample_rate"] / 2
         cfg["mel_n_fft"] = int(_yaml_scalar(feat, "n_fft") or 1024)
         cfg["mel_hop"] = int(_yaml_scalar(feat, "hop_size") or 256)
-        cfg["ras_sampling"] = "ras_sampling" in yaml_text
         self.config = cfg
 
         self.flow = _load_pt(d / "flow.pt")

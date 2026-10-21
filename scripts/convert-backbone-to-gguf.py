@@ -1098,6 +1098,46 @@ def run_llama_cpp_converter(
         sys.path[:] = saved_path
 
 
+_ARCH_SAMPLING = {
+    "CsmForConditionalGeneration": "csm",
+    "Qwen3TTSForConditionalGeneration": "qwen3_tts",
+    "MossTTSDForCausalLM": "moss_ttsd",
+    "AsteroidTTSModel": "moss_ttsd",
+    "MossTTSRealtime": "moss_tts_realtime",
+    "Lfm2AudioForConditionalGeneration": "lfm2_audio",
+    "KittenTTS2": "kitten_tts2",
+    "CosyVoice": "cosyvoice",
+    "Soprano": "soprano",
+}
+
+
+def sampling_model(arch: str, src: Path, model_id: str) -> str | None:
+    """The scripts/utils/sampling.py entry of a backbone (None: no TTS sampling)."""
+    if arch == "ChatterboxT3":
+        return "chatterbox_turbo" if _chatterbox_find_t3_safetensors(src).name == "t3_turbo_v1.safetensors" \
+            else "chatterbox"
+    if arch in ("CosyVoice1", "CosyVoice") and "breezy" in model_id.lower():
+        return "breezyvoice"
+    if arch == "CosyVoice1":
+        return "cosyvoice"
+    if arch == "PocketTTS":
+        return "pocket_tts"
+    return _ARCH_SAMPLING.get(arch)
+
+
+def write_sampling(output: Path, model: str | None) -> None:
+    """Rewrite the backbone GGUF with the model's general.sampling.* keys."""
+    if model is None:
+        return
+    here = Path(__file__).resolve().parent
+    sys.path[:0] = [str(here), str(here.parent / "common" / "third-party" / "llama.cpp" / "gguf-py")]
+    from utils.sampling import add_sampling_to_gguf
+    tmp = output.with_name(output.name + ".sampling.tmp")
+    add_sampling_to_gguf(output, tmp, model)
+    tmp.replace(output)
+    print(f"[bb] general.sampling.*: {model}", flush=True)
+
+
 def load_config(src: Path) -> dict:
     return json.loads((src / "config.json").read_text())
 
@@ -1123,12 +1163,14 @@ def main() -> int:
     if (src / "cosyvoice.yaml").is_file():   # CosyVoice v1: custom arch, written directly
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_cosyvoice1_backbone(src, args.output, args.outtype)
+        write_sampling(args.output, sampling_model("CosyVoice1", src, args.model_id))
         print(f"[bb] wrote {args.output}", flush=True)
         return 0
     pocket = pocket_tts_checkpoint(src)
     if pocket is not None:                    # Pocket-TTS: stock starcoder2, written directly
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_pocket_tts_backbone(pocket, args.output, args.outtype)
+        write_sampling(args.output, sampling_model("PocketTTS", src, args.model_id))
         print(f"[bb] wrote {args.output}", flush=True)
         return 0
     if chatterbox_layout_detected(src):
@@ -1157,6 +1199,7 @@ def main() -> int:
         print(f"[bb] running llama.cpp converter …", flush=True)
         run_llama_cpp_converter(hf_dir, args.output, Path(args.llama_cpp),
                                 args.outtype, patches)
+    write_sampling(args.output, sampling_model(arch, src, args.model_id))
 
     print(f"[bb] wrote {args.output}", flush=True)
     return 0

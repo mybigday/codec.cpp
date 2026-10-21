@@ -167,15 +167,8 @@ def dump(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_uint32 ("codec.lm.chatterbox.speaker_embed_dim",
                        SPEAKER_EMBED_DIM)
     writer.add_uint32 ("codec.lm.chatterbox.cond_len", COND_LEN)
-    # Reference sampling regime (tts.py::generate defaults).  mtl_tts.py uses
-    # repetition_penalty=2.0, but only together with its AlignmentStreamAnalyzer
-    # (attention-driven EOS forcing), which this runtime does not have: without
-    # it 2.0 runs to max length on half the test sentences, so both variants
-    # keep 1.2.
-    writer.add_float32("codec.lm.chatterbox.sampling.temperature", 0.8)
-    writer.add_float32("codec.lm.chatterbox.sampling.top_p",       1.0)
-    writer.add_float32("codec.lm.chatterbox.sampling.min_p",       0.05)
-    writer.add_float32("codec.lm.chatterbox.sampling.repetition_penalty", 1.2)
+    # Guidance weight of the T3 pair (tts.py::generate's cfg_weight), a decoder
+    # setting; the sampling itself is the backbone GGUF's general.sampling.*.
     writer.add_float32("codec.lm.chatterbox.sampling.cfg_weight",  0.5)
 
     # ---- speech embed + head (the n_cb=1 codec_lm pair) --------------
@@ -295,12 +288,7 @@ def dump_turbo(writer, sd: Dict[str, np.ndarray], cfg: Dict[str, Any],
     writer.add_uint32 ("codec.lm.chatterbox.speaker_embed_dim",  SPEAKER_EMBED_DIM)
     writer.add_uint32 ("codec.lm.chatterbox.silence_token",      TURBO_SILENCE_TOKEN)
     writer.add_uint32 ("codec.lm.chatterbox.n_trailing_silence", TURBO_N_TRAILING_SIL)
-    # Reference sampling regime (tts_turbo.py::generate defaults).
-    writer.add_float32("codec.lm.chatterbox.sampling.temperature", 0.8)
-    writer.add_int32  ("codec.lm.chatterbox.sampling.top_k",       1000)
-    writer.add_float32("codec.lm.chatterbox.sampling.top_p",       0.95)
-    writer.add_float32("codec.lm.chatterbox.sampling.min_p",       0.0)
-    writer.add_float32("codec.lm.chatterbox.sampling.repetition_penalty", 1.2)
+    # Turbo has no guidance pair; its sampling is the backbone GGUF's.
     writer.add_float32("codec.lm.chatterbox.sampling.cfg_weight",  0.0)
 
     _emit(writer, "lm.audio_embd_0.weight", _require(sd, "speech_emb.weight"),

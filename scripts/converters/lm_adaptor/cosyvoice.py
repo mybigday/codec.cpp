@@ -84,12 +84,6 @@ def dump_cosyvoice_lm(writer, ckpt_dir: Path, cfg: Dict[str, Any],
     w.add_uint32(p + "ignore_eos_id", speech_tokens)
     w.add_float32(p + "min_token_text_ratio", 2.0)
     w.add_float32(p + "max_token_text_ratio", 20.0)
-    ras = bool(cfg.get("ras_sampling", True))
-    w.add_string(p + "sampling", "ras" if ras else "top_k")
-    w.add_uint32(p + "top_k", 25)
-    w.add_float32(p + "top_p", 0.8)
-    w.add_uint32(p + "win_size", 10)
-    w.add_float32(p + "tau_r", 0.1)
     w.add_bool(p + "text_in_backbone", v != 1)
     if v == 3:
         w.add_array(p + "silent_tokens", V3_SILENT_TOKENS)

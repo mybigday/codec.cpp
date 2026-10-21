@@ -426,6 +426,9 @@ class BlueMagpieConverter(BaseConverter):
         writer.add_float32("codec.lm.rms_eps", cfg["rms_eps"])
         writer.add_float32("codec.lm.cfm_sigma_min", float(cfg["cfm"]["sigma_min"]))
         writer.add_string("codec.lm.cfm_solver", str(cfg["cfm"]["solver"]))
+        # Decoder graph settings of VoxCPM.generate (inference_timesteps, cfg_value).
+        writer.add_uint32("codec.lm.cfm_n_timesteps", 10)
+        writer.add_float32("codec.lm.cfm_cfg_value", 2.0)
         # speaker section: the SpeakerProjector weights ship in the GGUF
         # (lm.speaker.*), but the ECAPA centroid front-end isn't wired into the
         # codec_lm speaker API yet, so don't advertise a speaker encoder.
