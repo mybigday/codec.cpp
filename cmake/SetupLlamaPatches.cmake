@@ -8,6 +8,7 @@
 #   2. patches/cosyvoice-llamacpp.patch  (CosyVoice-300M / BreezyVoice speech LM)
 #   3. patches/soprano-llamacpp.patch    (Soprano tokenizer: `tokenizer.ggml.pre = soprano`)
 #   4. patches/penalty-exempt-llamacpp.patch (penalties that skip a token list)
+#   5. patches/sampling-meta-llamacpp.patch  (general.sampling.* for freq / present / DRY)
 #
 # Behaviour:
 #   - submodule not checked out          -> status message, skip.
@@ -28,7 +29,8 @@ set(_lp_patches
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/barbet-llamacpp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/cosyvoice-llamacpp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/soprano-llamacpp.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/penalty-exempt-llamacpp.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/penalty-exempt-llamacpp.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/sampling-meta-llamacpp.patch")
 
 find_package(Git QUIET)
 if(NOT Git_FOUND)

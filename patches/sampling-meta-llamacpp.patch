@@ -1,0 +1,140 @@
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -268,6 +268,12 @@
+         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT,
+         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU,
+         LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA,
++        LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_FREQ,
++        LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_PRESENT,
++        LLAMA_MODEL_META_KEY_SAMPLING_DRY_MULTIPLIER,
++        LLAMA_MODEL_META_KEY_SAMPLING_DRY_BASE,
++        LLAMA_MODEL_META_KEY_SAMPLING_DRY_ALLOWED_LENGTH,
++        LLAMA_MODEL_META_KEY_SAMPLING_DRY_PENALTY_LAST_N,
+     };
+ 
+     struct llama_model_kv_override {
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -168,6 +168,12 @@
+     LLM_KV_GENERAL_SAMPLING_MIROSTAT,
+     LLM_KV_GENERAL_SAMPLING_MIROSTAT_TAU,
+     LLM_KV_GENERAL_SAMPLING_MIROSTAT_ETA,
++    LLM_KV_GENERAL_SAMPLING_PENALTY_FREQ,
++    LLM_KV_GENERAL_SAMPLING_PENALTY_PRESENT,
++    LLM_KV_GENERAL_SAMPLING_DRY_MULTIPLIER,
++    LLM_KV_GENERAL_SAMPLING_DRY_BASE,
++    LLM_KV_GENERAL_SAMPLING_DRY_ALLOWED_LENGTH,
++    LLM_KV_GENERAL_SAMPLING_DRY_PENALTY_LAST_N,
+     LLM_KV_GENERAL_NAME,
+     LLM_KV_GENERAL_AUTHOR,
+     LLM_KV_GENERAL_VERSION,
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -163,6 +163,12 @@
+     { LLM_KV_GENERAL_SAMPLING_MIROSTAT,        "general.sampling.mirostat"             },
+     { LLM_KV_GENERAL_SAMPLING_MIROSTAT_TAU,    "general.sampling.mirostat_tau"         },
+     { LLM_KV_GENERAL_SAMPLING_MIROSTAT_ETA,    "general.sampling.mirostat_eta"         },
++    { LLM_KV_GENERAL_SAMPLING_PENALTY_FREQ,    "general.sampling.penalty_freq"         },
++    { LLM_KV_GENERAL_SAMPLING_PENALTY_PRESENT, "general.sampling.penalty_present"      },
++    { LLM_KV_GENERAL_SAMPLING_DRY_MULTIPLIER,  "general.sampling.dry_multiplier"       },
++    { LLM_KV_GENERAL_SAMPLING_DRY_BASE,        "general.sampling.dry_base"             },
++    { LLM_KV_GENERAL_SAMPLING_DRY_ALLOWED_LENGTH, "general.sampling.dry_allowed_length" },
++    { LLM_KV_GENERAL_SAMPLING_DRY_PENALTY_LAST_N, "general.sampling.dry_penalty_last_n" },
+     { LLM_KV_GENERAL_NAME,                     "general.name"                          },
+     { LLM_KV_GENERAL_AUTHOR,                   "general.author"                        },
+     { LLM_KV_GENERAL_VERSION,                  "general.version"                       },
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2591,6 +2591,12 @@
+         case LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT:        return "general.sampling.mirostat";
+         case LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU:    return "general.sampling.mirostat_tau";
+         case LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA:    return "general.sampling.mirostat_eta";
++        case LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_FREQ:    return "general.sampling.penalty_freq";
++        case LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_PRESENT: return "general.sampling.penalty_present";
++        case LLAMA_MODEL_META_KEY_SAMPLING_DRY_MULTIPLIER:  return "general.sampling.dry_multiplier";
++        case LLAMA_MODEL_META_KEY_SAMPLING_DRY_BASE:        return "general.sampling.dry_base";
++        case LLAMA_MODEL_META_KEY_SAMPLING_DRY_ALLOWED_LENGTH: return "general.sampling.dry_allowed_length";
++        case LLAMA_MODEL_META_KEY_SAMPLING_DRY_PENALTY_LAST_N: return "general.sampling.dry_penalty_last_n";
+         default:                                            return nullptr;
+     }
+ }
+--- a/common/common.h
++++ b/common/common.h
+@@ -162,6 +162,12 @@
+     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT        = 1 << 9,
+     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU    = 1 << 10,
+     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA    = 1 << 11,
++    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_FREQ    = 1 << 12,
++    COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_PRESENT = 1 << 13,
++    COMMON_PARAMS_SAMPLING_CONFIG_DRY_MULTIPLIER  = 1 << 14,
++    COMMON_PARAMS_SAMPLING_CONFIG_DRY_BASE        = 1 << 15,
++    COMMON_PARAMS_SAMPLING_CONFIG_DRY_ALLOWED_LENGTH = 1 << 16,
++    COMMON_PARAMS_SAMPLING_CONFIG_DRY_PENALTY_LAST_N = 1 << 17,
+ };
+ 
+ enum common_speculative_type {
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1176,6 +1176,12 @@
+     get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT),        sparams.mirostat,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
+     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU),    sparams.mirostat_tau,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
+     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
++    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_FREQ),    sparams.penalty_freq,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_FREQ);
++    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_PENALTY_PRESENT), sparams.penalty_present, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_PRESENT);
++    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_DRY_MULTIPLIER),  sparams.dry_multiplier,  common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_MULTIPLIER);
++    get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_DRY_BASE),        sparams.dry_base,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_BASE);
++    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_DRY_ALLOWED_LENGTH), sparams.dry_allowed_length, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_ALLOWED_LENGTH);
++    get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_DRY_PENALTY_LAST_N), sparams.dry_penalty_last_n, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_PENALTY_LAST_N);
+ }
+ 
+ struct common_init_result::impl {
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1848,6 +1848,7 @@
+         string_format("repeat alpha presence penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_present),
+         [](common_params & params, const std::string & value) {
+             params.sampling.penalty_present = std::stof(value);
++            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_PRESENT;
+         }
+     ).set_sampling());
+     add_opt(common_arg(
+@@ -1855,6 +1856,7 @@
+         string_format("repeat alpha frequency penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_freq),
+         [](common_params & params, const std::string & value) {
+             params.sampling.penalty_freq = std::stof(value);
++            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_FREQ;
+         }
+     ).set_sampling());
+     add_opt(common_arg(
+@@ -1862,6 +1864,7 @@
+         string_format("set DRY sampling multiplier (default: %.2f, 0.0 = disabled)", (double)params.sampling.dry_multiplier),
+         [](common_params & params, const std::string & value) {
+             params.sampling.dry_multiplier = std::stof(value);
++            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_MULTIPLIER;
+         }
+     ).set_sampling());
+     add_opt(common_arg(
+@@ -1872,6 +1875,7 @@
+             if (potential_base >= 1.0f)
+             {
+                 params.sampling.dry_base = potential_base;
++                params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_BASE;
+             }
+         }
+     ).set_sampling());
+@@ -1880,6 +1884,7 @@
+         string_format("set allowed length for DRY sampling (default: %d)", params.sampling.dry_allowed_length),
+         [](common_params & params, int value) {
+             params.sampling.dry_allowed_length = value;
++            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_ALLOWED_LENGTH;
+         }
+     ).set_sampling());
+     add_opt(common_arg(
+@@ -1890,6 +1895,7 @@
+                 throw std::runtime_error(string_format("error: invalid dry-penalty-last-n = %d\n", value));
+             }
+             params.sampling.dry_penalty_last_n = value;
++            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_DRY_PENALTY_LAST_N;
+         }
+     ).set_sampling());
+     add_opt(common_arg(
