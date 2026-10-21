@@ -44,7 +44,8 @@ it (tts-cli, `codec_cpp.TTS` / `AudioLM`, llama.rn):
 - per frame: the frame input (`input_linear` of `bos_emb` ending the prompt,
   then of the previous latent, fed back as an embedding) → backbone hidden →
   the EOS head (logit > −4) and the LSD flow head (latent from noise
-  ~ N(0, 0.7) seeded by `--seed`);
+  ~ N(0, temperature) seeded by `--seed`; the recommended `--temp 0.7` is
+  upstream's, in the backbone GGUF's `general.sampling.temp`);
 - after EOS, `frames_after_eos` more frames (word-count guess + 2), dropping
   the frame it stops on; `--min-len` ignores EOS before that frame.
 

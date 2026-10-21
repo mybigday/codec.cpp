@@ -262,7 +262,6 @@ class codec_audio_lm_caps(Structure):
         ("needs_voice", c_bool),
         ("sample_rate", c_int32),
         ("segment_bytes", c_int32),
-        ("presets", c_char_p),
     ]
 
 
@@ -296,18 +295,36 @@ class codec_audio_lm_backbone_req(Structure):
     ]
 
 
+CODEC_AUDIO_LM_DEFAULT_SEED = 0xFFFFFFFF
+
+
+class codec_audio_lm_sampler(Structure):
+    _fields_ = [
+        ("seed", ctypes.c_uint32),
+        ("temp", c_float),
+        ("top_k", c_int32),
+        ("top_p", c_float),
+        ("min_p", c_float),
+        ("penalty_last_n", c_int32),
+        ("penalty_repeat", c_float),
+        ("penalty_freq", c_float),
+        ("penalty_present", c_float),
+        ("penalty_exempt", POINTER(c_int32)),
+        ("n_penalty_exempt", c_int32),
+        ("dry_multiplier", c_float),
+        ("dry_base", c_float),
+        ("dry_allowed_length", c_int32),
+        ("dry_penalty_last_n", c_int32),
+        ("samplers", c_char_p),
+    ]
+
+
 class codec_audio_lm_tts_request(Structure):
     _fields_ = [
         ("text", c_char_p),
         ("voice", c_void_p),
         ("instruct", c_char_p),
-        ("preset", c_char_p),
-        ("seed", ctypes.c_uint32),
-        ("temperature", c_float),
-        ("top_p", c_float),
-        ("top_k", c_int32),
-        ("min_p", c_float),
-        ("repetition_penalty", c_float),
+        ("sampler", codec_audio_lm_sampler),
         ("min_frames", c_int32),
         ("max_frames", c_int32),
         ("lm_guidance", c_float),
@@ -325,28 +342,6 @@ class codec_audio_lm_chunk(Structure):
         ("tokens", POINTER(c_int32)),
         ("embd", POINTER(c_float)),
         ("n", c_int32),
-    ]
-
-
-class codec_audio_lm_sampler(Structure):
-    _fields_ = [
-        ("seed", ctypes.c_uint32),
-        ("temp", c_float),
-        ("top_k", c_int32),
-        ("top_p", c_float),
-        ("min_p", c_float),
-        ("penalty_last_n", c_int32),
-        ("penalty_repeat", c_float),
-        ("penalty_freq", c_float),
-        ("penalty_present", c_float),
-        ("penalize_prompt", c_bool),
-        ("penalty_exempt", POINTER(c_int32)),
-        ("n_penalty_exempt", c_int32),
-        ("dry_multiplier", c_float),
-        ("dry_base", c_float),
-        ("dry_allowed_length", c_int32),
-        ("dry_penalty_last_n", c_int32),
-        ("samplers", c_char_p),
     ]
 
 
@@ -370,8 +365,6 @@ class codec_audio_lm_completion(Structure):
         ("sample_first", c_bool),
         ("streamable", c_bool),
         ("max_frames", c_int32),
-        ("min_frames", c_int32),
-        ("stop_token", c_int32),
     ]
 
 
@@ -664,6 +657,7 @@ LLAMA_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "llama_model_get_vocab": (_P, [_P]),
     "llama_model_n_embd": (c_int32, [_P]),
     "llama_model_n_ctx_train": (c_int32, [_P]),
+    "llama_model_meta_val_str": (c_int32, [_P, c_char_p, c_char_p, c_size_t]),
     "llama_context_default_params": (llama_context_params, []),
     "llama_init_from_model": (_P, [_P, llama_context_params]),
     "llama_free": (None, [_P]),

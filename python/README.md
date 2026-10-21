@@ -57,17 +57,20 @@ import codec_cpp
 tts = codec_cpp.TTS("backbone.gguf", "codec.gguf")    # use_gpu=, n_threads=, max_frames=, kv_overrides=
 audio, sr = tts.synthesize("Hello there.")
 audio, sr = tts.synthesize("Hello there.", ref_audio="me.wav", ref_text="What the clip says.")
-audio, sr = tts.synthesize("Hello there.", voice=tts.voices()[0], seed=7, temperature=0.8)
+audio, sr = tts.synthesize("Hello there.", voice=tts.voices()[0], seed=7, temp=0.8)   # llama.cpp sampling names
 voice = tts.audio_lm.create_voice(pcm, sr, "What the clip says.")   # a codec_cpp.Speaker: reuse / save it
 audio, sr = tts.synthesize("Hello there.", voice=voice)
 for piece, sr in tts.stream(long_text, chunk_ms=500):   # audio as it becomes final
     play(piece, sr)
 ```
 
-Options left unset keep the model's defaults (from its GGUF): `instruct`,
-`preset`, `grammar`, `seed`, `temperature`, `top_p`, `top_k`, `min_p`,
-`repetition_penalty`, `min_frames`, `lm_guidance`, `flow_guidance`,
-`flow_steps`, `segment_bytes`, `speaker_file`, `save_speaker`.
+Sampling takes llama.cpp's settings by name (`seed`, `temp`, `top_k`, `top_p`,
+`min_p`, `penalty_last_n`, `penalty_repeat`, `penalty_freq`,
+`penalty_present`, `dry_*`, `samplers`, `penalty_exempt`); unset ones come from
+the backbone GGUF (`general.sampling.*`, the model card's), then llama.cpp's
+defaults. Other options: `instruct`, `grammar`, `min_frames`, `lm_guidance`,
+`flow_guidance`, `flow_steps` (decoder settings, unset = the codec GGUF's),
+`segment_bytes`, `speaker_file`, `save_speaker`.
 
 ## Your own llama.cpp loop: AudioLM
 

@@ -86,7 +86,7 @@ tts-cli synthesize --backbone MODEL.gguf --model CODEC.gguf \
 | `--ref-text TEXT` | transcript of `--ref-audio`, for models that use one |
 | `--save-speaker FILE.gguf` / `--speaker-file FILE.gguf` | save a voice once, reuse it later |
 | `--seed N` | repeatable output |
-| `--temp F`, `--top-k N`, `--top-p F` | sampling (defaults come from the model file) |
+| `--temp F`, `--top-k N`, `--top-p F`, `--min-p F`, `--repeat-penalty F`, ... | llama.cpp's sampling flags; unset ones come from the backbone file (`general.sampling.*`, the model card's), then llama.cpp's defaults |
 | `--max-frames N` | cap the output length |
 | `--gpu` | run on the GPU backend the build has (CUDA / Vulkan / Metal) |
 | `--n-threads N` | CPU threads |
@@ -132,6 +132,11 @@ How it differs from OpenAI's API:
 - `instructions` works only on models with an instruct mode (CosyVoice), and
   is passed through as the model expects it (CosyVoice-300M-Instruct: end it
   with `<|endofprompt|>`). `speed` must be 1.0.
+- Sampling (an extension): llama-server's request fields (`temperature`,
+  `top_k`, `top_p`, `min_p`, `repeat_last_n`, `repeat_penalty`,
+  `presence_penalty`, `frequency_penalty`, `dry_*`, `samplers`, `seed`) override
+  the server's `--temp` / `--top-k` / ... flags, which override the backbone
+  file's `general.sampling.*` (the model card's), then llama.cpp's defaults.
 - Every response is 24 kHz mono, matching OpenAI's formats (`pcm` is raw
   16-bit little-endian). Requests run one at a time.
 

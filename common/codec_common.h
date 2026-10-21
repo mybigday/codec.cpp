@@ -105,13 +105,6 @@ struct audio_lm_prompt {
     // shape as `embeds_prefix` when present; empty when CFG isn't used.
     std::vector<float> embeds_uncond;
 
-    // Sampler hints — model's training-time defaults.  Host may
-    // override; presented for one-call convenience.
-    float                 default_temperature        = 0.0f;
-    float                 default_top_p              = 0.0f;
-    float                 default_min_p              = 0.0f;
-    float                 default_repetition_penalty = 0.0f;
-    float                 default_cfg_weight         = 0.0f;   // 0 = no CFG
     codec_common_token    start_token                = -1;    // -1 = no seed
     codec_common_token    stop_token                 = -1;    // -1 = use vocab EOS
 };
@@ -501,11 +494,6 @@ struct audio_lm_prompt_info {
     int32_t eos_code_c0   = -1;     // cb0 EOS sentinel (-1 = none)
     int32_t eos_min_step  = 0;
 
-    // Sampling defaults (rn-tts convention): temp 0.9 / top_p 0.95 /
-    // top_k 50.  Host may override.  0 → greedy.
-    float   default_temperature = 0.0f;
-    float   default_top_p       = 0.0f;
-    int32_t default_top_k       = 0;
 
     // ── Streaming text↔audio interleave (MOSS-TTS-Realtime) ─────────────
     // When true the per-backbone-step input is composed as
@@ -527,8 +515,6 @@ struct audio_lm_prompt_info {
     int32_t text_pad_id           = -1;     // text lane fill once text ends
     int32_t audio_pad_code        = -1;     // audio lane fill during text-only
     int32_t bos_code_c0           = -1;     // audio BOS in last prefill row cb0
-    float   default_repetition_penalty = 1.0f;
-    int32_t repetition_window          = 0;
 
     // ── Sequential text→audio (LFM2-Audio) ──────────────────────────────
     // When true the model is a *sequential* multimodal LM (LFM2-Audio):

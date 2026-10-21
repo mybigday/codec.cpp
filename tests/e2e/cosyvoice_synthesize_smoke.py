@@ -23,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from _common import REPO
+from _common import MODEL_SAMPLING, REPO, sampling_flags
 from ttscli_synthesize_smoke import _try_cer, _wav_stats
 TTS_CLI = REPO / "build" / "tts-cli"
 MODELS = REPO / "models" / "cosyvoice"
@@ -40,7 +40,8 @@ def case(label, name, text, lang, extra, cer_max, tmp) -> bool:
         return True
     out = Path(tmp) / f"{label}.wav"
     cmd = [str(TTS_CLI), "synthesize", "--model", str(codec), "--backbone", str(backbone),
-           "--text", text, "--output", str(out), "--n-threads", "8", "--seed", "1"] + extra
+           "--text", text, "--output", str(out), "--n-threads", "8", "--seed", "1"]
+    cmd += sampling_flags(MODEL_SAMPLING["breezyvoice" if name.startswith("breezy") else "cosyvoice"]) + extra
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if proc.returncode != 0 or not out.is_file():
         print(f"[FAIL] {label}: exit {proc.returncode}\n{proc.stderr[-2000:]}")

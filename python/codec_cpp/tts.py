@@ -25,8 +25,13 @@ from ._lib import backbone_lib
 from .audio_lm import AudioLM, Vocab
 from .codec import CodecError, PathLike, Speaker
 
-_FULL_HISTORY = 1 << 16       # penalty window "whole history" (tts_runner's)
-_DEFAULT_SEED = 0xC0DEC1AB    # tts_runner's base seed; segment i uses base + i
+# The backbone GGUF's recommended sampling (general.sampling.*, as llama.cpp's
+# common_init_sampler_from_model reads it), by codec_audio_lm_sampler name.
+_GGUF_SAMPLING = {"samplers": "sequence", "temp": "temp", "top_k": "top_k", "top_p": "top_p", "min_p": "min_p",
+                  "penalty_last_n": "penalty_last_n", "penalty_repeat": "penalty_repeat",
+                  "penalty_freq": "penalty_freq", "penalty_present": "penalty_present",
+                  "dry_multiplier": "dry_multiplier", "dry_base": "dry_base",
+                  "dry_allowed_length": "dry_allowed_length", "dry_penalty_last_n": "dry_penalty_last_n"}
 
 
 def _read_wav(path: PathLike) -> tuple[np.ndarray, int]:
@@ -96,6 +101,18 @@ class _Backbone:
             n = self.L.llama_tokenize(self.vocab_ptr, b, len(b), buf, len(buf), add_special, parse_special)
         return list(buf[:max(n, 0)])
 
+    def sampling(self) -> dict:
+        """The general.sampling.* settings this GGUF carries."""
+        out = {}
+        buf = ctypes.create_string_buffer(512)
+        for name, key in _GGUF_SAMPLING.items():
+            if self.L.llama_model_meta_val_str(self.model, f"general.sampling.{key}".encode(), buf, len(buf)) > 0:
+                v = buf.value.decode()
+                out[name] = v if name == "samplers" else (int(v) if name in ("top_k", "penalty_last_n",
+                                                                           "dry_allowed_length",
+                                                                           "dry_penalty_last_n") else float(v))
+        return out
+
     def clear(self) -> None:
         self.L.llama_memory_clear(self.L.llama_get_memory(self.ctx), True)
 
@@ -152,18 +169,16 @@ class _Backbone:
 
 class _Sampler:
     """A llama.cpp sampler chain as common_sampler builds it from common_params_sampling:
-    logit bias, the warpers in order, dist.  A grammar constrains the chain first."""
+    logit bias, the stages in order, dist.  A grammar constrains the chain first."""
 
-    _NAMES = {"penalties": "penalties", "dry": "dry", "top_k": "top_k", "top_p": "top_p", "min_p": "min_p",
-              "typ_p": "typical", "typical_p": "typical", "typical": "typical",
-              "temperature": "temperature", "temp": "temperature"}
+    _STAGES = {"penalties", "dry", "top_k", "top_p", "nucleus", "min_p", "typ_p", "typical_p", "typical",
+               "temperature", "temp", "top_n_sigma", "xtc"}
+    _DEFAULT = ["penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]
 
-    def __init__(self, bb: _Backbone, sp: dict, *, grammar: str = "", bias: list[int] = (),
-                 plain: bool = False):
+    def __init__(self, bb: _Backbone, sp: dict, *, grammar: str = "", bias: list[int] = ()):
         L = self.L = bb.L
         self.chain = L.llama_sampler_chain_init(L.llama_sampler_chain_default_params())
         self.penalties = None
-        self._keep = []
         if grammar:
             g = L.llama_sampler_init_grammar(bb.vocab_ptr, grammar.encode("utf-8"), b"root")
             if not g:
@@ -173,46 +188,38 @@ class _Sampler:
         if len(bias):
             arr = (_ffi.llama_logit_bias * len(bias))(*[_ffi.llama_logit_bias(int(t), float("-inf")) for t in bias])
             L.llama_sampler_chain_add(self.chain, L.llama_sampler_init_logit_bias(bb.n_vocab, len(bias), arr))
-        rep = sp["penalty_repeat"] if not plain else 1.0
-        freq, present = (sp["penalty_freq"], sp["penalty_present"]) if not plain else (0.0, 0.0)
-        last_n = sp["penalty_last_n"]
-        last_n = (last_n if last_n > 0 else _FULL_HISTORY) if (rep != 1.0 or freq != 0.0 or present != 0.0) else 0
-        dry = sp["dry_multiplier"] if not plain else 0.0
-        order = [s for s in sp["samplers"].split(";") if s] if sp["samplers"] and not plain else []
-        if order:
-            try:
-                order = [self._NAMES[s] for s in order]
-            except KeyError as e:
-                self.free()
-                raise ValueError(f"unsupported backbone sampler {e.args[0]!r}") from None
-        else:
-            order = ["penalties"] + (["dry"] if dry > 0 else []) + ["top_k", "min_p", "top_p", "temperature"]
-        top_p = sp["top_p"] if 0.0 < sp["top_p"] < 1.0 else 1.0
-        min_p = sp["min_p"] if sp["min_p"] > 0.0 and not plain else 0.0
+        order = [s for s in sp["samplers"].split(";") if s] if sp["samplers"] else self._DEFAULT
+        bad = [s for s in order if s not in self._STAGES]
+        if bad:
+            self.free()
+            raise ValueError(f"unknown backbone sampler {bad[0]!r}")
+        # llama.cpp's penalties clamp -1 to "off"; -1 ("the whole context") is the context size.
+        last_n = bb.n_ctx if sp["penalty_last_n"] < 0 else sp["penalty_last_n"]
         for name in order:
             if name == "penalties":
-                ex = [] if plain else list(sp["penalty_exempt"])
+                ex = list(sp["penalty_exempt"])
                 exa = (_ffi.llama_token * max(1, len(ex)))(*ex)
-                s = L.llama_sampler_init_penalties_exempt(last_n, rep, freq, present, exa, len(ex))
-                self.penalties = s
+                s = self.penalties = L.llama_sampler_init_penalties_exempt(
+                    last_n, sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"], exa, len(ex))
             elif name == "dry":
-                s = L.llama_sampler_init_dry(bb.vocab_ptr, L.llama_model_n_ctx_train(bb.model), dry, sp["dry_base"],
-                                             sp["dry_allowed_length"], sp["dry_penalty_last_n"], None, 0)
+                s = L.llama_sampler_init_dry(bb.vocab_ptr, L.llama_model_n_ctx_train(bb.model), sp["dry_multiplier"],
+                                             sp["dry_base"], sp["dry_allowed_length"], sp["dry_penalty_last_n"],
+                                             None, 0)
             elif name == "top_k":
-                s = L.llama_sampler_init_top_k(max(0, sp["top_k"]))
-            elif name == "top_p":
-                s = L.llama_sampler_init_top_p(top_p, 0)
+                s = L.llama_sampler_init_top_k(sp["top_k"])
+            elif name in ("top_p", "nucleus"):
+                s = L.llama_sampler_init_top_p(sp["top_p"], 0)
             elif name == "min_p":
-                s = L.llama_sampler_init_min_p(min_p, 0)
-            elif name == "typical":
-                s = L.llama_sampler_init_typical(1.0, 0)
-            else:
+                s = L.llama_sampler_init_min_p(sp["min_p"], 0)
+            elif name in ("temperature", "temp"):
                 s = L.llama_sampler_init_temp_ext(sp["temp"], 0.0, 1.0)
+            else:
+                continue   # typical / top-n-sigma / XTC: off at llama.cpp's defaults
             L.llama_sampler_chain_add(self.chain, s)
         L.llama_sampler_chain_add(self.chain, L.llama_sampler_init_dist(sp["seed"] & 0xFFFFFFFF))
 
     def accept_prompt(self, tokens) -> None:
-        """Prompt tokens count for the penalties only (not the grammar)."""
+        """Prompt tokens count for the penalties (not the grammar), as llama-server's init_sampler."""
         if self.penalties:
             for t in tokens:
                 self.L.llama_sampler_accept(self.penalties, int(t))
@@ -310,11 +317,14 @@ class TTS:
         Voice: ``speaker_file`` > ``ref_audio`` (clone; a WAV path or a
         ``(pcm, sample_rate)`` tuple, with ``ref_text`` its transcript) >
         ``voice`` (builtin name, or a codec_cpp.Speaker) > model default.
-        Other options (unset = the model's default): ``instruct``,
-        ``preset``, ``grammar``, ``seed``, ``temperature``, ``top_p``,
-        ``top_k``, ``min_p``, ``repetition_penalty``, ``min_frames``,
-        ``lm_guidance``, ``flow_guidance``, ``flow_steps``,
-        ``segment_bytes``, ``save_speaker``.
+        Sampling: llama.cpp's settings by their names (``seed``, ``temp``,
+        ``top_k``, ``top_p``, ``min_p``, ``penalty_last_n``,
+        ``penalty_repeat``, ``penalty_freq``, ``penalty_present``,
+        ``dry_*``, ``samplers``, ``penalty_exempt``); unset ones come from
+        the backbone GGUF (general.sampling.*), then llama.cpp's defaults.
+        Other options: ``instruct``, ``grammar``, ``min_frames``,
+        ``lm_guidance``, ``flow_guidance``, ``flow_steps`` (decoder settings,
+        unset = the codec GGUF's), ``segment_bytes``, ``save_speaker``.
         """
         pieces = list(self._run(text, opts, 0))
         if not pieces:
@@ -332,21 +342,24 @@ class TTS:
         alm, opts = self.audio_lm, dict(opts)
         segment_bytes = int(opts.pop("segment_bytes", 0) or 0)
         grammar = opts.pop("grammar", None) or ""
-        seed = int(opts.pop("seed", 0) or 0)
-        repetition_penalty = opts.pop("repetition_penalty", None)
         spk = self._voice(opts)
-        known = {"instruct", "preset", "temperature", "top_p", "top_k", "min_p", "min_frames", "lm_guidance",
-                 "flow_guidance", "flow_steps"}
+        sampling = AudioLM.default_sampling()
+        if self._bb is not None:
+            sampling.update(self._bb.sampling())
+        sampling.update({k: opts.pop(k) for k in list(opts) if k in AudioLM.SAMPLING and opts[k] is not None})
+        known = {"instruct", "min_frames", "lm_guidance", "flow_guidance", "flow_steps"}
         if set(opts) - known:
             raise TypeError(f"unknown synthesis option(s): {', '.join(sorted(set(opts) - known))}")
         segments = alm.split(text, segment_bytes)
         if not segments:
             raise ValueError("empty text")
         self.last_result = {"n_frames": 0, "stop_reason": ""}
+        base_seed = int(sampling["seed"]) & 0xFFFFFFFF
         for i, seg in enumerate(segments):
+            if base_seed != _ffi.CODEC_AUDIO_LM_DEFAULT_SEED:   # a random seed stays random
+                sampling["seed"] = (base_seed + i) & 0xFFFFFFFF
             alm.tts_prompt(seg, vocab=self._bb.vocab if self._bb else None, voice=spk,
-                           seed=((seed or _DEFAULT_SEED) + i) & 0xFFFFFFFF, repetition_penalty=repetition_penalty,
-                           max_frames=self.max_frames or None, **opts)
+                           max_frames=self.max_frames or None, **opts, **sampling)
             c = None if self._bb is None else alm.completion()
             if c is None or c.flow == AudioLM.FLOW_SELF_CONTAINED:
                 alm.generate_self_contained()
@@ -383,10 +396,6 @@ class TTS:
             return np.nonzero(~ok)[0].tolist()
 
         smpl = _Sampler(bb, c.sampler, grammar=grammar or c.grammar, bias=bias())
-        # Minimum length: a second sampler without the stop token (nor penalties /
-        # grammar) replaces a stop drawn too early.
-        guard = _Sampler(bb, c.sampler, bias=bias(c.stop_token), plain=True) \
-            if c.min_frames > 0 and c.stop_token >= 0 else None
         try:
             bb.clear()   # every generation starts from an empty context
             pos, prompt_hidden = 0, []
@@ -411,8 +420,7 @@ class TTS:
                 if pos + len(toks) + 1 >= bb.n_ctx:
                     raise RuntimeError(f"the prompt ({pos + len(toks)} tokens) does not fit the backbone context "
                                        f"({bb.n_ctx}); shorten the reference or raise max_frames")
-                if c.sampler["penalize_prompt"]:
-                    smpl.accept_prompt(toks)
+                smpl.accept_prompt(toks)
                 bb.decode_tokens(toks, pos, all_out=c.needs_prompt_hidden)
                 if c.needs_prompt_hidden:
                     prompt_hidden += [bb.hidden(k) for k in range(len(toks))]
@@ -433,9 +441,7 @@ class TTS:
                     h = np.stack([bb.hidden(-(n_seq - q)) for q in range(n_seq)])
                 tok = None
                 if sample:
-                    tok = smpl.sample(bb.ctx)   # always first: its random stream advances every step
-                    if guard is not None and frames < c.min_frames and tok == c.stop_token:
-                        tok = guard.sample(bb.ctx)
+                    tok = smpl.sample(bb.ctx)
                 v = alm.observe(tokens=None if tok is None else [tok], hiddens=h)
                 frames += v.is_audio
                 if v.action == AudioLM.STOP:
@@ -459,5 +465,3 @@ class TTS:
             return frames, stop
         finally:
             smpl.free()
-            if guard is not None:
-                guard.free()

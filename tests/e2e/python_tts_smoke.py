@@ -25,35 +25,43 @@ sys.path.insert(0, str(REPO / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import codec_cpp  # noqa: E402
-from _common import read_wav_mono_f32  # noqa: E402
+from _common import MODEL_SAMPLING, read_wav_mono_f32, sampling_flags  # noqa: E402
 
 TTS_CLI = REPO / "build" / "tts-cli"
 M = REPO / "models"
 REF = REPO / "assets" / "refs"
 
-# name, codec, backbone (None = self-contained), text, tts-cli args, codec_cpp.TTS options[, max_frames]
+_JFK = (REF / "jfk_en.txt").read_text().strip()
+
+
+def _case(name, codec, backbone, text, card, seed, cli=(), opts=None, max_frames=0):
+    """Both sides get the model card's sampling, the seed and the case's own options."""
+    sp = dict(MODEL_SAMPLING[card], seed=seed)
+    return (name, codec, backbone, text, sampling_flags(sp) + list(cli), dict(sp, **(opts or {})), max_frames)
+
+
+# name, codec, backbone (None = self-contained), text, tts-cli args, codec_cpp.TTS options, max_frames
 CASES = [
-    ("csm", M / "csm/csm.gguf", M / "csm/llama_backbone.gguf",
-     "Hello, this is a test of the emergency broadcast system.",
-     ["--temp", "0"], dict(temperature=0)),
-    ("chatterbox_t3", M / "chatterbox/chatterbox.gguf", M / "chatterbox/llama_backbone.gguf",
-     "Hello, this is a test of the emergency broadcast system.",
-     ["--seed", "42"], dict(seed=42)),
-    ("kitten_tts2", M / "kitten_tts_2/kitten_tts2.gguf", M / "kitten_tts_2/kitten_tts2_backbone-q4_0.gguf",
-     "One day, a little girl named Lily found a needle in her room.",
-     ["--seed", "42", "--voice", "bruno"], dict(seed=42, voice="bruno")),
-    ("qwen3_tts_icl", M / "qwen3_tts/qwen3_tts_06b_base.gguf", M / "qwen3_tts/qwen3_tts_talker.gguf",
-     "The birch canoe slid on the smooth planks.",
-     ["--seed", "2", "--ref-audio", str(REF / "jfk_en.wav"), "--ref-text", (REF / "jfk_en.txt").read_text().strip()],
-     dict(seed=2, ref_audio=REF / "jfk_en.wav", ref_text=(REF / "jfk_en.txt").read_text().strip())),
-    ("outetts_1_0", M / "output/outetts/outetts-1.0-0.6b-codec-F32.gguf",
-     M / "hf/outetts_1_0/OuteTTS-1.0-0.6B-Q8_0.gguf",
-     "The birch canoe slid on the smooth planks.", ["--seed", "1"], dict(seed=1)),
-    ("soprano", M / "soprano/soprano.gguf", M / "soprano/backbone-f16.gguf",
-     "The birch canoe slid on the smooth planks.", ["--seed", "42"], dict(seed=42)),
-    ("pocket_tts", M / "pocket_tts/pocket_tts_en.gguf", M / "pocket_tts/backbone-f16.gguf",
-     "Hello world. This is a small text to speech model.",
-     ["--seed", "11", "--max-frames", "80", "--min-len", "24"], dict(seed=11, min_frames=24), 80),
+    _case("csm", M / "csm/csm.gguf", M / "csm/llama_backbone.gguf",
+          "Hello, this is a test of the emergency broadcast system.", "csm", 0xC0DEC1AB,
+          ["--temp", "0"], dict(temp=0)),
+    _case("chatterbox_t3", M / "chatterbox/chatterbox.gguf", M / "chatterbox/llama_backbone.gguf",
+          "Hello, this is a test of the emergency broadcast system.", "chatterbox", 42),
+    _case("kitten_tts2", M / "kitten_tts_2/kitten_tts2.gguf", M / "kitten_tts_2/kitten_tts2_backbone-q4_0.gguf",
+          "One day, a little girl named Lily found a needle in her room.", "kitten_tts2", 42,
+          ["--voice", "bruno"], dict(voice="bruno")),
+    _case("qwen3_tts_icl", M / "qwen3_tts/qwen3_tts_06b_base.gguf", M / "qwen3_tts/qwen3_tts_talker.gguf",
+          "The birch canoe slid on the smooth planks.", "qwen3_tts", 2,
+          ["--ref-audio", str(REF / "jfk_en.wav"), "--ref-text", _JFK],
+          dict(ref_audio=REF / "jfk_en.wav", ref_text=_JFK)),
+    _case("outetts_1_0", M / "output/outetts/outetts-1.0-0.6b-codec-F32.gguf",
+          M / "hf/outetts_1_0/OuteTTS-1.0-0.6B-Q8_0.gguf",
+          "The birch canoe slid on the smooth planks.", "outetts_1_0", 1),
+    _case("soprano", M / "soprano/soprano.gguf", M / "soprano/backbone-f16.gguf",
+          "The birch canoe slid on the smooth planks.", "soprano", 42),
+    _case("pocket_tts", M / "pocket_tts/pocket_tts_en.gguf", M / "pocket_tts/backbone-f16.gguf",
+          "Hello world. This is a small text to speech model.", "pocket_tts", 11,
+          ["--max-frames", "80", "--min-len", "24"], dict(min_frames=24), 80),
 ]
 
 
@@ -78,7 +86,7 @@ def main() -> int:
         print(f"tts-cli not built at {TTS_CLI}")
         return 1
     failed = 0
-    for name, codec, backbone, text, args, opts, *max_frames in CASES:
+    for name, codec, backbone, text, args, opts, max_frames in CASES:
         if not codec.exists() or (backbone is not None and not backbone.exists()):
             print(f"[skip] {name}: missing GGUFs")
             continue
@@ -86,7 +94,7 @@ def main() -> int:
             with tempfile.TemporaryDirectory() as d:
                 cli_stop = tts_cli(codec, backbone, text, args, Path(d) / "cli.wav")
                 ref, ref_sr = read_wav_mono_f32(Path(d) / "cli.wav")
-            with codec_cpp.TTS(backbone, codec, max_frames=max_frames[0] if max_frames else 0) as tts:
+            with codec_cpp.TTS(backbone, codec, max_frames=max_frames) as tts:
                 audio, sr = tts.synthesize(text, **opts)
                 stop = tts.last_result["stop_reason"]
         except Exception as e:

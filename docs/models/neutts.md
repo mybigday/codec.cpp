@@ -48,6 +48,7 @@ tts-cli synthesize --backbone neutts-air-q8_0.gguf --model neutts-codec-F16.gguf
     --voice dave --text "ðə bˈɜːtʃ kənˈuː slˈɪd ɔnðə smˈuːð plˈæŋks." --output out.wav
 ```
 
-`--ref-text` overrides the voice's transcript. Sampling defaults temp 1.0,
-top-k 50; the stream is masked to the speech range plus the end token, with
-eos forbidden for the first 25 frames (`--min-len`).
+`--ref-text` overrides the voice's transcript. Recommended sampling:
+`--temp 1.0 --top-k 50 --top-p 1.0 --min-p 0`. The stream is masked to the
+speech range plus the end token, and the completion's grammar forbids eos for
+the first 25 frames (`--min-len`). These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.

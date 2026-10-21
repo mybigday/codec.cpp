@@ -54,10 +54,15 @@ everything else is `codec.lm.kitten.*` metadata in the codec GGUF.
   dropped and only `lm_cond` carries the voice.
 - `{emo: 1}` is inserted when the text has a known `[emotion]`, `<event>` or
   `(((emphasis)))` tag.
-- Sampling (`logits.py`): token-run penalty (grace 10, 1.3/step over the grace)
-  → repetition penalty 1.1 over the last 50 generated tokens, exempting
-  `<|speech_end|>`, `[STOP]` and silence (4299) → temp → top-k → top-p → min-p.
-  Presets `stable` (0.8 / 50 / 0.8) and `expressive` (0.9 / 50 / 0.9), `--preset`.
+- Sampling: llama.cpp's, the penalties never touching `<|speech_end|>`,
+  `[STOP]` and silence (4299) (`penalty_exempt`, from the codec GGUF).
+  `logits.py`'s `stable` preset as tts-cli flags: `--temp 0.8 --top-k 50
+  --top-p 0.8 --min-p 0 --repeat-penalty 1.1 --repeat-last-n 50
+  --dry-multiplier 1.3 --dry-base 1.5 --dry-allowed-length 10
+  --dry-penalty-last-n -1 --samplers "dry;penalties;temperature;top_k;top_p;min_p"`
+  (the token-run penalty, 1.3/step past a grace of 10, is DRY); `expressive`
+  is `--temp 0.9 --top-p 0.9`. The penalties count the prompt as well, as
+  llama-server does. These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.
 - Stops on `<|speech_end|>` or `[STOP]`; non-audio tokens are dropped; 3 silence
   tokens are appended before S3Gen.
 - Text > 380 chars is split on sentences (min 130), each chunk generated with a

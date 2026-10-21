@@ -4,7 +4,10 @@
 //
 // One codec (+ backbone) pair is loaded at start-up and serves
 //
-//   POST /v1/audio/speech   {model, input, voice?, instructions?, response_format, speed?}
+//   POST /v1/audio/speech   {model, input, voice?, instructions?, response_format, speed?,
+//                            + llama-server sampling fields: temperature, top_k, top_p, min_p,
+//                              repeat_last_n, repeat_penalty, presence_penalty, frequency_penalty,
+//                              dry_*, samplers, seed}
 //   GET  /v1/audio/voices   the names `voice` accepts
 //   GET  /v1/models
 //   GET  /health
@@ -13,6 +16,9 @@
 // aac / flac only when built with their encoder), `voice` names a speaker of
 // the loaded model (omitted = the model default), `speed` must be 1.0 and
 // `instructions` is taken only by models with an instruct mode (CosyVoice).
+// Sampling (a codec.cpp extension): llama-server's request fields override
+// the server's --temp / --top-k / ... flags, which override the backbone GGUF's
+// general.sampling.* (the model card's), which override llama.cpp's defaults.
 // Audio is resampled to 24 kHz mono as OpenAI's formats specify.
 //
 // Responses stream: the input is synthesized a segment at a time
@@ -72,6 +78,10 @@ struct args {
     int32_t     segment_bytes   = 160;    // ~10 s of speech per segment
     int32_t     stream_chunk_ms = 1000;
     std::vector<codec_model_kv_override> kv_overrides;
+    // llama.cpp sampling defaults of every request (flags given: sampling_set).
+    codec_audio_lm_sampler sampling = codec_audio_lm_default_tts_request().sampler;
+    std::string samplers;
+    uint32_t    sampling_set = 0;
 };
 
 void print_usage(const char * argv0) {
@@ -81,9 +91,17 @@ void print_usage(const char * argv0) {
         "          [--host 127.0.0.1] [--port 8080] [--api-key KEY] [--model-id NAME]\n"
         "          [--gpu] [--n-threads N] [--max-frames N] [--override-kv KEY=TYPE:VALUE]\n"
         "          [--segment-bytes N (160; 0 = whole input)] [--stream-chunk-ms N (1000; 0 = per segment)]\n"
+        "          [llama.cpp sampling: --seed N --temp F --top-k N --top-p F --min-p F --repeat-last-n N\n"
+        "           --repeat-penalty F --presence-penalty F --frequency-penalty F --dry-multiplier F\n"
+        "           --dry-base F --dry-allowed-length N --dry-penalty-last-n N --samplers LIST]\n"
         "response formats in this build:", argv0);
     for (const auto & f : codec_example_audio_formats()) std::fprintf(stderr, " %s", f.c_str());
     std::fprintf(stderr, "\n");
+}
+
+const codec_common::tts_sampling_option * find_sampling_flag(const std::string & a) {
+    for (const auto & o : codec_common::tts_sampling_options()) if (a == o.flag) return &o;
+    return nullptr;
 }
 
 bool parse_args(int argc, char ** argv, args * out) {
@@ -108,6 +126,15 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--segment-bytes")   { if (!(v = need())) return false; out->segment_bytes = std::atoi(v); }
         else if (a == "--stream-chunk-ms") { if (!(v = need())) return false; out->stream_chunk_ms = std::atoi(v); }
         else if (a == "--gpu")          { out->use_gpu = true; }
+        else if (a == "--seed")         { if (!(v = need())) return false; out->sampling.seed = (uint32_t) std::strtoll(v, nullptr, 10); }
+        else if (a == "--samplers")     { if (!(v = need())) return false; out->samplers = v;
+                                          out->sampling_set |= codec_common::TTS_SAMPLING_SAMPLERS; }
+        else if (const codec_common::tts_sampling_option * so = find_sampling_flag(a)) {
+            if (!(v = need())) return false;
+            if (so->f32) out->sampling.*(so->f32) = (float) std::atof(v);
+            else         out->sampling.*(so->i32) = std::atoi(v);
+            out->sampling_set |= so->bit;
+        }
         else if (a == "--override-kv") {
             if (!(v = need())) return false;
             codec_model_kv_override ov;
@@ -295,6 +322,9 @@ int main(int argc, char ** argv) {
     lp.max_frames    = a.max_frames;
     lp.segment_bytes   = a.segment_bytes;
     lp.stream_chunk_ms = a.stream_chunk_ms;
+    lp.sampling          = a.sampling;
+    lp.samplers          = a.samplers;
+    lp.sampling_user_set = a.sampling_set;
 
     std::string err;
     codec_common::tts_runner_session * session = codec_common::tts_runner_load(lp, &err);
@@ -453,6 +483,31 @@ int main(int argc, char ** argv) {
                 return;
             }
         }
+        // llama-server's sampling fields (numbers; samplers a ';' string or an array).
+        codec_common::tts_runner_params rs = lp;
+        for (const auto & o : codec_common::tts_sampling_options()) {
+            if (!body.contains(o.json) || body[o.json].is_null()) continue;
+            if (!body[o.json].is_number()) {
+                send_error(res, 400, std::string("'") + o.json + "' must be a number", "invalid_request_error", o.json);
+                return;
+            }
+            if (o.f32) rs.sampling.*(o.f32) = body[o.json].get<float>();
+            else       rs.sampling.*(o.i32) = body[o.json].get<int32_t>();
+            rs.sampling_user_set |= o.bit;
+        }
+        if (body.contains("seed") && body["seed"].is_number()) {
+            const int64_t s = body["seed"].get<int64_t>();
+            rs.sampling.seed = s < 0 ? CODEC_AUDIO_LM_DEFAULT_SEED : (uint32_t) s;
+        }
+        if (body.contains("samplers") && !body["samplers"].is_null()) {
+            std::string list;
+            if (body["samplers"].is_string()) list = body["samplers"].get<std::string>();
+            else if (body["samplers"].is_array()) {
+                for (const auto & n : body["samplers"]) if (n.is_string()) list += (list.empty() ? "" : ";") + n.get<std::string>();
+            }
+            rs.samplers = list;
+            rs.sampling_user_set |= codec_common::TTS_SAMPLING_SAMPLERS;
+        }
         if (!instructions.empty() && !info.takes_instruct) {
             send_error(res, 400, "this model takes no 'instructions'", "invalid_request_error", "instructions");
             return;
@@ -488,7 +543,7 @@ int main(int argc, char ** argv) {
         if (!enc) { send_error(res, 500, enc_err, "server_error"); return; }
         const std::string content_type = enc->content_type();
 
-        codec_common::tts_runner_params rp = lp;
+        codec_common::tts_runner_params rp = rs;
         rp.text         = input;
         rp.voice        = voice;
         rp.speaker_file = custom_spk ? "" : a.speaker_file;

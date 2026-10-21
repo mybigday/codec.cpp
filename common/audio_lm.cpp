@@ -483,11 +483,6 @@ bool audio_lm_build_prompt(audio_lm_context * ctx,
     out->embeds_prefix_rows   = 0;
     out->embeds_prefix_hidden = 0;
     out->embeds_uncond.clear();
-    out->default_temperature        = 0.0f;
-    out->default_top_p              = 0.0f;
-    out->default_min_p              = 0.0f;
-    out->default_repetition_penalty = 0.0f;
-    out->default_cfg_weight         = 0.0f;
     out->start_token                = -1;
     out->stop_token                 = -1;
 
@@ -1046,10 +1041,6 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
     // cb0_speech_range_end mirrors speech_token_range[1] (exclusive end).
     out->cb0_speech_range_start = meta_i32_or(ctx, "codec.lm.cb0_speech_offset", -1);
     out->cb0_speech_range_end   = meta_i32_or(ctx, "codec.lm.cb0_speech_range_end", -1);
-    // rn-tts sampling defaults.
-    out->default_temperature = 0.9f;
-    out->default_top_p       = 0.95f;
-    out->default_top_k       = 50;
 
     const bool is_delay = kind && std::strcmp(kind, "parallel_heads_delay") == 0;
     const bool is_depth = kind && std::strcmp(kind, "residual_depth_ar") == 0;
@@ -1166,20 +1157,10 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
                 out->text_pad_id    = meta_i32_or(ctx, "codec.lm.text_pad", 151655);
                 out->audio_pad_code = meta_i32_or(ctx, "codec.lm.audio_pad_token", 1024);
                 out->bos_code_c0    = meta_i32_or(ctx, "codec.lm.bos_code_c0", 1025);
-                // Reference streaming sampling defaults.
-                out->default_temperature = 0.8f;
-                out->default_top_p       = 0.6f;
-                out->default_top_k       = 30;
-                out->default_repetition_penalty = 1.1f;
-                out->repetition_window          = 50;
                 return true;
             }
         }
-        // ChatML for Qwen3-TTS.  Sampling as the reference talker generate
-        // (generation_config.json): temperature 0.9, top-k 50, top-p 1.0 and
-        // repetition_penalty 1.05 on codebook 0.
-        out->default_top_p              = 1.0f;
-        out->default_repetition_penalty = 1.05f;
+        // ChatML for Qwen3-TTS.
         out->prompt_prefix = "<|im_start|>user\n";
         out->prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n";
         out->add_bos       = false;
@@ -1217,11 +1198,6 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
         out->audio_start_id = meta_i32_or(ctx, "codec.lm.audio_start_id", 128);
         out->text_end_id    = meta_i32_or(ctx, "codec.lm.text_end_id",    7);
         out->max_text_tokens = meta_i32_or(ctx, "codec.lm.max_text_tokens", 64);
-        // Reference TTS defaults: greedy text, greedy audio (temperature=None
-        // → argmax in generate_sequential).  Host --temp overrides.
-        out->default_temperature = 0.0f;
-        out->default_top_p       = 1.0f;
-        out->default_top_k       = 0;
         return true;
     }
 

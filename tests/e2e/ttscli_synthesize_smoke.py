@@ -25,12 +25,22 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import REPO, asr_cer, read_wav_mono_f32
+from _common import MODEL_SAMPLING, REPO, asr_cer, read_wav_mono_f32, sampling_flags
 
 TTS_CLI = REPO / "build" / "tts-cli"
 
 
-def _run_synth(codec, backbone, text, out_wav, extra=None, greedy=True):
+def _card(name):
+    """The model card's sampling for a case (by name prefix)."""
+    for key in sorted(MODEL_SAMPLING, key=len, reverse=True):
+        if name.startswith(key):
+            return MODEL_SAMPLING[key]
+    if name.startswith("outetts_0"):
+        return MODEL_SAMPLING["outetts_legacy"]
+    return {}
+
+
+def _run_synth(codec, backbone, text, out_wav, extra=None, greedy=True, card=None):
     cmd = [
         str(TTS_CLI), "synthesize",
         "--model", str(codec),
@@ -41,6 +51,9 @@ def _run_synth(codec, backbone, text, out_wav, extra=None, greedy=True):
     # Self-contained models (Pocket-TTS FlowLM) take no backbone.
     if backbone is not None:
         cmd += ["--backbone", str(backbone)]
+    cmd += sampling_flags(card or {})
+    if "--seed" not in (extra or []):
+        cmd += ["--seed", str(0xC0DEC1AB)]   # a fixed seed (llama.cpp's default is random)
     if greedy and backbone is not None:
         cmd += ["--temp", "0"]
     if extra:
@@ -90,7 +103,7 @@ def _case(name, codec, backbone, text, lang, want_stop, cer_max, extra=None,
     out = Path("/tmp") / f"ttscli_{name}.wav"
     if out.exists():
         out.unlink()
-    proc = _run_synth(codec, backbone, text, out, extra, greedy=greedy)
+    proc = _run_synth(codec, backbone, text, out, extra, greedy=greedy, card=_card(name))
     if proc.returncode != 0:
         print(f"[FAIL] {name}: exit {proc.returncode}\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}")
         return False

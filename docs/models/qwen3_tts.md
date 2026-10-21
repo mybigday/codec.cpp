@@ -32,12 +32,13 @@ CustomVoice `codec_embedding[spk_id]`.
 
 ## Sampling
 
-Defaults follow upstream's `generation_config.json`: temperature 0.9 and
-top-k 50 for every codebook, top-p 1.0, and `repetition_penalty` 1.05 on
-codebook 0 only (over the generated frames, as the talker's
-`generate`); the depth codebooks take no penalty. Without the penalty an
-ICL clone on a quantized talker (Q4_K_M) can loop and never reach the end
-code. `--rep-penalty` / `repetition_penalty` overrides it.
+Every codebook is sampled codec-side with the request's llama.cpp settings;
+the penalties count codebook 0's codes only (the talker's repetition_penalty),
+the depth codebooks take none. Recommended, upstream's
+`generation_config.json`: `--temp 0.9 --top-k 50 --top-p 1.0 --min-p 0
+--repeat-penalty 1.05 --repeat-last-n -1 --samplers
+"penalties;temperature;top_k;top_p"`. Without the penalty an ICL clone on a
+quantized talker (Q4_K_M) can loop and never reach the end code. These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.
 
 ## Cloned voices (Base)
 

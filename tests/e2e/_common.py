@@ -255,3 +255,26 @@ def llamacpp_hidden_seq(embeds: np.ndarray, gguf: Path) -> np.ndarray:
     T = int(embeds.shape[0])
     with LlamaBackbone(gguf, n_ctx=max(T + 8, 64)) as bb:
         return bb.feed_embeds(embeds, all_hidden=True)
+
+
+# --- model-card sampling ------------------------------------------------
+# Each model's recommended llama.cpp sampling (scripts/utils/sampling.py, the
+# backbone GGUF's general.sampling.*), by codec_audio_lm_sampler name.  Tests
+# pass them explicitly so they do not depend on the local GGUFs carrying the keys.
+sys.path.insert(0, str(REPO / "scripts"))
+from utils.sampling import MODEL_SAMPLING  # noqa: E402
+
+_FLAGS = {"temp": "--temp", "top_k": "--top-k", "top_p": "--top-p", "min_p": "--min-p",
+          "penalty_last_n": "--repeat-last-n", "penalty_repeat": "--repeat-penalty",
+          "penalty_freq": "--frequency-penalty", "penalty_present": "--presence-penalty",
+          "dry_multiplier": "--dry-multiplier", "dry_base": "--dry-base",
+          "dry_allowed_length": "--dry-allowed-length", "dry_penalty_last_n": "--dry-penalty-last-n",
+          "samplers": "--samplers", "seed": "--seed"}
+
+
+def sampling_flags(sampling: dict) -> list[str]:
+    """tts-cli flags (llama.cpp names) for a sampling dict."""
+    out = []
+    for k, v in sampling.items():
+        out += [_FLAGS[k], str(v)]
+    return out

@@ -79,7 +79,8 @@ tts-cli synthesize --backbone OuteTTS-0.3-500M-Q8_0.gguf --model outetts-0.3-500
   Markers such as `<|audio_end|>` are matched as tokens, so they cannot be
   spelled out of text pieces; the loop also stops on any end-of-generation
   token.
-- Sampling defaults: 1.0 temp 1.0, top-k 50, repetition penalty 1.1 over 64
-  tokens (README); 0.2/0.3 temp 0.1, top-k 50, repetition penalty 1.1 over the
-  whole sequence (`GenerationConfig`). Context: 8192 tokens for 1.0, 4096 for
+- Recommended sampling: 1.0 `--temp 1.0 --top-k 50 --top-p 1.0 --min-p 0
+  --repeat-penalty 1.1 --repeat-last-n 64` (README); 0.2/0.3 `--temp 0.1
+  --top-k 50 --top-p 1.0 --min-p 0 --repeat-penalty 1.1 --repeat-last-n -1`
+  (`GenerationConfig`). These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone. Context: 8192 tokens for 1.0, 4096 for
   0.2/0.3 (upstream `max_length`).

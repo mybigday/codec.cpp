@@ -138,8 +138,6 @@ class Completion:
     sample_first: bool
     streamable: bool
     max_frames: int
-    min_frames: int
-    stop_token: int
 
 
 @dataclass
@@ -162,7 +160,6 @@ class Caps:
     needs_voice: bool
     sample_rate: int
     segment_bytes: int
-    presets: list[str] = field(default_factory=list)
 
 
 class AudioLM:
@@ -214,10 +211,9 @@ class AudioLM:
     def caps(self) -> Caps:
         c = _ffi.codec_audio_lm_caps()
         lib().codec_audio_lm_get_caps(self.ptr, ctypes.byref(c))
-        presets = [s for s in _str(c.presets).split(";") if s] if c.presets else []
         return Caps(int(c.modality), c.needs_backbone, c.needs_backbone_path, c.text_needs_phonemes,
                     c.takes_ref_audio, c.takes_ref_text, c.takes_instruct, c.needs_voice, int(c.sample_rate),
-                    int(c.segment_bytes), presets)
+                    int(c.segment_bytes))
 
     def voices(self, speaker_file: PathLike | None = None) -> list[dict]:
         """Builtin voices, or those in a speaker file: [{name, ref_text, is_default}]."""
@@ -273,23 +269,52 @@ class AudioLM:
         if not lib().codec_audio_lm_save_voice(self.ptr, voice.ptr, os.fsencode(path), name.encode("utf-8")):
             self._fail("codec_audio_lm_save_voice")
 
+    # llama.cpp sampling settings (codec_audio_lm_sampler / common_params_sampling names).
+    SAMPLING = ("seed", "temp", "top_k", "top_p", "min_p", "penalty_last_n", "penalty_repeat", "penalty_freq",
+                "penalty_present", "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n",
+                "samplers", "penalty_exempt")
+
+    @staticmethod
+    def default_sampling() -> dict:
+        """llama.cpp's sampling defaults (codec_audio_lm_default_tts_request)."""
+        s = lib().codec_audio_lm_default_tts_request().sampler
+        out = {n: getattr(s, n) for n in AudioLM.SAMPLING if n not in ("samplers", "penalty_exempt")}
+        out.update(samplers="", penalty_exempt=[])
+        return out
+
     def tts_prompt(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
-                   preset: str | None = None, seed: int = 0, temperature: float | None = None,
-                   top_p: float | None = None, top_k: int | None = None, min_p: float | None = None,
-                   repetition_penalty: float | None = None, min_frames: int | None = None,
-                   max_frames: int | None = None, lm_guidance: float | None = None,
-                   flow_guidance: float | None = None, flow_steps: int | None = None,
-                   voice: Speaker | None = None) -> None:
-        """Prepare the prompt of one generation (unset options keep the model's defaults; voice None = default)."""
+                   min_frames: int | None = None, max_frames: int | None = None,
+                   lm_guidance: float | None = None, flow_guidance: float | None = None,
+                   flow_steps: int | None = None, voice: Speaker | None = None, **sampling) -> None:
+        """Prepare the prompt of one generation.  ``sampling``: llama.cpp settings by
+        their common_params_sampling names (AudioLM.SAMPLING), unset = llama.cpp's
+        defaults; the decoder settings left None are the GGUF's; voice None = default."""
         L = lib()
         r = L.codec_audio_lm_default_tts_request()
-        r.text, r.instruct, r.preset = text.encode("utf-8"), _b(instruct), _b(preset)
+        r.text, r.instruct = text.encode("utf-8"), _b(instruct)
         r.voice = voice.ptr if voice is not None else None
         self._voice = voice   # the library borrows it until the generation is decoded
-        r.seed = int(seed) & 0xFFFFFFFF
-        for name, val, conv in (("temperature", temperature, float), ("top_p", top_p, float), ("top_k", top_k, int),
-                                ("min_p", min_p, float), ("repetition_penalty", repetition_penalty, float),
-                                ("min_frames", min_frames, int), ("max_frames", max_frames, int),
+        unknown = set(sampling) - set(self.SAMPLING)
+        if unknown:
+            raise TypeError(f"unknown sampling setting(s): {', '.join(sorted(unknown))}")
+        s = r.sampler
+        keep = []
+        for name, val in sampling.items():
+            if val is None:
+                continue
+            if name == "samplers":
+                b = _b(val)
+                keep.append(b)
+                s.samplers = b
+            elif name == "penalty_exempt":
+                arr = (ctypes.c_int32 * max(1, len(val)))(*val)
+                keep.append(arr)
+                s.penalty_exempt, s.n_penalty_exempt = arr, len(val)
+            elif name == "seed":
+                s.seed = int(val) & 0xFFFFFFFF
+            else:
+                setattr(s, name, type(getattr(s, name))(val))
+        for name, val, conv in (("min_frames", min_frames, int), ("max_frames", max_frames, int),
                                 ("lm_guidance", lm_guidance, float), ("flow_guidance", flow_guidance, float),
                                 ("flow_steps", flow_steps, int)):
             if val is not None:
@@ -357,7 +382,7 @@ class AudioLM:
                           _str(c.grammar) if c.grammar else "",
                           [(c.allowed[i].begin, c.allowed[i].end) for i in range(c.n_allowed)],
                           c.needs_embeddings, c.needs_prompt_hidden, c.sample_first, c.streamable,
-                          int(c.max_frames), int(c.min_frames), int(c.stop_token))
+                          int(c.max_frames))
 
     def prefill(self, hiddens: np.ndarray) -> None:
         """Every prompt position's hidden state, (n_pos, n_embd) (when needs_prompt_hidden)."""

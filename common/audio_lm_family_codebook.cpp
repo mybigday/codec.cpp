@@ -144,19 +144,11 @@ public:
         }
         out->seqs = {std::move(chunks)};
 
-        // Defaults from the codec_lm metadata, request overrides on top; the
-        // same settings drive the codec heads.
-        out->sampler.temp  = pi_.default_temperature;
-        out->sampler.top_p = pi_.default_top_p;
-        out->sampler.top_k = pi_.default_top_k;
-        out->sampler.penalty_repeat = pi_.default_repetition_penalty > 0.0f ? pi_.default_repetition_penalty : 1.0f;
-        req.apply(out->sampler);
-        out->sampler.min_p = 0.0f;
-        // The repetition penalty is codebook 0's (Qwen3-TTS: the talker's
-        // repetition_penalty over the frames' first codes); the depth codebooks
-        // take none.  A backbone-sampled codebook 0 keeps none either.
-        const float c0_repeat = pi_.cb0_from_backbone ? 1.0f : out->sampler.penalty_repeat;
-        out->sampler.penalty_repeat = c0_repeat;
+        // The request's llama.cpp settings drive the backbone and the codec
+        // heads.  The penalties count codebook 0's codes only (Qwen3-TTS: the
+        // talker's repetition_penalty over the frames' first codes); the depth
+        // codebooks take none.
+        req.sampling_to(out);
         if (pi_.cb0_from_backbone) {
             // Codebook 0 is a backbone token: keep it to the speech range + end.
             out->grammar = tts_auto_grammar(pi_, req.text);
@@ -165,10 +157,15 @@ public:
                 if (pi_.audio_tok_eos >= 0) out->allowed.push_back({pi_.audio_tok_eos, pi_.audio_tok_eos + 1});
             }
         }
-        const codec_audio_lm_sampler & sp = out->sampler;
-        head_.init(sp.seed, sp.temp, sp.top_k, sp.top_p, 0.0f, 1.0f, 0);
-        c0_penalized_ = c0_repeat != 1.0f;
-        if (c0_penalized_) head_c0_.init(sp.seed ^ 0x9E3779B9u, sp.temp, sp.top_k, sp.top_p, 0.0f, c0_repeat, 0);
+        codec_audio_lm_sampler hs = req.head_sampler();
+        hs.seed = req.seed();
+        std::string serr;
+        if (!head_.init(hs, false, &serr)) return fail(serr);
+        const codec_audio_lm_sampler & sp = hs;
+        c0_penalized_ = !pi_.cb0_from_backbone && sp.penalty_last_n != 0 &&
+                        (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+        hs.seed ^= 0x9E3779B9u;
+        if (c0_penalized_ && !head_c0_.init(hs, true, &serr)) return fail(serr);
         out->needs_embeddings = true;
         out->sample_first     = pi_.cb0_from_backbone;
         out->streamable       = true;

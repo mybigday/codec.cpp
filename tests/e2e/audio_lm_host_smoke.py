@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import codec_cpp  # noqa: E402
-from _common import asr_cer, read_wav_mono_f32, write_wav_pcm16  # noqa: E402
+from _common import MODEL_SAMPLING, asr_cer, read_wav_mono_f32, write_wav_pcm16  # noqa: E402
 
 
 def make_sampler(sp: dict, allowed, n_vocab: int):
@@ -45,8 +45,8 @@ def make_sampler(sp: dict, allowed, n_vocab: int):
         bias = [(t, float("-inf")) for t in np.nonzero(~ok)[0]]
         arr = (lc.llama_logit_bias * len(bias))(*[lc.llama_logit_bias(int(t), v) for t, v in bias])
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_logit_bias(n_vocab, len(bias), arr))
-    if sp["penalty_repeat"] != 1.0:
-        last_n = sp["penalty_last_n"] if sp["penalty_last_n"] > 0 else 1 << 16
+    if sp["penalty_repeat"] != 1.0 or sp["penalty_freq"] != 0.0 or sp["penalty_present"] != 0.0:
+        last_n = sp["penalty_last_n"] if sp["penalty_last_n"] >= 0 else 1 << 16   # -1: the whole context
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_penalties(
             last_n, sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"]))
     if sp["temp"] <= 0:
@@ -171,16 +171,16 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
 CASES = [
     dict(name="csm", codec=REPO / "models/csm/csm.gguf", backbone=REPO / "models/csm/llama_backbone.gguf",
          text="Hello, this is a test of the emergency broadcast system.", lang="en", stop="eos_code_c0",
-         cer_max=0.2, req=dict(temperature=0)),   # greedy, as in the tts-cli smoke
+         cer_max=0.2, req=dict(MODEL_SAMPLING["csm"], temp=0, seed=0xC0DEC1AB)),   # greedy, as in the tts-cli smoke
     dict(name="qwen3_tts_icl", codec=REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf",
          backbone=REPO / "models/qwen3_tts/qwen3_tts_talker.gguf",
          ref=(REPO / "assets/refs/jfk_en.wav", REPO / "assets/refs/jfk_en.txt"),
          text="The birch canoe slid on the smooth planks.", lang="en", stop="eos_code_c0", cer_max=0.15,
-         req=dict(temperature=0.9, top_k=50, seed=2)),
+         req=dict(MODEL_SAMPLING["qwen3_tts"], seed=2)),
     dict(name="moss_tts_realtime", codec=REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
          backbone=REPO / "models/moss_tts_realtime/qwen3_backbone_bf16.gguf", backbone_path=True,
          text="你好，欢迎使用语音合成。", lang="zh", stop="eos_code_c0", cer_max=0.35,
-         req=dict(temperature=0.8, top_p=0.6, top_k=30, seed=42)),
+         req=dict(MODEL_SAMPLING["moss_tts_realtime"], seed=42)),
 ]
 
 

@@ -44,7 +44,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import REPO, must
+from _common import MODEL_SAMPLING, REPO, must, sampling_flags
 
 SERVER = REPO / "build" / "tts-server"
 TTS_CLI = REPO / "build" / "tts-cli"
@@ -117,8 +117,12 @@ class Server:
         port = free_port()
         self.base = f"http://127.0.0.1:{port}"
         self.log = tempfile.TemporaryFile()
+        # The model card's sampling and a fixed seed (llama.cpp's default is random).
+        card = "csm" if "csm" in self.codec.name else "qwen3_tts" if "qwen3" in self.codec.name else "kitten_tts2"
+        sampling = sampling_flags(dict(MODEL_SAMPLING[card], seed=0xC0DEC1AB))
         self.proc = subprocess.Popen([str(SERVER), "--model", str(self.codec), "--backbone", str(self.backbone),
-                                      "--port", str(port), "--n-threads", "8", "--api-key", KEY, *self.extra],
+                                      "--port", str(port), "--n-threads", "8", "--api-key", KEY, *sampling,
+                                      *self.extra],
                                      stdout=self.log, stderr=subprocess.STDOUT)
         for _ in range(600):
             try:
@@ -247,7 +251,9 @@ def main() -> int:
         must(code == 200 and wav_none == wav_default, "request without voice did not get the default speaker back")
         code, _, wav_again = post(speech, {**req, "voice": default})
         must(wav_again == wav_default, "repeat request is not byte-identical")
-        print(f"[PASS] session reuse: {other} differs, default restored, repeat identical")
+        code, _, wav_seed = post(speech, {**req, "voice": default, "seed": 7, "temperature": 0.9})
+        must(code == 200 and wav_seed != wav_default, "request sampling fields (seed / temperature) had no effect")
+        print(f"[PASS] session reuse: {other} differs, default restored, repeat identical, request sampling")
 
         code, ctype, pcm = post(speech, {**req, "response_format": "pcm"})
         must(code == 200 and ctype == "audio/pcm" and pcm == wav_default[44:], "pcm != wav body")
@@ -326,7 +332,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         spk = Path(tmp) / "spk.gguf"
         r = subprocess.run([str(TTS_CLI), "synthesize", "--model", str(CODEC), "--backbone", str(BACKBONE),
-                            "--n-threads", "8", "--text", "Hi.", "--ref-audio", str(REF_WAV), "--ref-text", REF_TEXT,
+                            "--n-threads", "8", "--text", "Hi.", *sampling_flags(MODEL_SAMPLING["kitten_tts2"]), "--ref-audio", str(REF_WAV), "--ref-text", REF_TEXT,
                             "--save-speaker", str(spk), "--output", str(Path(tmp) / "x.wav")], capture_output=True)
         must(r.returncode == 0 and spk.exists(), "tts-cli --save-speaker failed: " + r.stderr.decode()[-2000:])
         with Server("--speaker-file", str(spk)) as srv:

@@ -115,16 +115,27 @@ older GGUFs fall back to the defaults below.
 | `cosyvoice.flow.n_timesteps` | 10 | Euler steps |
 | `cosyvoice.flow.cfg_rate` | 0.7 | classifier-free guidance |
 | `cosyvoice.flow.max_prompt_s` | 0 (whole prompt) | flow prompt kept, in trailing seconds of the speaker's prompt tokens + mel; the LM prompt is unchanged |
-| `codec.lm.cosyvoice.sampling` | `ras` (`topk` for BreezyVoice) | `ras` or `topk` |
-| `codec.lm.cosyvoice.top_k` / `top_p` | 25 / 0.8 | nucleus sampling |
-| `codec.lm.cosyvoice.win_size` / `tau_r` | 10 / 0.1 | RAS repetition window / threshold |
 | `codec.lm.cosyvoice.min_token_text_ratio` / `max_token_text_ratio` | 2 / 20 | speech-length bounds per text token |
 | `codec.lm.cosyvoice.max_silent_run` | 5 (v3), 0 (off) | drop longer runs of silent tokens |
 
 ```bash
-tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2 \
-    --override-kv codec.lm.cosyvoice.top_k=int:10
+tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2
 ```
+
+### Recommended sampling
+
+The speech head (sampled codec-side) uses the request's llama.cpp settings:
+
+| Model | Settings |
+|---|---|
+| CosyVoice 300M / 2 / 3 | `--temp 1.0 --top-k 25 --top-p 0.8 --min-p 0 --repeat-last-n 10 --repeat-penalty 1.1 --samplers "penalties;top_k;top_p"` |
+| BreezyVoice | `--temp 1.0 --top-k 25 --top-p 1.0 --min-p 0` |
+
+Upstream's `ras_sampling` (nucleus top-p 0.8 / top-k 25, redrawn from the full
+distribution when the pick occurs in the last 10 tokens) is not a llama.cpp
+sampler; a repetition penalty of 1.1 over its 10-token window stands in for it
+(without one, CosyVoice-300M cross-lingual runs to max_len on some seeds;
+1.1 and 1.2 both stop and transcribe on seeds 1-3, measured 2026-10-21). These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.
 
 ### Faster flow decoding
 
@@ -178,9 +189,8 @@ reference clip.
   v3 prepends `You are a helpful assistant.<|endofprompt|>` to the prompt text
   (to the target text in cross-lingual mode); instruct text must end with
   `<|endofprompt|>` (added for v2/v3 when missing).
-- **Sampling**: `ras_sampling` (nucleus top_p 0.8 / top_k 25, redraw from the
-  full distribution when the pick occurs in the last 10 tokens) or BreezyVoice's
-  top-k 25; `min_len = 2 × text tokens` (target text only), `max_len = 20 ×`.
+- **Sampling**: the request's llama.cpp settings (see "Recommended sampling");
+  `min_len = 2 × text tokens` (target text only, `--min-len` overrides), `max_len = 20 ×`.
   As upstream, the min-length mask hits id `speech_token_size`, which in v3 is
   sos rather than eos, so v3 has no effective minimum. v3 drops runs of more
   than 5 silent / breath tokens before the flow.

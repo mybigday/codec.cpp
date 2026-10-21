@@ -141,17 +141,24 @@ void print_usage(const char * prog) {
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
-        "             [--preset NAME] [--instruct STR]\n"
-        "             [--max-frames N] [--segment-bytes N] [--seed N] [--temp F] [--top-p F] [--top-k N]\n"
-        "             [--cfg F] [--timesteps N] [--min-len N]\n"
-        "             [--cfg-weight F] [--min-p F] [--rep-penalty F] [--n-threads N]\n"
+        "             [--instruct STR] [--max-frames N] [--min-len N] [--segment-bytes N]\n"
+        "             [--seed N] [--temp F] [--top-k N] [--top-p F] [--min-p F]\n"
+        "             [--repeat-last-n N] [--repeat-penalty F] [--presence-penalty F]\n"
+        "             [--frequency-penalty F] [--dry-multiplier F] [--dry-base F]\n"
+        "             [--dry-allowed-length N] [--dry-penalty-last-n N] [--samplers LIST]\n"
+        "             [--cfg-weight F] [--cfg F] [--timesteps N] [--n-threads N]\n"
         "             [--grammar FILE|STRING]\n"
+        "             Sampling flags are llama.cpp's, with its defaults; settings left\n"
+        "             unset come from the backbone GGUF (general.sampling.*), the\n"
+        "             model card's recommendation.  --cfg-weight (backbone pair),\n"
+        "             --cfg / --timesteps (flow / CFM decoder) default to the codec\n"
+        "             GGUF's.\n"
         "             --grammar attaches a GBNF constraint to the backbone\n"
         "             sampler (models with a metadata-derived auto-grammar use\n"
         "             it by default; --grammar overrides).\n"
         "             Full host AR loop: a llama.cpp backbone (--backbone) drives\n"
         "             the codec_common per-step hooks end-to-end.  Flow is chosen\n"
-        "             from the model's GGUF metadata.  --temp 0 = greedy.\n"
+        "             from the model's GGUF metadata.  --temp 0 = greedy, --seed -1 = random.\n"
         "             Decoder speaker: --speaker-file > --ref-audio (when the codec\n"
         "             bundles speaker encoders) > --voice (builtin) > model default;\n"
         "             with --speaker-file, --voice picks a speaker inside the file.\n"
@@ -223,7 +230,6 @@ struct args {
     std::string voice;
     std::string speaker_file;
     std::string save_speaker;
-    std::string preset;
     std::string instruct;
     std::string output;
     std::string backbone;
@@ -232,25 +238,27 @@ struct args {
     bool     use_gpu   = false;
     int32_t  max_frames = 0;
     int32_t  segment_bytes = 0;
-    uint32_t seed       = 0xC0DEC1AB;
+    int32_t  min_len   = -1;
 
-    // Sampler / flow knobs — has_* gates whether the value was supplied.
-    bool has_temp = false;   float   temp  = 0.0f;
-    bool has_top_p = false;  float   top_p = 0.0f;
-    bool has_top_k = false;  int32_t top_k = 0;
+    // llama.cpp sampling; `sampling_set` marks the flags given (the backbone
+    // GGUF's general.sampling.* fills the rest).
+    codec_audio_lm_sampler sampling = codec_audio_lm_default_tts_request().sampler;
+    std::string samplers;
+    uint32_t    sampling_set = 0;
 
-    float   cfg       = 2.0f;    // continuous CFM / FlowLM
-    int32_t timesteps = 10;
-    int32_t min_len   = -1;
-
-    bool has_cfg_weight = false;  float cfg_weight = 0.0f;   // Chatterbox T3
-    bool has_min_p = false;       float min_p = 0.0f;
-    bool has_rep_penalty = false; float repetition_penalty = 0.0f;
+    float   cfg_weight = -1.0f;  // decoder settings; < 0 = the codec GGUF's
+    float   cfg        = -1.0f;
+    int32_t timesteps  = -1;
 
     std::string grammar;   // GBNF for the backbone sampler (FILE contents or literal)
 
     std::vector<codec_model_kv_override> kv_overrides;  // --override-kv (codec GGUF)
 };
+
+const codec_common::tts_sampling_option * find_sampling_flag(const std::string & a) {
+    for (const auto & o : codec_common::tts_sampling_options()) if (a == o.flag) return &o;
+    return nullptr;
+}
 
 bool parse_args(int argc, char ** argv, args * out) {
     if (argc < 2) return false;
@@ -269,7 +277,6 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--voice")      { const char * v = need(); if (!v) return false; out->voice = v; i++; }
         else if (a == "--speaker-file") { const char * v = need(); if (!v) return false; out->speaker_file = v; i++; }
         else if (a == "--save-speaker") { const char * v = need(); if (!v) return false; out->save_speaker = v; i++; }
-        else if (a == "--preset")     { const char * v = need(); if (!v) return false; out->preset = v; i++; }
         else if (a == "--instruct")   { const char * v = need(); if (!v) return false; out->instruct = v; i++; }
         else if (a == "--output")     { const char * v = need(); if (!v) return false; out->output = v; i++; }
         else if (a == "--backbone")   { const char * v = need(); if (!v) return false; out->backbone = v; i++; }
@@ -277,16 +284,17 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--gpu")        { out->use_gpu = true; }
         else if (a == "--max-frames") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->max_frames)) return false; i++; }
         else if (a == "--segment-bytes") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->segment_bytes)) return false; i++; }
-        else if (a == "--seed")       { const char * v = need(); if (!v) return false; int32_t s; if (!parse_i32(v, &s)) return false; out->seed = (uint32_t) s; i++; }
-        else if (a == "--temp")       { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->temp)) return false; out->has_temp = true; i++; }
-        else if (a == "--top-p")      { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->top_p)) return false; out->has_top_p = true; i++; }
-        else if (a == "--top-k")      { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->top_k)) return false; out->has_top_k = true; i++; }
+        else if (a == "--seed")       { const char * v = need(); if (!v) return false; int32_t s; if (!parse_i32(v, &s)) return false; out->sampling.seed = (uint32_t) s; i++; }
+        else if (a == "--min-len")    { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->min_len)) return false; i++; }
+        else if (a == "--cfg-weight") { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cfg_weight)) return false; i++; }
         else if (a == "--cfg")        { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cfg)) return false; i++; }
         else if (a == "--timesteps")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->timesteps)) return false; i++; }
-        else if (a == "--min-len")    { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->min_len)) return false; i++; }
-        else if (a == "--cfg-weight") { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->cfg_weight)) return false; out->has_cfg_weight = true; i++; }
-        else if (a == "--min-p")      { const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->min_p)) return false; out->has_min_p = true; i++; }
-        else if (a == "--rep-penalty"){ const char * v = need(); if (!v) return false; if (!parse_f32(v, &out->repetition_penalty)) return false; out->has_rep_penalty = true; i++; }
+        else if (a == "--samplers")   { const char * v = need(); if (!v) return false; out->samplers = v; out->sampling_set |= codec_common::TTS_SAMPLING_SAMPLERS; i++; }
+        else if (const codec_common::tts_sampling_option * so = find_sampling_flag(a)) {
+            const char * v = need(); if (!v) return false;
+            if (so->f32 ? !parse_f32(v, &(out->sampling.*(so->f32))) : !parse_i32(v, &(out->sampling.*(so->i32)))) return false;
+            out->sampling_set |= so->bit; i++;
+        }
         else if (a == "--override-kv"){
             const char * v = need(); if (!v) return false;
             codec_model_kv_override ov;
@@ -444,20 +452,18 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.voice          = a.voice;
     rp.speaker_file   = a.speaker_file;
     rp.save_speaker   = a.save_speaker;
-    rp.preset         = a.preset;
     rp.instruct       = a.instruct;
     rp.n_threads     = a.n_threads;
     rp.use_gpu       = a.use_gpu;
-    rp.seed          = a.seed;
     rp.max_frames    = a.max_frames;
+    rp.min_frames    = a.min_len;
     rp.segment_bytes = a.segment_bytes;
-    rp.has_temp = a.has_temp;   rp.temp  = a.temp;
-    rp.has_top_p = a.has_top_p; rp.top_p = a.top_p;
-    rp.has_top_k = a.has_top_k; rp.top_k = a.top_k;
-    rp.cfg = a.cfg; rp.timesteps = a.timesteps; rp.min_len = a.min_len;
-    rp.has_cfg_weight = a.has_cfg_weight; rp.cfg_weight = a.cfg_weight;
-    rp.has_min_p = a.has_min_p; rp.min_p = a.min_p;
-    rp.has_rep_penalty = a.has_rep_penalty; rp.repetition_penalty = a.repetition_penalty;
+    rp.sampling          = a.sampling;
+    rp.samplers          = a.samplers;
+    rp.sampling_user_set = a.sampling_set;
+    rp.lm_guidance   = a.cfg_weight;
+    rp.flow_guidance = a.cfg;
+    rp.flow_steps    = a.timesteps;
     rp.grammar = a.grammar;
     return rp;
 }

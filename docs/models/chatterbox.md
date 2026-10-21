@@ -94,10 +94,21 @@ GGUF metadata, overridable with `--override-kv KEY=TYPE:VALUE`:
 | `chatterbox_s3g.flow.n_timesteps` | 10 (Turbo: 2) | flow steps |
 | `chatterbox_s3g.flow.cfg_rate` | 0.7 (MeanFlow: not used) | flow classifier-free guidance |
 | `chatterbox_s3g.flow.max_prompt_s` | 0 (whole prompt) | flow prompt kept, in trailing seconds of the speaker's prompt tokens + mel |
-| `codec.lm.chatterbox.sampling.temperature` | 0.8 | T3 sampling |
-| `codec.lm.chatterbox.sampling.min_p` / `top_p` / `top_k` | 0.05 / 1.0 / – (Turbo: – / 0.95 / 1000) | T3 sampling |
-| `codec.lm.chatterbox.sampling.repetition_penalty` | 1.2 | T3 sampling |
-| `codec.lm.chatterbox.sampling.cfg_weight` | 0.5 (Turbo: none) | T3 CFG |
+| `codec.lm.chatterbox.sampling.cfg_weight` | 0.5 (Turbo: none) | T3 CFG (`--cfg-weight`) |
+
+### Recommended sampling
+
+The T3 speech head (sampled codec-side) uses the request's llama.cpp settings.
+The reference generate()'s, as tts-cli flags:
+
+| Model | Settings |
+|---|---|
+| Chatterbox / Multilingual | `--temp 0.8 --top-k 0 --top-p 1.0 --min-p 0.05 --repeat-penalty 1.2 --repeat-last-n -1 --samplers "penalties;temperature;min_p;top_p"` |
+| Chatterbox Turbo | `--temp 0.8 --top-k 1000 --top-p 0.95 --min-p 0 --repeat-penalty 1.2 --repeat-last-n -1 --samplers "temperature;top_k;top_p;penalties"` |
+
+The penalty history of T3 starts with the start-of-speech token (sample_t3);
+`mtl_tts.py`'s repetition_penalty 2.0 needs its AlignmentStreamAnalyzer, which
+this runtime does not have, so the multilingual model keeps 1.2. These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.
 
 Fewer flow steps trade speaker fidelity for speed the same way as CosyVoice's
 flow; see "Faster flow decoding" in [cosyvoice.md](cosyvoice.md). So does a
@@ -120,8 +131,7 @@ throughout:
   emotion), start/stop text tokens, two speech BOS, learned text / speech
   position embeddings, CFG as a second sequence with the text zeroed.
   Turbo: speaker projection + 375 raw `speech_emb` rows, one speech BOS,
-  3 trailing silence codes before S3Gen; sampling order temperature →
-  top-k → top-p → repetition penalty (HF warper order).
+  3 trailing silence codes before S3Gen.
 - **Speakers** (`codec_speaker`, see [codec_speaker.md](../codec_speaker.md)):
   S3G slots `prompt_token` (S3 tokens), `prompt_feat` (24 kHz mel) and
   `embedding` (CAMPPlus x-vector); T3 takes the 256-d VoiceEncoder embedding
