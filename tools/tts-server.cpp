@@ -79,7 +79,7 @@ struct args {
     int32_t     stream_chunk_ms = 1000;
     std::vector<codec_model_kv_override> kv_overrides;
     // llama.cpp sampling defaults of every request (flags given: sampling_set).
-    codec_audio_lm_sampler sampling = codec_audio_lm_default_tts_request().sampler;
+    codec_common::tts_sampling sampling;
     std::string samplers;
     uint32_t    sampling_set = 0;
 };

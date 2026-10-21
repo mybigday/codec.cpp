@@ -32,9 +32,10 @@ CustomVoice `codec_embedding[spk_id]`.
 
 ## Sampling
 
-Every codebook is sampled codec-side with the request's llama.cpp settings;
-the penalties count codebook 0's codes only (the talker's repetition_penalty),
-the depth codebooks take none. Recommended, upstream's
+The host samples every codebook (codec-side heads) with its llama.cpp
+settings: codebook 0 is one head group with the penalties (the talker's
+repetition_penalty), the depth codebooks share another without them (the
+subtalker). Recommended, upstream's
 `generation_config.json`: `--temp 0.9 --top-k 50 --top-p 1.0 --min-p 0
 --repeat-penalty 1.05 --repeat-last-n -1 --samplers
 "penalties;temperature;top_k;top_p"`. Without the penalty an ICL clone on a

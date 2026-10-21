@@ -237,6 +237,7 @@ CODEC_AUDIO_LM_FLOW_SELF_CONTAINED = 3
 CODEC_AUDIO_LM_FEED_TOKEN = 0
 CODEC_AUDIO_LM_FEED_EMBD = 1
 CODEC_AUDIO_LM_STOP = 2
+CODEC_AUDIO_LM_SAMPLE_HEAD = 3
 
 
 class codec_audio_lm_params(Structure):
@@ -298,33 +299,12 @@ class codec_audio_lm_backbone_req(Structure):
 CODEC_AUDIO_LM_DEFAULT_SEED = 0xFFFFFFFF
 
 
-class codec_audio_lm_sampler(Structure):
-    _fields_ = [
-        ("seed", ctypes.c_uint32),
-        ("temp", c_float),
-        ("top_k", c_int32),
-        ("top_p", c_float),
-        ("min_p", c_float),
-        ("penalty_last_n", c_int32),
-        ("penalty_repeat", c_float),
-        ("penalty_freq", c_float),
-        ("penalty_present", c_float),
-        ("penalty_exempt", POINTER(c_int32)),
-        ("n_penalty_exempt", c_int32),
-        ("dry_multiplier", c_float),
-        ("dry_base", c_float),
-        ("dry_allowed_length", c_int32),
-        ("dry_penalty_last_n", c_int32),
-        ("samplers", c_char_p),
-    ]
-
-
 class codec_audio_lm_tts_request(Structure):
     _fields_ = [
         ("text", c_char_p),
         ("voice", c_void_p),
         ("instruct", c_char_p),
-        ("sampler", codec_audio_lm_sampler),
+        ("seed", c_uint32),
         ("min_frames", c_int32),
         ("max_frames", c_int32),
         ("lm_guidance", c_float),
@@ -349,6 +329,16 @@ class codec_audio_lm_token_range(Structure):
     _fields_ = [("begin", c_int32), ("end", c_int32)]
 
 
+class codec_audio_lm_head_group(Structure):
+    _fields_ = [
+        ("penalties", c_bool),
+        ("history", POINTER(c_int32)),
+        ("n_history", c_int32),
+        ("penalty_exempt", POINTER(c_int32)),
+        ("n_penalty_exempt", c_int32),
+    ]
+
+
 class codec_audio_lm_completion(Structure):
     _fields_ = [
         ("flow", c_int),
@@ -356,8 +346,9 @@ class codec_audio_lm_completion(Structure):
         ("n_embd", c_int32),
         ("chunks", POINTER(codec_audio_lm_chunk)),
         ("n_chunks", c_int32),
-        ("sampler", codec_audio_lm_sampler),
         ("grammar", c_char_p),
+        ("penalty_exempt", POINTER(c_int32)),
+        ("n_penalty_exempt", c_int32),
         ("allowed", POINTER(codec_audio_lm_token_range)),
         ("n_allowed", c_int32),
         ("needs_embeddings", c_bool),
@@ -365,6 +356,8 @@ class codec_audio_lm_completion(Structure):
         ("sample_first", c_bool),
         ("streamable", c_bool),
         ("max_frames", c_int32),
+        ("head_groups", POINTER(codec_audio_lm_head_group)),
+        ("n_head_groups", c_int32),
     ]
 
 
@@ -374,6 +367,8 @@ class codec_audio_lm_verdict(Structure):
         ("sample_backbone", c_bool),
         ("is_audio", c_bool),
         ("token", c_int32),
+        ("head_group", c_int32),
+        ("n_vocab", c_int32),
     ]
 
 
@@ -528,6 +523,8 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_prefill": (c_bool, [c_void_p, _f32p, c_int32]),
     "codec_audio_lm_observe": (c_bool, [c_void_p, _i32p, _f32p, POINTER(codec_audio_lm_verdict)]),
     "codec_audio_lm_next_embd": (_f32p, [c_void_p, c_int32]),
+    "codec_audio_lm_head_logits": (_f32p, [c_void_p]),
+    "codec_audio_lm_head_token": (c_bool, [c_void_p, c_int32, POINTER(codec_audio_lm_verdict)]),
     "codec_audio_lm_stop_reason": (c_char_p, [c_void_p]),
     "codec_audio_lm_generate_self_contained": (c_bool, [c_void_p]),
     "codec_audio_lm_decode": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
@@ -643,6 +640,14 @@ class llama_sampler_chain_params(Structure):
     _fields_ = [("no_perf", c_bool)]
 
 
+class llama_token_data(Structure):
+    _fields_ = [("id", llama_token), ("logit", c_float), ("p", c_float)]
+
+
+class llama_token_data_array(Structure):
+    _fields_ = [("data", POINTER(llama_token_data)), ("size", c_size_t), ("selected", c_int64), ("sorted", c_bool)]
+
+
 class llama_logit_bias(Structure):
     _fields_ = [("token", llama_token), ("bias", c_float)]
 
@@ -691,6 +696,7 @@ LLAMA_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "llama_sampler_init_dist": (_P, [c_uint32]),
     "llama_sampler_sample": (llama_token, [_P, _P, c_int32]),
     "llama_sampler_accept": (None, [_P, llama_token]),
+    "llama_sampler_apply": (None, [_P, POINTER(llama_token_data_array)]),
     "llama_sampler_free": (None, [_P]),
 }
 

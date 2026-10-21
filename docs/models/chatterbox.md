@@ -98,7 +98,8 @@ GGUF metadata, overridable with `--override-kv KEY=TYPE:VALUE`:
 
 ### Recommended sampling
 
-The T3 speech head (sampled codec-side) uses the request's llama.cpp settings.
+The host samples the T3 speech head (a codec-side head; codec.cpp hands it
+the guided logits) with its llama.cpp settings.
 The reference generate()'s, as tts-cli flags:
 
 | Model | Settings |

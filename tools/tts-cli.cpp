@@ -242,7 +242,7 @@ struct args {
 
     // llama.cpp sampling; `sampling_set` marks the flags given (the backbone
     // GGUF's general.sampling.* fills the rest).
-    codec_audio_lm_sampler sampling = codec_audio_lm_default_tts_request().sampler;
+    codec_common::tts_sampling sampling;
     std::string samplers;
     uint32_t    sampling_set = 0;
 

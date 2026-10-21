@@ -35,8 +35,14 @@ import codec_cpp  # noqa: E402
 from _common import MODEL_SAMPLING, asr_cer, read_wav_mono_f32, write_wav_pcm16  # noqa: E402
 
 
-def make_sampler(sp: dict, allowed, n_vocab: int):
-    """A llama.cpp sampler chain from the completion's settings."""
+SAMPLING_DEFAULTS = dict(seed=0xFFFFFFFF, temp=0.8, top_k=40, top_p=0.95, min_p=0.05, penalty_last_n=64,
+                         penalty_repeat=1.0, penalty_freq=0.0, penalty_present=0.0)
+
+
+def make_sampler(sp: dict, allowed=(), n_vocab: int = 0, penalties: bool = True, history=(), seed=None):
+    """A llama.cpp sampler chain from the host's settings (llama.cpp's default
+    order without DRY / typical / XTC: penalties, top-k, top-p, min-p, temperature,
+    dist); `allowed` as a logit bias for the backbone."""
     chain = lc.llama_sampler_chain_init(lc.llama_sampler_chain_default_params())
     if allowed:
         ok = np.zeros(n_vocab, bool)
@@ -45,22 +51,35 @@ def make_sampler(sp: dict, allowed, n_vocab: int):
         bias = [(t, float("-inf")) for t in np.nonzero(~ok)[0]]
         arr = (lc.llama_logit_bias * len(bias))(*[lc.llama_logit_bias(int(t), v) for t, v in bias])
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_logit_bias(n_vocab, len(bias), arr))
-    if sp["penalty_repeat"] != 1.0 or sp["penalty_freq"] != 0.0 or sp["penalty_present"] != 0.0:
+    if penalties and (sp["penalty_repeat"] != 1.0 or sp["penalty_freq"] != 0.0 or sp["penalty_present"] != 0.0):
         last_n = sp["penalty_last_n"] if sp["penalty_last_n"] >= 0 else 1 << 16   # -1: the whole context
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_penalties(
             last_n, sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"]))
-    if sp["temp"] <= 0:
-        lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_greedy())
-        return chain
-    if sp["top_k"] > 0:
-        lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_top_k(sp["top_k"]))
-    if 0 < sp["top_p"] < 1:
-        lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_top_p(sp["top_p"], 1))
-    if sp["min_p"] > 0:
-        lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_min_p(sp["min_p"], 1))
-    lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_temp(sp["temp"]))
-    lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_dist(sp["seed"]))
+    order = [s for s in sp.get("samplers", "").split(";") if s] or ["top_k", "top_p", "min_p", "temperature"]
+    for name in order:
+        if name == "top_k":
+            lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_top_k(sp["top_k"]))
+        elif name == "top_p":
+            lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_top_p(sp["top_p"], 1))
+        elif name == "min_p":
+            lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_min_p(sp["min_p"], 1))
+        elif name == "temperature":
+            lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_temp_ext(sp["temp"], 0.0, 1.0))
+    lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_dist((sp["seed"] if seed is None else seed) & 0xFFFFFFFF))
+    for t in history:
+        lc.llama_sampler_accept(chain, int(t))
     return chain
+
+
+def sample_logits(chain, logits: np.ndarray) -> int:
+    """llama_sampler_apply on a host-built token data array (a codec-side head's logits)."""
+    n = len(logits)
+    cur = (lc.llama_token_data * n)(*[lc.llama_token_data(i, float(x), 0.0) for i, x in enumerate(logits)])
+    arr = lc.llama_token_data_array(cur, n, -1, False)
+    lc.llama_sampler_apply(chain, ctypes.byref(arr))
+    tid = int(arr.data[arr.selected].id)
+    lc.llama_sampler_accept(chain, tid)
+    return tid
 
 
 class Backbone:
@@ -123,13 +142,17 @@ class Backbone:
         lc.llama_model_free(self.model)
 
 
-def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
-    """The host loop of include/codec_audio_lm.h, one segment."""
-    alm.tts_prompt(text, vocab=bb.vocab, **req)
+def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, sampling: dict, **req):
+    """The host loop of include/codec_audio_lm.h, one segment: the host samples
+    every token, the backbone's and the codec-side heads' (one sampler per group)."""
+    sp = dict(SAMPLING_DEFAULTS, **sampling)
+    alm.tts_prompt(text, vocab=bb.vocab, seed=sp["seed"], **req)
     c = alm.completion()
     assert c.n_seq == 1, "this smoke drives single-sequence models"
     bb.clear()
-    smpl = make_sampler(c.sampler, c.allowed, bb.n_vocab)
+    smpl = make_sampler(sp, c.allowed, bb.n_vocab)
+    heads = [make_sampler(sp, penalties=g["penalties"], history=g["history"], seed=sp["seed"] + 1 + i)
+             for i, g in enumerate(c.head_groups)]
     pos, prompt_hidden = 0, []
     for ch in c.chunks[0]:
         if ch.type == codec_cpp.AudioLM.CHUNK_EMBD:
@@ -151,6 +174,8 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
         h = bb.hidden() if c.needs_embeddings else None
         tok = lc.llama_sampler_sample(smpl, bb.ctx, -1) if sample else None
         v = alm.observe(tokens=None if tok is None else [tok], hiddens=h)
+        while v.action == codec_cpp.AudioLM.SAMPLE_HEAD:
+            v = alm.head_token(sample_logits(heads[v.head_group], alm.head_logits(v.n_vocab)))
         frames += v.is_audio
         if v.action == codec_cpp.AudioLM.STOP:
             break
@@ -160,7 +185,8 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
             bb.decode(pos, embd=alm.next_embd(0, c.n_embd)[None, :])
         pos += 1
         sample = v.sample_backbone
-    lc.llama_sampler_free(smpl)
+    for ch in [smpl, *heads]:
+        lc.llama_sampler_free(ch)
     audio, sr = alm.decode()
     # The exported decoder input decodes to the same audio.
     again, _ = alm.decode_generation(alm.generation(), voice=req.get("voice"))
@@ -171,16 +197,16 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, **req):
 CASES = [
     dict(name="csm", codec=REPO / "models/csm/csm.gguf", backbone=REPO / "models/csm/llama_backbone.gguf",
          text="Hello, this is a test of the emergency broadcast system.", lang="en", stop="eos_code_c0",
-         cer_max=0.2, req=dict(MODEL_SAMPLING["csm"], temp=0, seed=0xC0DEC1AB)),   # greedy, as in the tts-cli smoke
+         cer_max=0.2, sampling=dict(MODEL_SAMPLING["csm"], temp=0, seed=0xC0DEC1AB)),   # greedy, as in the tts-cli smoke
     dict(name="qwen3_tts_icl", codec=REPO / "models/qwen3_tts/qwen3_tts_06b_base.gguf",
          backbone=REPO / "models/qwen3_tts/qwen3_tts_talker.gguf",
          ref=(REPO / "assets/refs/jfk_en.wav", REPO / "assets/refs/jfk_en.txt"),
          text="The birch canoe slid on the smooth planks.", lang="en", stop="eos_code_c0", cer_max=0.15,
-         req=dict(MODEL_SAMPLING["qwen3_tts"], seed=2)),
+         sampling=dict(MODEL_SAMPLING["qwen3_tts"], seed=2)),
     dict(name="moss_tts_realtime", codec=REPO / "models/moss_tts_realtime/moss_tts_realtime.gguf",
          backbone=REPO / "models/moss_tts_realtime/qwen3_backbone_bf16.gguf", backbone_path=True,
          text="你好，欢迎使用语音合成。", lang="zh", stop="eos_code_c0", cer_max=0.35,
-         req=dict(MODEL_SAMPLING["moss_tts_realtime"], seed=42)),
+         sampling=dict(MODEL_SAMPLING["moss_tts_realtime"], seed=42)),
 ]
 
 
@@ -194,7 +220,7 @@ def main() -> int:
         alm = codec_cpp.AudioLM(case["codec"], backbone_path=case["backbone"] if case.get("backbone_path") else None)
         bb = Backbone(case["backbone"], alm, max_frames=400)
         try:
-            req = dict(case["req"])
+            req = {}
             if "ref" in case:   # a cloned voice: create, save, reload
                 wav, txt = case["ref"]
                 pcm, wsr = read_wav_mono_f32(wav)
@@ -203,7 +229,7 @@ def main() -> int:
                     alm.save_voice(voice, Path(d) / "voice.gguf")
                     voice = alm.load_voice(Path(d) / "voice.gguf")
                 req["voice"] = voice
-            audio, sr, frames, stop = synthesize(alm, bb, case["text"], **req)
+            audio, sr, frames, stop = synthesize(alm, bb, case["text"], case["sampling"], **req)
         except Exception as e:
             print(f"[FAIL] {name}: {e}")
             failed += 1

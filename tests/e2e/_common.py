@@ -259,7 +259,7 @@ def llamacpp_hidden_seq(embeds: np.ndarray, gguf: Path) -> np.ndarray:
 
 # --- model-card sampling ------------------------------------------------
 # Each model's recommended llama.cpp sampling (scripts/utils/sampling.py, the
-# backbone GGUF's general.sampling.*), by codec_audio_lm_sampler name.  Tests
+# backbone GGUF's general.sampling.*), by common_params_sampling name.  Tests
 # pass them explicitly so they do not depend on the local GGUFs carrying the keys.
 sys.path.insert(0, str(REPO / "scripts"))
 from utils.sampling import MODEL_SAMPLING  # noqa: E402

@@ -36,7 +36,7 @@ _JFK = (REF / "jfk_en.txt").read_text().strip()
 
 def _case(name, codec, backbone, text, card, seed, cli=(), opts=None, max_frames=0):
     """Both sides get the model card's sampling, the seed and the case's own options."""
-    sp = dict(MODEL_SAMPLING[card], seed=seed)
+    sp = dict(MODEL_SAMPLING.get(card, {}), seed=seed)
     return (name, codec, backbone, text, sampling_flags(sp) + list(cli), dict(sp, **(opts or {})), max_frames)
 
 

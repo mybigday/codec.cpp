@@ -7,7 +7,7 @@ patches/sampling-meta-llamacpp.patch).  Hosts read them as llama.cpp does
 (common_init_sampler_from_model); a setting the user gives wins.  The values
 reproduce each model's reference generate(); docs/models/<model>.md lists them.
 
-Names are codec_audio_lm_sampler's (llama.cpp common_params_sampling);
+Names are llama.cpp common_params_sampling's;
 "samplers" is the stage order (general.sampling.sequence).
 """
 
@@ -36,7 +36,6 @@ MODEL_SAMPLING: dict[str, dict] = {
     "kitten_tts2":       dict(temp=0.8, top_k=50, top_p=0.8, min_p=0.0, penalty_repeat=1.1, penalty_last_n=50,
                               dry_multiplier=1.3, dry_base=1.5, dry_allowed_length=10, dry_penalty_last_n=-1,
                               samplers="dry;penalties;temperature;top_k;top_p;min_p"),
-    "pocket_tts":        dict(temp=0.7),   # the flow's init-noise variance (default_parameters.py)
     "soprano":           dict(temp=0.0, top_k=0, top_p=0.95, min_p=0.0, penalty_repeat=1.2, penalty_last_n=-1),
     "neutts":            dict(temp=1.0, top_k=50, top_p=1.0, min_p=0.0),
     "outetts_1_0":       dict(temp=1.0, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.1, penalty_last_n=64),
@@ -48,7 +47,7 @@ MODEL_SAMPLING: dict[str, dict] = {
     "breezyvoice":       dict(temp=1.0, top_k=25, top_p=1.0, min_p=0.0),
 }
 
-# codec_audio_lm_sampler name -> general.sampling.<key>, GGUF type
+# common_params_sampling name -> general.sampling.<key>, GGUF type
 _KEYS = {
     "samplers":           ("sequence", "str"),
     "temp":               ("temp", "f32"),

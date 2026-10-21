@@ -1,19 +1,22 @@
 """Audio-LM inference description (include/codec_audio_lm.h).
 
 codec_audio_lm tells a host how to run an audio LM whose backbone is a
-llama.cpp model: what to feed the backbone, how to sample, when to stop, and
-it turns the generation into audio.  The host owns every llama.cpp call, so
-any llama.cpp binding works (llama-cpp-python, your own).  For the ready-made
-loop use codec_cpp.TTS instead.
+llama.cpp model: what to feed the backbone, which logits to sample (the
+backbone's, or a codec-side head's) and with which suggested constraints,
+when to stop, and it turns the generation into audio.  The host owns every
+llama.cpp call and samples every token, so any llama.cpp binding works
+(llama-cpp-python, your own).  For the ready-made loop use codec_cpp.TTS.
 
     alm = codec_cpp.AudioLM("codec.gguf")
     vocab = codec_cpp.Vocab.from_llama_cpp(llama_model)    # or Vocab(tokenize=..., ...)
     voice = alm.voice("alice")                             # or alm.create_voice(pcm, sr, ref_text)
     alm.tts_prompt("Hello there.", vocab=vocab, voice=voice)
-    c = alm.completion()                                   # chunks, sampler, flags
+    c = alm.completion()                                   # chunks, constraints, head groups, flags
     ...                                                    # decode c.chunks with llama.cpp
     while True:                                            # per step
         v = alm.observe(tokens=[tok] if sampled else None, hiddens=hidden)
+        while v.action == codec_cpp.AudioLM.SAMPLE_HEAD:   # codec-side heads: the host draws
+            v = alm.head_token(draw(group[v.head_group], alm.head_logits(v.n_vocab)))
         if v.action == codec_cpp.AudioLM.STOP: break
         ...                                                # feed v.token / alm.next_embd()
     audio, sr = alm.decode()
@@ -130,7 +133,7 @@ class Completion:
     n_seq: int
     n_embd: int
     chunks: list[list[Chunk]]       # per sequence, decoded in order (empty chunks are padding)
-    sampler: dict                   # llama.cpp common_params_sampling names
+    penalty_exempt: list[int]       # backbone tokens the host's penalties should not touch
     grammar: str
     allowed: list[tuple[int, int]]  # [begin, end) backbone token ranges; empty = all
     needs_embeddings: bool
@@ -138,6 +141,7 @@ class Completion:
     sample_first: bool
     streamable: bool
     max_frames: int
+    head_groups: list[dict] = field(default_factory=list)   # [{penalties, history, penalty_exempt}]
 
 
 @dataclass
@@ -146,6 +150,8 @@ class Verdict:
     sample_backbone: bool
     is_audio: bool
     token: int                      # FEED_TOKEN: the token the model picked (-1 = the sampled one)
+    head_group: int = 0             # SAMPLE_HEAD: the group to sample with
+    n_vocab: int = 0                # SAMPLE_HEAD: the head's logits width
 
 
 @dataclass
@@ -170,7 +176,8 @@ class AudioLM:
     FLOW_TOKENS, FLOW_CODEC_HEAD, FLOW_HIDDEN, FLOW_SELF_CONTAINED = (
         _ffi.CODEC_AUDIO_LM_FLOW_TOKENS, _ffi.CODEC_AUDIO_LM_FLOW_CODEC_HEAD, _ffi.CODEC_AUDIO_LM_FLOW_HIDDEN,
         _ffi.CODEC_AUDIO_LM_FLOW_SELF_CONTAINED)
-    FEED_TOKEN, FEED_EMBD, STOP = _ffi.CODEC_AUDIO_LM_FEED_TOKEN, _ffi.CODEC_AUDIO_LM_FEED_EMBD, _ffi.CODEC_AUDIO_LM_STOP
+    FEED_TOKEN, FEED_EMBD, STOP, SAMPLE_HEAD = (_ffi.CODEC_AUDIO_LM_FEED_TOKEN, _ffi.CODEC_AUDIO_LM_FEED_EMBD,
+                                                _ffi.CODEC_AUDIO_LM_STOP, _ffi.CODEC_AUDIO_LM_SAMPLE_HEAD)
 
     def __init__(self, codec: PathLike, *, backbone_path: PathLike | None = None, use_gpu: bool = False,
                  n_threads: int = 0, kv_overrides: Mapping[str, object] | None = None):
@@ -269,51 +276,21 @@ class AudioLM:
         if not lib().codec_audio_lm_save_voice(self.ptr, voice.ptr, os.fsencode(path), name.encode("utf-8")):
             self._fail("codec_audio_lm_save_voice")
 
-    # llama.cpp sampling settings (codec_audio_lm_sampler / common_params_sampling names).
-    SAMPLING = ("seed", "temp", "top_k", "top_p", "min_p", "penalty_last_n", "penalty_repeat", "penalty_freq",
-                "penalty_present", "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n",
-                "samplers", "penalty_exempt")
-
-    @staticmethod
-    def default_sampling() -> dict:
-        """llama.cpp's sampling defaults (codec_audio_lm_default_tts_request)."""
-        s = lib().codec_audio_lm_default_tts_request().sampler
-        out = {n: getattr(s, n) for n in AudioLM.SAMPLING if n not in ("samplers", "penalty_exempt")}
-        out.update(samplers="", penalty_exempt=[])
-        return out
-
     def tts_prompt(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
-                   min_frames: int | None = None, max_frames: int | None = None,
+                   seed: int | None = None, min_frames: int | None = None, max_frames: int | None = None,
                    lm_guidance: float | None = None, flow_guidance: float | None = None,
-                   flow_steps: int | None = None, voice: Speaker | None = None, **sampling) -> None:
-        """Prepare the prompt of one generation.  ``sampling``: llama.cpp settings by
-        their common_params_sampling names (AudioLM.SAMPLING), unset = llama.cpp's
-        defaults; the decoder settings left None are the GGUF's; voice None = default."""
+                   flow_steps: int | None = None, voice: Speaker | None = None) -> None:
+        """Prepare the prompt of one generation.  Sampling is the host's (every
+        token, codec-side heads included); ``seed`` only drives the model's own
+        randomness (flow init noise).  Decoder settings left None are the GGUF's;
+        voice None = default."""
         L = lib()
         r = L.codec_audio_lm_default_tts_request()
         r.text, r.instruct = text.encode("utf-8"), _b(instruct)
         r.voice = voice.ptr if voice is not None else None
         self._voice = voice   # the library borrows it until the generation is decoded
-        unknown = set(sampling) - set(self.SAMPLING)
-        if unknown:
-            raise TypeError(f"unknown sampling setting(s): {', '.join(sorted(unknown))}")
-        s = r.sampler
-        keep = []
-        for name, val in sampling.items():
-            if val is None:
-                continue
-            if name == "samplers":
-                b = _b(val)
-                keep.append(b)
-                s.samplers = b
-            elif name == "penalty_exempt":
-                arr = (ctypes.c_int32 * max(1, len(val)))(*val)
-                keep.append(arr)
-                s.penalty_exempt, s.n_penalty_exempt = arr, len(val)
-            elif name == "seed":
-                s.seed = int(val) & 0xFFFFFFFF
-            else:
-                setattr(s, name, type(getattr(s, name))(val))
+        if seed is not None:
+            r.seed = int(seed) & 0xFFFFFFFF
         for name, val, conv in (("min_frames", min_frames, int), ("max_frames", max_frames, int),
                                 ("lm_guidance", lm_guidance, float), ("flow_guidance", flow_guidance, float),
                                 ("flow_steps", flow_steps, int)):
@@ -373,16 +350,16 @@ class AudioLM:
                     k.embd = np.zeros((0, c.n_embd), np.float32)
                 row.append(k)
             seqs.append(row)
-        s = c.sampler
-        sampler = {name: getattr(s, name) for name, _ in s._fields_
-                   if name not in ("penalty_exempt", "n_penalty_exempt", "samplers")}
-        sampler["penalty_exempt"] = [s.penalty_exempt[i] for i in range(s.n_penalty_exempt)]
-        sampler["samplers"] = _str(s.samplers) if s.samplers else ""
-        return Completion(int(c.flow), int(c.n_seq), int(c.n_embd), seqs, sampler,
-                          _str(c.grammar) if c.grammar else "",
+        def ids(p, n):
+            return [p[i] for i in range(n)] if n else []
+        groups = [{"penalties": bool(g.penalties), "history": ids(g.history, g.n_history),
+                   "penalty_exempt": ids(g.penalty_exempt, g.n_penalty_exempt)}
+                  for g in (c.head_groups[i] for i in range(c.n_head_groups))]
+        return Completion(int(c.flow), int(c.n_seq), int(c.n_embd), seqs,
+                          ids(c.penalty_exempt, c.n_penalty_exempt), _str(c.grammar) if c.grammar else "",
                           [(c.allowed[i].begin, c.allowed[i].end) for i in range(c.n_allowed)],
                           c.needs_embeddings, c.needs_prompt_hidden, c.sample_first, c.streamable,
-                          int(c.max_frames))
+                          int(c.max_frames), groups)
 
     def prefill(self, hiddens: np.ndarray) -> None:
         """Every prompt position's hidden state, (n_pos, n_embd) (when needs_prompt_hidden)."""
@@ -401,7 +378,23 @@ class AudioLM:
                                             None if h is None else h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                                             ctypes.byref(v)):
             self._fail("codec_audio_lm_observe")
-        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), int(v.token))
+        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), int(v.token), int(v.head_group),
+                       int(v.n_vocab))
+
+    def head_logits(self, n_vocab: int) -> np.ndarray:
+        """After a SAMPLE_HEAD verdict: the head's logits (constraints applied), a view."""
+        p = lib().codec_audio_lm_head_logits(self.ptr)
+        if not p:
+            self._fail("codec_audio_lm_head_logits")
+        return np.ctypeslib.as_array(p, shape=(n_vocab,))
+
+    def head_token(self, token: int) -> Verdict:
+        """The id the host drew from head_logits(); the next verdict."""
+        v = _ffi.codec_audio_lm_verdict()
+        if not lib().codec_audio_lm_head_token(self.ptr, int(token), ctypes.byref(v)):
+            self._fail("codec_audio_lm_head_token")
+        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), int(v.token), int(v.head_group),
+                       int(v.n_vocab))
 
     def next_embd(self, seq: int = 0, n_embd: int | None = None) -> np.ndarray:
         """The next input row of sequence ``seq`` after FEED_EMBD."""

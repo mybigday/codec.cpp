@@ -10,7 +10,7 @@ penalties skip a list of tokens:
 Model-independent: a speech LM's end-of-speech and pause tokens recur by
 design, and penalizing them keeps the model from closing a segment cleanly
 (KittenTTS 2 exempts `<|speech_end|>`, `[STOP]` and its silence token).
-`codec_audio_lm_sampler.penalty_exempt` carries the list from the codec GGUF
+`codec_audio_lm_completion.penalty_exempt` (and a head group's) carries the list from the codec GGUF
 to the host's sampler; a llama.cpp without this patch ignores it.
 
 Stacked on `soprano-llamacpp.patch`; applied in order by

@@ -124,7 +124,7 @@ tts-cli synthesize ... --override-kv cosyvoice.flow.speed=float:1.2
 
 ### Recommended sampling
 
-The speech head (sampled codec-side) uses the request's llama.cpp settings:
+The host samples the speech head (a codec-side head, one group) with its llama.cpp settings:
 
 | Model | Settings |
 |---|---|

@@ -46,13 +46,16 @@ for (int i = 0; i < n; ++i) {
     if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) {
         codec_audio_lm_generate_self_contained(alm);
     } else {
-        // clear the KV cache; build a sampler from c.sampler (+ c.grammar / c.allowed)
+        // clear the KV cache; build the host's llama.cpp sampler (+ c.grammar / c.allowed /
+        // c.penalty_exempt) and one sampler per c.head_groups[g]
         // decode chunks 0..n_chunks-1 of every sequence (chunk i of all sequences in one batch)
         // if c.needs_prompt_hidden: codec_audio_lm_prefill(alm, every prompt position's hidden, n)
         bool sample = c.sample_first;
         for (int frames = 0; frames < c.max_frames; ) {
             tok = sample ? sample_backbone() : -1;
             codec_audio_lm_observe(alm, sample ? &tok : NULL, c.needs_embeddings ? hiddens : NULL, &v);
+            while (v.action == CODEC_AUDIO_LM_SAMPLE_HEAD)   // codec-side heads: the host draws
+                codec_audio_lm_head_token(alm, draw(group[v.head_group], codec_audio_lm_head_logits(alm), v.n_vocab), &v);
             frames += v.is_audio;
             if (v.action == CODEC_AUDIO_LM_STOP) break;
             if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) decode_token(v.token >= 0 ? v.token : tok);
@@ -81,7 +84,8 @@ tokens, or restrict sampling to their audio tokens. The library never decodes.
 |---|---|
 | `flow` | `TOKENS`: audio codes are backbone tokens. `CODEC_HEAD`: codec heads read the backbone hidden. `HIDDEN`: tokens drive, hiddens are the audio latent. `SELF_CONTAINED`: no backbone. |
 | `n_seq`, `chunks`, `n_chunks` | the prompt of each sequence: TEXT (tokenize), TOKENS or EMBD (`n_embd`-wide rows) chunks, decoded in order; chunk `i` of sequence `s` is `chunks[s * n_chunks + i]` |
-| `sampler` | the request's sampling (llama.cpp's `common_params_sampling`: temp, top_k, top_p, min_p, penalties, DRY, sampler order) plus the model's `penalty_exempt` tokens; count the prompt tokens for the penalties, as llama-server does |
+| `penalty_exempt` | backbone tokens the host's penalties should not touch (count the prompt tokens for the penalties, as llama-server does) |
+| `head_groups` | codec-side head groups the host samples (`SAMPLE_HEAD` verdicts), one host sampler each |
 | `grammar` / `allowed` | GBNF (the tokens the model may emit and its minimum length, `min_frames` frames before the end), and the allowed backbone token ranges as a logit bias |
 | `needs_embeddings` | the context returns hidden states; pass the last position's hidden of every sequence to `observe` |
 | `needs_prompt_hidden` | decode the prompt with every position as output and call `codec_audio_lm_prefill` |
@@ -94,16 +98,26 @@ the bundled llama.cpp); a stock llama.cpp ignores the list.
 
 ### Sampling
 
-The request's `sampler` is llama.cpp's sampling, field for field, defaulting to
-`common_params_sampling`'s values (`codec_audio_lm_default_tts_request`); the
-codec GGUF sets none of it. A model's recommended settings ship in its
-**backbone** GGUF as llama.cpp's `general.sampling.*` keys (with
-`patches/sampling-meta-llamacpp.patch` for freq / presence / DRY): the host
-fills the request from them where the user set nothing, as llama.cpp's
-`common_init_sampler_from_model` does (`tts_runner`, Python `codec_cpp.TTS`).
-The same settings drive the backbone sampler and the heads codec_audio_lm
-samples itself (`alm_head_sampler`: llama.cpp's penalties / top-k / top-p /
-min-p / temperature / dist, in `samplers` order). Decoder graph settings
+The host samples every token with llama.cpp's sampler: the backbone's, and
+each codec-side head's (`SAMPLE_HEAD` verdicts: `codec_audio_lm_head_logits`
+gives the head's logits, the model's constraints already applied as -inf and
+guidance already combined; `codec_audio_lm_head_token` takes the id back and
+gives the next verdict). codec_audio_lm holds no sampler and no sampling
+settings; it only suggests constraints: `grammar` / `allowed` /
+`penalty_exempt` for the backbone, and `head_groups` for the heads. Build one
+host sampler per group (one random stream and penalty history; seed group `g`
+with seed + 1 + g), with the same llama.cpp settings as the backbone; a group
+differs only by `penalties` (off for e.g. Qwen3-TTS's depth codebooks),
+`history` (accepted first: Chatterbox's start-of-speech token) and
+`penalty_exempt`. Heads have no vocabulary, so no grammar or DRY. External
+logits go through `llama_sampler_apply` on a host-built
+`llama_token_data_array`, then `llama_sampler_accept`.
+
+A model's recommended settings ship in its **backbone** GGUF as llama.cpp's
+`general.sampling.*` keys (with `patches/sampling-meta-llamacpp.patch` for
+freq / presence / DRY), read the way llama.cpp's
+`common_init_sampler_from_model` does. The request's `seed` only drives the
+model's own randomness (flow / CFM init noise); decoder settings
 (`lm_guidance`, `flow_guidance`, `flow_steps`) are not sampling: < 0 takes the
 codec GGUF's.
 
