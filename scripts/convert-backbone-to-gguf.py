@@ -1064,6 +1064,7 @@ def run_llama_cpp_converter(
         llama_cpp: Path,
         outtype: str,
         patches: list[tuple[str, str]],
+        model_name: str | None = None,
 ) -> None:
     """Spawn llama.cpp's `convert_hf_to_gguf.py` in-process via exec,
     applying source patches before execution.  Patches handle the
@@ -1102,7 +1103,7 @@ def run_llama_cpp_converter(
         "convert_hf_to_gguf.py", str(hf_dir),
         "--outfile", str(output),
         "--outtype", outtype,
-    ]
+    ] + (["--model-name", model_name] if model_name else [])
     try:
         for needle, repl in patches:
             if needle not in src:
@@ -1175,6 +1176,8 @@ def main() -> int:
                     help=f"path to llama.cpp checkout (default: {DEFAULT_LLAMA_CPP})")
     ap.add_argument("--outtype", default="f16",
                     help="dtype to pass through to convert_hf_to_gguf.py")
+    ap.add_argument("--model-name", default=None,
+                    help="general.name (default: llama.cpp's guess from the prepared dir)")
     args = ap.parse_args()
 
     src = resolve_source(args.model_id)
@@ -1221,7 +1224,7 @@ def main() -> int:
                   flush=True)
         print(f"[bb] running llama.cpp converter …", flush=True)
         run_llama_cpp_converter(hf_dir, args.output, Path(args.llama_cpp),
-                                args.outtype, patches)
+                                args.outtype, patches, args.model_name)
     write_sampling(args.output, sampling_model(arch, src, args.model_id))
 
     print(f"[bb] wrote {args.output}", flush=True)
