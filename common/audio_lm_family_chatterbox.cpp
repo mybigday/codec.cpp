@@ -30,7 +30,9 @@ public:
 
     bool backbone_requirements(const alm_vocab & vocab, int32_t max_frames, codec_audio_lm_backbone_req * out) override {
         alm_family::backbone_requirements(vocab, max_frames, out);
-        out->n_seq_max = ci_->is_turbo ? 1 : 2;   // the guidance pair
+        // The guidance pair needs a second sequence; a GGUF cfg_weight of 0 (or
+        // --override-kv codec.lm.chatterbox.sampling.cfg_weight=float:0) has none.
+        out->n_seq_max = (!ci_->is_turbo && ci_->cfg_weight != 0.0f) ? 2 : 1;
         return true;
     }
 
