@@ -78,6 +78,8 @@ ExternalProject_Add(llama_static
         -DGGML_VULKAN=${_ll_vulkan}
         -DGGML_BACKEND_DL=OFF
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-common --config Release
+    # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
+    BUILD_ALWAYS    ON
     BUILD_BYPRODUCTS ${_ll_archives}
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""

@@ -45,17 +45,35 @@ public:
         cfg_ = turbo ? 0.0f : (req.lm_guidance >= 0.0f ? req.lm_guidance : (ci_->cfg_weight >= 0.0f ? ci_->cfg_weight : 0.5f));
 
         std::vector<int32_t> text_ids;
-        if (ci_->backbone_tokenizer) {
-            // Turbo: punc_norm on the codec side, then the backbone's GPT-2 BPE
-            // (paralinguistic tags such as "[laugh]" are added tokens).
-            if (!vocab.valid()) return fail("Chatterbox Turbo needs the backbone vocabulary");
+        // The text normalized here (punc_norm; T3's tokenizer also spells ' ' as
+        // its [SPACE] token), tokenized by the backbone's vocab: Turbo's GPT-2 BPE,
+        // or T3's own tokenizer in a backbone converted with it
+        // (tokenizer.ggml.pre = chatterbox).
+        const bool backbone_vocab = vocab.valid() && (ci_->backbone_tokenizer || vocab.n_tokens() > 8);
+        if (backbone_vocab) {
             std::vector<char> normed(req.text.size() * 2 + 64);
             if (codec_lm_chatterbox_normalize_text(lm_, req.text.c_str(), normed.data(), (int32_t) normed.size()) !=
                 CODEC_STATUS_SUCCESS) {
                 return fail(std::string("text normalization: ") + codec_lm_get_last_error(lm_));
             }
-            text_ids = vocab.tokenize(normed.data(), false, true);
+            std::string text = normed.data();
+            if (!ci_->backbone_tokenizer) {
+                std::string spaced;
+                for (char ch : text) spaced += ch == ' ' ? std::string("[SPACE]") : std::string(1, ch);
+                text = spaced;
+            }
+            text_ids = vocab.tokenize(text, false, true);
+        } else if (ci_->backbone_tokenizer) {
+            return fail("Chatterbox Turbo needs the backbone vocabulary");
         } else {
+            // Deprecated: a backbone GGUF without T3's vocab (converted before it
+            // carried one) falls back to the codec GGUF's copy of the tokenizer.
+            static bool warned = false;
+            if (!warned) {
+                codec_log(CODEC_LOG_LEVEL_WARN, "chatterbox: this backbone GGUF has no text vocabulary; tokenizing in "
+                                                "codec.cpp (deprecated: reconvert / redownload the backbone)\n");
+                warned = true;
+            }
             text_ids.resize(req.text.size() + 64);
             int32_t n = 0;
             if (codec_lm_chatterbox_tokenize(lm_, req.text.c_str(), text_ids.data(), (int32_t) text_ids.size(), &n) !=

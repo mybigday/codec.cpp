@@ -441,78 +441,44 @@ def prep_chatterbox_t3(src: Path, dst: Path, cfg: dict) -> list[tuple[str, str]]
             out_sd["model." + k[len("tfmr."):]] = v
         elif k == "tfmr.norm.weight":
             out_sd["model.norm.weight"] = v
-        elif k == "tfmr.embed_tokens.weight":
-            # vocab=8 placeholder; kept for round-trip but unused at inference.
+        elif k == "text_emb.weight":
+            # The token embedding of the backbone vocab: T3's text tokenizer
+            # (the host feeds codec-composed rows; the table sizes the vocab).
             out_sd["model.embed_tokens.weight"] = v
 
     if "model.embed_tokens.weight" not in out_sd:
-        raise SystemExit(f"missing tfmr.embed_tokens.weight in {t3_path}")
+        raise SystemExit(f"missing text_emb.weight in {t3_path}")
 
     llama_cfg = {
         "architectures": ["LlamaForCausalLM"],
         "model_type": "llama",
         **CHATTERBOX_T3_LLAMA_CFG,
+        "vocab_size": int(out_sd["model.embed_tokens.weight"].shape[0]),
     }
     (dst / "config.json").write_text(json.dumps(llama_cfg, indent=2))
     _save_state_dict(out_sd, dst)
     _write_generation_config(dst, None, None)
-    # No tokenizer to copy — Chatterbox's tokenizer.json is the speech-LM
-    # text tokenizer (704-vocab EN or 2454-vocab multilingual), not the
-    # backbone's vocab (which is just an 8-row placeholder).  We
-    # synthesise a minimal HF tokenizer dir so llama.cpp's converter
-    # doesn't reject the source.
-    _write_chatterbox_placeholder_tokenizer(dst)
-
-    # Force llama.cpp's converter into the `no_vocab` path for
-    # Chatterbox.  Our 8-token placeholder isn't a real tokenizer
-    # (and the backbone is embd-driven at inference); writing a
-    # `tokenizer.ggml.model = "none"` marker tells llama.cpp's loader
-    # to skip vocab validation.  We patch LlamaModel.set_vocab to
-    # early-return _set_vocab_none() for any model with vocab_size<=8.
-    return [(
-        'if self.origin_hf_arch == "GlmasrModel":',
-        'if (self.hparams.get("vocab_size", 0) or 0) <= 8:\n'
-        '            return self._set_vocab_none()\n'
-        '        if self.origin_hf_arch == "GlmasrModel":',
-    )]
-
-
-def _write_chatterbox_placeholder_tokenizer(dst: Path) -> None:
-    """T3's backbone has a vocab=8 placeholder embed table (real text +
-    speech embeddings live in the LM-adaptor side).  llama.cpp's
-    converter expects a HF tokenizer.json — synthesise a minimal one
-    with the same 8-token vocab.  `<unk>` must be in the vocab for
-    `tokenizers.Tokenizer` to load it; we put it at id 0 and fill the
-    rest with `<t1>`..`<t7>` placeholders."""
-    # WordLevel tokenizer with no merges — simplest type that
-    # `tokenizers.Tokenizer.from_file()` accepts.  We never tokenize
-    # through this vocab (backbone is embd-driven only); it just exists
-    # so llama.cpp's converter has *some* vocab to write.
-    vocab = {"<unk>": 0}
-    vocab.update({f"<t{i}>": i for i in range(1, 8)})
-    placeholder = {
-        "version": "1.0",
-        "model": {
-            "type":         "WordLevel",
-            "unk_token":    "<unk>",
-            "vocab":        vocab,
-        },
-        "added_tokens": [
-            {"id": tid, "content": tok, "single_word": False,
-             "lstrip": False, "rstrip": False, "normalized": False,
-             "special": True}
-            for tok, tid in vocab.items()
-        ],
-        "pre_tokenizer": None,
-        "post_processor": None,
-        "decoder": None,
-        "normalizer": None,
-    }
-    (dst / "tokenizer.json").write_text(json.dumps(placeholder, indent=2))
+    # The backbone vocab is T3's text tokenizer (704-token EN tokenizer.json /
+    # 2454-token multilingual grapheme BPE): a raw-UTF-8 BPE behind HF's
+    # Whitespace pre-tokenizer, which patches/chatterbox-tokenizer-llamacpp.patch
+    # implements as `tokenizer.ggml.pre = chatterbox`.  The text normalization
+    # (punc_norm, lowercase / NFKD, ' ' -> [SPACE]) is codec_audio_lm's format
+    # step; [lang] tags are the caller's.
+    tok = src / "tokenizer.json"
+    if t3_path.name != "t3_cfg.safetensors" or not tok.is_file():
+        tok = src / "grapheme_mtl_merged_expanded_v1.json"
+    if not tok.is_file():
+        raise SystemExit(f"no T3 tokenizer (tokenizer.json / grapheme_mtl_merged_expanded_v1.json) in {src}")
+    shutil.copy(tok, dst / "tokenizer.json")
     (dst / "tokenizer_config.json").write_text(json.dumps({
         "tokenizer_class": "PreTrainedTokenizerFast",
         "model_max_length": CHATTERBOX_T3_LLAMA_CFG["max_position_embeddings"],
+        "unk_token": "[UNK]",
     }, indent=2))
+    return [(
+        'raise NotImplementedError("BPE pre-tokenizer was not recognized - update get_vocab_base_pre()")',
+        'res = "chatterbox"  # patches/chatterbox-tokenizer-llamacpp.patch',
+    )]
 
 
 # ---- MOSS-TTS-Realtime (Qwen3 language_model) --------------------------
@@ -1076,16 +1042,35 @@ def run_llama_cpp_converter(
 
     saved_argv = sys.argv
     saved_path = list(sys.path)
+    saved_modules = {k: v for k, v in sys.modules.items() if k == "conversion" or k.startswith("conversion.")}
     # Newer llama.cpp splits the converter into a `conversion/` package next
     # to convert_hf_to_gguf.py; exec() doesn't add the script dir itself.
     sys.path[:0] = [str(llama_cpp.resolve()), str((llama_cpp / "gguf-py").resolve())]
+    # A patch whose needle lives in the package (not the script) is applied to
+    # a copy of it put first on sys.path.
+    src = conv.read_text()
+    pkg = llama_cpp / "conversion"
+    pkg_patches = [(n, r) for n, r in patches if n not in src]
+    pkg_tmp = None
+    if pkg_patches and pkg.is_dir():
+        pkg_tmp = Path(tempfile.mkdtemp(prefix="codec-conv-"))
+        shutil.copytree(pkg, pkg_tmp / "conversion")
+        for needle, repl in pkg_patches:
+            hits = [p for p in (pkg_tmp / "conversion").rglob("*.py") if needle in p.read_text()]
+            if not hits:
+                raise SystemExit(f"patch failed: needle not found in {conv} or {pkg}: {needle!r}")
+            for p in hits:
+                p.write_text(p.read_text().replace(needle, repl))
+        patches = [(n, r) for n, r in patches if n in src]
+        for k in saved_modules:
+            del sys.modules[k]
+        sys.path.insert(0, str(pkg_tmp))
     sys.argv = [
         "convert_hf_to_gguf.py", str(hf_dir),
         "--outfile", str(output),
         "--outtype", outtype,
     ]
     try:
-        src = conv.read_text()
         for needle, repl in patches:
             if needle not in src:
                 raise SystemExit(
@@ -1096,6 +1081,11 @@ def run_llama_cpp_converter(
     finally:
         sys.argv = saved_argv
         sys.path[:] = saved_path
+        for k in [k for k in sys.modules if k == "conversion" or k.startswith("conversion.")]:
+            del sys.modules[k]
+        sys.modules.update(saved_modules)
+        if pkg_tmp is not None:
+            shutil.rmtree(pkg_tmp, ignore_errors=True)
 
 
 _ARCH_SAMPLING = {

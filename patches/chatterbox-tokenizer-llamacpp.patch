@@ -1,0 +1,69 @@
+--- a/src/llama-vocab.h
++++ b/src/llama-vocab.h
+@@ -65,6 +65,7 @@
+     LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI = 54,
+     LLAMA_VOCAB_PRE_TYPE_MELLUM2           = 55,
+     LLAMA_VOCAB_PRE_TYPE_SOPRANO           = 56,
++    LLAMA_VOCAB_PRE_TYPE_CHATTERBOX        = 57,
+ };
+ 
+ struct LLM_KV;
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -533,6 +533,12 @@
+                 regex_exprs = { "\\p{N}", "\\s+|[\\p{L}\\p{N}_]+|[^\\p{L}\\p{N}_\\s]+" };
+                 byte_encode = false;
+                 break;
++            case LLAMA_VOCAB_PRE_TYPE_CHATTERBOX:
++                // HF tokenizers' Whitespace pre-tokenizer (\w+|[^\w\s]+) over a
++                // raw-UTF-8 BPE (Chatterbox T3's text tokenizer)
++                regex_exprs = { "[\\p{L}\\p{M}\\p{N}_]+|[^\\p{L}\\p{M}\\p{N}_\\s]+" };
++                byte_encode = false;
++                break;
+             case LLAMA_VOCAB_PRE_TYPE_WHITESPACE:
+                 // whitespace pre-tokenizer (jinaai/jina-embeddings-v2-base-zh)
+                 regex_exprs = {
+@@ -621,6 +627,13 @@
+         auto tok_pre = vocab.get_pre_type();
+ 
+         for (const auto & word : word_collection) {
++            if (tok_pre == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX) {
++                // the Whitespace pre-tokenizer drops the whitespace between words
++                const auto cpts = unicode_cpts_from_utf8(word);
++                if (std::all_of(cpts.begin(), cpts.end(), [](uint32_t c) { return unicode_cpt_flags_from_cpt(c).is_whitespace; })) {
++                    continue;
++                }
++            }
+             work_queue = llm_bigram_bpe::queue();
+             symbols.clear();
+ 
+@@ -711,7 +724,8 @@
+                 const std::string str = std::string(symbol.text, symbol.n);
+                 const auto token = vocab.text_to_token(str);
+ 
+-                if (token == LLAMA_TOKEN_NULL && tok_pre == LLAMA_VOCAB_PRE_TYPE_SOPRANO) {
++                if (token == LLAMA_TOKEN_NULL && (tok_pre == LLAMA_VOCAB_PRE_TYPE_SOPRANO ||
++                                                  tok_pre == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX)) {
+                     output.push_back(vocab.token_unk());
+                 } else if (token == LLAMA_TOKEN_NULL) {
+                     for (auto j = str.begin(); j != str.end(); ++j) {
+@@ -2187,6 +2201,10 @@
+                 special_eos_id = 3;
+                 add_bos = false;
+             } else if (
++                    tokenizer_pre == "chatterbox") {
++                pre_type = LLAMA_VOCAB_PRE_TYPE_CHATTERBOX;
++                add_bos = false;
++            } else if (
+                     tokenizer_pre == "jais-2") {
+                 pre_type = LLAMA_VOCAB_PRE_TYPE_JAIS2;
+             } else if (
+@@ -3578,7 +3596,7 @@
+                     return _try_copy(token_text.data(), token_text.size());
+                 }
+                 if (attr & LLAMA_TOKEN_ATTR_NORMAL) {
+-                    if (pre_type == LLAMA_VOCAB_PRE_TYPE_SOPRANO) {
++                    if (pre_type == LLAMA_VOCAB_PRE_TYPE_SOPRANO || pre_type == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX) {
+                         return _try_copy(token_text.data(), token_text.size());
+                     }
+                     if (escape_whitespaces) {
