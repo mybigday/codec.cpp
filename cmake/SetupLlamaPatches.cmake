@@ -10,6 +10,7 @@
 #   4. patches/penalty-exempt-llamacpp.patch (penalties that skip a token list)
 #   5. patches/sampling-meta-llamacpp.patch  (general.sampling.* for freq / present / DRY)
 #   6. patches/chatterbox-tokenizer-llamacpp.patch (Chatterbox T3 text tokenizer: `tokenizer.ggml.pre = chatterbox`)
+#   7. patches/ugm-byte-fallback-llamacpp.patch (SentencePiece byte_fallback in the UGM tokenizer: Pocket-TTS)
 #
 # Behaviour:
 #   - submodule not checked out          -> status message, skip.
@@ -32,7 +33,8 @@ set(_lp_patches
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/soprano-llamacpp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/penalty-exempt-llamacpp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/sampling-meta-llamacpp.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/chatterbox-tokenizer-llamacpp.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/chatterbox-tokenizer-llamacpp.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/ugm-byte-fallback-llamacpp.patch")
 
 find_package(Git QUIET)
 if(NOT Git_FOUND)

@@ -901,6 +901,39 @@ def pocket_tts_checkpoint(src: Path) -> Path | None:
     return None
 
 
+def _write_pocket_tts_vocab(w, tok_path: Path, n_vocab: int) -> None:
+    """The text tokenizer (a SentencePiece unigram model) as llama.cpp's UGM vocab,
+    so the host tokenizes the prompt; the LUT's extra row is an unused token."""
+    import gguf
+    from sentencepiece import sentencepiece_model_pb2 as spm_pb2
+    if not tok_path.is_file():
+        raise SystemExit(f"no tokenizer.model next to the Pocket-TTS checkpoint ({tok_path})")
+    m = spm_pb2.ModelProto()
+    m.ParseFromString(tok_path.read_bytes())
+    ttype = {1: gguf.TokenType.NORMAL, 2: gguf.TokenType.UNKNOWN, 3: gguf.TokenType.CONTROL,
+             4: gguf.TokenType.USER_DEFINED, 5: gguf.TokenType.UNUSED, 6: gguf.TokenType.BYTE}
+    tokens = [p.piece for p in m.pieces]
+    scores = [p.score for p in m.pieces]
+    types = [ttype.get(p.type, gguf.TokenType.NORMAL) for p in m.pieces]
+    for i in range(len(tokens), n_vocab):
+        tokens.append(f"<lut_pad_{i}>"); scores.append(-1e9); types.append(gguf.TokenType.UNUSED)
+    if len(tokens) != n_vocab:
+        raise SystemExit(f"tokenizer has {len(m.pieces)} pieces, the text LUT {n_vocab} rows")
+    w.add_tokenizer_model("t5")      # llama.cpp's UGM (unigram) tokenizer
+    w.add_tokenizer_pre("default")
+    w.add_token_list(tokens)
+    w.add_token_scores(scores)
+    w.add_token_types(types)
+    w.add_add_space_prefix(m.normalizer_spec.add_dummy_prefix)
+    w.add_remove_extra_whitespaces(m.normalizer_spec.remove_extra_whitespaces)
+    if m.normalizer_spec.precompiled_charsmap:
+        w.add_precompiled_charsmap(m.normalizer_spec.precompiled_charsmap)
+    if m.trainer_spec.unk_id >= 0:
+        w.add_unk_token_id(m.trainer_spec.unk_id)
+    w.add_add_bos_token(False)
+    w.add_add_eos_token(False)
+
+
 def write_pocket_tts_backbone(st_path: Path, output: Path, outtype: str) -> None:
     """Pocket-TTS FlowLM transformer (`flow_lm.transformer.*` + `out_norm`) →
     stock GGUF arch `starcoder2`: pre-LN affine LayerNorm, separate q/k/v,
@@ -942,7 +975,7 @@ def write_pocket_tts_backbone(st_path: Path, output: Path, outtype: str) -> None
     w.add_vocab_size(n_vocab)
     w.add_file_type(gguf.LlamaFileType.MOSTLY_BF16 if qtype == gguf.GGMLQuantizationType.BF16
                     else gguf.LlamaFileType.MOSTLY_F16)
-    w.add_tokenizer_model("none")   # tokenized by codec_lm's SentencePiece model
+    _write_pocket_tts_vocab(w, st_path.parent / "tokenizer.model", n_vocab)
 
     def add(name: str, arr) -> None:
         arr = np.ascontiguousarray(arr, dtype=np.float32)
@@ -1111,7 +1144,7 @@ def sampling_model(arch: str, src: Path, model_id: str) -> str | None:
     if arch == "CosyVoice1":
         return "cosyvoice"
     if arch == "PocketTTS":
-        return "pocket_tts"
+        return None   # no token sampling (the flow's noise is a codec setting)
     return _ARCH_SAMPLING.get(arch)
 
 

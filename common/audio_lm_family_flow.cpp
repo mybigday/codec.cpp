@@ -53,18 +53,32 @@ public:
         out->sample_rate = sr ? std::atoi(sr) : 24000;
     }
 
-    bool tts_prompt(const alm_tts_request & req, const alm_vocab &, alm_completion * out) override {
+    bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) override {
         const int32_t ldim = fi_->ldim, hidden = fi_->d_model;
         std::string text = req.text;
         const int32_t fae_guess = flow_prepare_text(text) + 2;   // the reference adds 2
         fae_ = fi_->frames_after_eos >= 0 ? fi_->frames_after_eos : fae_guess;
-        std::vector<int32_t> ids(text.size() + 16);
-        int32_t n_tok = 0;
-        if (codec_lm_flow_tokenize(lm_, text.c_str(), ids.data(), (int32_t) ids.size(), &n_tok) != CODEC_STATUS_SUCCESS ||
-            n_tok <= 0) {
-            return fail(std::string("tokenize: ") + codec_lm_get_last_error(lm_));
+        // The backbone's vocab (the SentencePiece model as llama.cpp's UGM)
+        // tokenizes; a backbone without one falls back to the codec GGUF's copy
+        // (deprecated).
+        std::vector<int32_t> ids;
+        if (vocab.valid()) ids = vocab.tokenize(text, false, false);   // nothing from a backbone without a vocab
+        if (ids.empty()) {
+            static bool warned = false;
+            if (!warned) {
+                codec_log(CODEC_LOG_LEVEL_WARN, "pocket: this backbone GGUF has no text vocabulary; tokenizing in "
+                                                "codec.cpp (deprecated: reconvert the backbone)\n");
+                warned = true;
+            }
+            ids.resize(text.size() + 16);
+            int32_t n = 0;
+            if (codec_lm_flow_tokenize(lm_, text.c_str(), ids.data(), (int32_t) ids.size(), &n) != CODEC_STATUS_SUCCESS) {
+                return fail(std::string("tokenize: ") + codec_lm_get_last_error(lm_));
+            }
+            ids.resize((size_t) std::max(0, n));
         }
-        ids.resize((size_t) n_tok);
+        if (ids.empty()) return fail("the text tokenized to nothing");
+        const int32_t n_tok = (int32_t) ids.size();
         codec_log(CODEC_LOG_LEVEL_INFO, "pocket: text=\"%s\" -> %d tokens\n", text.c_str(), n_tok);
 
         // Voice conditioning: the speaker's reference latents -> [bos_before_voice | speaker_proj] rows.

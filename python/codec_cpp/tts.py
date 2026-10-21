@@ -93,6 +93,8 @@ class _Backbone:
                      eos=L.llama_vocab_eos(v), is_eog=lambda t: bool(L.llama_vocab_is_eog(v, t)))
 
     def tokenize(self, text: str, add_special: bool, parse_special: bool) -> list[int]:
+        if self.L.llama_vocab_type(self.vocab_ptr) == 0:   # LLAMA_VOCAB_TYPE_NONE: codec_audio_lm falls back
+            return []
         b = text.encode("utf-8")
         buf = (_ffi.llama_token * (len(b) + 8))()
         n = self.L.llama_tokenize(self.vocab_ptr, b, len(b), buf, len(buf), add_special, parse_special)

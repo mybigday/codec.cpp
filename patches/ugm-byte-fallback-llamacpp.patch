@@ -1,0 +1,34 @@
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -1065,17 +1065,29 @@
+         }
+ 
+         // now backtrack from the end to gather token ids of the best tokenization
+-        // merge sequences of consecutive unknown tokens into single unknown tokens
++        // merge sequences of consecutive unknown tokens into single unknown tokens;
++        // with byte-fallback pieces (<0xXX>), an unknown span is its UTF-8 bytes
++        // instead, as SentencePiece's byte_fallback does
++        const bool byte_fallback = vocab.text_to_token("<0x00>") != LLAMA_TOKEN_NULL;
+         bool is_prev_unknown = false;
++        size_t end_offset = input_len;
+         for (struct best_tokenization & tokenization = tokenization_results[input_len]; ; tokenization = tokenization_results[tokenization.input_offset]) {
+             bool is_unknown = tokenization.token_id == vocab.token_unk();
+-            if (!(is_prev_unknown && is_unknown)) {
++            if (is_unknown && byte_fallback) {
++                for (size_t i = end_offset; i > tokenization.input_offset; --i) {
++                    char piece[8];
++                    snprintf(piece, sizeof(piece), "<0x%02X>", (uint8_t) normalized[i - 1]);
++                    output.push_back(vocab.text_to_token(piece));
++                }
++                is_unknown = false;
++            } else if (!(is_prev_unknown && is_unknown)) {
+                 output.push_back(tokenization.token_id);
+             }
+             if (tokenization.input_offset == 0) {
+                 break;
+             }
+             is_prev_unknown = is_unknown;
++            end_offset = tokenization.input_offset;
+         }
+ 
+         // reverse the output since we added tokens starting from the end of the input

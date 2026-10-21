@@ -50,7 +50,7 @@ public:
         // or T3's own tokenizer in a backbone converted with it
         // (tokenizer.ggml.pre = chatterbox).
         const bool backbone_vocab = vocab.valid() && (ci_->backbone_tokenizer || vocab.n_tokens() > 8);
-        if (backbone_vocab) {
+        if (backbone_vocab) {   // (a backbone without a vocab tokenizes nothing: the fallback below)
             std::vector<char> normed(req.text.size() * 2 + 64);
             if (codec_lm_chatterbox_normalize_text(lm_, req.text.c_str(), normed.data(), (int32_t) normed.size()) !=
                 CODEC_STATUS_SUCCESS) {

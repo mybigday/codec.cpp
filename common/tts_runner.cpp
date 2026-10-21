@@ -276,6 +276,8 @@ private:
 
 int32_t vocab_tokenize(void * ud, const char * text, int32_t len, int32_t * out, int32_t cap, bool add_special,
                        bool parse_special) {
+    // A backbone without a vocabulary tokenizes nothing (codec_audio_lm falls back).
+    if (llama_vocab_type((const llama_vocab *) ud) == LLAMA_VOCAB_TYPE_NONE) return 0;
     return llama_tokenize((const llama_vocab *) ud, text, len, out, cap, add_special, parse_special);
 }
 int32_t vocab_piece(void * ud, int32_t token, char * buf, int32_t cap) {

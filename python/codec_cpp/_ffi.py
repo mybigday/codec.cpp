@@ -676,6 +676,7 @@ LLAMA_PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "llama_tokenize": (c_int32, [_P, c_char_p, c_int32, POINTER(llama_token), c_int32, c_bool, c_bool]),
     "llama_token_to_piece": (c_int32, [_P, llama_token, c_char_p, c_int32, c_int32, c_bool]),
     "llama_vocab_n_tokens": (c_int32, [_P]),
+    "llama_vocab_type": (c_int, [_P]),
     "llama_vocab_eos": (llama_token, [_P]),
     "llama_vocab_is_eog": (c_bool, [_P, llama_token]),
     "llama_sampler_chain_default_params": (llama_sampler_chain_params, []),

@@ -12,7 +12,10 @@ transformer's hidden state; an EOS head ends the utterance.
 python scripts/convert-to-gguf.py --checkpoint-path models/pocket_tts \
     --model-type pocket_tts --output models/pocket_tts/pocket_tts_en.gguf
 
-# FlowLM transformer → stock starcoder2 backbone GGUF (no llama.cpp patch)
+# FlowLM transformer → stock starcoder2 backbone GGUF, with the SentencePiece
+# text tokenizer as its llama.cpp vocab (UGM; byte fallback needs
+# patches/ugm-byte-fallback-llamacpp.patch). Older backbones without the vocab
+# fall back to the codec GGUF's tokenizer copy (deprecated).
 python scripts/convert-backbone-to-gguf.py --model-id models/pocket_tts \
     --output models/pocket_tts/backbone-f16.gguf --outtype f16
 ```

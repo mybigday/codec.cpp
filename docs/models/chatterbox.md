@@ -23,7 +23,10 @@ S3G decodes at 24 kHz.
     --model-type chatterbox_s3g --lm-source models/chatterbox_turbo \
     --output models/chatterbox_turbo/chatterbox_turbo.gguf
 
-# T3 backbone GGUF (Llama-520M, or GPT-2 medium + tokenizer for Turbo)
+# T3 backbone GGUF (Llama-520M with T3's text tokenizer as its llama.cpp vocab,
+# tokenizer.ggml.pre = chatterbox from patches/chatterbox-tokenizer-llamacpp.patch;
+# or GPT-2 medium + tokenizer for Turbo). Older Llama backbones without the vocab
+# fall back to the codec GGUF's tokenizer copy (deprecated).
 .venv/bin/python scripts/convert-backbone-to-gguf.py --model-id models/chatterbox_turbo \
     --output models/chatterbox_turbo/gpt2_backbone.gguf --outtype f16
 ```
