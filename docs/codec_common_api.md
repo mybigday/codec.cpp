@@ -116,8 +116,11 @@ logits go through `llama_sampler_apply` on a host-built
 A model's recommended settings ship in its **backbone** GGUF as llama.cpp's
 `general.sampling.*` keys (with `patches/sampling-meta-llamacpp.patch` for
 freq / presence / DRY), read the way llama.cpp's
-`common_init_sampler_from_model` does. The request's `seed` only drives the
-model's own randomness (flow / CFM init noise); decoder settings
+`common_init_sampler_from_model` does. The model's own randomness (the init
+noise of a codec-side flow / CFM head: Pocket-TTS, BlueMagpie) is not token
+sampling: `codec_audio_lm_set_seed` seeds it after `tts_prompt` (unset =
+random), and hosts pass the seed the user gave the completion. Decoders are
+deterministic (Chatterbox S3G / CosyVoice use a fixed noise seed). Decoder settings
 (`lm_guidance`, `flow_guidance`, `flow_steps`) are not sampling: < 0 takes the
 codec GGUF's.
 

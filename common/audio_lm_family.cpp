@@ -69,8 +69,8 @@ alm_chunk alm_chunk::of_embd(std::vector<float> e, int32_t n_rows) {
     return c;
 }
 
-uint32_t alm_tts_request::seed() const {
-    return seed_ == CODEC_AUDIO_LM_DEFAULT_SEED ? std::random_device{}() : seed_;
+uint32_t alm_resolve_seed(uint32_t seed) {
+    return seed == CODEC_AUDIO_LM_DEFAULT_SEED ? std::random_device{}() : seed;
 }
 
 std::string alm_min_length_grammar(int32_t end, int32_t min_tokens, const std::string & body) {

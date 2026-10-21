@@ -146,7 +146,8 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, sampling: dict, 
     """The host loop of include/codec_audio_lm.h, one segment: the host samples
     every token, the backbone's and the codec-side heads' (one sampler per group)."""
     sp = dict(SAMPLING_DEFAULTS, **sampling)
-    alm.tts_prompt(text, vocab=bb.vocab, seed=sp["seed"], **req)
+    alm.tts_prompt(text, vocab=bb.vocab, **req)
+    alm.set_seed(sp["seed"])
     c = alm.completion()
     assert c.n_seq == 1, "this smoke drives single-sequence models"
     bb.clear()

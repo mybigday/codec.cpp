@@ -326,6 +326,7 @@ static bool run_one(tts_runner_session * s, const tts_runner_params & a, tts_run
     };
     const codec_audio_lm_tts_request req = tts_runner_request(a);
     if (!codec_audio_lm_tts_prompt(alm, &req, &cv)) return fail("prompt");
+    codec_audio_lm_set_seed(alm, a.sampling.seed);   // the model's own noise follows the user's seed too
     codec_audio_lm_completion c;
     if (!codec_audio_lm_get_completion(alm, &c)) return fail("completion");
     if (c.flow == CODEC_AUDIO_LM_FLOW_SELF_CONTAINED) return tts_runner_generate_self_contained(alm, a, out);

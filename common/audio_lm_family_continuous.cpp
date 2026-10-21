@@ -5,6 +5,8 @@
 
 #include "audio_lm_family.h"
 
+#include <random>
+
 namespace codec_common {
 namespace {
 
@@ -24,6 +26,7 @@ public:
         if (!audio_lm_get_prompt_info(alm_, &pi_)) return fail_alm("prompt info");
         hidden_ = audio_lm_hidden_dim(alm_);
         frames_ = 0;
+        set_seed(CODEC_AUDIO_LM_DEFAULT_SEED);   // random unless the host sets one
         stop_reason_ = "max_frames";
         // CFM steps / guidance: the request's, else the GGUF's (VoxCPM.generate's 10 / 2.0).
         const char * m_steps = audio_lm_meta_str(alm_, "codec.lm.cfm_n_timesteps");
@@ -53,7 +56,12 @@ public:
 
     bool observe(const int32_t *, const float * hiddens, codec_audio_lm_verdict * v) override {
         if (hiddens == nullptr) return fail("observe needs the backbone hidden state");
-        if (audio_lm_observe_hidden(alm_, hiddens, hidden_, nullptr) == OBSERVE_STOP) {
+        // CFM init noise ~ N(0, 1) per patch (torch.randn), from the host's seed.
+        const codec_lm_info * li = codec_lm_get_info(audio_lm_get_lm(alm_));
+        noise_.resize((size_t) li->patch_size * li->latent_dim);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (float & z : noise_) z = nd(rng_);
+        if (audio_lm_observe_hidden(alm_, hiddens, hidden_, noise_.data()) == OBSERVE_STOP) {
             const char * e = audio_lm_last_error(alm_);
             if (e && *e) return fail_alm("frame");
             stop_reason_ = "stop_head";
@@ -72,8 +80,12 @@ public:
 
     const float * next_embd(int32_t) const override { return next_.data(); }
 
+    void set_seed(uint32_t seed) override { rng_.seed(alm_resolve_seed(seed)); }
+
 private:
     audio_lm_prompt_info pi_;
+    std::mt19937 rng_;
+    std::vector<float> noise_;
     int32_t hidden_ = 0, frames_ = 0;
     std::vector<float> next_;
 };

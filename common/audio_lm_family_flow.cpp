@@ -97,9 +97,8 @@ public:
         // CFM init noise ~ N(0, temperature) (the GGUF's codec.lm.temperature): Box-Muller on a uniform mt19937
         // stream (std::normal_distribution's polar method gives poor early
         // draws; the FlowLM is very sensitive to the first frames' noise).
-        std::seed_seq seq{ req.seed(), 0x9E3779B9u, 0x243F6A88u, 0xB7E15162u };
+        set_seed(CODEC_AUDIO_LM_DEFAULT_SEED);   // random unless the host sets one (codec_audio_lm_set_seed)
         flow_steps_  = req.flow_steps > 0 ? req.flow_steps : 0;   // 0: the GGUF's lsd_decode_steps
-        rng_.seed(seq);
         min_len_ = req.min_frames >= 0 ? req.min_frames : 0;   // ignore the EOS head before this frame
         eos_step_ = -1;
         step_ = 0;
@@ -117,6 +116,11 @@ public:
         // _estimate_max_gen_len: 12.5 frames/s for ~3 tokens/s + 2 s.
         out->max_frames = std::max(8, (int32_t) std::ceil(((double) n_tok / 3.0 + 2.0) * 12.5));
         return true;
+    }
+
+    void set_seed(uint32_t seed) override {
+        std::seed_seq seq{ alm_resolve_seed(seed), 0x9E3779B9u, 0x243F6A88u, 0xB7E15162u };
+        rng_.seed(seq);
     }
 
     bool observe(const int32_t *, const float * hiddens, codec_audio_lm_verdict * v) override {

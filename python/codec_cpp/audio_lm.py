@@ -277,11 +277,11 @@ class AudioLM:
             self._fail("codec_audio_lm_save_voice")
 
     def tts_prompt(self, text: str, *, vocab: Vocab | None = None, instruct: str | None = None,
-                   seed: int | None = None, min_frames: int | None = None, max_frames: int | None = None,
+                   min_frames: int | None = None, max_frames: int | None = None,
                    lm_guidance: float | None = None, flow_guidance: float | None = None,
                    flow_steps: int | None = None, voice: Speaker | None = None) -> None:
         """Prepare the prompt of one generation.  Sampling is the host's (every
-        token, codec-side heads included); ``seed`` only drives the model's own
+        token, codec-side heads included); set_seed() seeds the model's own
         randomness (flow init noise).  Decoder settings left None are the GGUF's;
         voice None = default."""
         L = lib()
@@ -289,8 +289,6 @@ class AudioLM:
         r.text, r.instruct = text.encode("utf-8"), _b(instruct)
         r.voice = voice.ptr if voice is not None else None
         self._voice = voice   # the library borrows it until the generation is decoded
-        if seed is not None:
-            r.seed = int(seed) & 0xFFFFFFFF
         for name, val, conv in (("min_frames", min_frames, int), ("max_frames", max_frames, int),
                                 ("lm_guidance", lm_guidance, float), ("flow_guidance", flow_guidance, float),
                                 ("flow_steps", flow_steps, int)):
@@ -298,6 +296,12 @@ class AudioLM:
                 setattr(r, name, conv(val))
         if not L.codec_audio_lm_tts_prompt(self.ptr, ctypes.byref(r), ctypes.byref(vocab.struct) if vocab else None):
             self._fail("codec_audio_lm_tts_prompt")
+
+    def set_seed(self, seed: int) -> None:
+        """Seed the model's own noise (Pocket-TTS / BlueMagpie flow init noise) of the
+        prepared generation; call after tts_prompt.  Unset = random."""
+        if not lib().codec_audio_lm_set_seed(self.ptr, int(seed) & 0xFFFFFFFF):
+            self._fail("codec_audio_lm_set_seed")
 
     def split(self, text: str, max_bytes: int = 0) -> list[str]:
         """The model's segmentation of long text (one generation per segment)."""

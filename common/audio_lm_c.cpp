@@ -253,7 +253,6 @@ bool codec_audio_lm_save_voice(struct codec_audio_lm * ctx, const struct codec_s
 
 struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void) {
     codec_audio_lm_tts_request r{};
-    r.seed = CODEC_AUDIO_LM_DEFAULT_SEED;
     r.lm_guidance = r.flow_guidance = -1.0f;
     r.min_frames = r.flow_steps = -1;
     r.max_frames = 0;
@@ -271,7 +270,6 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_a
     alm_tts_request r;
     r.text = req->text;
     if (req->instruct) r.instruct = req->instruct;
-    r.seed_ = req->seed;
     r.min_frames = req->min_frames;
     r.lm_guidance = req->lm_guidance;
     r.flow_guidance = req->flow_guidance;
@@ -280,6 +278,12 @@ bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_a
     alm_vocab v{vocab};
     if (!ctx->family->tts_prompt(r, v, &ctx->completion)) return ctx->fail_family();
     if (r.max_frames > 0) ctx->completion.max_frames = r.max_frames;
+    return true;
+}
+
+bool codec_audio_lm_set_seed(struct codec_audio_lm * ctx, uint32_t seed) {
+    if (ctx == nullptr) return false;
+    ctx->family->set_seed(seed);
     return true;
 }
 

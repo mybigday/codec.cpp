@@ -25,7 +25,8 @@ extern "C" {
 //   voice = codec_audio_lm_get_voice / create_voice / load_voice   // NULL = default
 //   n = codec_audio_lm_tts_split(ctx, text, 0)                 // optional segmentation
 //   for each segment i (codec_audio_lm_tts_segment(ctx, i)):
-//       codec_audio_lm_tts_prompt(ctx, &{segment_text, voice, instruct, seed}, &vocab)
+//       codec_audio_lm_tts_prompt(ctx, &{segment_text, voice, instruct}, &vocab)
+//       codec_audio_lm_set_seed(ctx, seed)                    // the model's own noise
 //       codec_audio_lm_get_completion(ctx, &c)
 //       if c.flow == SELF_CONTAINED: codec_audio_lm_generate_self_contained(ctx)
 //       else:
@@ -173,7 +174,7 @@ bool codec_audio_lm_backbone_requirements(struct codec_audio_lm * ctx, const str
 // llama.cpp's sampler and its settings (the backbone GGUF's general.sampling.*
 // recommends them).  codec_audio_lm only suggests constraints (grammar,
 // allowed ranges, penalty_exempt, head groups) and masks a head's logits.
-#define CODEC_AUDIO_LM_DEFAULT_SEED 0xFFFFFFFFu   // random
+#define CODEC_AUDIO_LM_DEFAULT_SEED 0xFFFFFFFFu   // random (also llama.cpp's LLAMA_DEFAULT_SEED)
 
 struct codec_audio_lm_tts_request {
     const char * text;          // required: one text (one segment)
@@ -181,9 +182,6 @@ struct codec_audio_lm_tts_request {
     // the generation is decoded (decode / stream_finish) or the next prompt.
     const struct codec_speaker * voice;
     const char * instruct;      // instruction text, for models that take it (may be NULL)
-    // Seed of the model's own randomness (flow / CFM init noise; not token
-    // sampling); CODEC_AUDIO_LM_DEFAULT_SEED = random.
-    uint32_t     seed;
     // Generation length: at least min_frames audio frames before the model's
     // end (< 0: the model's own minimum), at most max_frames (<= 0: the
     // model's default).
@@ -198,9 +196,16 @@ struct codec_audio_lm_tts_request {
 struct codec_audio_lm_tts_request codec_audio_lm_default_tts_request(void);
 
 // Prompt for one request.  `vocab` may be NULL for self-contained models.
-// Resets the per-generation state.
+// Resets the per-generation state: a context holds one prepared request.
 bool codec_audio_lm_tts_prompt(struct codec_audio_lm * ctx, const struct codec_audio_lm_tts_request * req,
                                const struct codec_audio_lm_vocab * vocab);
+
+// Seed of the model's own randomness in the prepared generation: the init
+// noise of a codec-side flow / CFM head (Pocket-TTS, BlueMagpie), not token
+// sampling.  Call after tts_prompt, before the first prefill / observe (or
+// generate_self_contained); not called (or CODEC_AUDIO_LM_DEFAULT_SEED) = random.
+// Hosts pass the seed the user gave the completion.
+bool codec_audio_lm_set_seed(struct codec_audio_lm * ctx, uint32_t seed);
 
 // ── TTS segmentation ─────────────────────────────────────────────────
 // Splits long text into segments generated one by one, at sentence and

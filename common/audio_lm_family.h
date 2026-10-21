@@ -71,16 +71,17 @@ struct alm_completion {
 struct alm_tts_request {
     std::string text;
     std::string instruct;
-    uint32_t seed_ = CODEC_AUDIO_LM_DEFAULT_SEED;   // the model's own randomness
     int32_t min_frames = -1;         // < 0 = the model's own minimum
     int32_t max_frames = 0;          // <= 0 = model default
     float   lm_guidance = -1.0f;     // < 0 = the model's (likewise below)
     float   flow_guidance = -1.0f;
     int32_t flow_steps = -1;
 
-    // The seed of the model's own random stream (random when unset).
-    uint32_t seed() const;
 };
+
+// The seed of a model-owned random stream: `seed`, or a random one for
+// CODEC_AUDIO_LM_DEFAULT_SEED.
+uint32_t alm_resolve_seed(uint32_t seed);
 
 // GBNF for a minimum length on backbone-sampled tokens: `min_tokens` tokens
 // other than `end` before `end` (an end-of-generation token or not) may follow.  `body` is the grammar of one
@@ -137,6 +138,8 @@ public:
     virtual int32_t join(std::vector<float> & pcm, int32_t sample_rate, int32_t i, int32_t n);
     virtual bool tts_prompt(const alm_tts_request & req, const alm_vocab & vocab, alm_completion * out) = 0;
     virtual bool prefill(const float * hiddens, int32_t n_pos);
+    // codec_audio_lm_set_seed: the model's own noise (flow / CFM heads).
+    virtual void set_seed(uint32_t) {}
     virtual bool observe(const int32_t * tokens, const float * hiddens, codec_audio_lm_verdict * v) = 0;
     // After a SAMPLE_HEAD verdict: the head's logits, and the id the host drew.
     virtual const float * head_logits() const { return nullptr; }
