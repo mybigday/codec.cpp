@@ -155,7 +155,7 @@ public:
         const int32_t step = (int32_t) decoded_.size();
         if (step >= max_len_) {
             stop_reason_ = "max_len";
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         if (!audio_lm_step_begin(alm_, hiddens, hidden_)) return fail_alm("speech head");
@@ -169,7 +169,7 @@ public:
 
         // The reference holds the end token back for the first min_len tokens.
         if (step < min_len_) logits_[(size_t) ci_->ignore_eos_id] = -INFINITY;
-        *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, -1, 0, n};
+        *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, 0, n};
         return true;
     }
 
@@ -179,13 +179,13 @@ public:
         if (id < 0 || id >= (int32_t) logits_.size()) return fail("head token out of range");
         if (id >= ci_->stop_begin && id < ci_->stop_end) {
             stop_reason_ = "eos";
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         decoded_.push_back(id);
         next_.assign((size_t) hidden_, 0.0f);
         if (codec_lm_cosyvoice_speech_embd(lm_, &id, 1, next_.data(), 1) != CODEC_STATUS_SUCCESS) return fail_lm("speech embedding");
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1, 0, 0};
         return true;
     }
 

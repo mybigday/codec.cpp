@@ -79,7 +79,7 @@ protected:
             const float * lg = audio_lm_step_logits(alm_, &idx, &n);
             if (lg == nullptr) return fail_alm("step logits");
             logits_.assign(lg, lg + n);
-            *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, -1, group_of(cb_), n};
+            *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, group_of(cb_), n};
             return true;
         }
         std::vector<int32_t> codes((size_t) n_cb_, 0);
@@ -89,7 +89,7 @@ protected:
             if (e && *e) return fail_alm("frame");
             stop_reason_ = "eos_code_c0";
             codec_log(CODEC_LOG_LEVEL_INFO, "AR loop done: %d frames, stop=eos_code_c0\n", frames_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         ++frames_;
@@ -157,7 +157,7 @@ protected:
         ++text_idx_;
         next_.assign((size_t) hidden_, 0.0f);
         if (!compose(t, codes.data(), next_.data())) return false;
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1, 0, 0};
         return true;
     }
 
@@ -208,7 +208,7 @@ public:
             if (text_steps_ < pi_.max_text_tokens) {
                 text_logits(hiddens);
                 in_text_ = true;
-                *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, -1, 0, (int32_t) logits_.size()};
+                *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, false, -1, 0, (int32_t) logits_.size()};   // text, not audio
                 return true;
             }
             return text_token(pi_.audio_start_id, v);
@@ -224,7 +224,7 @@ protected:
     bool after_frame(const std::vector<int32_t> & codes, codec_audio_lm_verdict * v) override {
         next_.assign((size_t) hidden_, 0.0f);
         if (!audio_lm_compose_audio_codes_embd(alm_, codes.data(), n_cb_, next_.data(), hidden_)) return fail_alm("audio embedding");
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1, 0, 0};
         return true;
     }
 
@@ -232,11 +232,11 @@ protected:
         ++text_steps_;
         if (tok == pi_.text_end_id) {
             stop_reason_ = "text_end";
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         if (tok == pi_.audio_start_id) audio_ = true;
-        *v = {CODEC_AUDIO_LM_FEED_TOKEN, false, false, tok, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_TOKEN, false, audio_, false, tok, 0, 0};   // <|audio_start|> opens the audio
         return true;
     }
 

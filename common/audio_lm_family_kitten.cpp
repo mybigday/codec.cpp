@@ -158,11 +158,11 @@ public:
         if (t == cfg_run_.speech_end || t == cfg_run_.stop) {
             stop_reason_ = "eos";
             codec_log(CODEC_LOG_LEVEL_INFO, "KittenTTS AR done: %zu frames, stop=eos\n", codes_.size());
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1};
             return true;
         }
         codes_.push_back(t - cfg_run_.audio_base);
-        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, true, -1};
+        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, true, true, -1};
         return true;
     }
 

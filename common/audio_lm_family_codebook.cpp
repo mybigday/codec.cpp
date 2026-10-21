@@ -204,7 +204,7 @@ private:
             }
             logits_.assign(lg, lg + n);
             const int32_t group = (!pi_.cb0_from_backbone && cb_ > 0) ? 1 : 0;   // head_groups above
-            *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, -1, group, n};
+            *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, group, n};
             return true;
         }
         return finish_frame(v);
@@ -218,7 +218,7 @@ private:
             if (e && *e) return fail_alm("frame");
             stop_reason_ = "eos_code_c0";
             codec_log(CODEC_LOG_LEVEL_INFO, "AR loop done: %d frames, stop=eos_code_c0\n", frames_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         ++frames_;
@@ -236,7 +236,7 @@ private:
             for (int32_t i = 0; i < hidden_; ++i) next_[(size_t) i] += tt[(size_t) i];
             ++talker_step_;
         }
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, pi_.cb0_from_backbone, true, -1, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, pi_.cb0_from_backbone, true, true, -1, 0, 0};
         return true;
     }
 

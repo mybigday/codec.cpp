@@ -488,7 +488,7 @@ class TTS:
                 v = alm.observe(tokens=None if tok is None else [tok], hiddens=h)
                 while v.action == AudioLM.SAMPLE_HEAD:   # the codec-side heads, drawn here
                     v = alm.head_token(heads[v.head_group].sample_logits(alm.head_logits(v.n_vocab)))
-                frames += v.is_audio
+                frames += v.frame_done
                 if v.action == AudioLM.STOP:
                     break
                 if v.action == AudioLM.FEED_TOKEN:
@@ -497,7 +497,7 @@ class TTS:
                     rows = np.stack([alm.next_embd(q, c.n_embd) for q in range(n_seq)])[:, None, :]
                     bb.decode_embd(rows, pos)
                 pos += 1
-                if v.is_audio and streaming:
+                if v.frame_done and streaming:
                     pcm, sr = alm.stream_poll(chunk_ms)
                     if len(pcm):
                         yield pcm, sr

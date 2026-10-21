@@ -56,7 +56,7 @@ for (int i = 0; i < n; ++i) {
             codec_audio_lm_observe(alm, sample ? &tok : NULL, c.needs_embeddings ? hiddens : NULL, &v);
             while (v.action == CODEC_AUDIO_LM_SAMPLE_HEAD)   // codec-side heads: the host draws
                 codec_audio_lm_head_token(alm, draw(group[v.head_group], codec_audio_lm_head_logits(alm), v.n_vocab), &v);
-            frames += v.is_audio;
+            frames += v.frame_done;
             if (v.action == CODEC_AUDIO_LM_STOP) break;
             if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) decode_token(v.token >= 0 ? v.token : tok);
             else for each sequence s: decode_embd(codec_audio_lm_next_embd(alm, s));
@@ -91,7 +91,7 @@ tokens, or restrict sampling to their audio tokens. The library never decodes.
 | `needs_prompt_hidden` | decode the prompt with every position as output and call `codec_audio_lm_prefill` |
 | `sample_first` | the first step samples a backbone token; afterwards each verdict's `sample_backbone` says |
 | `streamable` | `codec_audio_lm_stream_poll` works during the generation |
-| `max_frames` | audio frames (`is_audio` verdicts) after which to stop |
+| `max_frames` | audio frames (`frame_done` verdicts) after which to stop |
 
 `penalty_exempt` needs `patches/penalty-exempt-llamacpp.patch` (applied to
 the bundled llama.cpp); a stock llama.cpp ignores the list.
@@ -134,13 +134,19 @@ the hidden state per sequence (or NULL) and answers:
 - `FEED_EMBD`: decode `codec_audio_lm_next_embd(alm, s)` on every sequence `s`;
 - `STOP`: the generation ended; `codec_audio_lm_stop_reason` says why.
 
-`is_audio` marks steps that produced audio (count them against `max_frames`,
-poll the stream after them).
+`is_audio` marks steps whose token belongs to the audio: every codebook token
+and, for models with an audio start / end, the markup between them (OuteTTS
+word pieces, timestamps, code_start / code_end). OuteTTS, NeuTTS and Kitten
+prefill their audio start, so all their steps are audio; LFM2's text warm-up
+is not (its `<|audio_start|>` step is). The host emits the fed-back tokens of
+the other steps as text. `frame_done` marks steps that completed an audio frame
+(count them against `max_frames`, poll the stream after them). A STOP verdict
+does not report the end token.
 
 ### Audio
 
 `codec_audio_lm_decode` returns the generation's audio. For streaming, call
-`codec_audio_lm_stream_poll(alm, chunk_ms, &pcm)` after each audio step: it
+`codec_audio_lm_stream_poll(alm, chunk_ms, &pcm)` after each `frame_done` step: it
 returns the audio that became final since the last call. Each window is
 re-decoded from the first frame (causal decoders need the whole left context),
 the right edge the decoder may still revise is held back (0.32 s), and the

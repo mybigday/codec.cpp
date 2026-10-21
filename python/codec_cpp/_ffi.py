@@ -365,6 +365,7 @@ class codec_audio_lm_verdict(Structure):
         ("action", c_int),
         ("sample_backbone", c_bool),
         ("is_audio", c_bool),
+        ("frame_done", c_bool),
         ("token", c_int32),
         ("head_group", c_int32),
         ("n_vocab", c_int32),

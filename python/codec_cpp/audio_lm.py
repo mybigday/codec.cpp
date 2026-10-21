@@ -148,7 +148,8 @@ class Completion:
 class Verdict:
     action: int                     # AudioLM.FEED_TOKEN / FEED_EMBD / STOP
     sample_backbone: bool
-    is_audio: bool
+    is_audio: bool      # the token belongs to the audio (not text)
+    frame_done: bool    # an audio frame completed
     token: int                      # FEED_TOKEN: the token the model picked (-1 = the sampled one)
     head_group: int = 0             # SAMPLE_HEAD: the group to sample with
     n_vocab: int = 0                # SAMPLE_HEAD: the head's logits width
@@ -382,7 +383,7 @@ class AudioLM:
                                             None if h is None else h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                                             ctypes.byref(v)):
             self._fail("codec_audio_lm_observe")
-        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), int(v.token), int(v.head_group),
+        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), bool(v.frame_done), int(v.token), int(v.head_group),
                        int(v.n_vocab))
 
     def head_logits(self, n_vocab: int) -> np.ndarray:
@@ -397,7 +398,7 @@ class AudioLM:
         v = _ffi.codec_audio_lm_verdict()
         if not lib().codec_audio_lm_head_token(self.ptr, int(token), ctypes.byref(v)):
             self._fail("codec_audio_lm_head_token")
-        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), int(v.token), int(v.head_group),
+        return Verdict(int(v.action), bool(v.sample_backbone), bool(v.is_audio), bool(v.frame_done), int(v.token), int(v.head_group),
                        int(v.n_vocab))
 
     def next_embd(self, seq: int = 0, n_embd: int | None = None) -> np.ndarray:

@@ -66,7 +66,7 @@ public:
             if (e && *e) return fail_alm("frame");
             stop_reason_ = "stop_head";
             codec_log(CODEC_LOG_LEVEL_INFO, "AR loop done: %d frames, stop=stop_head\n", frames_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1};
             return true;
         }
         ++frames_;
@@ -74,7 +74,7 @@ public:
         const float * fb = audio_lm_get_next_embed(alm_, &dim);
         if (fb == nullptr || dim != hidden_) return fail("no feedback embedding");
         next_.assign(fb, fb + dim);
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1};
         return true;
     }
 

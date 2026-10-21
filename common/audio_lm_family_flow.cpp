@@ -157,7 +157,7 @@ public:
         if (eos_step_ >= 0 && step >= eos_step_ + fae_) {
             stop_reason_ = "eos_head";
             codec_log(CODEC_LOG_LEVEL_INFO, "pocket AR done: %d frames, eos_step=%d, stop=eos_head\n", n_frames_, eos_step_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1};
             return true;
         }
         latents_.insert(latents_.end(), lat.begin(), lat.end());
@@ -166,7 +166,7 @@ public:
         if (codec_lm_step_feedback_embd(st_, next_.data()) != CODEC_STATUS_SUCCESS) {
             return fail(std::string("frame input: ") + codec_lm_state_get_last_error(st_));
         }
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1};
         return true;
     }
 

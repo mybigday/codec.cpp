@@ -283,7 +283,7 @@ struct codec_audio_lm_completion {
     bool    sample_first;                  // the first step samples a backbone token
     bool    streamable;                    // stream_poll works during this generation (else
                                            // only the whole generation decodes)
-    int32_t max_frames;                    // audio frames to stop after (verdicts with is_audio)
+    int32_t max_frames;                    // audio frames to stop after (verdicts with frame_done)
     // Codec-side head groups (n_head_groups = 0: no SAMPLE_HEAD verdicts).
     const struct codec_audio_lm_head_group * head_groups;
     int32_t n_head_groups;
@@ -310,7 +310,10 @@ enum codec_audio_lm_action {
 struct codec_audio_lm_verdict {
     enum codec_audio_lm_action action;
     bool sample_backbone;              // sample a backbone token before the next observe
-    bool is_audio;                     // this step produced audio (for progress / streaming)
+    bool is_audio;                     // this step's token belongs to the audio (codes, and the markup
+                                       // between the model's audio start and end); the host emits the
+                                       // fed-back tokens of the other steps as text
+    bool frame_done;                   // this step completed an audio frame (progress / max_frames / streaming)
     int32_t token;                     // FEED_TOKEN: the token to decode when the model picked it
                                        // itself (-1 = the token the host sampled)
     int32_t head_group;                // SAMPLE_HEAD: the group to sample with
@@ -372,7 +375,7 @@ bool codec_audio_lm_decode_generation(struct codec_audio_lm * ctx, const struct 
                                       const struct codec_speaker * voice, struct codec_pcm_buffer * out);
 
 // Streaming.  Call codec_audio_lm_stream_poll after every observe whose
-// verdict has is_audio; it returns (in `out`, possibly empty) the audio that
+// verdict has frame_done; it returns (in `out`, possibly empty) the audio that
 // became final since the last call, at most every `chunk_ms` of new audio.
 // It re-decodes the generation from its first frame (causal decoders need the
 // whole left context), holds back the right edge the decoder may still

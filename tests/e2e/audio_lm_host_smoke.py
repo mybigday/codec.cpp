@@ -177,7 +177,7 @@ def synthesize(alm: codec_cpp.AudioLM, bb: Backbone, text: str, sampling: dict, 
         v = alm.observe(tokens=None if tok is None else [tok], hiddens=h)
         while v.action == codec_cpp.AudioLM.SAMPLE_HEAD:
             v = alm.head_token(sample_logits(heads[v.head_group], alm.head_logits(v.n_vocab)))
-        frames += v.is_audio
+        frames += v.frame_done
         if v.action == codec_cpp.AudioLM.STOP:
             break
         if v.action == codec_cpp.AudioLM.FEED_TOKEN:

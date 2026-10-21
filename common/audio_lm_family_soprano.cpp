@@ -59,11 +59,11 @@ public:
             stop_reason_ = "eos";
             codec_log(CODEC_LOG_LEVEL_INFO, "soprano AR done: %zu frames, stop=eos\n",
                       hiddens_.size() / (size_t) n_embd_);
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1};
             return true;
         }
         hiddens_.insert(hiddens_.end(), hiddens, hiddens + n_embd_);
-        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, true, -1};
+        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, true, true, -1};
         return true;
     }
 

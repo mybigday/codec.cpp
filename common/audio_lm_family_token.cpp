@@ -26,11 +26,11 @@ public:
         if (act == OBSERVE_STOP) {
             stop_reason_ = "eos";
             codec_log(CODEC_LOG_LEVEL_INFO, "%s AR done: %d frames, stop=eos\n", log_name(), audio_lm_codes_n_frames(alm_));
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1};
             return true;
         }
         if (act == OBSERVE_CONSUMED_EMBED) return fail("unexpected embedding feedback for a token model");
-        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, audio_lm_codes_n_frames(alm_) > before, -1};
+        *v = {CODEC_AUDIO_LM_FEED_TOKEN, true, true, audio_lm_codes_n_frames(alm_) > before, -1};
         return true;
     }
 

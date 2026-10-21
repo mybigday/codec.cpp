@@ -144,7 +144,7 @@ public:
         for (int32_t i = 0; i < n; ++i) {
             logits_[(size_t) i] = n_seq_ == 2 ? cond[(size_t) i] + cfg_ * (cond[(size_t) i] - uncond[(size_t) i]) : cond[(size_t) i];
         }
-        *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, false, -1, 0, n};
+        *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, 0, n};
         return true;
     }
 
@@ -156,7 +156,7 @@ public:
             stop_reason_ = "eos_code_c0";
             codec_log(CODEC_LOG_LEVEL_INFO, "chatterbox AR done: %d frames, %zu speech codes, stop=eos_code_c0\n", frames_,
                       codes_.size());
-            *v = {CODEC_AUDIO_LM_STOP, false, false, -1, 0, 0};
+            *v = {CODEC_AUDIO_LM_STOP, false, false, false, -1, 0, 0};
             return true;
         }
         if (code < ci_->start_speech_token) codes_.push_back(code);
@@ -165,7 +165,7 @@ public:
         if (codec_lm_chatterbox_compose_speech_embd(lm_, code, frames_, next_.data(), hidden_) != CODEC_STATUS_SUCCESS) {
             return fail(std::string("speech embedding: ") + codec_lm_get_last_error(lm_));
         }
-        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, -1, 0, 0};
+        *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1, 0, 0};
         return true;
     }
 

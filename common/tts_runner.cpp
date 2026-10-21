@@ -461,7 +461,7 @@ static bool run_one(tts_runner_session * s, const tts_runner_params & a, tts_run
             const int32_t id = heads[(size_t) v.head_group].sample(codec_audio_lm_head_logits(alm), v.n_vocab);
             if (!codec_audio_lm_head_token(alm, id, &v)) return fail("head");
         }
-        if (v.is_audio) ++frames;
+        if (v.frame_done) ++frames;
         if (v.action == CODEC_AUDIO_LM_STOP) break;
         bool ok = true;
         if (v.action == CODEC_AUDIO_LM_FEED_TOKEN) {
@@ -474,7 +474,7 @@ static bool run_one(tts_runner_session * s, const tts_runner_params & a, tts_run
         }
         if (!ok) { out->error = "decode failed"; return false; }
         ++n_past;
-        if (v.is_audio && streaming && !so->poll()) return false;
+        if (v.frame_done && streaming && !so->poll()) return false;
         sample = v.sample_backbone;
     }
     if (stop == nullptr) stop = codec_audio_lm_stop_reason(alm);
