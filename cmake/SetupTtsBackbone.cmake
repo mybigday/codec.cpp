@@ -5,89 +5,70 @@
 # SAME soname.  add_subdirectory'ing llama.cpp would (a) collide the `ggml`
 # CMake target and (b) at runtime load only one libggml.so.0 → ABI crash.
 #
-# Isolation strategy (proven): build llama.cpp + its ggml 0.15 STATIC + PIC
-# via ExternalProject, then wrap the static archives into ONE shared object
-# `libttsbackbone.so` whose dynamic symbol table exports ONLY `llama_*`
-# (version script hides every ggml_* symbol as local).  tts-cli then links
-# codec (→ shared ggml 0.9) + libttsbackbone.so (self-contained ggml 0.15),
-# and the two ggml instances never see each other's symbols.
+# Isolation strategy (proven): build llama.cpp + its ggml STATIC + PIC via
+# ExternalProject (cmake/ttsbackbone) and wrap them into ONE shared object,
+# libttsbackbone, whose dynamic symbol table exports ONLY `llama_*` and the
+# common_sampler API (every ggml_* symbol is local).  tts-cli then links
+# codec (→ shared ggml) + libttsbackbone (self-contained ggml), and the two
+# ggml instances never see each other's symbols.
 #
-# The backbone gets the Vulkan / CUDA backend when codec.cpp does
-# (GGML_VULKAN=ON / GGML_CUDA=ON), so `tts-cli synthesize --gpu` offloads
-# both, as a llama.cpp host would.
+# The backbone is built for the platform codec.cpp is: every GGML_* option
+# (backends, CPU ISA / arch, backend tuning) and the toolchain / cross-compile
+# settings are forwarded, so `tts-cli synthesize --gpu` offloads both, as a
+# llama.cpp host would.
 # Set -DCODEC_TTS_BACKBONE=OFF to skip (tts-cli then builds without
 # `synthesize`, which #ifdef's out).
 
 include(ExternalProject)
 
-set(_ll_dir      "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp")
-set(_ll_prefix   "${CMAKE_BINARY_DIR}/llama-static")
-set(_ll_libdir   "${_ll_prefix}/src/llama-build/src")
-set(_ll_ggmldir  "${_ll_prefix}/src/llama-build/ggml/src")
-set(_ll_commondir "${_ll_prefix}/src/llama-build/common")
-set(_ll_vendordir "${_ll_prefix}/src/llama-build/vendor")
+set(_ll_dir "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp")
+set(TTS_BACKBONE_SO
+    "${CMAKE_BINARY_DIR}/ttsbackbone/${CMAKE_SHARED_LIBRARY_PREFIX}ttsbackbone${CMAKE_SHARED_LIBRARY_SUFFIX}")
 
-# Static archives ExternalProject will produce.
-#
-# The `common` layer (LLAMA_BUILD_COMMON=ON below) gives us the shared
-# sampling API (common_sampler_*, common_params_sampling, common_grammar
-# GBNF integration) instead of hand-rolled llama_sampler chains.  Its
-# CMake target is `llama-common` → libllama-common.a, which drags in
-# libllama-common-base.a (build-info) and vendor/cpp-httplib (a PRIVATE
-# header-lib TU).  All three MUST sit inside the --whole-archive group at
-# wrapper-link time (below): nothing in llama/ggml references common's
-# symbols, so outside --whole-archive the linker would drop the objects
-# before the version script could export common_sampler_*.  Verified: none
-# of these archives DEFINE bare ggml_* symbols (they reference them as
-# undefined, resolved internally against the bundled ggml 0.15) so the
-# `local: *` catch-all still hides every ggml_* — no ABI leak.
-set(_ll_archives
-    "${_ll_libdir}/libllama.a"
-    "${_ll_commondir}/libllama-common.a"
-    "${_ll_commondir}/libllama-common-base.a"
-    "${_ll_vendordir}/cpp-httplib/libcpp-httplib.a"
-    "${_ll_ggmldir}/libggml.a"
-    "${_ll_ggmldir}/libggml-cpu.a"
-    "${_ll_ggmldir}/libggml-base.a")
-
-set(_ll_vulkan OFF)
-set(_ll_link_extra "")
-if(GGML_VULKAN)
-    find_package(Vulkan REQUIRED)
-    set(_ll_vulkan ON)
-    list(INSERT _ll_archives 5 "${_ll_ggmldir}/ggml-vulkan/libggml-vulkan.a")
-    list(APPEND _ll_link_extra ${Vulkan_LIBRARY})
-endif()
-
-# Likewise CUDA (GGML_CUDA=ON): the backbone links the CUDA runtime + cuBLAS
-# shared, and the driver (libcuda.so.1) at run time.
-set(_ll_cuda OFF)
-set(_ll_cuda_args "")
-if(GGML_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    set(_ll_cuda ON)
-    list(INSERT _ll_archives 5 "${_ll_ggmldir}/ggml-cuda/libggml-cuda.a")
-    list(APPEND _ll_link_extra "-L${CUDAToolkit_LIBRARY_DIR}" "-L${CUDAToolkit_LIBRARY_DIR}/stubs"
-         -lcudart -lcublas -lcublasLt -lcuda)
-    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-        list(APPEND _ll_cuda_args "-DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
+# Every GGML_* cache option, at the value codec.cpp's ggml sees.  Left out:
+# the ones the isolation fixes (static, no backend DL), install paths and
+# find results.  The two ggml copies share their option names, so an option
+# one of them lacks is just unused.
+set(_ll_args "")
+get_cmake_property(_ll_cache_vars CACHE_VARIABLES)
+foreach(_v ${_ll_cache_vars})
+    if(NOT _v MATCHES "^GGML_" OR
+       _v MATCHES "^GGML_(BACKEND_DL|BACKEND_DIR|STATIC|BUILD_TESTS|BUILD_EXAMPLES|ALL_WARNINGS.*)$" OR
+       _v MATCHES "(_INSTALL_DIR|_FOUND)$")
+        continue()
     endif()
-endif()
+    get_property(_t CACHE ${_v} PROPERTY TYPE)
+    if(_t STREQUAL "INTERNAL" OR _t STREQUAL "STATIC")
+        continue()
+    endif()
+    string(REPLACE ";" "|" _val "${${_v}}")
+    list(APPEND _ll_args "-D${_v}:${_t}=${_val}")
+endforeach()
 
-# The backbone's ggml gets the same CPU tuning as codec.cpp's: GGML_NATIVE=OFF
-# (portable builds, e.g. wheels) must reach it too, with the ISA options.
-set(_ll_cpu_args "-DGGML_NATIVE=${GGML_NATIVE}")
-foreach(_opt SSE42 AVX AVX_VNNI AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 FMA F16C)
-    if(DEFINED GGML_${_opt})
-        list(APPEND _ll_cpu_args "-DGGML_${_opt}=${GGML_${_opt}}")
+# Toolchain / target platform (cross builds: Android NDK, iOS / macOS
+# architectures, CUDA / HIP GPU archs).
+foreach(_v CMAKE_TOOLCHAIN_FILE CMAKE_C_COMPILER CMAKE_CXX_COMPILER
+           CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_C_FLAGS CMAKE_CXX_FLAGS
+           CMAKE_SYSTEM_NAME CMAKE_SYSTEM_PROCESSOR CMAKE_SYSTEM_VERSION
+           CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_OSX_SYSROOT
+           CMAKE_FIND_ROOT_PATH CMAKE_PREFIX_PATH
+           ANDROID_ABI ANDROID_PLATFORM ANDROID_NDK ANDROID_STL
+           CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER CMAKE_CUDA_ARCHITECTURES
+           CMAKE_HIP_COMPILER CMAKE_HIP_ARCHITECTURES AMDGPU_TARGETS
+           Vulkan_INCLUDE_DIR Vulkan_LIBRARY Vulkan_GLSLC_EXECUTABLE)
+    if(DEFINED ${_v} AND NOT "${${_v}}" STREQUAL "")
+        string(REPLACE ";" "|" _val "${${_v}}")
+        list(APPEND _ll_args "-D${_v}=${_val}")
     endif()
 endforeach()
 
-ExternalProject_Add(llama_static
-    SOURCE_DIR      "${_ll_dir}"
-    PREFIX          "${_ll_prefix}"
-    BINARY_DIR      "${_ll_prefix}/src/llama-build"
+ExternalProject_Add(ttsbackbone
+    SOURCE_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ttsbackbone"
+    PREFIX          "${CMAKE_BINARY_DIR}/ttsbackbone-build"
+    LIST_SEPARATOR  |
     CMAKE_ARGS
+        -DLLAMA_DIR=${_ll_dir}
+        -DTTSBACKBONE_OUTPUT_DIR=${CMAKE_BINARY_DIR}/ttsbackbone
         -DCMAKE_BUILD_TYPE=Release
         -DBUILD_SHARED_LIBS=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -99,43 +80,15 @@ ExternalProject_Add(llama_static
         -DLLAMA_BUILD_COMMON=ON
         -DLLAMA_CURL=OFF
         -DLLAMA_OPENSSL=OFF
-        ${_ll_cpu_args}
-        -DGGML_VULKAN=${_ll_vulkan}
-        -DGGML_CUDA=${_ll_cuda}
-        ${_ll_cuda_args}
+        ${_ll_args}
         -DGGML_BACKEND_DL=OFF
-    BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-common --config Release
+    BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target ttsbackbone --config Release
     # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
     BUILD_ALWAYS    ON
-    BUILD_BYPRODUCTS ${_ll_archives}
+    BUILD_BYPRODUCTS "${TTS_BACKBONE_SO}"
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""
 )
-
-# Version script: export llama_* (C ABI) + the common_sampler_* C++ API on
-# the wrapper's dynamic table; hide everything else (ggml_* included) as
-# local.  The `extern "C++"` block matches the DEMANGLED name, and the glob
-# MUST be unquoted for `*` to act as a wildcard (a quoted "common_sampler*"
-# is a literal and matches nothing).  This exports common_sampler_init /
-# _free / _accept / _reset / _sample / _get and friends.  common_grammar
-# and common_params_sampling need no exported symbols (plain struct; its
-# ctor/dtor are emitted inline in the codec_tts_runner TU).
-set(_ll_vscript "${CMAKE_BINARY_DIR}/ttsbackbone.map")
-file(WRITE "${_ll_vscript}"
-"{\n  global:\n    llama_*;\n    extern \"C++\" {\n      common_sampler*;\n    };\n  local:\n    *;\n};\n")
-
-set(TTS_BACKBONE_SO "${CMAKE_BINARY_DIR}/ttsbackbone/libttsbackbone.so")
-add_custom_command(
-    OUTPUT  "${TTS_BACKBONE_SO}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/ttsbackbone"
-    COMMAND ${CMAKE_CXX_COMPILER} -shared -fPIC -o "${TTS_BACKBONE_SO}"
-            -Wl,--whole-archive ${_ll_archives} -Wl,--no-whole-archive
-            -Wl,--version-script=${_ll_vscript}
-            ${_ll_link_extra} -lpthread -lm -ldl -lgomp
-    DEPENDS llama_static ${_ll_archives} "${_ll_vscript}"
-    COMMENT "Linking isolated llama backbone → libttsbackbone.so (ggml_* hidden)"
-    VERBATIM)
-add_custom_target(ttsbackbone DEPENDS "${TTS_BACKBONE_SO}")
 
 # Exported for the tts-cli target.  `common` is added so the runner can
 # include common.h / sampling.h (the common_sampler API).
