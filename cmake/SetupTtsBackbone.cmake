@@ -58,6 +58,15 @@ if(GGML_VULKAN)
     list(APPEND _ll_link_extra ${Vulkan_LIBRARY})
 endif()
 
+# The backbone's ggml gets the same CPU tuning as codec.cpp's: GGML_NATIVE=OFF
+# (portable builds, e.g. wheels) must reach it too, with the ISA options.
+set(_ll_cpu_args "-DGGML_NATIVE=${GGML_NATIVE}")
+foreach(_opt SSE42 AVX AVX_VNNI AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 FMA F16C)
+    if(DEFINED GGML_${_opt})
+        list(APPEND _ll_cpu_args "-DGGML_${_opt}=${GGML_${_opt}}")
+    endif()
+endforeach()
+
 ExternalProject_Add(llama_static
     SOURCE_DIR      "${_ll_dir}"
     PREFIX          "${_ll_prefix}"
@@ -74,7 +83,7 @@ ExternalProject_Add(llama_static
         -DLLAMA_BUILD_COMMON=ON
         -DLLAMA_CURL=OFF
         -DLLAMA_OPENSSL=OFF
-        -DGGML_NATIVE=ON
+        ${_ll_cpu_args}
         -DGGML_VULKAN=${_ll_vulkan}
         -DGGML_BACKEND_DL=OFF
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-common --config Release
