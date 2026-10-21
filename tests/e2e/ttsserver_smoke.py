@@ -22,7 +22,9 @@ asserts over HTTP:
   * frame-level streaming (CSM, Mimi decoder): audio arrives in several
     pieces long before the end, and matches the per-segment decode,
   * a run that fails before any audio (Qwen3-TTS without a reference clip)
-    still gets a 500 in OpenAI's error shape, streamed or not.
+    still gets a 500 in OpenAI's error shape, streamed or not,
+  * `--parallel 2`: requests sent at once come back byte-identical to the
+    same requests one at a time.
 
 Missing assets → skipped.  Run from the repo root:
     .venv/bin/python tests/e2e/ttsserver_smoke.py
@@ -36,6 +38,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -285,6 +288,25 @@ def main() -> int:
                 dur = len(out.stdout) / 2 / 24000
                 must(abs(dur - len(x) / sr) < 0.2, f"{fmt}: duration {dur:.2f} vs {len(x) / sr:.2f}")
             print(f"[PASS] {fmt}: {ctype} {len(data)} bytes")
+
+    with Server("--parallel", "2") as srv:
+        speech = srv.base + "/v1/audio/speech"
+        lines = [TEXT, "She knew it was difficult to play with it because it was sharp.",
+                 "Lily wanted to share the needle with her mom.", "The quick brown fox jumps over the lazy dog."]
+        jobs = [{"input": t, "response_format": "pcm", "seed": 100 + i} for i, t in enumerate(lines)]
+        t0 = time.time()
+        serial = [post(speech, j) for j in jobs]
+        t_serial = time.time() - t0
+        together = [None] * len(jobs)
+        def send(i): together[i] = post(speech, jobs[i])
+        threads = [threading.Thread(target=send, args=(i,)) for i in range(len(jobs))]
+        t0 = time.time()
+        for t in threads: t.start()
+        for t in threads: t.join()
+        t_par = time.time() - t0
+        must(all(r[0] == 200 for r in serial + together), "parallel: a request failed")
+        must(all(a[2] == b[2] for a, b in zip(serial, together)), "parallel: concurrent output differs from serial")
+        print(f"[PASS] parallel 2: {len(jobs)} concurrent requests == serial ({t_serial:.1f}s -> {t_par:.1f}s)")
 
     if CSM_CODEC.exists() and CSM_BACKBONE.exists():
         body = {"input": "Hello, this is a test of the emergency broadcast system. We are checking that "

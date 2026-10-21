@@ -213,6 +213,17 @@ class AudioLM:
             raise CodecError("codec_audio_lm_init", None, _str(err.value))
         self._keep: list = []   # buffers the library reads during the current generation
 
+    def share(self) -> "AudioLM":
+        """Another context on this one's weights, to run a request on each at
+        the same time (one thread each).  It keeps this context alive."""
+        err = ctypes.create_string_buffer(2048)
+        other = object.__new__(type(self))
+        other.ptr = lib().codec_audio_lm_init_shared(self.ptr, err, len(err))
+        if not other.ptr:
+            raise CodecError("codec_audio_lm_init_shared", None, _str(err.value))
+        other._kv, other._keep, other._base = None, [], self
+        return other
+
     def close(self) -> None:
         if getattr(self, "ptr", None):
             lib().codec_audio_lm_free(self.ptr)

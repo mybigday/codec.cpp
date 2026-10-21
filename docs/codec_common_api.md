@@ -72,6 +72,17 @@ for (int i = 0; i < n; ++i) {
 `common/tts_runner.cpp` (`run_one`) is this loop over llama.cpp in C++;
 `tests/e2e/audio_lm_host_smoke.py` is the same loop over llama-cpp-python.
 
+### Several requests at once
+
+A context runs one generation at a time. For more, open one context per
+concurrent request with `codec_audio_lm_init_shared(base, ...)`: it shares
+`base`'s weights (the codec GGUF, and the backbone's embedding table for the
+models that read it) and has its own generation state, codec graphs and
+backend instances, so each context can run on its own thread. Pair each
+with its own llama.cpp context on the same `llama_model`. `base` must outlive
+the contexts made from it. `tts-server --parallel N` (`tts_runner_load`
+with `n_parallel`) works this way.
+
 ### The prompt
 
 As in llama.cpp's MTMD, the prompt is text: `codec_audio_lm_tts_format`

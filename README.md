@@ -102,7 +102,7 @@ input rules (language tags, phonemes) are on each model card.
 so the `openai` SDKs and other compatible clients can use it:
 
 ```bash
-tts-server --backbone MODEL.gguf --model CODEC.gguf --port 8080   # also --gpu, --n-threads, --api-key KEY
+tts-server --backbone MODEL.gguf --model CODEC.gguf --port 8080   # also --gpu, --n-threads, --parallel N, --api-key KEY
 
 curl http://127.0.0.1:8080/v1/audio/speech -H 'Content-Type: application/json' \
     -d '{"model": "tts", "input": "Hello there.", "voice": "NAME", "response_format": "wav"}' -o out.wav
@@ -138,7 +138,15 @@ How it differs from OpenAI's API:
   the server's `--temp` / `--top-k` / ... flags, which override the backbone
   file's `general.sampling.*` (the model card's), then llama.cpp's defaults.
 - Every response is 24 kHz mono, matching OpenAI's formats (`pcm` is raw
-  16-bit little-endian). Requests run one at a time.
+  16-bit little-endian).
+
+`--parallel N` (llama-server's `-np`, default 1) serves N requests at once.
+The model files load once; each of the N slots gets its own codec and
+backbone contexts, so memory grows by those contexts (the backbone's KV
+cache, the codec's graph buffers) per slot, not by the weights. Further
+requests wait for a free slot in arrival order. Each running request uses
+`--n-threads` CPU threads, so on CPU keep N × threads within the cores. A
+request gives the same audio whether it ran alone or beside others.
 
 Responses stream: audio is sent as it is generated, with chunked transfer
 encoding, or as `speech.audio.delta` / `speech.audio.done` events with

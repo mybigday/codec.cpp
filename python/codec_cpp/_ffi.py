@@ -519,6 +519,7 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     # codec_audio_lm.h
     "codec_audio_lm_default_params": (codec_audio_lm_params, []),
     "codec_audio_lm_init": (c_void_p, [POINTER(codec_audio_lm_params), c_char_p, c_size_t]),
+    "codec_audio_lm_init_shared": (c_void_p, [c_void_p, c_char_p, c_size_t]),
     "codec_audio_lm_free": (None, [c_void_p]),
     "codec_audio_lm_last_error": (c_char_p, [c_void_p]),
     "codec_audio_lm_meta_str": (c_char_p, [c_void_p, c_char_p]),

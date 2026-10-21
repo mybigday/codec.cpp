@@ -28,8 +28,9 @@
 // `speech.audio.done` events with `stream_format: "sse"`.  An error after the
 // first chunk ends the stream early (an `error` event under SSE).
 //
-// TODO: requests run one at a time behind a mutex; llama-server style
-// parallel slots (--parallel N) would serve several at once.
+// --parallel N (llama-server's -np) serves N requests at once: the weights
+// load once, each slot has its own codec and backbone contexts, and further
+// requests wait for a free slot in arrival order.
 
 #include "codec_common.h"
 #include "tts_runner.h"
@@ -73,6 +74,7 @@ struct args {
     int32_t     port = 8080;
     std::string api_key;
     int32_t     n_threads  = 0;
+    int32_t     n_parallel = 1;
     bool        use_gpu    = false;
     int32_t     max_frames = 0;
     int32_t     segment_bytes   = 160;    // ~10 s of speech per segment
@@ -89,7 +91,7 @@ void print_usage(const char * argv0) {
         "usage: %s --model CODEC.gguf [--backbone LLAMA.gguf] [--speaker-file SPK.gguf]\n"
         "          [--voice-dir DIR [--allow-voice-create]]\n"
         "          [--host 127.0.0.1] [--port 8080] [--api-key KEY] [--model-id NAME]\n"
-        "          [--gpu] [--n-threads N] [--max-frames N] [--override-kv KEY=TYPE:VALUE]\n"
+        "          [--gpu] [--n-threads N] [--parallel N (1)] [--max-frames N] [--override-kv KEY=TYPE:VALUE]\n"
         "          [--segment-bytes N (160; 0 = whole input)] [--stream-chunk-ms N (1000; 0 = per segment)]\n"
         "          [llama.cpp sampling: --seed N --temp F --top-k N --top-p F --min-p F --repeat-last-n N\n"
         "           --repeat-penalty F --presence-penalty F --frequency-penalty F --dry-multiplier F\n"
@@ -122,6 +124,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--port")         { if (!(v = need())) return false; out->port = std::atoi(v); }
         else if (a == "--api-key")      { if (!(v = need())) return false; out->api_key = v; }
         else if (a == "--n-threads")    { if (!(v = need())) return false; out->n_threads = std::atoi(v); }
+        else if (a == "--parallel" || a == "-np") { if (!(v = need())) return false; out->n_parallel = std::atoi(v); }
         else if (a == "--max-frames")   { if (!(v = need())) return false; out->max_frames = std::atoi(v); }
         else if (a == "--segment-bytes")   { if (!(v = need())) return false; out->segment_bytes = std::atoi(v); }
         else if (a == "--stream-chunk-ms") { if (!(v = need())) return false; out->stream_chunk_ms = std::atoi(v); }
@@ -318,6 +321,7 @@ int main(int argc, char ** argv) {
     lp.backbone_path = a.backbone;
     lp.kv_overrides  = a.kv_overrides;
     lp.n_threads     = a.n_threads;
+    lp.n_parallel    = a.n_parallel;
     lp.use_gpu       = a.use_gpu;
     lp.max_frames    = a.max_frames;
     lp.segment_bytes   = a.segment_bytes;
@@ -338,10 +342,10 @@ int main(int argc, char ** argv) {
         codec_common::tts_runner_free(session);
         return 1;
     }
-    std::mutex run_mutex;
+    std::mutex voices_mutex;   // `custom`; runs and voice work wait for a slot in the runner
     voice_store custom;
     if (!a.voice_dir.empty()) {
-        custom.load(codec_common::tts_runner_audio_lm(session), a.voice_dir);
+        codec_common::tts_runner_with_audio_lm(session, [&](codec_audio_lm * alm) { custom.load(alm, a.voice_dir); });
         std::fprintf(stderr, "tts-server: %zu custom voices in %s%s\n", custom.voices.size(), a.voice_dir.c_str(),
                      a.allow_voice_create ? " (creation enabled)" : "");
     }
@@ -370,7 +374,7 @@ int main(int argc, char ** argv) {
         j["default"] = info.default_voice.empty() ? json(nullptr) : json(info.default_voice);
         json list = json::array();
         {
-            std::lock_guard<std::mutex> lock(run_mutex);
+            std::lock_guard<std::mutex> lock(voices_mutex);
             for (const auto & kv : custom.voices) list.push_back(custom.describe(kv.second));
         }
         j["custom"] = list;
@@ -409,20 +413,25 @@ int main(int argc, char ** argv) {
         if (!read || n <= 0) { send_error(res, 400, "audio_sample is not a PCM16 WAV file", "invalid_request_error", "audio_sample"); return; }
         if (n > (int64_t) 30 * sr) { send_error(res, 400, "audio_sample is longer than 30 seconds", "invalid_request_error", "audio_sample"); return; }
 
-        std::lock_guard<std::mutex> lock(run_mutex);
-        codec_audio_lm * alm = codec_common::tts_runner_audio_lm(session);
         custom_voice v;
         v.id = id;
         v.name = name;
         v.created_at = (int64_t) std::time(nullptr);
-        v.spk = codec_audio_lm_create_voice(alm, pcm.data(), n, sr, ref_text.empty() ? nullptr : ref_text.c_str());
-        if (v.spk == nullptr) { send_error(res, 400, codec_audio_lm_last_error(alm), "invalid_request_error", "audio_sample"); return; }
-        if (!codec_audio_lm_save_voice(alm, v.spk, (dir / (id + ".gguf")).string().c_str(), id.c_str())) {
-            codec_speaker_free(v.spk);
-            send_error(res, 500, codec_audio_lm_last_error(alm), "server_error");
-            return;
-        }
+        int status = 0;
+        std::string fail;
+        codec_common::tts_runner_with_audio_lm(session, [&](codec_audio_lm * alm) {
+            v.spk = codec_audio_lm_create_voice(alm, pcm.data(), n, sr, ref_text.empty() ? nullptr : ref_text.c_str());
+            if (v.spk == nullptr) { status = 400; fail = codec_audio_lm_last_error(alm); return; }
+            if (!codec_audio_lm_save_voice(alm, v.spk, (dir / (id + ".gguf")).string().c_str(), id.c_str())) {
+                codec_speaker_free(v.spk);
+                status = 500;
+                fail = codec_audio_lm_last_error(alm);
+            }
+        });
+        if (status == 400) { send_error(res, 400, fail, "invalid_request_error", "audio_sample"); return; }
+        if (status != 0) { send_error(res, 500, fail, "server_error"); return; }
         std::ofstream((dir / (id + ".json")).string()) << json{ { "id", id }, { "name", name }, { "created_at", v.created_at } }.dump();
+        std::lock_guard<std::mutex> lock(voices_mutex);
         custom.voices[id] = v;
         std::fprintf(stderr, "voice %s (%s): %.1fs reference\n", id.c_str(), name.c_str(), (double) n / sr);
         res.set_content(custom.describe(v).dump(), "application/json");
@@ -443,7 +452,7 @@ int main(int argc, char ** argv) {
             // A custom voice: {"id": "voice_..."}.
             const json & vid = body["voice"]["id"];
             {
-                std::lock_guard<std::mutex> lock(run_mutex);
+                std::lock_guard<std::mutex> lock(voices_mutex);
                 custom_spk = vid.is_string() ? custom.find(vid.get<std::string>()) : nullptr;
             }
             if (custom_spk == nullptr) {
@@ -513,7 +522,7 @@ int main(int argc, char ** argv) {
             return;
         }
         if (!voice.empty() && custom_spk == nullptr) {
-            std::lock_guard<std::mutex> lock(run_mutex);
+            std::lock_guard<std::mutex> lock(voices_mutex);
             custom_spk = custom.find(voice);   // a custom voice's id given as a string
             if (custom_spk != nullptr) voice.clear();
         }
@@ -557,7 +566,6 @@ int main(int argc, char ** argv) {
         // error status, not a truncated 200.
         auto st = std::make_shared<speech_stream>();
         st->worker = std::thread([&, st, rp, enc = std::move(enc), format, n_chars, sse]() mutable {
-            std::lock_guard<std::mutex> run_lock(run_mutex);
             std::unique_ptr<codec_example_resampler> rs;
             size_t n_out = 0;
             std::string err;
@@ -634,8 +642,8 @@ int main(int argc, char ** argv) {
             });
     });
 
-    std::fprintf(stderr, "tts-server: %s on http://%s:%d (%zu voices)\n",
-                 a.model_id.c_str(), a.host.c_str(), a.port, info.voices.size());
+    std::fprintf(stderr, "tts-server: %s on http://%s:%d (%zu voices, %d parallel)\n",
+                 a.model_id.c_str(), a.host.c_str(), a.port, info.voices.size(), std::max(1, a.n_parallel));
     const bool listened = svr.listen(a.host, a.port);
     codec_common::tts_runner_free(session);
     if (!listened) {
