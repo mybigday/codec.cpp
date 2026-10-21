@@ -1,8 +1,8 @@
 # codec-cpp (Python bindings)
 
 `codec_cpp` is the Python API for codec.cpp. It wraps the public C API
-(`include/codec.h`, `codec_speaker.h`, `codec_lm.h`, `codec_audio_lm.h`, and `codec_tts.h` from
-libcodec_tts) with ctypes. It has no compiled extension, and its only
+(`include/codec.h`, `codec_speaker.h`, `codec_lm.h`, `codec_audio_lm.h`, and `common/codec_tts.h`
+from libcodec_tts) with ctypes. It has no compiled extension, and its only
 dependency is numpy.
 
 ## Install

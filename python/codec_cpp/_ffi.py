@@ -1,5 +1,6 @@
 """Raw ctypes declarations mirroring include/codec.h, include/codec_speaker.h,
-include/codec_lm.h and include/codec_audio_lm.h; codec_tts.h (libcodec_tts) at the end.
+include/codec_lm.h and include/codec_audio_lm.h; common/codec_tts.h (libcodec_tts) at
+the end.
 
 Struct field order must match the headers exactly; the headers follow an
 ABI-append discipline (new fields at the end), so keep the same here.

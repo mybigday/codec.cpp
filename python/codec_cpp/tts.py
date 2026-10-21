@@ -1,4 +1,4 @@
-"""One-call text to speech (include/codec_tts.h, libcodec_tts).
+"""One-call text to speech (common/codec_tts.h, libcodec_tts).
 
     tts = codec_cpp.TTS("model.gguf", "codec.gguf")
     audio, sr = tts.synthesize("Hello there.")

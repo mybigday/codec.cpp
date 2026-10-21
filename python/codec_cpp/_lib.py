@@ -94,7 +94,7 @@ from . import _ffi as _ffi_mod  # noqa: E402
 _log_cb = _ffi_mod.codec_log_callback(_on_log)
 
 
-# libcodec_tts (include/codec_tts.h): the one-call TTS session, with the
+# libcodec_tts (common/codec_tts.h): the one-call TTS session, with the
 # bundled llama.cpp backbone.  Separate from libcodec so codec-only users
 # never load llama.cpp; looked up next to libcodec.
 if sys.platform == "darwin":

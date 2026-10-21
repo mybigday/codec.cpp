@@ -267,7 +267,7 @@ if(CODEC_BUILD_TTS_CLI)
         target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE codec-example-utils "${TTS_BACKBONE_SO}")
 
         # libcodec_tts: the same runner behind the codec_tts C API
-        # (include/codec_tts.h), next to libcodec (Python: codec_cpp.TTS).
+        # (common/codec_tts.h), next to libcodec (Python: codec_cpp.TTS).
         set_target_properties(codec-example-utils PROPERTIES POSITION_INDEPENDENT_CODE ON)
         add_library(codec_tts SHARED
             common/tts_c.cpp
@@ -373,7 +373,7 @@ if(NOT SKBUILD)
     install(TARGETS codec_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(FILES include/codec.h include/codec_speaker.h include/codec_lm.h include/codec_audio_lm.h include/codec_tts.h
+    install(FILES include/codec.h include/codec_speaker.h include/codec_lm.h include/codec_audio_lm.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     if(TARGET codec_tts)
         set_target_properties(codec_tts PROPERTIES INSTALL_RPATH "${_codec_origin}")
