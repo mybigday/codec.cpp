@@ -1228,7 +1228,11 @@ bool audio_lm_get_prompt_info(const audio_lm_context * ctx,
                 return true;
             }
         }
-        // ChatML for Qwen3-TTS.
+        // ChatML for Qwen3-TTS.  Sampling as the reference talker generate
+        // (generation_config.json): temperature 0.9, top-k 50, top-p 1.0 and
+        // repetition_penalty 1.05 on codebook 0.
+        out->default_top_p              = 1.0f;
+        out->default_repetition_penalty = 1.05f;
         out->prompt_prefix = "<|im_start|>user\n";
         out->prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n";
         out->add_bos       = false;

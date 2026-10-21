@@ -149,9 +149,14 @@ public:
         out->sampler.temp  = pi_.default_temperature;
         out->sampler.top_p = pi_.default_top_p;
         out->sampler.top_k = pi_.default_top_k;
+        out->sampler.penalty_repeat = pi_.default_repetition_penalty > 0.0f ? pi_.default_repetition_penalty : 1.0f;
         req.apply(out->sampler);
         out->sampler.min_p = 0.0f;
-        out->sampler.penalty_repeat = 1.0f;
+        // The repetition penalty is codebook 0's (Qwen3-TTS: the talker's
+        // repetition_penalty over the frames' first codes); the depth codebooks
+        // take none.  A backbone-sampled codebook 0 keeps none either.
+        const float c0_repeat = pi_.cb0_from_backbone ? 1.0f : out->sampler.penalty_repeat;
+        out->sampler.penalty_repeat = c0_repeat;
         if (pi_.cb0_from_backbone) {
             // Codebook 0 is a backbone token: keep it to the speech range + end.
             out->grammar = tts_auto_grammar(pi_, req.text);
@@ -162,6 +167,8 @@ public:
         }
         const codec_audio_lm_sampler & sp = out->sampler;
         head_.init(sp.seed, sp.temp, sp.top_k, sp.top_p, 0.0f, 1.0f, 0);
+        c0_penalized_ = c0_repeat != 1.0f;
+        if (c0_penalized_) head_c0_.init(sp.seed ^ 0x9E3779B9u, sp.temp, sp.top_k, sp.top_p, 0.0f, c0_repeat, 0);
         out->needs_embeddings = true;
         out->sample_first     = pi_.cb0_from_backbone;
         out->streamable       = true;
@@ -182,7 +189,9 @@ public:
             int32_t idx = 0, n = 0;
             const float * lg = audio_lm_step_logits(alm_, &idx, &n);
             if (lg == nullptr) return fail_alm("step logits");
-            const int32_t code = (pi_.cb0_from_backbone && cb == 0) ? codes[0] : head_.sample(lg, n);
+            const int32_t code = (pi_.cb0_from_backbone && cb == 0) ? codes[0]
+                               : (c0_penalized_ && cb == 0)         ? head_c0_.sample(lg, n)
+                                                                    : head_.sample(lg, n);
             if (!audio_lm_step_push_code(alm_, code)) return fail_alm("step");
         }
         if (!audio_lm_step_finish(alm_, codes.data(), n_cb_)) return fail_alm("step");
@@ -270,6 +279,8 @@ private:
     std::vector<int32_t> icl_codes_;   // reference frames [n, n_cb] of an ICL voice
     std::vector<float> next_;
     alm_head_sampler head_;
+    alm_head_sampler head_c0_;   // codebook 0 when it takes a repetition penalty
+    bool c0_penalized_ = false;
 };
 
 }  // namespace

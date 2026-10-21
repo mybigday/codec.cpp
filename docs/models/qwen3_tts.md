@@ -30,6 +30,15 @@ with codec control tags, `[nothink, think_bos, think_eos, SPEAKER, pad, bos]`
 for the auto language. The speaker row is the Base x-vector, or for
 CustomVoice `codec_embedding[spk_id]`.
 
+## Sampling
+
+Defaults follow upstream's `generation_config.json`: temperature 0.9 and
+top-k 50 for every codebook, top-p 1.0, and `repetition_penalty` 1.05 on
+codebook 0 only (over the generated frames, as the talker's
+`generate`); the depth codebooks take no penalty. Without the penalty an
+ICL clone on a quantized talker (Q4_K_M) can loop and never reach the end
+code. `--rep-penalty` / `repetition_penalty` overrides it.
+
 ## Cloned voices (Base)
 
 A Base voice is a codec speaker (docs/codec_speaker.md) made by
