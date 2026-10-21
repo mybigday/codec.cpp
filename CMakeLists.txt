@@ -264,7 +264,7 @@ if(CODEC_BUILD_TTS_CLI)
         target_include_directories(codec_tts_runner
             PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/common
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${TTS_BACKBONE_INCLUDE_DIRS})
-        target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE codec-example-utils "${TTS_BACKBONE_SO}")
+        target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE "${TTS_BACKBONE_SO}")
 
         add_dependencies(tts-cli ttsbackbone)
         target_compile_definitions(tts-cli PRIVATE TTS_CLI_HAVE_BACKBONE=1)

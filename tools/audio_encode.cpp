@@ -76,17 +76,6 @@ void codec_example_resampler::finish(std::vector<float> * out) {
     run((size_t) ((new_ * (int64_t) in_.size() + orig_ - 1) / orig_), out);   // ceil(new * n / orig)
 }
 
-std::vector<float> codec_example_downmix_mono(const float * in, size_t n_samples, int32_t n_channels) {
-    if (n_channels <= 1) return std::vector<float>(in, in + n_samples);
-    std::vector<float> out(n_samples);
-    for (size_t t = 0; t < n_samples; ++t) {
-        float s = 0.0f;
-        for (int32_t c = 0; c < n_channels; ++c) s += in[t * (size_t) n_channels + (size_t) c];
-        out[t] = s / (float) n_channels;
-    }
-    return out;
-}
-
 // ─── Encoders ───────────────────────────────────────────────────────────────
 
 namespace {

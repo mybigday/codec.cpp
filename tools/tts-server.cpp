@@ -514,7 +514,7 @@ int main(int argc, char ** argv) {
             };
             rp.on_audio = [&](const float * pcm, int32_t n, int32_t sr, int32_t nch) {
                 if (!rs) rs = std::make_unique<codec_example_resampler>(sr, k_out_sample_rate);
-                const std::vector<float> mono = codec_example_downmix_mono(pcm, (size_t) n, nch);
+                const std::vector<float> mono = codec_common::downmix_mono(pcm, (size_t) n, nch);
                 std::vector<float> out;
                 rs->push(mono.data(), mono.size(), &out);
                 return encode(out);

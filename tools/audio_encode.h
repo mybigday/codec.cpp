@@ -29,9 +29,6 @@ private:
     size_t produced_ = 0;
 };
 
-// Interleaved multi-channel → mono (channel average).
-std::vector<float> codec_example_downmix_mono(const float * in, size_t n_samples, int32_t n_channels);
-
 // The formats this build can encode, in OpenAI's order.
 std::vector<std::string> codec_example_audio_formats();
 

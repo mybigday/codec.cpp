@@ -115,6 +115,8 @@ int tts_runner_synthesize_selfcontained(const tts_runner_params & params,
                                         tts_runner_result * out);
 
 // Pieces of the runner that need no backbone (tts_runner_base.cpp).
+// Interleaved multi-channel PCM -> mono (channel average); n_frames samples per channel.
+std::vector<float> downmix_mono(const float * in, size_t n_frames, int32_t n_channels);
 // Mono F32 from a WAV file (channels averaged); true with an empty `ref_pcm`
 // when `path` is empty.
 bool load_ref_audio(const std::string & path, std::vector<float> & ref_pcm, int32_t * out_n, int32_t * out_sr,
