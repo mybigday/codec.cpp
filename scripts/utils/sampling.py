@@ -18,7 +18,7 @@ from pathlib import Path
 _HF = "penalties;temperature;top_k;top_p"   # HF warper order (temperature first)
 
 MODEL_SAMPLING: dict[str, dict] = {
-    "csm":               dict(temp=0.9, top_k=50, top_p=0.95, min_p=0.0, samplers=_HF),
+    "csm":               dict(temp=0.9, top_k=50, top_p=1.0, min_p=0.0, samplers=_HF),   # generation_config.json
     "qwen3_tts":         dict(temp=0.9, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.05, penalty_last_n=-1,
                               samplers=_HF),
     "moss_ttsd":         dict(temp=0.9, top_k=50, top_p=0.95, min_p=0.0, samplers=_HF),
