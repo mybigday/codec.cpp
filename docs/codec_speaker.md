@@ -7,7 +7,7 @@ the cross-model handle for that conditioning: a set of named tensors
 counterpart for prompt embeddings is `codec_lm_speaker_*`
 ([audio_speaker_encoders.md](audio_speaker_encoders.md)).
 
-## API (`include/codec.h`)
+## API (`include/codec_speaker.h`)
 
 | Call | Ownership |
 |---|---|

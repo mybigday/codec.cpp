@@ -11,6 +11,7 @@
 
 #include "codec.h"
 #include "codec_lm.h"
+#include "codec_speaker.h"
 
 #include <cstdint>
 #include <map>

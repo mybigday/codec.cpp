@@ -2,6 +2,7 @@
 #define CODEC_AUDIO_LM_H
 
 #include "codec.h"
+#include "codec_speaker.h"
 
 #include <stdbool.h>
 #include <stddef.h>

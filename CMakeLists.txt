@@ -373,7 +373,7 @@ if(NOT SKBUILD)
     install(TARGETS codec_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(FILES include/codec.h include/codec_lm.h include/codec_audio_lm.h include/codec_tts.h
+    install(FILES include/codec.h include/codec_speaker.h include/codec_lm.h include/codec_audio_lm.h include/codec_tts.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     if(TARGET codec_tts)
         set_target_properties(codec_tts PROPERTIES INSTALL_RPATH "${_codec_origin}")

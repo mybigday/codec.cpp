@@ -1,4 +1,5 @@
 #include "codec.h"
+#include "codec_speaker.h"
 
 #include <cstdio>
 

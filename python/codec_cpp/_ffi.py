@@ -1,5 +1,5 @@
-"""Raw ctypes declarations mirroring include/codec.h, include/codec_lm.h and
-include/codec_audio_lm.h; codec_tts.h (libcodec_tts) at the end.
+"""Raw ctypes declarations mirroring include/codec.h, include/codec_speaker.h,
+include/codec_lm.h and include/codec_audio_lm.h; codec_tts.h (libcodec_tts) at the end.
 
 Struct field order must match the headers exactly; the headers follow an
 ABI-append discipline (new fields at the end), so keep the same here.
@@ -454,7 +454,7 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_model_latent_dim": (c_int32, [c_void_p]),
     "codec_model_metadata": (POINTER(codec_gguf_metadata), [c_void_p]),
     "codec_arch_name": (c_char_p, [c_int]),
-    # codec.h — speakers
+    # codec_speaker.h
     "codec_model_n_speakers": (c_int32, [c_void_p]),
     "codec_model_speaker_name": (c_char_p, [c_void_p, c_int32]),
     "codec_get_speaker": (c_void_p, [c_void_p, c_char_p]),
