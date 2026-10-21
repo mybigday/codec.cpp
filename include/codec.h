@@ -236,7 +236,6 @@ int32_t codec_model_n_mels(const struct codec_model * model);
 int32_t codec_model_latent_dim(const struct codec_model * model);
 
 const struct codec_gguf_metadata * codec_model_metadata(const struct codec_model * model);
-void codec_metadata_free(struct codec_gguf_metadata * meta);
 
 const char * codec_arch_name(enum codec_arch arch);
 

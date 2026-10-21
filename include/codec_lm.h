@@ -121,8 +121,8 @@ struct codec_lm_info {
     // matches `llama_model_n_embd(host_model)`.
     int32_t         hidden_dim;
 
-    // Audio embedding dimension (the dim of vectors returned by
-    // codec_lm_audio_embd).  Used to size the depth-side audio embed
+    // Audio embedding dimension (the width of one codebook's embedding
+    // row).  Used to size the depth-side audio embed
     // rows; equals hidden_dim for shared / in_proj-on-prefix models
     // (CSM / Qwen3-TTS) and depth_hidden for in_proj_per_pos models
     // (Moshi / LFM2).
@@ -229,18 +229,6 @@ enum codec_status codec_lm_state_set_text_context(
 // Audio embedding lookup.
 // ─────────────────────────────────────────────────────────────────────
 
-// Look up the audio embedding row for codebook `cb_idx` and code
-// `code`.  Returns a pointer into the model's weight buffer (read-only;
-// lifetime = lifetime of `lm`).  Returns NULL when the arguments are
-// out of range.
-//
-// `code == -1` is reserved for "skip / pad" by callers and is rejected
-// by this lookup with NULL — use codec_lm_compose_audio_embd to do a
-// pad-aware sum.
-const float * codec_lm_audio_embd(
-    struct codec_lm * lm,
-    int32_t           cb_idx,
-    int32_t           code);
 
 // Qwen3-TTS talker text-projection.  Projects one text-vocab token
 // through the talker `text_projection` MLP (fc2 ∘ silu ∘ fc1 applied to

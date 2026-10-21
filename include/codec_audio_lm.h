@@ -373,12 +373,8 @@ bool codec_audio_lm_decode_generation(struct codec_audio_lm * ctx, const struct 
 bool codec_audio_lm_stream_poll  (struct codec_audio_lm * ctx, int32_t chunk_ms, struct codec_pcm_buffer * out);
 bool codec_audio_lm_stream_finish(struct codec_audio_lm * ctx, struct codec_pcm_buffer * out);
 
-// Lower level: frames of the current generation that can be decoded, the codec
-// hop (samples per frame) and the PCM of frames [frame_begin, frame_end).
+// Frames of the current generation that can be decoded.
 int32_t codec_audio_lm_decodable_frames(const struct codec_audio_lm * ctx);
-int32_t codec_audio_lm_hop(const struct codec_audio_lm * ctx);
-bool    codec_audio_lm_decode_range(struct codec_audio_lm * ctx, int32_t frame_begin, int32_t frame_end,
-                                    struct codec_pcm_buffer * out);
 
 #ifdef __cplusplus
 }

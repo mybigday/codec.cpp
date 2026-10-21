@@ -877,7 +877,6 @@ const codec_lm_kind_vtable codec_lm_vtable_continuous_latent_cfm = {
     /*.step_logits        =*/ nullptr,
     /*.step_push_code     =*/ nullptr,
     /*.step_finish        =*/ nullptr,
-    /*.audio_embd         =*/ nullptr,
     /*.compose_audio_embd =*/ nullptr,
     /*.compose_next_embd  =*/ nullptr,
     /*.speaker_encode     =*/ nullptr,

@@ -124,10 +124,6 @@ struct codec_lm_kind_vtable {
     enum codec_status (*step_push_code)(codec_lm_state * st, int32_t code);
     enum codec_status (*step_finish)(codec_lm_state * st, int32_t * out_codes);
 
-    // Audio embd (kind-specific because the table layout — fused vs
-    // unfused — varies, even though the v1 schema standardises on
-    // unfused per-cb tables).
-    const float *     (*audio_embd)(codec_lm * lm, int32_t cb_idx, int32_t code);
     enum codec_status (*compose_audio_embd)(codec_lm * lm, const int32_t * codes, float * out_embd);
 
     // Like compose_audio_embd but adds a learned per-step positional

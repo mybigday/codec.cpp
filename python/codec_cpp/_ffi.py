@@ -404,8 +404,6 @@ _i32p = POINTER(c_int32)
 _f32p = POINTER(c_float)
 _status = c_int
 
-# codec_metadata_free is left out: the only metadata a caller can get is
-# model-owned (codec_model_metadata) and freed with the model.
 PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     # codec.h — params / lifetime
     "codec_model_default_params": (codec_model_params, []),
@@ -487,7 +485,6 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_lm_state_reset": (None, [c_void_p]),
     "codec_lm_state_set_text_context": (_status, [c_void_p, c_int32]),
     # codec_lm.h — embeddings
-    "codec_lm_audio_embd": (_f32p, [c_void_p, c_int32, c_int32]),
     "codec_lm_project_text": (c_bool, [c_void_p, c_int32, _f32p, c_int32]),
     "codec_lm_text_proj_dim": (c_int32, [c_void_p]),
     "codec_lm_codec_embd_row": (c_bool, [c_void_p, c_int32, _f32p, c_int32]),
@@ -548,8 +545,6 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_audio_lm_stream_poll": (c_bool, [c_void_p, c_int32, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_stream_finish": (c_bool, [c_void_p, POINTER(codec_pcm_buffer)]),
     "codec_audio_lm_decodable_frames": (c_int32, [c_void_p]),
-    "codec_audio_lm_hop": (c_int32, [c_void_p]),
-    "codec_audio_lm_decode_range": (c_bool, [c_void_p, c_int32, c_int32, POINTER(codec_pcm_buffer)]),
 }
 
 

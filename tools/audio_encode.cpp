@@ -76,14 +76,6 @@ void codec_example_resampler::finish(std::vector<float> * out) {
     run((size_t) ((new_ * (int64_t) in_.size() + orig_ - 1) / orig_), out);   // ceil(new * n / orig)
 }
 
-std::vector<float> codec_example_resample_sinc_hann(const std::vector<float> & in, int32_t in_sr, int32_t out_sr) {
-    codec_example_resampler rs(in_sr, out_sr);
-    std::vector<float> out;
-    rs.push(in.data(), in.size(), &out);
-    rs.finish(&out);
-    return out;
-}
-
 std::vector<float> codec_example_downmix_mono(const float * in, size_t n_samples, int32_t n_channels) {
     if (n_channels <= 1) return std::vector<float>(in, in + n_samples);
     std::vector<float> out(n_samples);
@@ -469,11 +461,3 @@ std::unique_ptr<codec_example_audio_encoder> codec_example_audio_encoder::create
     return nullptr;
 }
 
-bool codec_example_encode_audio(const std::string & format, const std::vector<float> & pcm, int32_t sample_rate,
-                                std::string * out, std::string * content_type, std::string * err) {
-    auto enc = codec_example_audio_encoder::create(format, sample_rate, (int64_t) pcm.size(), err);
-    if (!enc) return false;
-    out->clear();
-    *content_type = enc->content_type();
-    return enc->push(pcm.data(), pcm.size(), out, err) && enc->finish(out, err);
-}

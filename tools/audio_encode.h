@@ -29,8 +29,6 @@ private:
     size_t produced_ = 0;
 };
 
-std::vector<float> codec_example_resample_sinc_hann(const std::vector<float> & in, int32_t in_sr, int32_t out_sr);
-
 // Interleaved multi-channel → mono (channel average).
 std::vector<float> codec_example_downmix_mono(const float * in, size_t n_samples, int32_t n_channels);
 
@@ -58,6 +56,3 @@ protected:
     std::string content_type_;
 };
 
-// Whole-signal encode.
-bool codec_example_encode_audio(const std::string & format, const std::vector<float> & pcm, int32_t sample_rate,
-                                std::string * out, std::string * content_type, std::string * err);

@@ -449,13 +449,3 @@ class AudioLM:
     @property
     def decodable_frames(self) -> int:
         return int(lib().codec_audio_lm_decodable_frames(self.ptr))
-
-    @property
-    def hop(self) -> int:
-        return int(lib().codec_audio_lm_hop(self.ptr))
-
-    def decode_range(self, frame_begin: int, frame_end: int) -> tuple[np.ndarray, int]:
-        buf = _ffi.codec_pcm_buffer()
-        if not lib().codec_audio_lm_decode_range(self.ptr, int(frame_begin), int(frame_end), ctypes.byref(buf)):
-            self._fail("codec_audio_lm_decode_range")
-        return _take_pcm(buf)

@@ -507,19 +507,6 @@ enum codec_status codec_lm_state_set_text_context(
 // audio embed lookup + compose — delegate to vtable
 // ---------------------------------------------------------------------
 
-const float * codec_lm_audio_embd(struct codec_lm * lm, int32_t cb_idx, int32_t code) {
-    if (lm == nullptr || lm->vtable == nullptr || lm->vtable->audio_embd == nullptr) {
-        return nullptr;
-    }
-    if (cb_idx < 0 || cb_idx >= lm->info.n_codebook) {
-        return nullptr;
-    }
-    if (code < 0 || code >= lm->info.codebook_sizes[cb_idx]) {
-        return nullptr;
-    }
-    return lm->vtable->audio_embd(lm, cb_idx, code);
-}
-
 enum codec_status codec_lm_compose_audio_embd(
     struct codec_lm * lm,
     const int32_t * codes,

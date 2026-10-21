@@ -90,12 +90,6 @@ class LM:
 
     # --- embeddings ---------------------------------------------------
 
-    def audio_embd(self, cb_idx: int, code: int) -> np.ndarray:
-        p = lib().codec_lm_audio_embd(self.ptr, int(cb_idx), int(code))
-        if not p:
-            raise CodecError(f"codec_lm_audio_embd(cb={cb_idx}, code={code})", None, self.last_error)
-        return np.ctypeslib.as_array(p, shape=(self.info.audio_embed_dim,)).copy()
-
     @property
     def text_proj_dim(self) -> int:
         return int(lib().codec_lm_text_proj_dim(self.ptr))

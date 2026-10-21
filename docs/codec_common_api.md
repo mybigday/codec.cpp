@@ -114,7 +114,7 @@ returns the audio that became final since the last call. Each window is
 re-decoded from the first frame (causal decoders need the whole left context),
 the right edge the decoder may still revise is held back (0.32 s), and the
 joins are crossfaded (20 ms). `codec_audio_lm_stream_finish` returns the rest.
-`decodable_frames` / `hop` / `decode_range` are the lower-level pieces.
+`decodable_frames` says how many frames are decodable so far.
 
 To decode later (out of order, several generations on, more than once),
 `codec_audio_lm_get_generation` returns the generation's decoder input:

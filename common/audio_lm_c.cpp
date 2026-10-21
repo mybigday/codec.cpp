@@ -448,20 +448,6 @@ int32_t codec_audio_lm_decodable_frames(const struct codec_audio_lm * ctx) {
     return ctx != nullptr ? ctx->family->decodable_frames() : 0;
 }
 
-int32_t codec_audio_lm_hop(const struct codec_audio_lm * ctx) {
-    return ctx != nullptr ? audio_lm_codec_hop(ctx->alm) : 0;
-}
-
-bool codec_audio_lm_decode_range(struct codec_audio_lm * ctx, int32_t frame_begin, int32_t frame_end,
-                                 struct codec_pcm_buffer * out) {
-    if (ctx == nullptr || out == nullptr) return false;
-    audio_lm_audio_output pcm;
-    if (!audio_lm_decode_audio_range(ctx->alm, frame_begin, frame_end, &pcm)) {
-        return ctx->fail(audio_lm_last_error(ctx->alm));
-    }
-    return fill_pcm(pcm.pcm.data(), pcm.pcm.size(), pcm.sample_rate, pcm.n_channels, out) || ctx->fail("out of memory");
-}
-
 }  // extern "C"
 
 namespace codec_common {
