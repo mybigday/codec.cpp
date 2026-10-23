@@ -303,7 +303,7 @@ static int cmd_e2e(const e2e_args & args) {
 
     codec_example_wav_data wav;
     std::string wav_err;
-    if (!codec_example_load_wav_pcm16(args.input_wav, &wav, &wav_err)) {
+    if (!codec_example_load_wav(args.input_wav, &wav, &wav_err)) {
         std::fprintf(stderr, "failed to load wav: %s (%s)\n", args.input_wav, wav_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -311,11 +311,11 @@ static int cmd_e2e(const e2e_args & args) {
     }
 
     struct codec_audio in_audio = {
-        /*.data =*/ wav.pcm_i16.data(),
-        /*.n_samples =*/ (int32_t)(wav.pcm_i16.size() / (size_t)wav.n_channels),
+        /*.data =*/ wav.pcm.data(),
+        /*.n_samples =*/ (int32_t)(wav.pcm.size() / (size_t)wav.n_channels),
         /*.sample_rate =*/ wav.sample_rate,
         /*.n_channels =*/ wav.n_channels,
-        /*.pcm_type =*/ CODEC_PCM_TYPE_I16,
+        /*.pcm_type =*/ CODEC_PCM_TYPE_F32,
     };
 
     struct codec_token_buffer tokens = {};
@@ -560,7 +560,7 @@ static int cmd_encode(const encode_args & args) {
 
     codec_example_wav_data wav;
     std::string wav_err;
-    if (!codec_example_load_wav_pcm16(args.input_wav, &wav, &wav_err)) {
+    if (!codec_example_load_wav(args.input_wav, &wav, &wav_err)) {
         std::fprintf(stderr, "failed to load wav: %s (%s)\n", args.input_wav, wav_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -568,11 +568,11 @@ static int cmd_encode(const encode_args & args) {
     }
 
     struct codec_audio in_audio = {
-        /*.data =*/ wav.pcm_i16.data(),
-        /*.n_samples =*/ (int32_t)(wav.pcm_i16.size() / (size_t)wav.n_channels),
+        /*.data =*/ wav.pcm.data(),
+        /*.n_samples =*/ (int32_t)(wav.pcm.size() / (size_t)wav.n_channels),
         /*.sample_rate =*/ wav.sample_rate,
         /*.n_channels =*/ wav.n_channels,
-        /*.pcm_type =*/ CODEC_PCM_TYPE_I16,
+        /*.pcm_type =*/ CODEC_PCM_TYPE_F32,
     };
 
     struct codec_token_buffer tokens = {};
