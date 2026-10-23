@@ -130,6 +130,12 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
             raise FileNotFoundError(f"Missing model.safetensors in {checkpoint_dir}")
         if not cfg_path.exists():
             raise FileNotFoundError(f"Missing config.json in {checkpoint_dir}")
+        with safe_open(st_path, framework="numpy") as f:
+            if not any(k.startswith(("encoder.", "decoder.")) for k in f.keys()):
+                raise ValueError(
+                    f"{checkpoint_dir} has no Qwen3-TTS-Tokenizer weights (encoder.* / decoder.*); "
+                    f"pass a Qwen3-TTS LM checkpoint as --lm-source, or as the input "
+                    f"without --model-type")
         self.state_dict = _load_safetensors(st_path)
         with open(cfg_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)

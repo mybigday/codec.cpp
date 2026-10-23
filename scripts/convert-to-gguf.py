@@ -382,8 +382,11 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
         # Local checkpoint mode
         input_path = Path(args.checkpoint_path)
         checkpoint_path = input_path
-        
-        if args.model_type:
+        # An LM checkpoint dir routes to its codec even with --model-type set,
+        # or the codec converter would read the LM weights as the codec.
+        lm_dir = input_path.is_dir() and _is_lm_source_config(input_path / "config.json")
+
+        if args.model_type and not lm_dir:
             model_type = args.model_type
         elif input_path.is_file() and input_path.suffix in ('.ckpt', '.pth', '.bin'):
             # Single file - infer from filename
@@ -404,6 +407,10 @@ Supported models: mimi, dac, wavtokenizer, qwen3_tts_tokenizer, chatterbox_s3t, 
                         cfg = json.load(f)
                     arch = (cfg.get("architectures") or [""])[0]
                     model_type = LM_SOURCE_TO_CODEC[arch]
+                    if args.model_type and args.model_type != model_type:
+                        raise ValueError(
+                            f"{input_path} is a {arch} LM checkpoint, which pairs with "
+                            f"--model-type {model_type}, not {args.model_type}")
                     if args.lm_source is None:
                         args.lm_source = str(input_path)
                     if args.codec_source is None:

@@ -7,7 +7,7 @@ for codebooks 1..15, and the Qwen3-TTS-Tokenizer-12Hz codec.
 
 | Model | Speaker | Instruct |
 |---|---|---|
-| 0.6B Base | cloned: `--ref-audio` (+ `--ref-text` for the in-context prompt) | no |
+| 0.6B / 1.7B Base | cloned: `--ref-audio` (+ `--ref-text` for the in-context prompt) | no |
 | 0.6B / 1.7B CustomVoice | builtin voices (`--voice`) | 1.7B only |
 
 The codec GGUF holds the codec plus that model's adaptor (talker codec
