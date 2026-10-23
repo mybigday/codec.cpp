@@ -97,7 +97,7 @@ void print_usage(const char * argv0) {
         "           --repeat-penalty F --presence-penalty F --frequency-penalty F --dry-multiplier F\n"
         "           --dry-base F --dry-allowed-length N --dry-penalty-last-n N --samplers LIST]\n"
         "response formats in this build:", argv0);
-    for (const auto & f : codec_example_audio_formats()) std::fprintf(stderr, " %s", f.c_str());
+    for (const auto & f : codec_util_audio_formats()) std::fprintf(stderr, " %s", f.c_str());
     std::fprintf(stderr, "\n");
 }
 
@@ -473,7 +473,7 @@ int main(int argc, char ** argv) {
             send_error(res, 400, "'input' exceeds 4096 characters", "invalid_request_error", "input");
             return;
         }
-        const std::vector<std::string> formats = codec_example_audio_formats();
+        const std::vector<std::string> formats = codec_util_audio_formats();
         if (format.empty()) {
             std::string list;
             for (const auto & f : formats) list += (list.empty() ? "" : ", ") + f;
@@ -540,15 +540,15 @@ int main(int argc, char ** argv) {
         // Reject a format this build lacks before spending the synthesis on it.
         {
             std::string ferr;
-            if (!codec_example_audio_format_ok(format, &ferr)) {
+            if (!codec_util_audio_format_ok(format, &ferr)) {
                 send_error(res, 400, ferr, "invalid_request_error", "response_format");
                 return;
             }
         }
 
         std::string enc_err;
-        std::unique_ptr<codec_example_audio_encoder> enc =
-            codec_example_audio_encoder::create(format, k_out_sample_rate, /*total_samples=*/-1, &enc_err);
+        std::unique_ptr<codec_util_audio_encoder> enc =
+            codec_util_audio_encoder::create(format, k_out_sample_rate, /*total_samples=*/-1, &enc_err);
         if (!enc) { send_error(res, 500, enc_err, "server_error"); return; }
         const std::string content_type = enc->content_type();
 
@@ -566,7 +566,7 @@ int main(int argc, char ** argv) {
         // error status, not a truncated 200.
         auto st = std::make_shared<speech_stream>();
         st->worker = std::thread([&, st, rp, enc = std::move(enc), format, n_chars, sse]() mutable {
-            std::unique_ptr<codec_example_resampler> rs;
+            std::unique_ptr<codec_util_resampler> rs;
             size_t n_out = 0;
             std::string err;
             auto encode = [&](const std::vector<float> & pcm) {
@@ -576,7 +576,7 @@ int main(int argc, char ** argv) {
                 return st->put(std::move(bytes));
             };
             rp.on_audio = [&](const float * pcm, int32_t n, int32_t sr, int32_t nch) {
-                if (!rs) rs = std::make_unique<codec_example_resampler>(sr, k_out_sample_rate);
+                if (!rs) rs = std::make_unique<codec_util_resampler>(sr, k_out_sample_rate);
                 const std::vector<float> mono = codec_common::downmix_mono(pcm, (size_t) n, nch);
                 std::vector<float> out;
                 rs->push(mono.data(), mono.size(), &out);

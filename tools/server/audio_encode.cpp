@@ -22,7 +22,7 @@
 
 // ─── Resampler ──────────────────────────────────────────────────────────────
 
-codec_example_resampler::codec_example_resampler(int32_t in_sr, int32_t out_sr) {
+codec_util_resampler::codec_util_resampler(int32_t in_sr, int32_t out_sr) {
     if (in_sr == out_sr) return;
     const int64_t g = std::gcd(in_sr, out_sr);
     orig_ = in_sr / g;
@@ -48,7 +48,7 @@ codec_example_resampler::codec_example_resampler(int32_t in_sr, int32_t out_sr) 
 
 // Output sample o is block o / new, phase o % new: a correlation over the
 // input padded by (width, width + orig) zeros, at stride orig.
-void codec_example_resampler::run(size_t n_out, std::vector<float> * out) {
+void codec_util_resampler::run(size_t n_out, std::vector<float> * out) {
     const int64_t n_in = (int64_t) in_.size();
     for (; produced_ < n_out; ++produced_) {
         const int64_t j = (int64_t) produced_ / new_, i = (int64_t) produced_ % new_;
@@ -62,7 +62,7 @@ void codec_example_resampler::run(size_t n_out, std::vector<float> * out) {
     }
 }
 
-void codec_example_resampler::push(const float * x, size_t n, std::vector<float> * out) {
+void codec_util_resampler::push(const float * x, size_t n, std::vector<float> * out) {
     if (kernel_.empty()) { out->insert(out->end(), x, x + n); return; }
     in_.insert(in_.end(), x, x + n);
     // Outputs whose whole kernel window is already in hand.
@@ -71,7 +71,7 @@ void codec_example_resampler::push(const float * x, size_t n, std::vector<float>
     run((size_t) std::max<int64_t>(0, blocks * new_), out);
 }
 
-void codec_example_resampler::finish(std::vector<float> * out) {
+void codec_util_resampler::finish(std::vector<float> * out) {
     if (kernel_.empty()) return;
     run((size_t) ((new_ * (int64_t) in_.size() + orig_ - 1) / orig_), out);   // ceil(new * n / orig)
 }
@@ -89,7 +89,7 @@ std::vector<int16_t> to_s16(const float * pcm, size_t n) {
 void put_u32(std::string * o, uint32_t v) { for (int i = 0; i < 4; ++i) o->push_back((char) ((v >> (8 * i)) & 0xff)); }
 void put_u16(std::string * o, uint16_t v) { o->push_back((char) (v & 0xff)); o->push_back((char) (v >> 8)); }
 
-class pcm_encoder : public codec_example_audio_encoder {
+class pcm_encoder : public codec_util_audio_encoder {
 public:
     pcm_encoder() { content_type_ = "audio/pcm"; }
     bool push(const float * pcm, size_t n, std::string * out, std::string *) override {
@@ -126,11 +126,11 @@ private:
 };
 
 #ifdef CODEC_TTS_SERVER_MP3
-class mp3_encoder : public codec_example_audio_encoder {
+class mp3_encoder : public codec_util_audio_encoder {
 public:
     explicit mp3_encoder(lame_global_flags * lf) : lf_(lf) { content_type_ = "audio/mpeg"; }
     ~mp3_encoder() override { lame_close(lf_); }
-    static std::unique_ptr<codec_example_audio_encoder> create(int32_t sr, std::string * err) {
+    static std::unique_ptr<codec_util_audio_encoder> create(int32_t sr, std::string * err) {
         lame_global_flags * lf = lame_init();
         if (lf == nullptr) { *err = "lame_init failed"; return nullptr; }
         lame_set_in_samplerate(lf, sr);
@@ -167,7 +167,7 @@ private:
 #ifdef CODEC_TTS_SERVER_OPUS
 // Ogg Opus (RFC 7845), as OpenAI's `opus` response.  Granule positions are in
 // 48 kHz units whatever the input rate; every push flushes its pages.
-class opus_encoder : public codec_example_audio_encoder {
+class opus_encoder : public codec_util_audio_encoder {
 public:
     opus_encoder(OpusEncoder * enc, int32_t sr) : enc_(enc), sr_(sr) {
         content_type_ = "audio/ogg";
@@ -178,7 +178,7 @@ public:
         ogg_stream_init(&os_, 0x636f6463);   // "codc"
     }
     ~opus_encoder() override { ogg_stream_clear(&os_); opus_encoder_destroy(enc_); }
-    static std::unique_ptr<codec_example_audio_encoder> create(int32_t sr, std::string * err) {
+    static std::unique_ptr<codec_util_audio_encoder> create(int32_t sr, std::string * err) {
         int oerr = 0;
         OpusEncoder * enc = opus_encoder_create(sr, 1, OPUS_APPLICATION_AUDIO, &oerr);
         if (enc == nullptr) { *err = std::string("opus_encoder_create: ") + opus_strerror(oerr); return nullptr; }
@@ -260,11 +260,11 @@ private:
 
 #ifdef CODEC_TTS_SERVER_AAC
 // AAC-LC in ADTS, as OpenAI's `aac` response.
-class aac_encoder : public codec_example_audio_encoder {
+class aac_encoder : public codec_util_audio_encoder {
 public:
     explicit aac_encoder(HANDLE_AACENCODER enc) : enc_(enc) { content_type_ = "audio/aac"; }
     ~aac_encoder() override { aacEncClose(&enc_); }
-    static std::unique_ptr<codec_example_audio_encoder> create(int32_t sr, std::string * err) {
+    static std::unique_ptr<codec_util_audio_encoder> create(int32_t sr, std::string * err) {
         HANDLE_AACENCODER enc = nullptr;
         if (aacEncOpen(&enc, 0, 1) != AACENC_OK) { *err = "aacEncOpen failed"; return nullptr; }
         if (aacEncoder_SetParam(enc, AACENC_AOT, AOT_AAC_LC) != AACENC_OK ||
@@ -327,11 +327,11 @@ private:
 #endif
 
 #ifdef CODEC_TTS_SERVER_FLAC
-class flac_encoder : public codec_example_audio_encoder {
+class flac_encoder : public codec_util_audio_encoder {
 public:
     explicit flac_encoder(FLAC__StreamEncoder * enc) : enc_(enc) { content_type_ = "audio/flac"; }
     ~flac_encoder() override { FLAC__stream_encoder_delete(enc_); }
-    static std::unique_ptr<codec_example_audio_encoder> create(int32_t sr, int64_t total, std::string * err) {
+    static std::unique_ptr<codec_util_audio_encoder> create(int32_t sr, int64_t total, std::string * err) {
         FLAC__StreamEncoder * enc = FLAC__stream_encoder_new();
         if (enc == nullptr) { *err = "FLAC__stream_encoder_new failed"; return nullptr; }
         auto e = std::make_unique<flac_encoder>(enc);
@@ -409,13 +409,13 @@ const format_entry k_formats[] = {
 
 }  // namespace
 
-std::vector<std::string> codec_example_audio_formats() {
+std::vector<std::string> codec_util_audio_formats() {
     std::vector<std::string> v;
     for (const auto & f : k_formats) if (f.built) v.emplace_back(f.name);
     return v;
 }
 
-bool codec_example_audio_format_ok(const std::string & format, std::string * err) {
+bool codec_util_audio_format_ok(const std::string & format, std::string * err) {
     for (const auto & f : k_formats) {
         if (format != f.name) continue;
         if (f.built) return true;
@@ -429,9 +429,9 @@ bool codec_example_audio_format_ok(const std::string & format, std::string * err
     return false;
 }
 
-std::unique_ptr<codec_example_audio_encoder> codec_example_audio_encoder::create(
+std::unique_ptr<codec_util_audio_encoder> codec_util_audio_encoder::create(
         const std::string & format, int32_t sample_rate, int64_t total_samples, std::string * err) {
-    if (!codec_example_audio_format_ok(format, err)) return nullptr;
+    if (!codec_util_audio_format_ok(format, err)) return nullptr;
     if (format == "wav") return std::make_unique<wav_encoder>(sample_rate, total_samples);
     if (format == "pcm") return std::make_unique<pcm_encoder>();
 #ifdef CODEC_TTS_SERVER_MP3

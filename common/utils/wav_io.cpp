@@ -6,12 +6,12 @@
 #include <cstring>
 #include <vector>
 
-static bool codec_example_read_exact(FILE * fp, void * ptr, size_t n) {
+static bool codec_util_read_exact(FILE * fp, void * ptr, size_t n) {
     return std::fread(ptr, 1, n, fp) == n;
 }
 
 // One sample of `bits` bytes at `p` (little-endian) as a float in [-1, 1).
-static float codec_example_wav_sample(const uint8_t * p, uint16_t bits, bool is_float) {
+static float codec_util_wav_sample(const uint8_t * p, uint16_t bits, bool is_float) {
     if (is_float) {
         if (bits == 32) {
             float v;
@@ -30,7 +30,7 @@ static float codec_example_wav_sample(const uint8_t * p, uint16_t bits, bool is_
     }
 }
 
-bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std::string * err) {
+bool codec_util_load_wav(const char * path, codec_util_wav_data * out, std::string * err) {
     FILE * fp = std::fopen(path, "rb");
     if (fp == nullptr) {
         if (err != nullptr) {
@@ -42,7 +42,7 @@ bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std
     char riff[4] = { 0 };
     uint32_t riff_size = 0;
     char wave[4] = { 0 };
-    if (!codec_example_read_exact(fp, riff, 4) || !codec_example_read_exact(fp, &riff_size, 4) || !codec_example_read_exact(fp, wave, 4)) {
+    if (!codec_util_read_exact(fp, riff, 4) || !codec_util_read_exact(fp, &riff_size, 4) || !codec_util_read_exact(fp, wave, 4)) {
         std::fclose(fp);
         if (err != nullptr) {
             *err = "invalid wav header";
@@ -68,19 +68,19 @@ bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std
     while (true) {
         char chunk_id[4] = { 0 };
         uint32_t chunk_size = 0;
-        if (!codec_example_read_exact(fp, chunk_id, 4) || !codec_example_read_exact(fp, &chunk_size, 4)) {
+        if (!codec_util_read_exact(fp, chunk_id, 4) || !codec_util_read_exact(fp, &chunk_size, 4)) {
             break;
         }
 
         if (std::memcmp(chunk_id, "fmt ", 4) == 0) {
             uint16_t block_align = 0;
             uint32_t byte_rate = 0;
-            if (!codec_example_read_exact(fp, &audio_format, 2) ||
-                !codec_example_read_exact(fp, &n_channels, 2) ||
-                !codec_example_read_exact(fp, &sample_rate, 4) ||
-                !codec_example_read_exact(fp, &byte_rate, 4) ||
-                !codec_example_read_exact(fp, &block_align, 2) ||
-                !codec_example_read_exact(fp, &bits_per_sample, 2)) {
+            if (!codec_util_read_exact(fp, &audio_format, 2) ||
+                !codec_util_read_exact(fp, &n_channels, 2) ||
+                !codec_util_read_exact(fp, &sample_rate, 4) ||
+                !codec_util_read_exact(fp, &byte_rate, 4) ||
+                !codec_util_read_exact(fp, &block_align, 2) ||
+                !codec_util_read_exact(fp, &bits_per_sample, 2)) {
                 std::fclose(fp);
                 if (err != nullptr) {
                     *err = "invalid fmt chunk";
@@ -93,7 +93,7 @@ bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std
             long skip = (long) chunk_size - 16;
             if (audio_format == 0xFFFE && chunk_size >= 40) {
                 uint8_t ext[24];
-                if (!codec_example_read_exact(fp, ext, sizeof(ext))) {
+                if (!codec_util_read_exact(fp, ext, sizeof(ext))) {
                     std::fclose(fp);
                     if (err != nullptr) {
                         *err = "invalid fmt chunk";
@@ -108,7 +108,7 @@ bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std
             }
         } else if (std::memcmp(chunk_id, "data", 4) == 0) {
             pcm_bytes.resize(chunk_size);
-            if (chunk_size > 0 && !codec_example_read_exact(fp, pcm_bytes.data(), chunk_size)) {
+            if (chunk_size > 0 && !codec_util_read_exact(fp, pcm_bytes.data(), chunk_size)) {
                 std::fclose(fp);
                 if (err != nullptr) {
                     *err = "failed to read data chunk";
@@ -150,12 +150,12 @@ bool codec_example_load_wav(const char * path, codec_example_wav_data * out, std
     const size_t bytes = bits_per_sample / 8;
     out->pcm.resize(pcm_bytes.size() / bytes);
     for (size_t i = 0; i < out->pcm.size(); ++i) {
-        out->pcm[i] = codec_example_wav_sample(pcm_bytes.data() + i * bytes, bits_per_sample, is_float);
+        out->pcm[i] = codec_util_wav_sample(pcm_bytes.data() + i * bytes, bits_per_sample, is_float);
     }
     return true;
 }
 
-bool codec_example_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err, int32_t n_channels) {
+bool codec_util_write_wav_pcm16(const char * path, const float * pcm, int32_t n_samples, int32_t sample_rate, std::string * err, int32_t n_channels) {
     FILE * fp = std::fopen(path, "wb");
     if (fp == nullptr) {
         if (err != nullptr) {

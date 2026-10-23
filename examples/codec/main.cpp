@@ -301,9 +301,9 @@ static int cmd_e2e(const e2e_args & args) {
         return 4;
     }
 
-    codec_example_wav_data wav;
+    codec_util_wav_data wav;
     std::string wav_err;
-    if (!codec_example_load_wav(args.input_wav, &wav, &wav_err)) {
+    if (!codec_util_load_wav(args.input_wav, &wav, &wav_err)) {
         std::fprintf(stderr, "failed to load wav: %s (%s)\n", args.input_wav, wav_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -362,7 +362,7 @@ static int cmd_e2e(const e2e_args & args) {
     }
 
     std::string write_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &write_err, pcm.n_channels)) {
+    if (!codec_util_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &write_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", write_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_latent_buffer_free(&latent);
@@ -390,7 +390,7 @@ static int cmd_decode(const decode_args & args) {
     std::vector<int32_t> tokens_data;
     int32_t n_q = 0;
     int32_t n_frames = 0;
-    if (!codec_example_load_npy_i32_2d_tq(args.codes_npy, &tokens_data, &n_q, &n_frames, &npy_err)) {
+    if (!codec_util_load_npy_i32_2d_tq(args.codes_npy, &tokens_data, &n_q, &n_frames, &npy_err)) {
         std::fprintf(stderr, "failed to read codes npy: %s (%s)\n", args.codes_npy, npy_err.c_str());
         return 2;
     }
@@ -450,7 +450,7 @@ static int cmd_decode(const decode_args & args) {
     }
 
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
+    if (!codec_util_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_free(ctx);
@@ -475,7 +475,7 @@ static int cmd_decode_latent(const decode_latent_args & args) {
     std::vector<float> latent_data;
     int32_t n_frames = 0;
     int32_t latent_dim = 0;
-    if (!codec_example_load_npy_f32_2d(args.latent_npy, &latent_data, &n_frames, &latent_dim, &npy_err)) {
+    if (!codec_util_load_npy_f32_2d(args.latent_npy, &latent_data, &n_frames, &latent_dim, &npy_err)) {
         std::fprintf(stderr, "failed to read latent npy: %s (%s)\n", args.latent_npy, npy_err.c_str());
         return 2;
     }
@@ -515,7 +515,7 @@ static int cmd_decode_latent(const decode_latent_args & args) {
     }
 
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
+    if (!codec_util_write_wav_pcm16(args.out_wav, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err, pcm.n_channels)) {
         std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
         codec_pcm_buffer_free(&pcm);
         codec_free(ctx);
@@ -558,9 +558,9 @@ static int cmd_encode(const encode_args & args) {
         return 4;
     }
 
-    codec_example_wav_data wav;
+    codec_util_wav_data wav;
     std::string wav_err;
-    if (!codec_example_load_wav(args.input_wav, &wav, &wav_err)) {
+    if (!codec_util_load_wav(args.input_wav, &wav, &wav_err)) {
         std::fprintf(stderr, "failed to load wav: %s (%s)\n", args.input_wav, wav_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -590,7 +590,7 @@ static int cmd_encode(const encode_args & args) {
     }
 
     std::string npy_err;
-    if (!codec_example_save_npy_i32_2d_qt(args.out_codes, tokens.data, tokens.n_q, tokens.n_frames, &npy_err)) {
+    if (!codec_util_save_npy_i32_2d_qt(args.out_codes, tokens.data, tokens.n_q, tokens.n_frames, &npy_err)) {
         std::fprintf(stderr, "failed to write codes npy: %s (%s)\n", args.out_codes, npy_err.c_str());
         codec_token_buffer_free(&tokens);
         codec_free(ctx);

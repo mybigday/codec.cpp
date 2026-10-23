@@ -9,16 +9,12 @@
 //     every per-model flow, sampling, CFG, streaming, EOS, decode) →
 //     common/tts_runner (codec_tts_runner, built with CODEC_TTS_BACKBONE)
 //
-// This file is just: parse args → load → { info | decode | synthesize } →
-// write WAV.  tools/tts-server links codec_tts_runner the same way.
+// This file is just: parse args → load → { info | voices | synthesize } →
+// write WAV.  tools/server/tts-server links codec_tts_runner the same way.
 //
 //   tts-cli info       --model X.gguf
 //        Lifecycle + capability queries (modality, n_codebook, hidden_dim,
 //        has_speaker_enc) via the plain codec_common API.
-//
-//   tts-cli decode     --model X.gguf --codes codes.npy --output OUT.wav
-//        Reads a (T, n_cb) int32 .npy of codes, runs codec_decode through
-//        codec_common, writes mono PCM16 WAV.
 //
 //   tts-cli synthesize --model X.gguf [--backbone LLAMA.gguf] --text "..."
 //                      --output OUT.wav [--ref-audio REF.wav] [knobs]
@@ -27,7 +23,6 @@
 #include "codec_common.h"
 #include "tts_runner.h"
 #include "utils/wav_io.h"
-#include "utils/npy_io.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -137,7 +132,6 @@ void print_usage(const char * prog) {
         "  voices     --model CODEC.gguf [--speaker-file PATH.gguf]\n"
         "             List the codec's builtin speakers (or those in a speaker\n"
         "             file); * marks the default.\n"
-        "  decode     --model PATH --codes PATH.npy --output PATH.wav [--n-threads N]\n"
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
@@ -223,7 +217,6 @@ void print_modality_mask(uint32_t mask) {
 struct args {
     std::string sub;
     std::string model;
-    std::string codes;
     std::string text;
     std::string ref_audio;
     std::string ref_text;
@@ -270,7 +263,6 @@ bool parse_args(int argc, char ** argv, args * out) {
             return argv[i + 1];
         };
         if      (a == "--model")      { const char * v = need(); if (!v) return false; out->model = v; i++; }
-        else if (a == "--codes")      { const char * v = need(); if (!v) return false; out->codes = v; i++; }
         else if (a == "--text")       { const char * v = need(); if (!v) return false; out->text = v;  i++; }
         else if (a == "--ref-audio")  { const char * v = need(); if (!v) return false; out->ref_audio = v; i++; }
         else if (a == "--ref-text")   { const char * v = need(); if (!v) return false; out->ref_text = v; i++; }
@@ -382,61 +374,6 @@ int cmd_voices(const args & a) {
     return 0;
 }
 
-// ─── Subcommand: decode ──────────────────────────────────────────
-// Offline decode of pre-sampled codes through the codec_common pipeline.
-int cmd_decode(const args & a) {
-    if (a.codes.empty() || a.output.empty()) {
-        std::fprintf(stderr, "decode requires --codes and --output\n");
-        return 1;
-    }
-    codec_common::audio_lm_params p;
-    p.codec_path = a.model;
-    p.kv_overrides = a.kv_overrides;
-    p.use_gpu    = a.use_gpu;
-    p.n_threads  = a.n_threads;
-    std::string err;
-    auto * ctx = codec_common::audio_lm_init(p, &err);
-    if (!ctx) { std::fprintf(stderr, "audio_lm_init failed: %s\n", err.c_str()); return 2; }
-
-    std::vector<int32_t> npy_codes;
-    int32_t n_frames = 0, n_q = 0;
-    std::string npy_err;
-    if (!codec_example_load_npy_i32_2d_tq(a.codes.c_str(), &npy_codes, &n_q, &n_frames, &npy_err)) {
-        std::fprintf(stderr, "failed to load %s: %s\n", a.codes.c_str(), npy_err.c_str());
-        codec_common::audio_lm_free(ctx);
-        return 3;
-    }
-
-    if (!codec_common::audio_lm_push_codes(ctx, npy_codes.data(), n_frames, n_q)) {
-        std::fprintf(stderr, "audio_lm_push_codes failed: %s\n", codec_common::audio_lm_last_error(ctx));
-        codec_common::audio_lm_free(ctx);
-        return 4;
-    }
-
-    codec_common::audio_lm_audio_output pcm;
-    if (!codec_common::audio_lm_decode_audio(ctx, &pcm)) {
-        std::fprintf(stderr, "audio_lm_decode_audio failed: %s\n", codec_common::audio_lm_last_error(ctx));
-        codec_common::audio_lm_free(ctx);
-        return 5;
-    }
-
-    std::string wav_err;
-    if (!codec_example_write_wav_pcm16(
-            a.output.c_str(), pcm.pcm.data(),
-            (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
-            pcm.sample_rate, &wav_err, pcm.n_channels)) {
-        std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
-        codec_common::audio_lm_free(ctx);
-        return 6;
-    }
-    std::printf("wrote %s: %d samples @ %d Hz (%d ch)\n",
-                a.output.c_str(),
-                (int32_t) (pcm.pcm.size() / (size_t) pcm.n_channels),
-                pcm.sample_rate, pcm.n_channels);
-    codec_common::audio_lm_free(ctx);
-    return 0;
-}
-
 // ─── Subcommand: synthesize ──────────────────────────────────────
 // Thin driver over the reference runner.  With the backbone linked in
 // (TTS_CLI_HAVE_BACKBONE) the full flow set is available; without it, only
@@ -472,7 +409,7 @@ int write_result_wav(const args & a, const codec_common::tts_runner_result & r) 
     const int32_t nch = r.n_channels > 0 ? r.n_channels : 1;
     const int32_t nsamp = (int32_t) (r.pcm.size() / (size_t) nch);
     std::string wav_err;
-    if (!codec_example_write_wav_pcm16(a.output.c_str(), r.pcm.data(), nsamp,
+    if (!codec_util_write_wav_pcm16(a.output.c_str(), r.pcm.data(), nsamp,
                                        r.sample_rate, &wav_err, nch)) {
         std::fprintf(stderr, "failed to write %s: %s\n", a.output.c_str(), wav_err.c_str());
         return 9;
@@ -546,7 +483,6 @@ int main(int argc, char ** argv) {
 
     if (a.sub == "info")       return cmd_info(a);
     if (a.sub == "voices")     return cmd_voices(a);
-    if (a.sub == "decode")     return cmd_decode(a);
     if (a.sub == "synthesize") return cmd_synthesize(a);
 
     std::fprintf(stderr, "unknown subcommand: %s\n", a.sub.c_str());

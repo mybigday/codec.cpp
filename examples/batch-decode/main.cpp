@@ -183,10 +183,10 @@ int main(int argc, char ** argv) {
     dparams.n_q = args.n_q;
 
     std::string npy_err;
-    struct codec_example_npy_array arr;
+    struct codec_util_npy_array arr;
     const bool codes_mode = args.codes_path != nullptr;
     const char * input_path = codes_mode ? args.codes_path : args.latent_path;
-    if (!codec_example_load_npy(input_path, &arr, &npy_err)) {
+    if (!codec_util_load_npy(input_path, &arr, &npy_err)) {
         std::fprintf(stderr, "failed to load npy: %s (%s)\n", input_path, npy_err.c_str());
         codec_free(ctx);
         codec_model_free(model);
@@ -248,7 +248,7 @@ int main(int argc, char ** argv) {
         }
 
         std::string wav_err;
-        if (!codec_example_write_wav_pcm16(args.out_path, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
+        if (!codec_util_write_wav_pcm16(args.out_path, pcm.data, pcm.n_samples, pcm.sample_rate, &wav_err)) {
             std::fprintf(stderr, "failed to write wav: %s\n", wav_err.c_str());
             codec_pcm_buffer_free(&pcm);
             codec_free(ctx);
@@ -368,7 +368,7 @@ int main(int argc, char ** argv) {
     for (int32_t i = 0; i < n_seq; ++i) {
         std::string out_wav = std::string(args.out_path) + "/seq_" + std::to_string(i) + ".wav";
         std::string wav_err;
-        if (!codec_example_write_wav_pcm16(out_wav.c_str(), pcm[(size_t)i].data, pcm[(size_t)i].n_samples, pcm[(size_t)i].sample_rate, &wav_err)) {
+        if (!codec_util_write_wav_pcm16(out_wav.c_str(), pcm[(size_t)i].data, pcm[(size_t)i].n_samples, pcm[(size_t)i].sample_rate, &wav_err)) {
             std::fprintf(stderr, "failed to write %s: %s\n", out_wav.c_str(), wav_err.c_str());
             write_ok = false;
             break;

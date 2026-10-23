@@ -53,9 +53,9 @@ std::vector<float> downmix_mono(const float * in, size_t n_frames, int32_t n_cha
 bool load_ref_audio(const std::string & path, std::vector<float> & ref_pcm, int32_t * out_n, int32_t * out_sr,
                     std::string * err) {
     if (path.empty()) return true;
-    codec_example_wav_data w;
+    codec_util_wav_data w;
     std::string werr;
-    if (!codec_example_load_wav(path.c_str(), &w, &werr)) {
+    if (!codec_util_load_wav(path.c_str(), &w, &werr)) {
         *err = "failed to load " + path + ": " + werr;
         return false;
     }

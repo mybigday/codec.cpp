@@ -3,7 +3,7 @@
 
 // Generic audio-LM API for codec.cpp.  See docs/codec_common_api.md
 // for the full design.  Mirrors llama.cpp's `common/` layer pattern:
-// the host (llama.rn's rn-tts, tools/tts-cli, …) keeps full
+// the host (llama.rn's rn-tts, tools/cli/tts-cli, …) keeps full
 // ownership of the `llama_decode` loop, the sampler, and KV
 // management; this layer provides build-time + per-step + end-of-
 // sequence hooks that the host calls at three points in its existing

@@ -182,15 +182,22 @@ if(SKBUILD)
         RUNTIME DESTINATION codec_cpp/lib COMPONENT python)
 endif()
 
-# Small reusable example IO helpers (WAV / NPY).  Declared before
-# codec_common so the self-contained FlowLM runner (which loads ref-audio
-# WAVs) can link it.  `examples` is on the public include path so consumers
-# resolve "utils/wav_io.h".
-add_library(codec-example-utils STATIC
-    examples/utils/wav_io.cpp
+# WAV IO for the runner, tools and examples.  Declared before codec_common
+# so the self-contained FlowLM runner (which loads ref-audio WAVs) can link
+# it.  `common` is on the public include path so consumers resolve
+# "utils/wav_io.h".
+add_library(codec_utils STATIC
+    common/utils/wav_io.cpp
+)
+target_include_directories(codec_utils
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
+
+# NPY IO for the examples (codes / latents / hidden states exchanged with
+# Python references); consumers resolve "utils/npy_io.h".
+add_library(codec_example_utils STATIC
     examples/utils/npy_io.cpp
 )
-target_include_directories(codec-example-utils
+target_include_directories(codec_example_utils
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/examples)
 
 # codec_common — generic audio-LM API mirroring llama.cpp's `common/`.
@@ -209,32 +216,32 @@ target_include_directories(codec_common
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(codec_common PUBLIC codec PRIVATE codec-example-utils)
+target_link_libraries(codec_common PUBLIC codec PRIVATE codec_utils)
 
 add_executable(inspect-codec
-    examples/inspect-codec.cpp
+    examples/inspect/main.cpp
 )
 
 target_link_libraries(inspect-codec PRIVATE codec)
 
 add_executable(codec-cli
-    examples/codec-cli.cpp
+    examples/codec/main.cpp
 )
 
-target_link_libraries(codec-cli PRIVATE codec codec-example-utils)
+target_link_libraries(codec-cli PRIVATE codec codec_utils codec_example_utils)
 
 add_executable(codec-lm-cli
-    examples/codec-lm-cli.cpp
+    examples/codec-lm/main.cpp
 )
 
-target_link_libraries(codec-lm-cli PRIVATE codec codec-example-utils)
+target_link_libraries(codec-lm-cli PRIVATE codec codec_example_utils)
 
 add_executable(codec-batch-decode
-    examples/codec-batch-decode.cpp
+    examples/batch-decode/main.cpp
 )
 
 target_include_directories(codec-batch-decode PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(codec-batch-decode PRIVATE codec codec-example-utils ggml ggml-cpu)
+target_link_libraries(codec-batch-decode PRIVATE codec codec_utils codec_example_utils ggml ggml-cpu)
 
 option(CODEC_BUILD_TTS_CLI "Build the tts-cli tool" ON)
 if(CODEC_BUILD_TTS_CLI)
@@ -244,9 +251,9 @@ if(CODEC_BUILD_TTS_CLI)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupLlamaPatches.cmake)
 
     add_executable(tts-cli
-        tools/tts-cli.cpp
+        tools/cli/main.cpp
     )
-    target_link_libraries(tts-cli PRIVATE codec_common codec-example-utils)
+    target_link_libraries(tts-cli PRIVATE codec_common codec_utils)
 
     # Optional isolated llama.cpp backbone → enables the full `synthesize`
     # reference loop.  The loop itself lives in codec_tts_runner (common/
@@ -280,8 +287,8 @@ if(CODEC_BUILD_TTS_CLI)
             set(_ll_vendor "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp/vendor")
             find_package(Threads REQUIRED)
             add_executable(tts-server
-                tools/tts-server.cpp
-                tools/audio_encode.cpp
+                tools/server/main.cpp
+                tools/server/audio_encode.cpp
                 ${_ll_vendor}/cpp-httplib/httplib.cpp)
             target_include_directories(tts-server PRIVATE ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
             target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}" Threads::Threads)

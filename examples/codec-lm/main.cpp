@@ -63,9 +63,9 @@ static int cmd_step(int argc, char ** argv) {
         return usage(argv[0]);
     }
 
-    codec_example_npy_array h_arr;
+    codec_util_npy_array h_arr;
     std::string err;
-    if (!codec_example_load_npy(hidden_path, &h_arr, &err)) {
+    if (!codec_util_load_npy(hidden_path, &h_arr, &err)) {
         std::fprintf(stderr, "load hidden npy failed: %s\n", err.c_str());
         return 3;
     }
@@ -122,7 +122,7 @@ static int cmd_step(int argc, char ** argv) {
         }
 
         std::snprintf(path_buf, sizeof(path_buf), "%s_%d.npy", logits_pfx, cb_idx);
-        if (!codec_example_save_npy_f32_1d(path_buf, lg, n, &err)) {
+        if (!codec_util_save_npy_f32_1d(path_buf, lg, n, &err)) {
             std::fprintf(stderr, "save logits npy failed: %s\n", err.c_str());
             codec_lm_state_free(st); codec_lm_free(lm); codec_model_free(codec);
             return 10;
@@ -143,7 +143,7 @@ static int cmd_step(int argc, char ** argv) {
     codec_lm_step_finish(st, finished);
 
     if (codes_out) {
-        if (!codec_example_save_npy_i32_1d(codes_out, finished, info->n_codebook, &err)) {
+        if (!codec_util_save_npy_i32_1d(codes_out, finished, info->n_codebook, &err)) {
             std::fprintf(stderr, "save codes npy failed: %s\n", err.c_str());
             codec_lm_state_free(st); codec_lm_free(lm); codec_model_free(codec);
             return 11;
@@ -168,9 +168,9 @@ static int cmd_compose(int argc, char ** argv) {
     }
     if (!model_path || !codes_path || !embd_out) return usage(argv[0]);
 
-    codec_example_npy_array c_arr;
+    codec_util_npy_array c_arr;
     std::string err;
-    if (!codec_example_load_npy(codes_path, &c_arr, &err)) {
+    if (!codec_util_load_npy(codes_path, &c_arr, &err)) {
         std::fprintf(stderr, "load codes npy failed: %s\n", err.c_str());
         return 3;
     }
@@ -204,7 +204,7 @@ static int cmd_compose(int argc, char ** argv) {
         return 7;
     }
 
-    if (!codec_example_save_npy_f32_1d(embd_out, embd.data(), info->audio_embed_dim, &err)) {
+    if (!codec_util_save_npy_f32_1d(embd_out, embd.data(), info->audio_embed_dim, &err)) {
         std::fprintf(stderr, "save embd npy failed: %s\n", err.c_str());
         codec_lm_free(lm); codec_model_free(codec);
         return 8;
