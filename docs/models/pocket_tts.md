@@ -34,8 +34,12 @@ The checkpoint is BF16: `--outtype f16` / `bf16`; `f32` is capped at bf16.
 ```bash
 tts-cli synthesize --backbone backbone-f16.gguf --model pocket_tts_en.gguf \
     --text "Hello world. This is a small text to speech model." --output out.wav \
-    [--ref-audio voice.wav]
+    --ref-audio voice.wav   # or --speaker-file voice.gguf
 ```
+
+A voice is required: without one the format call fails ("Pocket-TTS needs a
+voice") and `caps.needs_voice` is set, since the unconditioned model's EOS head
+may never fire.
 
 The codec_audio_lm family (`common/audio_lm_family_flow.cpp`) follows
 `pocket_tts` `TTSModel`; any host loop over `include/codec_audio_lm.h` runs

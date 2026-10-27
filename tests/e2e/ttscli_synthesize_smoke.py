@@ -410,7 +410,8 @@ def main():
         REPO / "models" / "pocket_tts" / "backbone-f16.gguf",
         "Hello world. This is a small text to speech model.",
         "en", want_stop="eos_head", cer_max=1.0,
-        extra=["--seed", "11", "--max-frames", "80", "--min-len", "24"],
+        extra=["--seed", "11", "--max-frames", "80", "--min-len", "24",
+               "--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav")],   # needs a voice
         greedy=False, require_stop=False,
         cer_report_only=True, audio_report_only=True,
         stop_line="pocket AR done",
