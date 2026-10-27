@@ -61,7 +61,8 @@ CASES = [
           "The birch canoe slid on the smooth planks.", "soprano", 42),
     _case("pocket_tts", M / "pocket_tts/pocket_tts_en.gguf", M / "pocket_tts/backbone-f16.gguf",
           "Hello world. This is a small text to speech model.", "pocket_tts", 11,
-          ["--max-frames", "80", "--min-len", "24"], dict(min_frames=24), 80),
+          ["--max-frames", "80", "--min-len", "24", "--ref-audio", str(REF / "jfk_en.wav")],   # needs a voice
+          dict(min_frames=24, ref_audio=REF / "jfk_en.wav"), 80),
 ]
 
 
