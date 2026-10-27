@@ -14,7 +14,7 @@ Two parity modes:
   - Free-running:   each AR step is fed our own previous codes.  Drift
     compounds; reported but not strictly asserted.
 
-Expected behaviour, validated against MOSS-TTSD-v0.5 / Qwen3-2B (F16 GGUF):
+Expected behaviour, validated against MOSS-TTSD-v0.5 / Qwen3-2B (BF16 GGUF; F16 overflows to NaN):
   - codec_lm-side parity is bit-perfect (separate test:
     `tests/e2e/moss_ttsd_lm_smoke.py`).
   - Backbone hidden parity (separate test:
@@ -54,7 +54,7 @@ from codec_cpp import Model
 
 GGUF_BACKBONE = Path(_os.environ.get(
     "GGUF_BACKBONE_OVERRIDE",
-    str(REPO / "models/moss_ttsd_v0_5/qwen3_backbone.gguf")))
+    str(REPO / "models/moss_ttsd_v0_5/qwen3_backbone_bf16.gguf")))
 GGUF_CODEC_LM = Path(_os.environ.get(
     "GGUF_CODEC_LM_OVERRIDE",
     str(REPO / "models/moss_ttsd_v0_5/moss_ttsd_v0_5.gguf")))

@@ -128,6 +128,8 @@ If conversion scripts are involved, regenerate gguf after changes (stale gguf is
 
 Storage precision is a converter decision (`scripts/utils/precision.py`): `--outtype` (F32/F16/BF16/AUTO) and `--quantization` (Q8_0/Q5_K_M/Q4_K_M) for the codec part, `--lm-outtype` / `--lm-quantization` for the LM-side adaptor (`lm.*`). A float type is never wider than the checkpoint (F32 from a BF16 checkpoint stays BF16); generated DSP tables stay F32. In converter code `"F16"` means "this part's float type" and `"F32"` means "F32 capped at the checkpoint's precision".
 
+BF16 checkpoints are not converted to F16 — not the codec part, the LM adaptor or the backbone. F16 keeps more mantissa but tops out at 65504, and activations a BF16-trained model takes for granted overflow it (MOSS-TTSD's Qwen3 backbone: NaN logits on the first speech step). Convert to BF16 (or F32, or quantize from BF16) and publish no F16 variant of such a model. The converters do not refuse `--outtype f16`; the choice stays the publisher's.
+
 ---
 
 ## Conventions / guardrails for changes

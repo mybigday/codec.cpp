@@ -20,7 +20,8 @@ import numpy as np
 
 from _common import REPO, corr, llamacpp_hidden_seq, must
 
-GGUF  = REPO / "models/moss_ttsd_v0_5/qwen3_backbone.gguf"
+GGUF  = REPO / "models/moss_ttsd_v0_5/qwen3_backbone_bf16.gguf"   # F16 overflows to NaN on speech prompts
+MAD_MAX = 5e-2   # BF16 weights vs the F32 reference (corr stays ~0.9999)
 HF_LM = "fnlp/MOSS-TTSD-v0.5"
 
 
@@ -67,12 +68,12 @@ def main() -> int:
     for t in range(T):
         cc  = corr(cpp_hidden_seq[t], ref_hidden_seq[t])
         mad = float(np.max(np.abs(cpp_hidden_seq[t] - ref_hidden_seq[t])))
-        tag = "OK " if (cc >= 0.999 and mad <= 5e-3) else "warn"
+        tag = "OK " if (cc >= 0.999 and mad <= MAD_MAX) else "warn"
         print(f"  [{tag}] t={t:3d}  corr={cc:.6f}  max_abs_diff={mad:.5g}")
 
     last_cc  = corr(cpp_hidden_seq[-1], ref_hidden_seq[-1])
     last_mad = float(np.max(np.abs(cpp_hidden_seq[-1] - ref_hidden_seq[-1])))
-    if last_cc < 0.999 or last_mad > 5e-3:
+    if last_cc < 0.999 or last_mad > MAD_MAX:
         print(f"\nFAIL: last-position parity outside tolerance "
               f"(corr={last_cc:.6f}, max_abs_diff={last_mad:.5g})", file=sys.stderr)
         return 1
