@@ -136,6 +136,7 @@ tokens, or restrict sampling to their audio tokens. The library never decodes.
 | `needs_prompt_hidden` | decode the prompt with every position as output and call `codec_audio_lm_prefill` |
 | `sample_first` | the first step samples a backbone token; afterwards each verdict's `sample_backbone` says |
 | `streamable` | `codec_audio_lm_stream_poll` works during the generation |
+| `min_frames` | audio frames before the generation may end: the request's `min_frames` when >= 0, else the model's own minimum (0 = none). The generation keeps to it (grammar, or an end code masked in the codec-side head); `codec_audio_lm_tts_format` reports it too, so a host can pass it to its own minimum-length setting and back as the request's `min_frames` |
 | `max_frames` | audio frames (`frame_done` verdicts) after which to stop |
 
 `penalty_exempt` needs `patches/penalty-exempt-llamacpp.patch` (applied to

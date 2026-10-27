@@ -354,6 +354,7 @@ class codec_audio_lm_completion(Structure):
         ("needs_prompt_hidden", c_bool),
         ("sample_first", c_bool),
         ("streamable", c_bool),
+        ("min_frames", c_int32),
         ("max_frames", c_int32),
         ("head_groups", POINTER(codec_audio_lm_head_group)),
         ("n_head_groups", c_int32),
@@ -374,6 +375,7 @@ class codec_audio_lm_format(Structure):
         ("needs_prompt_hidden", c_bool),
         ("sample_first", c_bool),
         ("streamable", c_bool),
+        ("min_frames", c_int32),
         ("max_frames", c_int32),
     ]
 

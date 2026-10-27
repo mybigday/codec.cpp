@@ -139,6 +139,7 @@ class Format:
     needs_prompt_hidden: bool
     sample_first: bool
     streamable: bool
+    min_frames: int                 # frames before the end may come (the request's, else the model's)
     max_frames: int
 
 
@@ -156,6 +157,7 @@ class Completion:
     needs_prompt_hidden: bool
     sample_first: bool
     streamable: bool
+    min_frames: int                 # frames before the end may come (the request's, else the model's)
     max_frames: int
     head_groups: list[dict] = field(default_factory=list)   # [{penalties, history, penalty_exempt}]
 
@@ -330,7 +332,8 @@ class AudioLM:
         return Format(_str(f.prompt), int(f.flow), int(f.n_seq), _str(f.grammar) if f.grammar else "",
                       ids(f.penalty_exempt, f.n_penalty_exempt),
                       [(f.allowed[i].begin, f.allowed[i].end) for i in range(f.n_allowed)],
-                      f.needs_embeddings, f.needs_prompt_hidden, f.sample_first, f.streamable, int(f.max_frames))
+                      f.needs_embeddings, f.needs_prompt_hidden, f.sample_first, f.streamable, int(f.min_frames),
+                      int(f.max_frames))
 
     def tts_build(self, text: str | None, prompt: str, *, vocab: Vocab | None = None, instruct: str | None = None,
                   voice: Speaker | None = None, **settings) -> Completion:
@@ -413,7 +416,7 @@ class AudioLM:
                           ids(c.penalty_exempt, c.n_penalty_exempt), _str(c.grammar) if c.grammar else "",
                           [(c.allowed[i].begin, c.allowed[i].end) for i in range(c.n_allowed)],
                           c.needs_embeddings, c.needs_prompt_hidden, c.sample_first, c.streamable,
-                          int(c.max_frames), groups)
+                          int(c.min_frames), int(c.max_frames), groups)
 
     def prefill(self, hiddens: np.ndarray) -> None:
         """Every prompt position's hidden state, (n_pos, n_embd) (when needs_prompt_hidden)."""

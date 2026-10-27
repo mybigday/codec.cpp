@@ -595,7 +595,7 @@ enum class outetts_version { V1, V2, V3 };
 std::string outetts_build_grammar(outetts_version v, const std::string & text);
 
 std::string tts_auto_grammar(const audio_lm_prompt_info & pi,
-                             const std::string & text);
+                             const std::string & text, int32_t min_frames = 0);
 
 // ─── Codebook step machine passthroughs (Type C/D) ──────────────────
 //
