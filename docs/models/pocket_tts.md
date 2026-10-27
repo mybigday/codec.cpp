@@ -46,8 +46,9 @@ The codec_audio_lm family (`common/audio_lm_family_flow.cpp`) follows
 it (tts-cli, `codec_cpp.TTS` / `AudioLM`, llama.rn):
 
 - `prepare_text_prompt` (strip, capitalize, trailing period), then the backbone
-  sequence `[text tokens | bos_before_voice + speaker_proj(voice latents) |
-  per-frame input embeddings]`;
+  sequence `[bos_before_voice + speaker_proj(voice latents) | text tokens |
+  per-frame input embeddings]` (the reference fills its KV cache in that
+  order: `get_state_for_audio_prompt`, then the text, then the frames);
 - per frame: the frame input (`input_linear` of `bos_emb` ending the prompt,
   then of the previous latent, fed back as an embedding) → backbone hidden →
   the EOS head (logit > −4) and the LSD flow head (latent from noise

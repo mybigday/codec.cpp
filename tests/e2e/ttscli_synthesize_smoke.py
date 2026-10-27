@@ -395,26 +395,17 @@ def main():
     ))
 
     # Pocket-TTS FlowLM: the transformer is a stock starcoder2 backbone (text
-    # LUT as token_embd); codec_lm runs the step input projection, EOS head and
-    # LSD flow head.  The LM math was verified against the reference when it
-    # was ported (teacher-forced latent corr 0.99999, EOS agreement 1.0).  Here
-    # we assert the end-to-end pipeline runs, stops via the
-    # EOS head, and writes audio.  Content is REPORT-ONLY: pocket-tts is a fragile
-    # 100M short-utterance model whose free-run output quality depends on the CFM
-    # noise stream (torch.randn), which C++ can't bit-reproduce — even the reference,
-    # driven directly, transcribes short prompts as "Thank you."/"Okay.".  --min-len
-    # forces a minimum utterance so the EOS head is exercised past its trigger.
+    # LUT as token_embd); codec_lm runs the speaker projection, step input
+    # projection, EOS head and LSD flow head.  The model needs a voice; the
+    # backbone sequence is [voice rows | text | frames] as the reference's.
     results.append(_case(
         "pocket_tts",
         REPO / "models" / "pocket_tts" / "pocket_tts_en.gguf",
         REPO / "models" / "pocket_tts" / "backbone-f16.gguf",
         "Hello world. This is a small text to speech model.",
-        "en", want_stop="eos_head", cer_max=1.0,
-        extra=["--seed", "11", "--max-frames", "80", "--min-len", "24",
-               "--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav")],   # needs a voice
-        greedy=False, require_stop=False,
-        cer_report_only=True, audio_report_only=True,
-        stop_line="pocket AR done",
+        "en", want_stop="eos_head", cer_max=0.3,   # the reference also drops "Hello world." on some seeds
+        extra=["--seed", "11", "--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav")],
+        greedy=False, stop_line="pocket AR done",
     ))
 
     # Soprano: Qwen3 backbone (tokenizer.ggml.pre = soprano) whose final-norm
