@@ -37,7 +37,7 @@ settings: codebook 0 is one head group with the penalties (the talker's
 repetition_penalty), the depth codebooks share another without them (the
 subtalker). Recommended, upstream's
 `generation_config.json`: `--temp 0.9 --top-k 50 --top-p 1.0 --min-p 0
---repeat-penalty 1.05 --repeat-last-n -1 --samplers
+--repeat-penalty 1.05 --repeat-last-n 4096 --samplers
 "penalties;temperature;top_k;top_p"`. Without the penalty an ICL clone on a
 quantized talker (Q4_K_M) can loop and never reach the end code. These ship in the backbone GGUF as `general.sampling.*` (llama.cpp's own keys); a host reads them as llama.cpp does and a setting given on the command line or in the request wins. `scripts/set-backbone-sampling.py` writes them into an existing backbone.
 

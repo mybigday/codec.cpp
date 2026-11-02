@@ -36,9 +36,6 @@ namespace {
 // A common_params_sampling filled from the completion's settings (llama.cpp's
 // own names and defaults) plus the model's grammar / allowed-token bias.
 // build() returns false + err on a grammar parse failure.
-// llama.cpp's penalties sampler clamps penalty_last_n to >= 0 and treats 0 as
-// "disabled" (common's -1 -> n_ctx mapping is commented out); -1 ("the whole
-// context") maps to the context size here.
 struct BackboneSampler {
     common_sampler * smpl = nullptr;
 
@@ -48,7 +45,7 @@ struct BackboneSampler {
     ~BackboneSampler() { if (smpl) common_sampler_free(smpl); }
 
     bool build(const llama_model * model, const tts_sampling & s, const std::string & samplers,
-               const std::vector<int32_t> & exempt, int32_t n_ctx, const std::string & grammar,
+               const std::vector<int32_t> & exempt, const std::string & grammar,
                const std::vector<llama_logit_bias> & logit_bias, std::string * err) {
         common_params_sampling sp;
         sp.seed               = s.seed;
@@ -57,7 +54,7 @@ struct BackboneSampler {
         sp.top_k              = s.top_k;
         sp.top_p              = s.top_p;
         sp.min_p              = s.min_p;
-        sp.penalty_last_n     = s.penalty_last_n < 0 ? n_ctx : s.penalty_last_n;
+        sp.penalty_last_n     = s.penalty_last_n;
         sp.penalty_repeat     = s.penalty_repeat;
         sp.penalty_freq       = s.penalty_freq;
         sp.penalty_present    = s.penalty_present;
@@ -112,7 +109,7 @@ struct HeadSampler {
     ~HeadSampler() { if (chain) llama_sampler_free(chain); }
 
     bool build(const tts_sampling & s, const std::string & samplers, const codec_audio_lm_head_group & g,
-               uint32_t seed, int32_t n_ctx, std::string * err) {
+               uint32_t seed, std::string * err) {
         chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
         const std::string order = !samplers.empty() ? samplers
                                                     : "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature";
@@ -121,7 +118,7 @@ struct HeadSampler {
             if (n == "penalties") {
                 if (!g.penalties) continue;
                 llama_sampler_chain_add(chain, llama_sampler_init_penalties_exempt(
-                    s.penalty_last_n < 0 ? n_ctx : s.penalty_last_n, s.penalty_repeat, s.penalty_freq, s.penalty_present,
+                    s.penalty_last_n, s.penalty_repeat, s.penalty_freq, s.penalty_present,
                     g.penalty_exempt, (size_t) std::max(0, g.n_penalty_exempt)));
             } else if (n == "top_k") {
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(s.top_k));
@@ -397,7 +394,7 @@ static bool run_one(tts_runner_session * s, tts_runner_slot * sl, const tts_runn
     };
     BackboneSampler smpl;
     std::string serr;
-    if (!smpl.build(s->lmodel, sp, a.samplers, exempt, n_ctx, grammar, allowed_bias(-1), &serr)) {
+    if (!smpl.build(s->lmodel, sp, a.samplers, exempt, grammar, allowed_bias(-1), &serr)) {
         out->error = serr;
         return false;
     }
@@ -405,7 +402,7 @@ static bool run_one(tts_runner_session * s, tts_runner_slot * sl, const tts_runn
     std::vector<HeadSampler> heads((size_t) c.n_head_groups);
     for (int32_t g = 0; g < c.n_head_groups; ++g) {
         const uint32_t seed = sp.seed == CODEC_AUDIO_LM_DEFAULT_SEED ? sp.seed : sp.seed + 1u + (uint32_t) g;
-        if (!heads[(size_t) g].build(sp, a.samplers, c.head_groups[g], seed, n_ctx, &serr)) {
+        if (!heads[(size_t) g].build(sp, a.samplers, c.head_groups[g], seed, &serr)) {
             out->error = serr;
             return false;
         }

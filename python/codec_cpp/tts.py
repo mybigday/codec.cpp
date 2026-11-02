@@ -206,8 +206,6 @@ class _Sampler:
         if bad:
             self.free()
             raise ValueError(f"unknown backbone sampler {bad[0]!r}")
-        # llama.cpp's penalties clamp -1 to "off"; -1 ("the whole context") is the context size.
-        last_n = bb.n_ctx if sp["penalty_last_n"] < 0 else sp["penalty_last_n"]
         for name in order:
             if name == "penalties":
                 if head is not None and not head["penalties"]:
@@ -215,7 +213,7 @@ class _Sampler:
                 ex = list(sp["penalty_exempt"]) + list(exempt) + (list(head["penalty_exempt"]) if head else [])
                 exa = (_ffi.llama_token * max(1, len(ex)))(*ex)
                 s = self.penalties = L.llama_sampler_init_penalties_exempt(
-                    last_n, sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"], exa, len(ex))
+                    sp["penalty_last_n"], sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"], exa, len(ex))
             elif name == "dry":
                 if head is not None:
                     if sp["dry_multiplier"] != 0.0:

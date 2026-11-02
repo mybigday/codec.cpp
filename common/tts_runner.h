@@ -56,7 +56,7 @@ struct tts_sampling {
     int32_t  top_k              = 40;
     float    top_p              = 0.95f;
     float    min_p              = 0.05f;
-    int32_t  penalty_last_n     = 64;      // 0 = off, -1 = the whole context
+    int32_t  penalty_last_n     = 64;      // 0 = off (as are negatives, like llama.cpp)
     float    penalty_repeat     = 1.00f;
     float    penalty_freq       = 0.00f;
     float    penalty_present    = 0.00f;

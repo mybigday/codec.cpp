@@ -7,6 +7,11 @@ patches/sampling-meta-llamacpp.patch).  Hosts read them as llama.cpp does
 (common_init_sampler_from_model); a setting the user gives wins.  The values
 reproduce each model's reference generate(); docs/models/<model>.md lists them.
 
+A window (penalty_last_n / dry_penalty_last_n) is never -1: llama.cpp reads a
+negative window as "off".  A reference that penalizes the whole history gets
+its generation cap (max_new_tokens / max_length) rounded up, which holds every
+token it can see.
+
 Names are llama.cpp common_params_sampling's;
 "samplers" is the stage order (general.sampling.sequence).
 """
@@ -19,7 +24,7 @@ _HF = "penalties;temperature;top_k;top_p"   # HF warper order (temperature first
 
 MODEL_SAMPLING: dict[str, dict] = {
     "csm":               dict(temp=0.9, top_k=50, top_p=1.0, min_p=0.0, samplers=_HF),   # generation_config.json
-    "qwen3_tts":         dict(temp=0.9, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.05, penalty_last_n=-1,
+    "qwen3_tts":         dict(temp=0.9, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.05, penalty_last_n=4096,
                               samplers=_HF),
     "moss_ttsd":         dict(temp=0.9, top_k=50, top_p=0.95, min_p=0.0, samplers=_HF),
     "moss_tts_realtime": dict(temp=0.8, top_k=30, top_p=0.6, min_p=0.0, penalty_repeat=1.1, penalty_last_n=50,
@@ -29,17 +34,17 @@ MODEL_SAMPLING: dict[str, dict] = {
     # its AlignmentStreamAnalyzer (attention-driven EOS forcing), which this
     # runtime does not have; without it 2.0 runs to max length on half the
     # test sentences, so both variants keep 1.2.
-    "chatterbox":        dict(temp=0.8, top_k=0, top_p=1.0, min_p=0.05, penalty_repeat=1.2, penalty_last_n=-1,
+    "chatterbox":        dict(temp=0.8, top_k=0, top_p=1.0, min_p=0.05, penalty_repeat=1.2, penalty_last_n=1024,
                               samplers="penalties;temperature;min_p;top_p"),
-    "chatterbox_turbo":  dict(temp=0.8, top_k=1000, top_p=0.95, min_p=0.0, penalty_repeat=1.2, penalty_last_n=-1,
+    "chatterbox_turbo":  dict(temp=0.8, top_k=1000, top_p=0.95, min_p=0.0, penalty_repeat=1.2, penalty_last_n=1024,
                               samplers="temperature;top_k;top_p;penalties"),
     "kitten_tts2":       dict(temp=0.8, top_k=50, top_p=0.8, min_p=0.0, penalty_repeat=1.1, penalty_last_n=50,
-                              dry_multiplier=1.3, dry_base=1.5, dry_allowed_length=10, dry_penalty_last_n=-1,
+                              dry_multiplier=1.3, dry_base=1.5, dry_allowed_length=10, dry_penalty_last_n=1024,
                               samplers="dry;penalties;temperature;top_k;top_p;min_p"),
-    "soprano":           dict(temp=0.0, top_k=0, top_p=0.95, min_p=0.0, penalty_repeat=1.2, penalty_last_n=-1),
+    "soprano":           dict(temp=0.0, top_k=0, top_p=0.95, min_p=0.0, penalty_repeat=1.2, penalty_last_n=512),
     "neutts":            dict(temp=1.0, top_k=50, top_p=1.0, min_p=0.0),
     "outetts_1_0":       dict(temp=1.0, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.1, penalty_last_n=64),
-    "outetts_legacy":    dict(temp=0.1, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.1, penalty_last_n=-1),
+    "outetts_legacy":    dict(temp=0.1, top_k=50, top_p=1.0, min_p=0.0, penalty_repeat=1.1, penalty_last_n=4096),
     # RAS sampling (nucleus top-p 0.8 / top-k 25, redrawn when the pick repeats
     # in the last 10 tokens) approximated by a repetition penalty over that window.
     "cosyvoice":         dict(temp=1.0, top_k=25, top_p=0.8, min_p=0.0, penalty_repeat=1.1, penalty_last_n=10,

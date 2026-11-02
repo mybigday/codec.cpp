@@ -107,8 +107,8 @@ The reference generate()'s, as tts-cli flags:
 
 | Model | Settings |
 |---|---|
-| Chatterbox / Multilingual | `--temp 0.8 --top-k 0 --top-p 1.0 --min-p 0.05 --repeat-penalty 1.2 --repeat-last-n -1 --samplers "penalties;temperature;min_p;top_p"` |
-| Chatterbox Turbo | `--temp 0.8 --top-k 1000 --top-p 0.95 --min-p 0 --repeat-penalty 1.2 --repeat-last-n -1 --samplers "temperature;top_k;top_p;penalties"` |
+| Chatterbox / Multilingual | `--temp 0.8 --top-k 0 --top-p 1.0 --min-p 0.05 --repeat-penalty 1.2 --repeat-last-n 1024 --samplers "penalties;temperature;min_p;top_p"` |
+| Chatterbox Turbo | `--temp 0.8 --top-k 1000 --top-p 0.95 --min-p 0 --repeat-penalty 1.2 --repeat-last-n 1024 --samplers "temperature;top_k;top_p;penalties"` |
 
 The penalty history of T3 starts with the start-of-speech token (sample_t3);
 `mtl_tts.py`'s repetition_penalty 2.0 needs its AlignmentStreamAnalyzer, which

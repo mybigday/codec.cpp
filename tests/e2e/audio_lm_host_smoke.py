@@ -52,9 +52,8 @@ def make_sampler(sp: dict, allowed=(), n_vocab: int = 0, penalties: bool = True,
         arr = (lc.llama_logit_bias * len(bias))(*[lc.llama_logit_bias(int(t), v) for t, v in bias])
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_logit_bias(n_vocab, len(bias), arr))
     if penalties and (sp["penalty_repeat"] != 1.0 or sp["penalty_freq"] != 0.0 or sp["penalty_present"] != 0.0):
-        last_n = sp["penalty_last_n"] if sp["penalty_last_n"] >= 0 else 1 << 16   # -1: the whole context
         lc.llama_sampler_chain_add(chain, lc.llama_sampler_init_penalties(
-            last_n, sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"]))
+            sp["penalty_last_n"], sp["penalty_repeat"], sp["penalty_freq"], sp["penalty_present"]))
     order = [s for s in sp.get("samplers", "").split(";") if s] or ["top_k", "top_p", "min_p", "temperature"]
     for name in order:
         if name == "top_k":

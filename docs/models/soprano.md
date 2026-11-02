@@ -39,7 +39,7 @@ transformers backend:
 - recommended sampling: greedy (upstream temperature 0), top-p 0.95,
   repetition penalty 1.2 over the prompt and the generated ids
   (`--temp 0 --top-k 0 --top-p 0.95 --min-p 0 --repeat-penalty 1.2
-  --repeat-last-n -1`); sampling is masked to `[0]`..`[7999]` + `[STOP]`;
+  --repeat-last-n 512`); sampling is masked to `[0]`..`[7999]` + `[STOP]`;
 - decoder input: the hidden state at the position that predicts each
   non-`[STOP]` token (the first is the prompt's last position), frame-major
   `[n, 512]`; the decoder output, `(n-1)·2048` samples, is the whole result.
