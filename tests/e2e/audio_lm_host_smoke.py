@@ -219,6 +219,7 @@ def main() -> int:
         alm = codec_cpp.AudioLM(case["codec"], backbone_path=case["backbone"] if case.get("backbone_path") else None)
         bb = Backbone(case["backbone"], alm, max_frames=400)
         try:
+            caps = alm.caps
             req = {}
             if "ref" in case:   # a cloned voice: create, save, reload
                 wav, txt = case["ref"]
@@ -229,6 +230,8 @@ def main() -> int:
                     voice = alm.load_voice(Path(d) / "voice.gguf")
                 req["voice"] = voice
             audio, sr, frames, stop = synthesize(alm, bb, case["text"], case["sampling"], **req)
+            # Caps describe the model, not the last request's voice.
+            assert alm.caps == caps, f"caps changed after a generation: {caps} -> {alm.caps}"
         except Exception as e:
             print(f"[FAIL] {name}: {e}")
             failed += 1

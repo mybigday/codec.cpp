@@ -23,7 +23,8 @@ public:
         out->takes_ref_audio = audio_lm_codec_can_speaker_from_audio(alm_);
         out->takes_ref_text  = out->takes_ref_audio && audio_lm_talker_has_projection(alm_);
         out->takes_instruct  = meta_true("codec.lm.qwen3tts.takes_instruct");
-        out->needs_voice     = audio_lm_talker_has_projection(alm_) && !talker_voice(audio_lm_decode_speaker(alm_));
+        // The model's default voice, not the last request's (decode_speaker).
+        out->needs_voice     = audio_lm_talker_has_projection(alm_) && !talker_voice(audio_lm_resolve_speaker(alm_, nullptr));
         const char * sr = audio_lm_meta_str(alm_, "codec.sample_rate");
         out->sample_rate = sr ? std::atoi(sr) : 24000;
     }
