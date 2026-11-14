@@ -1,5 +1,6 @@
 #include "moss_audio.h"
 
+#include "../ops/audio_frontend.h"
 #include "../ops/conv1d.h"
 #include "../ops/ggml_ops.h"
 #include "../ops/lm_attn.h"
@@ -259,29 +260,19 @@ struct moss_encode_build {
     const codec_model * model    = nullptr;
 };
 
-static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
-    moss_encode_build * p = static_cast<moss_encode_build *>(user_data);
-    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->model == nullptr || p->cfg == nullptr) return false;
+// The encoder + quantizer on `x_tc` [n_in * n_channels (interleaved), 1];
+// returns codes [t, n_q] I32.
+static ggml_tensor * codec_moss_encode_from(ggml_context * ctx_eval, const moss_encode_build * p, ggml_tensor * x_tc) {
     const codec_moss_audio & cfg = *p->cfg;
     auto W = [&](const std::string & name) -> ggml_tensor * {
         return codec_graph_weight(ctx_eval, p->model, name);
     };
 
-    // Input PCM laid out as a single mono-equivalent stream.  When
-    // interleaving is on the prep step has already woven channels together,
-    // so the graph sees a length-`n_in * n_channels` flat tensor.
-    const int32_t n_total = p->n_in * (p->interleave ? p->n_channels : 1);
-    ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, n_total, 1);
-    ggml_set_name(t_pcm, codec_moss_name_pcm());
-
-    // The encoder works in TC layout (ne[0]=t, ne[1]=c=1).
-    ggml_tensor * x_tc = t_pcm;
-
     // Walk the encoder modules.
     for (int32_t mi = 0; mi < cfg.enc_n_modules; ++mi) {
         if (cfg.enc_module_type[mi] == 0) {
             x_tc = codec_moss_patch_encode(ctx_eval, x_tc, cfg.enc_patch_size[mi]);
-            if (x_tc == nullptr) return false;
+            if (x_tc == nullptr) return nullptr;
         } else {
             const std::string base = "moss.enc.b" + std::to_string(mi);
             ggml_tensor * x_ct = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_tc));
@@ -313,7 +304,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
                 cfg.enc_in_dim[mi], cfg.enc_out_dim[mi],
                 cfg.enc_d_model[mi], cfg.enc_n_heads[mi], cfg.enc_n_layers[mi],
                 win_tokens, cfg.enc_max_period[mi], n_valid_block);
-            if (x_ct == nullptr) return false;
+            if (x_ct == nullptr) return nullptr;
             x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct));
         }
     }
@@ -324,7 +315,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
                         W("moss.q.input_proj.w"),
                         W("moss.q.input_proj.b"),
                         /*stride=*/1, /*dilation=*/1, /*padding=*/0);
-    if (x_tc == nullptr) return false;
+    if (x_tc == nullptr) return nullptr;
 
     const int32_t cb_dim = p->cb_dim;
     // Residual LFQ: each level
@@ -335,7 +326,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
     //   residual -= z_q_e
     ggml_tensor * residual = x_tc;
     ggml_tensor * codes_per_level[64] = { nullptr };
-    if (p->n_q > 64) return false;
+    if (p->n_q > 64) return nullptr;
     for (int32_t qi = 0; qi < p->n_q; ++qi) {
         const std::string base = "moss.q." + std::to_string(qi);
 
@@ -344,7 +335,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
                                          W(base + ".in_proj.w"),
                                          W(base + ".in_proj.b"),
                                          1, 1, 0);
-        if (z_e == nullptr) return false;
+        if (z_e == nullptr) return nullptr;
 
         // L2-normalize per t-step (shared helper), then move to CT for the
         // upcoming mul_mat against the codebook.
@@ -354,7 +345,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
         // Cosine sims: (cb_size, cb_dim) @ (cb_dim, t) → (cb_size, t).  Use
         // mul_mat which contracts ne[0]=cb_dim.
         ggml_tensor * cb_norm = W(base + ".codebook_norm");
-        if (cb_norm == nullptr) return false;
+        if (cb_norm == nullptr) return nullptr;
         cb_norm = codec_graph_stored_weight(ctx_eval, cb_norm);                      // search at the stored type
         ggml_tensor * sims = ggml_mul_mat(ctx_eval, cb_norm, z_n_ct);                // [cb_size, t]
         ggml_tensor * idx = ggml_argmax(ctx_eval, sims);                              // ne=(t,) i32
@@ -362,14 +353,14 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
 
         // Reconstruction: gather codebook (raw, not normalised) + out_proj.
         ggml_tensor * cb = W(base + ".codebook");
-        if (cb == nullptr) return false;
+        if (cb == nullptr) return nullptr;
         ggml_tensor * z_q_ct = ggml_get_rows(ctx_eval, codec_graph_stored_weight(ctx_eval, cb), idx);                      // [cb_dim, t]
         ggml_tensor * z_q_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, z_q_ct));
         ggml_tensor * z_q_proj = codec_conv1d(ctx_eval, z_q_tc,
                                               W(base + ".out_proj.w"),
                                               W(base + ".out_proj.b"),
                                               1, 1, 0);
-        if (z_q_proj == nullptr) return false;
+        if (z_q_proj == nullptr) return nullptr;
         residual = ggml_sub(ctx_eval, residual, z_q_proj);
         (void) cb_dim;
     }
@@ -381,10 +372,141 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
         ggml_tensor * idx_2d = ggml_reshape_2d(ctx_eval, codes_per_level[qi], (int) codes_per_level[qi]->ne[0], 1);
         codes_2d = (codes_2d == nullptr) ? idx_2d : ggml_concat(ctx_eval, codes_2d, idx_2d, /*dim=*/1);
     }
-    codes_2d = ggml_cont(ctx_eval, codes_2d);
-    ggml_set_name(codes_2d, codec_moss_name_codes());
-    *out = codes_2d;
+    return ggml_cont(ctx_eval, codes_2d);
+}
+
+static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
+    moss_encode_build * p = static_cast<moss_encode_build *>(user_data);
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->model == nullptr || p->cfg == nullptr) return false;
+    // Input PCM laid out as a single mono-equivalent stream.  When
+    // interleaving is on the prep step has already woven channels together,
+    // so the graph sees a length-`n_in * n_channels` flat tensor (TC layout,
+    // ne[0]=t, ne[1]=c=1).
+    const int32_t n_total = p->n_in * (p->interleave ? p->n_channels : 1);
+    ggml_tensor * t_pcm = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, n_total, 1);
+    ggml_set_name(t_pcm, codec_moss_name_pcm());
+    ggml_tensor * codes = codec_moss_encode_from(ctx_eval, p, t_pcm);
+    if (codes == nullptr) return false;
+    ggml_set_name(codes, codec_moss_name_codes());
+    *out = codes;
     return true;
+}
+
+// =====================================================================
+// Speaker (reference codes) graph — MOSS-TTS-Nano voice clone
+// =====================================================================
+//
+// modeling_moss_tts_nano.py `_load_reference_audio` + `_call_audio_encode`:
+// the clip resampled to the codec rate (torchaudio sinc_interp_hann), mono
+// copied to every channel, encoded whole; `floor(n / hop)` frames are kept
+// (the reference's code length).  One graph: resample → channel interleave →
+// zero pad to the hop → encoder + quantizer.
+
+struct moss_speaker_build {
+    int32_t n_samples   = 0;   // reference PCM (mono, any rate)
+    int32_t sample_rate = 0;
+    int32_t n_rs        = 0;   // samples at the codec rate
+    moss_encode_build enc;
+};
+
+static bool codec_moss_build_speaker(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
+    auto * p = static_cast<moss_speaker_build *>(user_data);
+    if (ctx_eval == nullptr || p == nullptr || out == nullptr || p->enc.model == nullptr || p->enc.cfg == nullptr) {
+        return false;
+    }
+    const codec_moss_audio & cfg = *p->enc.cfg;
+    ggml_tensor * pcm = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_F32, p->n_samples);
+    ggml_set_name(pcm, "moss.spk.pcm");
+    ggml_tensor * wav = codec_op_resample_sinc_hann(ctx_eval, pcm, p->sample_rate, cfg.sample_rate);
+    if (wav == nullptr || ggml_nelements(wav) != p->n_rs) return false;
+    const int32_t n_ch = p->enc.interleave ? p->enc.n_channels : 1;
+    ggml_tensor * x = ggml_reshape_2d(ctx_eval, ggml_cont(ctx_eval, wav), 1, p->n_rs);   // [1, t]
+    ggml_tensor * xi = x;
+    for (int32_t c = 1; c < n_ch; ++c) xi = ggml_concat(ctx_eval, xi, x, 0);             // [ch, t]: s0c0 s0c1 …
+    xi = ggml_reshape_1d(ctx_eval, ggml_cont(ctx_eval, xi), (int64_t) n_ch * p->n_rs);
+    const int64_t pad = (int64_t) n_ch * (p->enc.n_in - p->n_rs);
+    if (pad > 0) xi = ggml_pad(ctx_eval, xi, (int) pad, 0, 0, 0);                        // trailing zeros
+    ggml_tensor * codes = codec_moss_encode_from(ctx_eval, &p->enc, ggml_reshape_2d(ctx_eval, xi, ggml_nelements(xi), 1));
+    if (codes == nullptr) return false;
+    ggml_set_name(codes, "moss.spk.ref_codes");
+    *out = codes;
+    return true;
+}
+
+static enum codec_status codec_moss_speaker_from_audio(
+        codec_context * ctx, const std::vector<float> & pcm, int32_t sample_rate, codec_speaker * out) {
+    const codec_moss_audio & cfg = *static_cast<const codec_moss_audio *>(ctx->model->impl);
+    if (pcm.empty() || sample_rate <= 0 || pcm.size() > (size_t) INT32_MAX) {
+        codec_context_set_error(ctx, "invalid reference audio");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    moss_speaker_build b;
+    b.n_samples   = (int32_t) pcm.size();
+    b.sample_rate = sample_rate;
+    b.n_rs        = (int32_t) codec_resample_out_len((int64_t) pcm.size(), sample_rate, cfg.sample_rate);
+    const int32_t hop = std::max(1, cfg.hop_size);
+    const int32_t n_keep = b.n_rs / hop;
+    if (n_keep < 1) {
+        codec_context_set_error(ctx, "reference audio shorter than one MOSS-Audio frame");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    const int32_t n_in = ((b.n_rs + hop - 1) / hop) * hop;
+    b.enc.n_in       = n_in;
+    b.enc.n_in_valid = b.n_rs;
+    b.enc.n_channels = cfg.number_channels;
+    b.enc.interleave = cfg.channel_interleave;
+    b.enc.latent_dim = cfg.latent_dim;
+    b.enc.rvq_dim    = cfg.rvq_dim;
+    b.enc.cb_dim     = cfg.codebook_dim;
+    b.enc.n_q        = cfg.n_q;
+    b.enc.n_codes    = n_in / hop;
+    b.enc.cfg        = &cfg;
+    b.enc.model      = ctx->model;
+
+    codec_graph_eval_guard guard(ctx);
+    std::string err;
+    codec_graph_cache_entry * entry = nullptr;
+    if (!codec_graph_cache_get_or_build(ctx, {CODEC_GRAPH_MOSS_AUDIO_SPEAKER, b.n_samples, cfg.n_q, sample_rate, 0, 0},
+                                        codec_moss_build_speaker, &b, sizeof(b), &entry, &err)) {
+        codec_context_set_error(ctx, "speaker graph: " + err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    ggml_tensor * t_pcm = codec_graph_get_tensor(ctx, entry, "moss.spk.pcm");
+    ggml_tensor * t_codes = codec_graph_get_tensor(ctx, entry, "moss.spk.ref_codes");
+    std::vector<int32_t> codes_tq;
+    if (t_pcm == nullptr || t_codes == nullptr ||
+        !codec_graph_prepare_io(ctx, entry, &err) ||
+        !codec_runtime_write_tensor(t_pcm, pcm.data(), pcm.size() * sizeof(float), &err) ||
+        !codec_graph_compute(ctx, entry, ctx->n_threads, &err) ||
+        !codec_runtime_read_tensor_i32_2d_tq(t_codes, &codes_tq, &err)) {
+        codec_context_set_error(ctx, "speaker graph: " + (err.empty() ? std::string("invalid IO") : err));
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    const int64_t n_t = t_codes->ne[0], n_q = t_codes->ne[1];
+    if (n_q != cfg.n_q || n_t < n_keep) {
+        codec_context_set_error(ctx, "speaker graph: unexpected code shape");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    // ref_codes I32 [n_q, T] (ne[0] = n_q): frame t's codes are contiguous.
+    std::vector<int32_t> ref((size_t) n_keep * (size_t) n_q);
+    for (int32_t t = 0; t < n_keep; ++t) {
+        for (int64_t q = 0; q < n_q; ++q) ref[(size_t) (t * n_q + q)] = codes_tq[(size_t) (t * n_q + q)];
+    }
+    const int64_t ne[2] = {n_q, n_keep};
+    codec_speaker_add_slot(out, "ref_codes", GGML_TYPE_I32, ne, 2, ref.data());
+    return CODEC_STATUS_SUCCESS;
+}
+
+// A MOSS-TTS-Nano voice: `ref_codes` I32 [n_q, T], the reference clip's codes,
+// which the LM prompt embeds (it conditions no decoder).
+static bool codec_moss_speaker_validate(const codec_model * model, const codec_speaker * spk, std::string * err) {
+    const codec_moss_audio & cfg = *static_cast<const codec_moss_audio *>(model->impl);
+    const codec_speaker_slot * rc = spk->slot("ref_codes");
+    bool ok = rc != nullptr && rc->type == GGML_TYPE_I32 && rc->ne[0] == cfg.n_q && rc->ne[1] >= 1 && rc->ne[2] == 1;
+    const auto * v = ok ? reinterpret_cast<const int32_t *>(rc->data.data()) : nullptr;
+    for (int64_t i = 0; ok && i < rc->nelements(); ++i) ok = v[i] >= 0 && v[i] < cfg.codebook_size;
+    if (!ok) *err = "MOSS-Audio speaker needs an I32 [" + std::to_string(cfg.n_q) + ", T] ref_codes slot";
+    return ok;
 }
 
 // =====================================================================
@@ -815,6 +937,9 @@ enum codec_status codec_moss_audio_init(struct codec_model * model) {
     model->codebook_size      = cfg.codebook_size;
     model->latent_dim         = cfg.latent_dim;
     model->expected_channels  = cfg.number_channels;
+    // Voices (reference codes) only for GGUFs converted for MOSS-TTS-Nano.
+    model->can_speaker_from_audio = cfg.has_encoder &&
+        !codec_read_str_kv(model->gguf, "moss_audio_tokenizer.spk.encoder_hash", "").empty();
     return CODEC_STATUS_SUCCESS;
 }
 
@@ -848,6 +973,9 @@ const struct codec_model_vtable * codec_moss_audio_vtable() {
         codec_graph_size_exact,
         codec_moss_encode_wrap,
         codec_moss_decode_wrap,
+        nullptr,
+        codec_moss_speaker_validate,
+        codec_moss_speaker_from_audio,
     };
     return &vtable;
 }
