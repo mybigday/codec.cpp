@@ -193,10 +193,22 @@ does not report the end token.
 
 `codec_audio_lm_decode` returns the generation's audio. For streaming, call
 `codec_audio_lm_stream_poll(alm, chunk_ms, &pcm)` after each `frame_done` step: it
-returns the audio that became final since the last call. Each window is
-re-decoded from the first frame (causal decoders need the whole left context),
-the right edge the decoder may still revise is held back (0.32 s), and the
-joins are crossfaded (20 ms). `codec_audio_lm_stream_finish` returns the rest.
+returns the audio that became final since the last call.
+`codec_audio_lm_stream_finish` returns the rest. Two paths:
+
+- **Exact incremental decode** for codecs whose decoder is strictly causal
+  (no lookahead anywhere; today the Qwen3-TTS-Tokenizer-12Hz). The codec keeps
+  the decoder's state between polls (each conv's left context, each
+  ConvTranspose's previous input frame, the sliding-window attention's K/V and
+  positions; `src/codec_stream.h`, internal), so a poll decodes only its new
+  frames in whole `chunk_ms` pieces and the pieces join exactly: no holdback,
+  no cross-fade, total cost about one batch decode. An ICL reference voice is
+  fed to the decoder first, and the state after it is cached per voice: later
+  runs (and batch decodes) start from it instead of decoding the reference
+  again.
+- **Otherwise** each window is re-decoded from the first frame (causal decoders
+  need the whole left context), the right edge the decoder may still revise is
+  held back (0.32 s), and the joins are crossfaded (20 ms).
 `decodable_frames` says how many frames are decodable so far.
 
 To decode later (out of order, several generations on, more than once),
