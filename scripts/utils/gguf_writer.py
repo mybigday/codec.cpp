@@ -12,6 +12,7 @@ from typing import List, Tuple, Union, Dict, Any
 
 # GGUF constants
 MAX_TENSOR_NAME = 63
+KV_UINT8 = 0
 KV_UINT32 = 4
 KV_INT32 = 5
 KV_FLOAT32 = 6
@@ -119,6 +120,10 @@ class GGUFWriter:
                 payload = [int(x) for x in arr.tolist()]
         self.kv.append((key, KV_ARRAY, (elem_type, payload)))
         
+    def add_uint8_array(self, key: str, data: bytes):
+        """Add a byte-array metadata value (GGUF UINT8 array), e.g. a binary blob."""
+        self.kv.append((key, KV_ARRAY, (KV_UINT8, bytes(data))))
+
     def add_tensor(self, name: str, arr: np.ndarray, st_dtype: str = None):
         """
         Add a tensor to the GGUF file.
@@ -275,7 +280,9 @@ class GGUFWriter:
             elem_type, payload = v
             out += _i32(int(elem_type))
             out += _u64(len(payload))
-            if elem_type == KV_UINT32:
+            if elem_type == KV_UINT8:
+                out += bytes(payload)
+            elif elem_type == KV_UINT32:
                 for item in payload:
                     out += _u32(int(item))
             elif elem_type == KV_INT32:

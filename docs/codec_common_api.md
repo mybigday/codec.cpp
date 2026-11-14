@@ -113,6 +113,7 @@ format only applies the model's deterministic normalization.
 | CSM, MOSS-TTSD | `[<__voice__>]{prefix}{text}{suffix}` (MOSS-TTSD: `[S1]` → `<speaker1>`) |
 | Qwen3-TTS | `[<\|im_start\|>user\n{instruct}<\|im_end\|>\n]<\|im_start\|>assistant\n<__voice__>[{reference transcript}]<__codec:text__>{text}` |
 | MOSS-TTS-Realtime | `{the GGUF's context}<__codec:text__>{text}` |
+| MOSS-TTS-Nano | `<__codec:user_prefix__><__codec:audio_start__><__voice__><__codec:audio_end__><__codec:after_reference__><__codec:text__>{nmt_nfkc text}<__codec:assistant_prefix__><__codec:audio_start__>` (no voice: `<__codec:no_reference__>` for the reference section; template spans are baked token ids) |
 | Chatterbox | `<__voice__>{punc_norm'd text}` (T3: ' ' as `[SPACE]`) |
 | CosyVoice | `<__codec:sos__>[<__voice__> (v1 x-vector)]{prompt text}<__codec:text__>{text}<__codec:task__>[<__voice__> (zero-shot reference tokens)]` |
 
@@ -251,6 +252,7 @@ A family that needs something else entirely can still override both.
 |---|---|---|---|
 | `codebook` | CSM, Qwen3-TTS, MOSS-TTSD | CODEC_HEAD | depth decoder or delayed parallel heads; MOSS-TTSD samples codebook 0 from the backbone under a grammar |
 | `realtime` | MOSS-TTS-Realtime | CODEC_HEAD | text lane from the backbone's embedding table (`params.backbone_path`) |
+| `moss_tts_nano` | MOSS-TTS-Nano | CODEC_HEAD | starcoder2 backbone; reference codes as voice rows; the depth decoder's text slot (continue / audio end, sampled by the host; requires top_p 1.0) stops it |
 | `lfm2` | LFM2-Audio | CODEC_HEAD | text warm-up from the tied embedding head (`verdict.token`), then audio frames |
 | `chatterbox` | Chatterbox T3, Turbo, Multilingual | CODEC_HEAD | guidance pair (`n_seq` 2) for T3 |
 | `cosyvoice` | CosyVoice 1/2/3, BreezyVoice | CODEC_HEAD | SFT / zero-shot / cross-lingual / instruct modes; v1 disables flash attention |

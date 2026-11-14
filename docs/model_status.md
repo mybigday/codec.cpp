@@ -44,7 +44,7 @@
 | OuteTTS-1.0 (0.6B / Llama-1B) | 🟡 | Builtin voices in a per-model codec GGUF, no voice clone; see [models/outetts.md](models/outetts.md) |
 | OuteTTS-0.2 / 0.3 | 🟡 | Same; text reduced to a-z words (numbers / romanization are the caller's job) |
 | Pocket-TTS | 🟡 | Needs a voice (reference audio / speaker file); a few seeds drop words, as in the reference; see [models/pocket_tts.md](models/pocket_tts.md) |
-| MOSS-TTS-Nano-100M | 🟡 | AR loop runs in HF; codec.cpp decode only |
+| MOSS-TTS-Nano-100M | 🟡 | Voice clone (`--ref-audio`) or no voice; sampled output varies a lot by seed (clipped or repeated phrases), as in the reference; see [models/moss_tts_nano.md](models/moss_tts_nano.md) |
 | Soprano | 🟡 | Text normalization + sentence splitting not ported (pass normalized sentences); see [models/soprano.md](models/soprano.md) |
 
 Moshi is out of scope for `synthesize` (full-duplex, no Helium arch in llama.cpp); tts-cli refuses it.

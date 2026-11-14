@@ -49,9 +49,6 @@ def dump_lm_into(writer, lm_source, *, verbose: bool = False) -> None:
         moss_tts_local.dump(writer, sd, cfg, verbose=verbose)
         return
     if arch == "MossTTSNanoForCausalLM":
-        # Stub: GGUF emission is shaped, but the GPT-2 depth-block
-        # runtime (LayerNorm + GELU + fused c_attn split + abs wpe) is
-        # still pending — the dump() will raise until that lands.
         from . import moss_tts_local
         moss_tts_local.dump(writer, sd, cfg, verbose=verbose)
         return
@@ -114,6 +111,7 @@ def _load_lm_source(lm_source, *, verbose: bool = False) -> Tuple[Dict[str, np.n
             pass
 
     sd = _load_state_dict(local)
+    cfg["_source_dir"] = str(local if local.is_dir() else local.parent)
     if verbose:
         print(f"[lm_adaptor] loaded {len(sd)} tensors from {local}")
     return sd, cfg
@@ -216,6 +214,12 @@ def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
             return sd
         if single.is_file():
             return _shard_to_numpy(single)
+        bin_path = path / "pytorch_model.bin"   # MOSS-TTS-Nano
+        if bin_path.is_file():
+            out: Dict[str, np.ndarray] = {}
+            for k, v in torch.load(str(bin_path), map_location="cpu", weights_only=True).items():
+                out[k] = (v.to(torch.float32) if v.dtype == torch.bfloat16 else v).detach().cpu().numpy()
+            return out
 
     raise FileNotFoundError(
         f"could not find safetensors at {path}; expected model.safetensors "

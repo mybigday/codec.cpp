@@ -9,6 +9,9 @@
 
 namespace codec_common {
 
+// Declared here, not in audio_lm_family.h (a header hosts include): the only caller is the dispatch below.
+std::unique_ptr<alm_family> alm_family_moss_nano(audio_lm_context * alm, struct codec_lm * lm);
+
 // ── alm_vocab ────────────────────────────────────────────────────────
 
 std::vector<int32_t> alm_vocab::tokenize(const std::string & text, bool add_special, bool parse_special) const {
@@ -246,6 +249,7 @@ static std::unique_ptr<alm_family> make_family(audio_lm_context * alm, std::stri
         if (codec_lm_flow_get_info(lm) != nullptr) return alm_family_flow(alm, lm);
         if (codec_lm_chatterbox_get_info(lm) != nullptr) return alm_family_chatterbox(alm, lm);
         if (codec_lm_cosyvoice_get_info(lm) != nullptr) return alm_family_cosyvoice(alm, lm);
+        if (codec_lm_moss_nano_get_info(lm) != nullptr) return alm_family_moss_nano(alm, lm);
         audio_lm_prompt_info pi;
         if (codec_lm_chatterbox_get_info(lm) == nullptr && codec_lm_cosyvoice_get_info(lm) == nullptr &&
             audio_lm_get_prompt_info(alm, &pi)) {

@@ -254,6 +254,11 @@ static void init_decode_transform(audio_lm_context * ctx) {
         const char * c0mod = meta_str(ctx, "codec.lm.residual.c0_input_modality");
         ctx->audio_cb_offset = (c0mod && std::strcmp(c0mod, "text") == 0) ? 1 : 0;
     }
+    // Explicit count of leading text codebooks (MOSS-TTS-Nano's text slot,
+    // emitted by the depth decoder itself).
+    if (const char * v = meta_str(ctx, "codec.lm.audio_cb_offset")) {
+        ctx->audio_cb_offset = std::atoi(v);
+    }
 
     // MOSS-TTSD merged-cb0 remap: subtract speech_token_range[0] from cb0
     // codes to map the merged text+speech vocab back into raw quantizer

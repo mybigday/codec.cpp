@@ -30,6 +30,12 @@ MODEL_SAMPLING: dict[str, dict] = {
     "moss_tts_realtime": dict(temp=0.8, top_k=30, top_p=0.6, min_p=0.0, penalty_repeat=1.1, penalty_last_n=50,
                               samplers=_HF),
     "lfm2_audio":        dict(temp=0.0, top_k=0, top_p=1.0, min_p=0.0),
+    # modeling_moss_tts_nano.py inference(do_sample=True): audio_temperature 1.7 /
+    # top_k 25 for the codebooks.  top_p is 1.0, not the reference's audio_top_p
+    # 0.8: the text slot (the stop decision, temperature 1.5 / top_p 1.0) is
+    # sampled by the same host chain, and top_p < 1 would cut the end token
+    # (required setting, docs/models/moss_tts_nano.md).
+    "moss_tts_nano":     dict(temp=1.7, top_k=25, top_p=1.0, min_p=0.0, samplers="temperature;top_k;top_p"),
     # tts.py::generate.  mtl_tts.py uses repetition_penalty 2.0, but only with
     # its AlignmentStreamAnalyzer (attention-driven EOS forcing), which this
     # runtime does not have; without it 2.0 runs to max length on half the

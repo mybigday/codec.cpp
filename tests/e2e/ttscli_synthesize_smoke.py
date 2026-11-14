@@ -408,6 +408,21 @@ def main():
         greedy=False, stop_line="pocket AR done",
     ))
 
+    # MOSS-TTS-Nano-100M: GPT-2 + RoPE global transformer as stock starcoder2,
+    # a 1-layer GPT-2 depth decoder (codec_lm residual_depth_ar, gpt2 block)
+    # for the text slot + 16 RVQ codes, MOSS-Audio-Tokenizer-Nano at 48 kHz.
+    # Voice clone from the reference clip's codes; the text slot's audio end
+    # stops it.  Sampled (the reference's settings); seed pinned.
+    results.append(_case(
+        "moss_tts_nano",
+        REPO / "models" / "moss_tts_nano" / "moss_tts_nano_codec.gguf",
+        REPO / "models" / "moss_tts_nano" / "backbone-bf16.gguf",
+        "The birch canoe slid on the smooth planks.",
+        "en", want_stop="audio_end", cer_max=0.35,
+        extra=["--seed", "3", "--ref-audio", str(REPO / "assets" / "refs" / "jfk_en.wav")],
+        greedy=False,
+    ))
+
     # Soprano: Qwen3 backbone (tokenizer.ggml.pre = soprano) whose final-norm
     # hidden states feed the Vocos decoder directly; greedy, stops on [STOP].
     results.append(_case(
