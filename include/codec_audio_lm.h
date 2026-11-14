@@ -165,8 +165,7 @@ struct codec_audio_lm_vocab {
 // embeddings (pooling none) / flash_attn_type.
 struct codec_audio_lm_backbone_req {
     int32_t n_ctx;           // minimum context length
-    int32_t n_ubatch;        // physical batch the prompt needs in one piece (0 = no requirement: the host
-                             // picks; codec_common::tts_runner uses 512 as llama.cpp does)
+    int32_t n_ubatch;        // physical batch (0 = n_ctx)
     int32_t n_seq_max;       // sequences decoded side by side (2: guidance pair)
     bool    embeddings;      // the context returns hidden states (no pooling)
     bool    flash_attn;      // false: the model needs flash attention disabled

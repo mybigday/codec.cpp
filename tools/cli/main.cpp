@@ -135,7 +135,7 @@ void print_usage(const char * prog) {
         "  synthesize --model CODEC.gguf [--backbone LLAMA.gguf] --text STRING\n"
         "             --output PATH.wav [--ref-audio PATH.wav] [--ref-text STR]\n"
         "             [--voice NAME] [--speaker-file PATH.gguf] [--save-speaker PATH.gguf]\n"
-        "             [--instruct STR] [--max-frames N] [--ubatch N] [--min-len N] [--segment-bytes N]\n"
+        "             [--instruct STR] [--max-frames N] [--min-len N] [--segment-bytes N]\n"
         "             [--seed N] [--temp F] [--top-k N] [--top-p F] [--min-p F]\n"
         "             [--repeat-last-n N] [--repeat-penalty F] [--presence-penalty F]\n"
         "             [--frequency-penalty F] [--dry-multiplier F] [--dry-base F]\n"
@@ -230,7 +230,6 @@ struct args {
     int32_t  n_threads = 0;
     bool     use_gpu   = false;
     int32_t  max_frames = 0;
-    int32_t  n_ubatch   = 0;
     int32_t  segment_bytes = 0;
     int32_t  min_len   = -1;
 
@@ -276,7 +275,6 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--n-threads")  { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_threads)) return false; i++; }
         else if (a == "--gpu")        { out->use_gpu = true; }
         else if (a == "--max-frames") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->max_frames)) return false; i++; }
-        else if (a == "--ubatch") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->n_ubatch)) return false; i++; }
         else if (a == "--segment-bytes") { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->segment_bytes)) return false; i++; }
         else if (a == "--seed")       { const char * v = need(); if (!v) return false; int32_t s; if (!parse_i32(v, &s)) return false; out->sampling.seed = (uint32_t) s; i++; }
         else if (a == "--min-len")    { const char * v = need(); if (!v) return false; if (!parse_i32(v, &out->min_len)) return false; i++; }
@@ -395,7 +393,6 @@ codec_common::tts_runner_params make_runner_params(const args & a) {
     rp.n_threads     = a.n_threads;
     rp.use_gpu       = a.use_gpu;
     rp.max_frames    = a.max_frames;
-    rp.n_ubatch      = a.n_ubatch;
     rp.min_frames    = a.min_len;
     rp.segment_bytes = a.segment_bytes;
     rp.sampling          = a.sampling;

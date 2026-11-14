@@ -566,11 +566,7 @@ tts_runner_session * tts_runner_load(const tts_runner_params & a, std::string * 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx        = (uint32_t) req.n_ctx;
     cp.n_batch      = cp.n_ctx;
-    // A model that needs its prompt in one physical batch says so (req.n_ubatch); otherwise llama.cpp splits the
-    // batch, and a micro-batch of the whole context would only reserve a compute buffer that size (2.5 GB for
-    // Qwen3-TTS 0.6B at n_ctx 4096, 0.3 GB at 512).
-    const uint32_t ub = a.n_ubatch > 0 ? (uint32_t) a.n_ubatch : TTS_RUNNER_DEFAULT_UBATCH;
-    cp.n_ubatch     = req.n_ubatch > 0 ? (uint32_t) req.n_ubatch : std::min(cp.n_ctx, ub);
+    cp.n_ubatch     = req.n_ubatch > 0 ? (uint32_t) req.n_ubatch : cp.n_ctx;
     cp.n_seq_max    = (uint32_t) std::max(1, req.n_seq_max);
     cp.embeddings   = req.embeddings;
     cp.pooling_type = LLAMA_POOLING_TYPE_NONE;

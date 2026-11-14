@@ -25,8 +25,6 @@
 
 namespace codec_common {
 
-constexpr int32_t TTS_RUNNER_DEFAULT_UBATCH = 512;
-
 // ─────────────────────────────────────────────────────────────────────
 // Params — everything the reference loop needs.  Sampling is llama.cpp's
 // (its defaults; the model card recommends values); decoder graph settings
@@ -97,9 +95,6 @@ struct tts_runner_params {
     bool     use_gpu   = false;
     int32_t  n_parallel = 1;         // tts_runner_load: requests a session runs at once
     int32_t  max_frames = 0;         // 0 → per-model default
-    // Backbone micro-batch when the model sets no requirement (codec_audio_lm_backbone_req::n_ubatch == 0):
-    // 0 → TTS_RUNNER_DEFAULT_UBATCH (llama.cpp's default); a model's own requirement always wins.
-    int32_t  n_ubatch = 0;
     int32_t  min_frames = -1;        // -1 → the model's own minimum
 
     // llama.cpp sampling (common_params_sampling defaults).  Segment i of a
