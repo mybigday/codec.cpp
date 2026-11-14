@@ -205,6 +205,12 @@ public:
     // speaker, without touching the current one.  Default: codec_decode of
     // the codes, or the codec's latent decode of the frame-major latents.
     virtual bool decode_generation(const alm_generation & g, audio_lm_audio_output * out);
+    // Codes the decoder must run through before this generation's own (codec codes, n_frames x width): an ICL
+    // reference whose audio is cut. Streaming feeds them to the incremental decoder first. Default: none.
+    virtual bool stream_prefix(std::vector<int32_t> * codes, int32_t * n_frames, int32_t width) {
+        (void) codes; (void) n_frames; (void) width;
+        return false;
+    }
     bool decode(audio_lm_audio_output * out) {
         alm_generation g;
         return generation(&g) && decode_generation(g, out);

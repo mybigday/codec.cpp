@@ -19,24 +19,40 @@ using namespace codec_common;
 
 namespace {
 
-// Frame-level streaming over the current generation: re-decodes [0, avail)
-// once enough new frames exist (causal decoders need the whole left
-// context), holds back the right edge the decoder may still revise, and
-// cross-fades the joins.
+// Frame-level streaming over the current generation.
+//  * Strictly causal codecs (audio_lm_stream_open): an incremental decoder
+//    keeps the decoder's state, so each poll decodes only the new frames and
+//    the pieces join exactly (no holdback, no cross-fade); an ICL reference is
+//    fed to it first (its state is cached per voice).
+//  * Otherwise: re-decodes [0, avail) once enough new frames exist (causal
+//    decoders need the whole left context), holds back the right edge the
+//    decoder may still revise, and cross-fades the joins.
 class alm_streamer {
 public:
-    explicit alm_streamer(audio_lm_context * alm) : alm_(alm) {}
+    alm_streamer(audio_lm_context * alm, alm_family * family) : alm_(alm), family_(family) {}
+    ~alm_streamer() { audio_lm_stream_close(st_); }
 
     // New final audio since the last call (possibly none).
     bool poll(int32_t chunk_ms, std::vector<float> * piece, int32_t * sr, int32_t * nch) {
         chunk_ms_ = chunk_ms;
         const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (open() && exact_) {
+            if (chunk_ == 0) {
+                const int32_t hop = audio_lm_codec_hop(alm_);
+                const int32_t rate = audio_lm_codec_sample_rate(alm_);
+                if (hop <= 0 || rate <= 0) return fail("streaming: the codec reports no hop size");
+                chunk_ = std::max(1, (int32_t) std::lround(chunk_ms_ * (double) rate / hop / 1000.0));
+            }
+            const int32_t n = (avail - committed_) / chunk_ * chunk_;  // whole chunks: few graph shapes
+            return (n <= 0 || exact_window(committed_ + n, piece)) && out(piece, sr, nch);
+        }
         if (spf_ == 0 ? avail < k_probe_frames : avail < committed_ + chunk_ + right_) return out(piece, sr, nch);
         return window(avail, false, piece) && out(piece, sr, nch);
     }
 
     bool finish(std::vector<float> * piece, int32_t * sr, int32_t * nch) {
         const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (open() && exact_) return (avail <= committed_ || exact_window(avail, piece)) && out(piece, sr, nch);
         if (avail > committed_ && !window(avail, true, piece)) return false;
         return out(piece, sr, nch);
     }
@@ -97,7 +113,35 @@ private:
 
     bool fail(const std::string & e) { error_ = e; return false; }
 
+    // Picks the path once, at the first poll of a generation.
+    bool open() {
+        if (opened_) return true;
+        opened_ = true;
+        std::vector<int32_t> prefix;
+        int32_t n_prefix = 0;
+        const int32_t width = audio_lm_n_codebooks(alm_);
+        if (family_ == nullptr || !family_->stream_prefix(&prefix, &n_prefix, width)) n_prefix = 0;
+        st_ = audio_lm_stream_open(alm_, n_prefix > 0 ? prefix.data() : nullptr, n_prefix, width);
+        exact_ = st_ != nullptr;
+        return true;
+    }
+
+    bool exact_window(int32_t end, std::vector<float> * piece) {
+        audio_lm_audio_output w;
+        if (!audio_lm_stream_decode_range(alm_, st_, committed_, end, &w)) {
+            return fail(std::string("streaming decode failed: ") + audio_lm_last_error(alm_));
+        }
+        sr_ = w.sample_rate;
+        nch_ = std::max(1, w.n_channels);
+        *piece = std::move(w.pcm);
+        committed_ = end;
+        return true;
+    }
+
     audio_lm_context * alm_;
+    alm_family * family_ = nullptr;
+    codec_decode_stream * st_ = nullptr;
+    bool opened_ = false, exact_ = false;
     int32_t chunk_ms_ = 0;
     int32_t spf_ = 0, sr_ = 0, nch_ = 1;
     int32_t chunk_ = 0, right_ = 0, xfade_ = 0;
@@ -135,6 +179,7 @@ struct codec_audio_lm {
     alm_generation                      exported;   // codec_audio_lm_get_generation
 
     ~codec_audio_lm() {
+        streamer.reset();   // its incremental decoder lives on alm's codec context
         family.reset();
         if (alm && owns_alm) audio_lm_free(alm);
     }
@@ -521,7 +566,7 @@ bool codec_audio_lm_decode_generation(struct codec_audio_lm * ctx, const struct 
 
 bool codec_audio_lm_stream_poll(struct codec_audio_lm * ctx, int32_t chunk_ms, struct codec_pcm_buffer * out) {
     if (ctx == nullptr || out == nullptr) return false;
-    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm);
+    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm, ctx->family.get());
     std::vector<float> piece;
     int32_t sr = 0, nch = 1;
     if (!ctx->streamer->poll(chunk_ms, &piece, &sr, &nch)) return ctx->fail(ctx->streamer->error());
@@ -530,7 +575,7 @@ bool codec_audio_lm_stream_poll(struct codec_audio_lm * ctx, int32_t chunk_ms, s
 
 bool codec_audio_lm_stream_finish(struct codec_audio_lm * ctx, struct codec_pcm_buffer * out) {
     if (ctx == nullptr || out == nullptr) return false;
-    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm);
+    if (!ctx->streamer) ctx->streamer = std::make_unique<alm_streamer>(ctx->alm, ctx->family.get());
     std::vector<float> piece;
     int32_t sr = 0, nch = 1;
     if (!ctx->streamer->finish(&piece, &sr, &nch)) return ctx->fail(ctx->streamer->error());

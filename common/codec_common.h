@@ -23,6 +23,8 @@
 // host's translation unit can include both <llama.h> and this header.
 using codec_common_token = int32_t;
 
+struct codec_decode_stream;  // src/codec_stream.h (internal incremental decode)
+
 namespace codec_common {
 
 // ─────────────────────────────────────────────────────────────────────
@@ -421,9 +423,28 @@ bool audio_lm_decode_audio(audio_lm_context * ctx, audio_lm_audio_output * out);
 bool    audio_lm_decode_audio_range(audio_lm_context * ctx, int32_t frame_begin, int32_t frame_end,
                                     audio_lm_audio_output * out);
 int32_t audio_lm_decodable_frames(const audio_lm_context * ctx);
+
+// Exact incremental decode, for codecs whose decoder is strictly causal (src/codec_stream.h): the stream keeps
+// the decoder's state, so frames decoded piece by piece equal one decode of them all (no window overlap or
+// cross-fade needed). audio_lm_stream_open returns nullptr when the codec has no such decode. `prefix` (codec codes,
+// n_prefix frames x n_cb, may be empty) is decoded first and its audio dropped: an in-context reference voice.
+// The state after a prefix is cached in the context, so a reference is decoded once per voice, not per run.
+struct codec_decode_stream * audio_lm_stream_open(audio_lm_context * ctx, const int32_t * prefix, int32_t n_prefix,
+                                                  int32_t n_cb);
+// Decodes accumulated frames [frame_begin, frame_end) (the next ones in the stream; LM codes, mapped as
+// audio_lm_decode_audio_range does).
+bool audio_lm_stream_decode_range(audio_lm_context * ctx, struct codec_decode_stream * st, int32_t frame_begin,
+                                  int32_t frame_end, audio_lm_audio_output * out);
+// Decodes `n_frames` x `n_cb` codec codes (an alm_generation's) through the stream.
+bool audio_lm_stream_decode_codes(audio_lm_context * ctx, struct codec_decode_stream * st, const int32_t * codes,
+                                  int32_t n_frames, int32_t n_cb, audio_lm_audio_output * out);
+void audio_lm_stream_close(struct codec_decode_stream * st);
 // Samples per decoded frame.  A window of n frames decodes to about n * hop
 // samples aligned at its start; some codecs drop a few at the end (DAC: 8).
 int32_t audio_lm_codec_hop(const audio_lm_context * ctx);
+int32_t audio_lm_codec_sample_rate(const audio_lm_context * ctx);
+// Codebooks per accumulated frame (the LM's, before any audio_cb_offset slice).
+int32_t audio_lm_n_codebooks(const audio_lm_context * ctx);
 // Width of the codec's continuous latent (codec_decode_quantized_representation).
 int32_t audio_lm_codec_latent_dim(const audio_lm_context * ctx);
 
