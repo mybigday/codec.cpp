@@ -426,7 +426,9 @@ class DacConverter(BaseConverter):
                 cfg = json.load(f)
             self.config = {
                 "sample_rate": int(cfg.get("sampling_rate", cfg.get("sample_rate", 24000))),
-                "hop_size": int(cfg.get("hop_length", cfg.get("hop_size", 320))),
+                # the product of the downsampling ratios (HF dac_16khz's hop_length says 512, its ratios give 320)
+                "hop_size": int(np.prod(cfg["downsampling_ratios"])) if cfg.get("downsampling_ratios")
+                            else int(cfg.get("hop_length", cfg.get("hop_size", 320))),
                 "n_q": int(cfg.get("n_codebooks", cfg.get("n_q", 12))),
                 "codebook_size": int(cfg.get("codebook_size", 1024)),
                 "latent_dim": int(cfg.get("hidden_size", cfg.get("latent_dim", 1024))),
@@ -457,7 +459,8 @@ class DacConverter(BaseConverter):
         cfg = model.config
         self.config = {
             "sample_rate": int(getattr(cfg, "sampling_rate", getattr(cfg, "sample_rate", 24000))),
-            "hop_size": int(getattr(cfg, "hop_length", getattr(cfg, "hop_size", 320))),
+            "hop_size": int(np.prod(cfg.downsampling_ratios)) if getattr(cfg, "downsampling_ratios", None)
+                        else int(getattr(cfg, "hop_length", getattr(cfg, "hop_size", 320))),
             "n_q": int(getattr(cfg, "n_codebooks", getattr(cfg, "n_q", 12))),
             "codebook_size": int(getattr(cfg, "codebook_size", 1024)),
             "latent_dim": int(getattr(cfg, "hidden_size", getattr(cfg, "latent_dim", 1024))),

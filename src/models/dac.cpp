@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+static int32_t codec_dac_decoder_hop(struct codec_model * model);
+
 enum codec_status codec_dac_init(struct codec_model * model) {
     codec_dac & dac = *static_cast<codec_dac *>(model->impl);
 
@@ -32,6 +34,14 @@ enum codec_status codec_dac_init(struct codec_model * model) {
     model->sample_rate = dac.sample_rate;
     model->has_encoder = dac.has_encoder;
     model->has_decoder = dac.has_decoder;
+    // The hop is the product of the decoder's upsampling strides. GGUFs converted from the HF config can carry
+    // its hop_length instead (512 for dac_16khz, whose ratios 2 * 4 * 5 * 8 give 320).
+    const int32_t hop_w = codec_dac_decoder_hop(model);
+    if (hop_w > 0 && hop_w != dac.hop_size) {
+        codec_log(CODEC_LOG_LEVEL_WARN, "dac: codec.hop_size is %d, the decoder's strides give %d; using %d\n",
+                  dac.hop_size, hop_w, hop_w);
+        dac.hop_size = hop_w;
+    }
     model->hop_size = dac.hop_size;
     model->n_q = dac.n_q;
     model->codebook_size = dac.codebook_size;
@@ -281,6 +291,26 @@ static std::string codec_dac_model_block_convtr_w_name(int32_t naming_mode, int3
 
 static std::string codec_dac_model_block_convtr_b_name(int32_t naming_mode, int32_t bi) {
     return codec_dac_model_block_prefix(naming_mode, bi) + "conv_t1.bias";
+}
+
+static bool codec_dac_infer_convtr_shape(ggml_tensor * w, ggml_tensor * b, int32_t * kernel, int32_t * in_c, int32_t * out_c);
+
+// Product of the decoder blocks' ConvTranspose strides (kernel = 2 * stride), 0 if the weights don't say.
+static int32_t codec_dac_decoder_hop(struct codec_model * model) {
+    if (model == nullptr || model->weights == nullptr) return 0;
+    for (int32_t mode : {CODEC_DAC_NAMING_MODEL, CODEC_DAC_NAMING_LEGACY}) {
+        int32_t hop = 1, n = 0;
+        for (int32_t bi = 0; bi < CODEC_DAC_MAX_BLOCKS; ++bi) {
+            ggml_tensor * w = ggml_get_tensor(model->weights, codec_dac_model_block_convtr_w_name(mode, bi).c_str());
+            ggml_tensor * b = ggml_get_tensor(model->weights, codec_dac_model_block_convtr_b_name(mode, bi).c_str());
+            int32_t k = 0, ci = 0, co = 0;
+            if (w == nullptr || b == nullptr || !codec_dac_infer_convtr_shape(w, b, &k, &ci, &co)) break;
+            hop *= std::max(1, k / 2);
+            ++n;
+        }
+        if (n > 0) return hop;
+    }
+    return 0;
 }
 
 static std::string codec_dac_model_resunit_snake1_name(int32_t naming_mode, int32_t bi, int32_t ri) {
