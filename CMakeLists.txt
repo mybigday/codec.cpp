@@ -101,6 +101,7 @@ set(CODEC_SOURCES
     src/lm/residual_depth_ar.cpp
     src/lm/chatterbox_t3.cpp
     src/lm/cosyvoice_lm.cpp
+    src/lm/moss_tts_nano.cpp
     src/lm/speaker_chatterbox.cpp
     src/lm/speaker_qwen3_tts.cpp
 )
@@ -134,6 +135,7 @@ add_library(codec_audio_lm_objs OBJECT
     common/audio_lm_family_cosyvoice.cpp
     common/audio_lm_family_continuous.cpp
     common/audio_lm_family_flow.cpp
+    common/audio_lm_family_moss_nano.cpp
     common/tts_segment.cpp
     common/kitten_text.cpp
 )
