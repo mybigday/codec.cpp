@@ -149,8 +149,11 @@ The host samples every token with llama.cpp's sampler: the backbone's, and
 each codec-side head's (`SAMPLE_HEAD` verdicts: `codec_audio_lm_head_logits`
 gives the head's logits, the model's constraints already applied as -inf and
 guidance already combined; `codec_audio_lm_head_token` takes the id back and
-gives the next verdict). codec_audio_lm holds no sampler and no sampling
-settings; it only suggests constraints: `grammar` / `allowed` /
+gives the next verdict). codec_audio_lm holds no token sampler and no sampling
+settings (one exception: MOSS-TTS-Nano's text slot, a two-way stop decision the
+reference draws at its own temperature, is drawn by the family from its own
+stream seeded by `codec_audio_lm_set_seed`, and the host gets a one-hot head;
+see models/moss_tts_nano.md); it only suggests constraints: `grammar` / `allowed` /
 `penalty_exempt` for the backbone, and `head_groups` for the heads. Build one
 host sampler per group (one random stream and penalty history; seed group `g`
 with seed + 1 + g), with the same llama.cpp settings as the backbone; a group

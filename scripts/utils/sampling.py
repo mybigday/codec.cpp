@@ -33,7 +33,8 @@ MODEL_SAMPLING: dict[str, dict] = {
     # modeling_moss_tts_nano.py inference(do_sample=True): the audio codebooks'
     # settings (audio_temperature / top_k / top_p, no repetition penalty).  Its
     # text slot (assistant slot vs audio end) uses temperature 1.5 / top_p 1.0;
-    # every head here takes the backbone's settings (docs/models/moss_tts_nano.md).
+    # the family draws that one model-side (codec.lm.moss_tts_nano.text_temperature),
+    # every codebook head takes these (docs/models/moss_tts_nano.md).
     "moss_tts_nano":     dict(temp=1.7, top_k=25, top_p=0.8, min_p=0.0, samplers="temperature;top_k;top_p"),
     # tts.py::generate.  mtl_tts.py uses repetition_penalty 2.0, but only with
     # its AlignmentStreamAnalyzer (attention-driven EOS forcing), which this

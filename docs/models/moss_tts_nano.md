@@ -27,8 +27,8 @@ python scripts/convert-backbone-to-gguf.py --model-id MOSS-TTS-Nano-100M \
 ```
 
 The voice is encoded by the codec's encoder, so its precision shows in the
-reference codes: equal to the reference's `batch_encode` on 96 % (F32), 95 %
-(F16) and 56–72 % (Q8_0) of the codes on the eval clips. Intelligibility did
+reference codes: equal to the reference's `batch_encode` on 96 % (F32),
+92.5–95.7 % (F16) and 56–72 % (Q8_0) of the codes on the eval clips. Intelligibility did
 not differ measurably between F16 and Q8_0 (below), but F16 keeps the voice
 prompt closest to the reference's.
 
@@ -109,7 +109,8 @@ prompt (331 rows):
 | tokenizer (normalizer + llama.cpp SPM) | equal to SentencePiece on 18 / 18 texts |
 | backbone hidden (llama.cpp starcoder2) | rel. error 4e-4 (F32 weights), 4e-3 (BF16) |
 | depth decoder, teacher-forced frame 0 (BF16 adaptor) | 17 / 17 argmax equal, logits max abs diff 0.05 |
-| greedy generation, all F32 | first 34 frames (17 tokens each) equal, then a float-noise near-tie flips |
+| greedy generation, all F32, stages chained by hand | first 34 frames (17 tokens each) equal, then a float-noise near-tie flips |
+| greedy `codec_cpp.TTS` (the family path: normalize, tokenize, voice rows, frame loop), all F32, same voice codes on both sides | first 244 frames equal (91 % of 300 frames' codes) |
 | voice codes vs `batch_encode` (F32 codec) | 96 % equal (as plain `codec_encode`; deep RVQ levels) |
 
 ## Evaluation
@@ -120,10 +121,11 @@ codec + BF16 adaptor, model-default sampling) against the PyTorch reference
 and voices: zh = 4 FLEURS cmn sentences in a FLEURS zh voice, ja = 4 FLEURS
 ja sentences in a ja voice, en = 4 FLEURS en sentences in an en voice,
 zh/en voice = 2 zh sentences in the en voice. ASR: whisper large-v3-turbo
-(live-translate `lt-eval`, cascade mode) on the 16 kHz mono mix; CER for zh
+(whisper.cpp, Q8_0, VAD-segmented) on the 16 kHz mono mix; CER for zh
 (hypothesis to simplified) / ja and WER for en, punctuation and spaces
-removed. Both sides use seeds 101 + i, 201 + i, ... 501 + i (20 utterances
-per language, 10 for zh/en voice).
+removed. Each side ran 5 seeds (101 + i ... 501 + i, 20 utterances per
+language, 10 for zh/en voice); the two use different RNGs, so a seed is not
+the same draw on both sides: compare the spreads, not the columns.
 
 Sampling makes single runs vary a lot, on both sides: the ASR also
 hallucinates repetitions on some clips (one en utterance scores WER 17.5),
@@ -137,10 +139,16 @@ utterance's errors capped at its length, and the median utterance.
 | en | WER | .55 .28 .10 .04 .35 (.264 / .264 / .165) | .51 4.03 .15 .31 .10 (1.021 / .344 / .189) | .12 .40 .12 .17 .50 (.259 / .256 / .134) |
 | zh, en voice | CER | .25 .13 .49 .07 .44 (.274 / .274 / .125) | .15 .20 .14 .37 .23 (.219 / .219 / .195) | .34 .23 .10 .35 .25 (.253 / .253 / .318) |
 
-The single unseeded reference run quoted earlier (zh .042, ja .43, en .115,
-zh/en voice .085) is one draw of the same spread; re-scored with this scorer
-it is zh .042, ja .406, en .115, zh/en voice .085. Failure modes are the
-reference's too: an early audio end (a clipped sentence), a repeated phrase.
+A single unseeded reference run (zh .042, ja .43, en .115, zh/en voice .085;
+with this scorer zh .042, ja .406, en .115, zh/en voice .085) is one draw of
+the same spread. Failure modes are the reference's too: an early audio end (a
+clipped sentence; 2 sub-second clips in the reference's 70 utterances, 0 and 1
+at 2.5 s in codec.cpp's two runs) and a repeated phrase.
+
+A run without a voice (the `None` reference section) and the
+`--save-speaker` / `--speaker-file` round trip (bit-identical audio) work;
+`codec_audio_lm_stream_poll` streams (chunks match the whole decode up to the
+crossfades).
 
 Host speed, `tts-cli`, 8 threads, CPU only (AMD Ryzen AI Max+ 395), over
 the 70 utterances of the F16 run (723 s of audio): generation (backbone +
