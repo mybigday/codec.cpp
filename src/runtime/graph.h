@@ -59,7 +59,8 @@ enum codec_graph_kind {
 
     CODEC_GRAPH_CHATTERBOX_S3G_SPEAKER = 65,
     CODEC_GRAPH_COSYVOICE_DECODE = 66,   // CosyVoice tokens → flow → HiFT PCM
-    CODEC_GRAPH_COSYVOICE_SPEAKER = 67,  // reference PCM → CosyVoice speaker slots  // reference PCM → S3G speaker slots (S3T + mel + CAMPPlus [+ x-vector])
+    CODEC_GRAPH_COSYVOICE_SPEAKER = 67,
+    CODEC_GRAPH_Q3T_DECODE_STREAM = 70,  // Qwen3-TTS-Tokenizer incremental decode (state in/out, codec_stream.h)  // reference PCM → CosyVoice speaker slots  // reference PCM → S3G speaker slots (S3T + mel + CAMPPlus [+ x-vector])
 };
 
 bool codec_runtime_init(codec_context * ctx, std::string * error);

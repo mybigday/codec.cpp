@@ -5,6 +5,7 @@
 // from the backbone's own vocabulary under a grammar, the rest from heads).
 
 #include "audio_lm_family.h"
+#include "audio_lm_stream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -298,6 +299,9 @@ public:
         }
         if (ref.empty()) return alm_family::decode_generation(g, out);
         const int32_t n_ref = (int32_t) ref.size() / g.width;
+        // A strictly causal codec decodes the generation from the decoder state after the reference (cached per
+        // voice): the same samples, without decoding the reference again.
+        if (audio_lm_decode_after_prefix(alm_, ref.data(), n_ref, g.codes.data(), g.n_frames, g.width, out)) return true;
         alm_generation all = g;
         all.codes.insert(all.codes.begin(), ref.begin(), ref.end());
         all.n_frames += n_ref;

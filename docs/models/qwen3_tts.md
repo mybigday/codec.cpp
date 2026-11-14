@@ -56,7 +56,17 @@ the speaker's ref_text. `--save-speaker` / `--speaker-file` keep and reuse it.
   the next T rows add the reference frames' summed codebook embeddings to it;
   the rest of the text then rides one token per step, `tts_eos` after it and
   `tts_pad` from then on. The decode prepends `ref_codes` to the generated
-  codes and cuts their share of the audio (`generate_voice_clone`).
+  codes and cuts their share of the audio (`generate_voice_clone`); since the
+  12 Hz decoder is strictly causal, codec.cpp decodes the reference once per
+  voice, caches the decoder state after it, and decodes each generation from
+  that state (same samples, the reference's decode cost only once).
+
+Streaming (`codec_audio_lm_stream_poll`) uses the decoder's exact incremental
+path: the 12 Hz tokenizer has no lookahead (left-padded convs, ConvTranspose
+with kernel 2 x stride cropped on the right, causal attention with a 72-frame
+sliding window), so polls decode only new frames and join without holdback or
+cross-fade. `tests/e2e/qwen3_tts_stream_smoke.py` checks prefix equivalence,
+streamed vs batch samples and the cached reference state.
 
 Against `qwen_tts` on a 5.5 s clip: x-vector cosine 1.000000, ref_codes 98 %
 (codebook 0 100 %); output speaker similarity (VoiceEncoder, 3 seeds) 0.80
