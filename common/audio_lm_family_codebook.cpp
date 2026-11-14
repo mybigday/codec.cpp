@@ -5,6 +5,7 @@
 // from the backbone's own vocabulary under a grammar, the rest from heads).
 
 #include "audio_lm_family.h"
+#include "audio_lm_stream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -282,41 +283,25 @@ private:
     }
 
 public:
-    // The ICL voice's reference codes (n_frames x width), if the current voice is one.
-    bool icl_ref(int32_t width, std::vector<int32_t> * ref) const {
-        ref->clear();
+    // ICL voices decode the reference's codes ahead of the generated ones and
+    // cut the reference's share of the audio (generate_voice_clone).
+    bool decode_generation(const alm_generation & g, audio_lm_audio_output * out) override {
+        std::vector<int32_t> ref;
         if (const codec_speaker * spk = audio_lm_decode_speaker(alm_)) {
             codec_speaker_slot_type ty;
             int64_t ne[4];
             const void * d = nullptr;
             const char * text = codec_speaker_ref_text(spk);
-            if (audio_lm_talker_has_projection(alm_) && text != nullptr && *text &&
-                codec_speaker_get_slot(spk, "ref_codes", &ty, ne, &d) && ty == CODEC_SPEAKER_SLOT_I32 && ne[0] == width) {
-                ref->assign(static_cast<const int32_t *>(d), static_cast<const int32_t *>(d) + ne[0] * ne[1]);
+            if (!g.latent && audio_lm_talker_has_projection(alm_) && text != nullptr && *text &&
+                codec_speaker_get_slot(spk, "ref_codes", &ty, ne, &d) && ty == CODEC_SPEAKER_SLOT_I32 && ne[0] == g.width) {
+                ref.assign(static_cast<const int32_t *>(d), static_cast<const int32_t *>(d) + ne[0] * ne[1]);
             }
         }
-        return !ref->empty();
-    }
-
-    bool stream_prefix(std::vector<int32_t> * codes, int32_t * n_frames, int32_t width) override {
-        if (!icl_ref(width, codes)) return false;
-        *n_frames = (int32_t) codes->size() / width;
-        return true;
-    }
-
-    // ICL voices decode the reference's codes ahead of the generated ones and
-    // cut the reference's share of the audio (generate_voice_clone).
-    bool decode_generation(const alm_generation & g, audio_lm_audio_output * out) override {
-        std::vector<int32_t> ref;
-        if (g.latent || !icl_ref(g.width, &ref)) return alm_family::decode_generation(g, out);
+        if (ref.empty()) return alm_family::decode_generation(g, out);
         const int32_t n_ref = (int32_t) ref.size() / g.width;
-        // Strictly causal codec: start from the decoder state after the reference (cached per voice) and decode
-        // only the generated frames, instead of decoding the reference again and cutting its audio.
-        if (codec_decode_stream * st = audio_lm_stream_open(alm_, ref.data(), n_ref, g.width)) {
-            const bool ok = audio_lm_stream_decode_codes(alm_, st, g.codes.data(), g.n_frames, g.width, out);
-            audio_lm_stream_close(st);
-            if (ok) return true;
-        }
+        // A strictly causal codec decodes the generation from the decoder state after the reference (cached per
+        // voice): the same samples, without decoding the reference again.
+        if (audio_lm_decode_after_prefix(alm_, ref.data(), n_ref, g.codes.data(), g.n_frames, g.width, out)) return true;
         alm_generation all = g;
         all.codes.insert(all.codes.begin(), ref.begin(), ref.end());
         all.n_frames += n_ref;

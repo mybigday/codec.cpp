@@ -1,5 +1,6 @@
 #include "codec_common.h"
 #include "codec_stream.h"
+#include "audio_lm_stream.h"
 
 #include <algorithm>
 #include <cstring>
@@ -2006,15 +2007,15 @@ bool audio_lm_decode_audio_range(audio_lm_context * ctx, int32_t frame_begin, in
     return audio_lm_decode_codec_codes(ctx, codes.data(), (int32_t) (codes.size() / (size_t) n_q), n_q, out);
 }
 
-// ─── Incremental decode ─────────────────────────────────────────────
+// ─── Incremental decode (internal: src/audio_lm_stream.h) ───────────
 
-static bool audio_lm_stream_push_codec(audio_lm_context * ctx, codec_decode_stream * st, const std::vector<int32_t> & codes,
-                                       int32_t n_q, audio_lm_audio_output * out) {
+static bool audio_lm_stream_push_codec(audio_lm_context * ctx, codec_decode_stream * st, const int32_t * codes,
+                                       int32_t n_frames, int32_t n_q, audio_lm_audio_output * out) {
     codec_token_buffer tokens = {};
-    tokens.data          = const_cast<int32_t *>(codes.data());
-    tokens.n_frames      = (int32_t) (codes.size() / (size_t) n_q);
+    tokens.data          = const_cast<int32_t *>(codes);
+    tokens.n_frames      = n_frames;
     tokens.n_q           = n_q;
-    tokens.n_tokens      = tokens.n_frames * n_q;
+    tokens.n_tokens      = n_frames * n_q;
     tokens.codebook_size = codec_model_codebook_size(ctx->model);
     tokens.sample_rate   = codec_model_sample_rate(ctx->model);
     tokens.hop_size      = codec_model_hop_size(ctx->model);
@@ -2028,20 +2029,24 @@ static bool audio_lm_stream_push_codec(audio_lm_context * ctx, codec_decode_stre
     return true;
 }
 
-codec_decode_stream * audio_lm_stream_open(audio_lm_context * ctx, const int32_t * prefix, int32_t n_prefix, int32_t n_cb) {
-    if (ctx == nullptr || ctx->codec_ctx == nullptr || !codec_model_has_decode_stream(ctx->model) ||
-        !(ctx->modality_mask & OUTPUT_AUDIO) || ctx->audio_cb_offset != 0 || !ctx->delay_pattern.empty()) {
-        return nullptr;
-    }
-    const int32_t n_q = std::max(0, (ctx->n_cb > 0 ? ctx->n_cb : n_cb) - ctx->audio_cb_offset);
-    if (prefix == nullptr || n_prefix <= 0) return codec_decode_stream_new(ctx->codec_ctx, n_q);
-    std::vector<int32_t> key(prefix, prefix + (size_t) n_prefix * n_cb);
+static bool audio_lm_stream_capable(const audio_lm_context * ctx) {
+    return ctx != nullptr && ctx->codec_ctx != nullptr && codec_model_has_decode_stream(ctx->model) &&
+           (ctx->modality_mask & OUTPUT_AUDIO) && ctx->audio_cb_offset == 0 && ctx->delay_pattern.empty() &&
+           ctx->cb0_speech_offset == 0 && !ctx->is_continuous;
+}
+
+// A new stream, from the cached state after `prefix` (codec codes) when there is one.
+static codec_decode_stream * audio_lm_stream_after(audio_lm_context * ctx, const int32_t * prefix, int32_t n_prefix,
+                                                   int32_t width) {
+    if (!audio_lm_stream_capable(ctx) || width <= 0) return nullptr;
+    if (prefix == nullptr || n_prefix <= 0) return codec_decode_stream_new(ctx->codec_ctx, width);
+    std::vector<int32_t> key(prefix, prefix + (size_t) n_prefix * width);
     if (ctx->prefix_stream == nullptr || key != ctx->prefix_codes) {
         codec_decode_stream_free(ctx->prefix_stream);
         ctx->prefix_stream = nullptr;
         ctx->prefix_codes.clear();
-        codec_decode_stream * st = codec_decode_stream_new(ctx->codec_ctx, n_q);
-        if (st == nullptr || !audio_lm_stream_push_codec(ctx, st, key, n_cb, nullptr)) {
+        codec_decode_stream * st = codec_decode_stream_new(ctx->codec_ctx, width);
+        if (st == nullptr || !audio_lm_stream_push_codec(ctx, st, key.data(), n_prefix, width, nullptr)) {
             codec_decode_stream_free(st);
             return nullptr;
         }
@@ -2051,28 +2056,69 @@ codec_decode_stream * audio_lm_stream_open(audio_lm_context * ctx, const int32_t
     return codec_decode_stream_clone(ctx->prefix_stream);
 }
 
-bool audio_lm_stream_decode_codes(audio_lm_context * ctx, codec_decode_stream * st, const int32_t * codes,
-                                  int32_t n_frames, int32_t n_cb, audio_lm_audio_output * out) {
-    if (ctx == nullptr || st == nullptr || codes == nullptr || n_frames <= 0 || out == nullptr) return false;
-    return audio_lm_stream_push_codec(ctx, st, std::vector<int32_t>(codes, codes + (size_t) n_frames * n_cb), n_cb, out);
+// The current voice's in-context reference (Qwen3-TTS ICL: a talker with a text projection, a voice with ref_text
+// and ref_codes), as audio_lm_family_codebook decodes it ahead of the generation.
+static bool audio_lm_icl_prefix(const audio_lm_context * ctx, std::vector<int32_t> * ref) {
+    ref->clear();
+    const codec_speaker * spk = audio_lm_decode_speaker(ctx);
+    if (spk == nullptr || !audio_lm_talker_has_projection(ctx)) return false;
+    codec_speaker_slot_type ty;
+    int64_t ne[4];
+    const void * d = nullptr;
+    const char * text = codec_speaker_ref_text(spk);
+    if (text == nullptr || !*text || !codec_speaker_get_slot(spk, "ref_codes", &ty, ne, &d) ||
+        ty != CODEC_SPEAKER_SLOT_I32 || ne[0] != ctx->n_cb) {
+        return false;
+    }
+    ref->assign(static_cast<const int32_t *>(d), static_cast<const int32_t *>(d) + ne[0] * ne[1]);
+    return true;
 }
 
-bool audio_lm_stream_decode_range(audio_lm_context * ctx, codec_decode_stream * st, int32_t frame_begin,
-                                  int32_t frame_end, audio_lm_audio_output * out) {
-    if (ctx == nullptr || st == nullptr || out == nullptr || ctx->codes_n_frames <= 0) return false;
+struct audio_lm_stream {
+    codec_decode_stream * st = nullptr;
+    int32_t next = 0;   // first accumulated frame not decoded yet
+};
+
+audio_lm_stream * audio_lm_stream_begin(audio_lm_context * ctx) {
+    if (!audio_lm_stream_capable(ctx)) return nullptr;
+    std::vector<int32_t> ref;
+    audio_lm_icl_prefix(ctx, &ref);
+    const int32_t width = ctx->n_cb;
+    codec_decode_stream * st = audio_lm_stream_after(ctx, ref.empty() ? nullptr : ref.data(), (int32_t) ref.size() / width, width);
+    if (st == nullptr) return nullptr;
+    auto * s = new (std::nothrow) audio_lm_stream();
+    if (s == nullptr) { codec_decode_stream_free(st); return nullptr; }
+    s->st = st;
+    return s;
+}
+
+bool audio_lm_stream_next(audio_lm_context * ctx, audio_lm_stream * s, int32_t frame_end, audio_lm_audio_output * out) {
+    if (ctx == nullptr || s == nullptr || out == nullptr || frame_end <= s->next || ctx->codes_n_frames <= 0) return false;
     std::vector<int32_t> cc;
     int32_t n_q = 0;
-    return audio_lm_codec_codes(ctx, ctx->codes.data(), ctx->codes_n_frames, ctx->n_cb, frame_begin, frame_end, &cc, &n_q) &&
-           audio_lm_stream_push_codec(ctx, st, cc, n_q, out);
+    if (!audio_lm_codec_codes(ctx, ctx->codes.data(), ctx->codes_n_frames, ctx->n_cb, s->next, frame_end, &cc, &n_q) ||
+        !audio_lm_stream_push_codec(ctx, s->st, cc.data(), (int32_t) (cc.size() / (size_t) n_q), n_q, out)) {
+        return false;
+    }
+    s->next = frame_end;
+    return true;
 }
 
-void audio_lm_stream_close(codec_decode_stream * st) { codec_decode_stream_free(st); }
-
-int32_t audio_lm_codec_sample_rate(const audio_lm_context * ctx) {
-    return ctx != nullptr && ctx->model != nullptr ? codec_model_sample_rate(ctx->model) : 0;
+void audio_lm_stream_end(audio_lm_stream * s) {
+    if (s == nullptr) return;
+    codec_decode_stream_free(s->st);
+    delete s;
 }
 
-int32_t audio_lm_n_codebooks(const audio_lm_context * ctx) { return ctx != nullptr ? ctx->n_cb : 0; }
+bool audio_lm_decode_after_prefix(audio_lm_context * ctx, const int32_t * prefix, int32_t n_prefix, const int32_t * codes,
+                                  int32_t n_frames, int32_t width, audio_lm_audio_output * out) {
+    if (codes == nullptr || n_frames <= 0 || out == nullptr) return false;
+    codec_decode_stream * st = audio_lm_stream_after(ctx, prefix, n_prefix, width);
+    if (st == nullptr) return false;
+    const bool ok = audio_lm_stream_push_codec(ctx, st, codes, n_frames, width, out);
+    codec_decode_stream_free(st);
+    return ok;
+}
 
 // ─── Decoder speaker ────────────────────────────────────────────────
 
