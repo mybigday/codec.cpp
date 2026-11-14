@@ -35,7 +35,7 @@ sys.path.insert(0, str(REPO / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import codec_cpp  # noqa: E402
-from _common import asr_cer, read_wav_mono_f32  # noqa: E402
+from _common import MODEL_SAMPLING, asr_cer, read_wav_mono_f32  # noqa: E402
 
 M = REPO / "models" / "moss_tts_nano"
 CODEC = M / "moss_tts_nano_codec.gguf"
@@ -65,7 +65,7 @@ def check_synth() -> bool:
     ok_all = True
     with codec_cpp.TTS(BACKBONE, CODEC) as tts:
         for name, text, lang, seed, cer_max in CASES:
-            audio, sr = tts.synthesize(text, ref_audio=REF_WAV, seed=seed)
+            audio, sr = tts.synthesize(text, ref_audio=REF_WAV, seed=seed, **MODEL_SAMPLING["moss_tts_nano"])
             stop = tts.last_result["stop_reason"]
             a = audio if audio.ndim == 1 else audio.mean(axis=1)
             dur, rms = len(a) / sr, float(np.sqrt((a ** 2).mean()))

@@ -23,7 +23,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 
 namespace codec_common {
 namespace {
@@ -164,8 +163,6 @@ public:
 
     const float * next_embd(int32_t) const override { return audio_lm_get_next_embed(alm_, nullptr); }
 
-    void set_seed(uint32_t seed) override { rng_.seed(alm_resolve_seed(seed)); }
-
 private:
     bool next_head(codec_audio_lm_verdict * v) {
         if (cb_ < n_cb_) {
@@ -173,7 +170,7 @@ private:
             const float * lg = audio_lm_step_logits(alm_, &idx, &n);
             if (lg == nullptr) return fail_alm("step logits");
             logits_.assign(lg, lg + n);
-            if (cb_ == 0) decide_text_slot();
+            if (cb_ == 0) present_text_slot();
             *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, 0, n};
             return true;
         }
@@ -189,36 +186,34 @@ private:
         return true;
     }
 
-    // The text slot is the stop decision. The reference (modeling_moss_tts_nano.py,
-    // _sample_next_assistant_text_token) keeps two text_lm_head logits, the assistant slot (continue) and the audio
-    // end (stop), and samples them at text_temperature 1.5 / top_p 1.0; the 16 codebooks use 1.7 / top_k 25 /
-    // top_p 0.8. The host samples every head with one llama.cpp chain, which applies top_p before the temperature,
-    // so no logit scaling here can give the 1.5 / no-truncation draw: under top_p 0.8 the end is dropped while its
-    // reference probability is below ~0.31, and generations run long (docs/models/moss_tts_nano.md, measured). So
-    // the family draws the decision from its two logits with a stream seeded by the host's seed (as the continuous
-    // and flow families draw their noise) and hands the host a one-hot head. A per-head-group sampler setting would
-    // move it to the host (docs/proposals/head-group-sampling.md).
-    // codec.lm.moss_tts_nano.text_temperature <= 0: argmax (greedy).
-    void decide_text_slot() {
+    // The text slot is the stop decision. The reference (modeling_moss_tts_nano.py, _sample_next_assistant_text_token)
+    // keeps two text_lm_head logits, the assistant slot (continue) and the audio end (stop), and samples them at
+    // text_temperature 1.5 with no top_p; the codebooks use audio_temperature 1.7 / top_k 25. The host samples every
+    // head with one chain, so the head offers only those two, as log-probabilities at 1.5 scaled by the host's
+    // temperature (codec.lm.moss_tts_nano.audio_temperature, = general.sampling.temp): the host's temperature step
+    // gives the reference's draw exactly, provided the chain keeps both (top_p 1, the model's required setting;
+    // with top_p < 1 the end is cut while its probability is below 1 - top_p and generations run long).
+    void present_text_slot() {
         const int32_t n = (int32_t) logits_.size(), end = mi_->audio_end, slot = mi_->assistant_slot;
         if (end < 0 || end >= n || slot < 0 || slot >= n) return;
-        bool stop;
-        if (frames_ < min_frames_) {
-            stop = false;   // min_frames not reached
-        } else {
-            const char * tv = audio_lm_meta_str(alm_, "codec.lm.moss_tts_nano.text_temperature");
-            const float temp = tv ? std::strtof(tv, nullptr) : 1.5f;
-            const float d = logits_[(size_t) end] - logits_[(size_t) slot];
-            if (temp <= 0.0f) {
-                stop = d > 0.0f;
-            } else {
-                const double p_end = 1.0 / (1.0 + std::exp(-(double) d / temp));
-                stop = std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < p_end;
-            }
+        auto kv = [&](const char * key, float dflt) {
+            const char * v = audio_lm_meta_str(alm_, key);
+            return v ? std::strtof(v, nullptr) : dflt;
+        };
+        const double t_text = kv("codec.lm.moss_tts_nano.text_temperature", 1.5f);
+        const double t_host = kv("codec.lm.moss_tts_nano.audio_temperature", 1.7f);
+        const double d = (double) logits_[(size_t) end] - (double) logits_[(size_t) slot];
+        std::fill(logits_.begin(), logits_.end(), -INFINITY);
+        if (frames_ < min_frames_) {   // min_frames not reached: continue only
+            logits_[(size_t) slot] = 0.0f;
+            return;
         }
-        for (int32_t i = 0; i < n; ++i) {
-            if (i != (stop ? end : slot)) logits_[(size_t) i] = -INFINITY;
-        }
+        // log-sigmoid at text_temperature, times the host temperature (the host divides by it)
+        const double x = d / t_text;
+        const double log_end = x > 0 ? -std::log1p(std::exp(-x)) : x - std::log1p(std::exp(x));
+        const double log_cont = log_end - x;
+        logits_[(size_t) end]  = (float) (log_end * t_host);
+        logits_[(size_t) slot] = (float) (log_cont * t_host);
     }
 
     // The voice's reference codes: I32 [n_q, T] with n_q = n_codebook - 1.
@@ -245,7 +240,6 @@ private:
     codec_lm * lm_;
     const codec_lm_moss_nano_info * mi_;
     std::vector<float> hidden_frame_, logits_;
-    std::mt19937 rng_;
     int32_t hidden_ = 0, n_cb_ = 0, cb_ = 0, frames_ = 0, min_frames_ = 0;
 };
 
