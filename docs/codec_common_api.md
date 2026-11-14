@@ -29,7 +29,7 @@ codec_audio_lm * alm = codec_audio_lm_init(&params, err, sizeof err);
 // Backbone: load the model, then size its context as the model asks.
 codec_audio_lm_backbone_req req;
 codec_audio_lm_backbone_requirements(alm, &vocab, max_frames, &req);
-// llama_context_params: n_ctx = req.n_ctx, n_ubatch = req.n_ubatch ?: n_ctx,
+// llama_context_params: n_ctx = req.n_ctx, n_ubatch = req.n_ubatch ?: min(n_ctx, 512),
 // n_seq_max = req.n_seq_max, embeddings = req.embeddings (pooling none),
 // flash_attn_type = req.flash_attn ? auto : disabled
 

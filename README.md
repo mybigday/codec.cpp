@@ -88,6 +88,7 @@ tts-cli synthesize --backbone MODEL.gguf --model CODEC.gguf \
 | `--seed N` | repeatable output |
 | `--temp F`, `--top-k N`, `--top-p F`, `--min-p F`, `--repeat-penalty F`, ... | llama.cpp's sampling flags; unset ones come from the backbone file (`general.sampling.*`, the model card's), then llama.cpp's defaults |
 | `--max-frames N` | cap the output length |
+| `--ubatch N` | backbone micro-batch (default 512, as llama.cpp; a model that needs more sets it itself). Larger only reserves more memory |
 | `--gpu` | run on the GPU backend the build has (CUDA / Vulkan / Metal) |
 | `--n-threads N` | CPU threads |
 | `--override-kv KEY=TYPE:VALUE` | change a setting stored in the codec file (keys are listed in [docs/models](docs/models)) |

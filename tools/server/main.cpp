@@ -77,6 +77,7 @@ struct args {
     int32_t     n_parallel = 1;
     bool        use_gpu    = false;
     int32_t     max_frames = 0;
+    int32_t     n_ubatch   = 0;
     int32_t     segment_bytes   = 160;    // ~10 s of speech per segment
     int32_t     stream_chunk_ms = 1000;
     std::vector<codec_model_kv_override> kv_overrides;
@@ -91,7 +92,7 @@ void print_usage(const char * argv0) {
         "usage: %s --model CODEC.gguf [--backbone LLAMA.gguf] [--speaker-file SPK.gguf]\n"
         "          [--voice-dir DIR [--allow-voice-create]]\n"
         "          [--host 127.0.0.1] [--port 8080] [--api-key KEY] [--model-id NAME]\n"
-        "          [--gpu] [--n-threads N] [--parallel N (1)] [--max-frames N] [--override-kv KEY=TYPE:VALUE]\n"
+        "          [--gpu] [--n-threads N] [--parallel N (1)] [--max-frames N] [--ubatch N] [--override-kv KEY=TYPE:VALUE]\n"
         "          [--segment-bytes N (160; 0 = whole input)] [--stream-chunk-ms N (1000; 0 = per segment)]\n"
         "          [llama.cpp sampling: --seed N --temp F --top-k N --top-p F --min-p F --repeat-last-n N\n"
         "           --repeat-penalty F --presence-penalty F --frequency-penalty F --dry-multiplier F\n"
@@ -126,6 +127,7 @@ bool parse_args(int argc, char ** argv, args * out) {
         else if (a == "--n-threads")    { if (!(v = need())) return false; out->n_threads = std::atoi(v); }
         else if (a == "--parallel" || a == "-np") { if (!(v = need())) return false; out->n_parallel = std::atoi(v); }
         else if (a == "--max-frames")   { if (!(v = need())) return false; out->max_frames = std::atoi(v); }
+        else if (a == "--ubatch")       { if (!(v = need())) return false; out->n_ubatch = std::atoi(v); }
         else if (a == "--segment-bytes")   { if (!(v = need())) return false; out->segment_bytes = std::atoi(v); }
         else if (a == "--stream-chunk-ms") { if (!(v = need())) return false; out->stream_chunk_ms = std::atoi(v); }
         else if (a == "--gpu")          { out->use_gpu = true; }
@@ -324,6 +326,7 @@ int main(int argc, char ** argv) {
     lp.n_parallel    = a.n_parallel;
     lp.use_gpu       = a.use_gpu;
     lp.max_frames    = a.max_frames;
+    lp.n_ubatch      = a.n_ubatch;
     lp.segment_bytes   = a.segment_bytes;
     lp.stream_chunk_ms = a.stream_chunk_ms;
     lp.sampling          = a.sampling;
