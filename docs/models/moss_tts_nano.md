@@ -89,14 +89,26 @@ The family (`common/audio_lm_family_moss_nano.cpp`) follows
 
 The reference samples the codebooks at temperature 1.7 / top_k 25 / top_p 0.8
 (the backbone GGUF's `general.sampling.*`, temperature first, no repetition
-penalty), and the text slot apart at temperature 1.5 / top_p 1. A host
-applies one setting to every codec-side head, and with the codebooks' top_p
-the audio end could not be drawn while its probability is below 0.2:
-generations ran past the end. So the text slot is drawn model-side, like a
-stop head: the family samples it from its two logits at
-`codec.lm.moss_tts_nano.text_temperature` (1.5; `<= 0` = argmax) with its own
-stream seeded by `codec_audio_lm_set_seed`, and hands the host a one-hot
-head. `--temp 0` makes the codebooks greedy; for a fully greedy run also pass
+penalty). The text slot is the stop decision: `_sample_next_assistant_text_token`
+keeps only two `text_lm_head` logits, the assistant slot (continue) and
+`<|audio_end|>` (stop), and samples them at temperature 1.5, top_p 1.0
+(`inference(text_temperature=1.5, text_top_p=1.0)`).
+
+A host samples every codec-side head with one llama.cpp chain (the card's
+settings). That can't reproduce the stop draw: llama.cpp's default order applies
+top_p **before** the temperature, so the codebooks' top_p 0.8 drops the end
+whenever the continue probability is >= 0.8, i.e. while the reference's end
+probability is below about 0.31. Scaling the two logits by 1.7 / 1.5 in the
+family fixes the temperature but not the truncation, and the generation then
+stops near the argmax point. Measured below, Japanese runs ~1.7x long, and the
+smoke's English sentence ran to the frame cap. So the family draws the slot
+itself: from its two logits at `codec.lm.moss_tts_nano.text_temperature` (1.5;
+`<= 0` = argmax), with its own stream seeded by `codec_audio_lm_set_seed` (as
+the continuous and flow families draw their noise), and it hands the host a
+one-hot head. Moving the draw to the host needs a sampler of its own for that
+head, which is a `codec_audio_lm.h` change, proposed in
+`docs/proposals/head-group-sampling.md`. `--temp 0` makes the codebooks greedy.
+For a fully greedy run also pass
 `--override-kv codec.lm.moss_tts_nano.text_temperature=float:0`.
 
 ## Parity
@@ -130,7 +142,7 @@ the same draw on both sides: compare the spreads, not the columns.
 Sampling makes single runs vary a lot, on both sides: the ASR also
 hallucinates repetitions on some clips (one en utterance scores WER 17.5),
 so the table gives the corpus score per seed, its mean, the mean with each
-utterance's errors capped at its length, and the median utterance.
+utterance's errors capped at its length, and the median utterance. The table after it compares the stop decisions.
 
 | Set | Metric | Reference: seeds (mean / capped / median) | codec.cpp Q8_0 codec | codec.cpp F16 codec |
 |---|---|---|---|---|
@@ -138,6 +150,21 @@ utterance's errors capped at its length, and the median utterance.
 | ja | CER | .54 .51 .47 .45 1.49 (.692 / .513 / .549) | .33 .43 .45 .44 .52 (.433 / .433 / .424) | .53 .39 .52 .43 .59 (.492 / .492 / .496) |
 | en | WER | .55 .28 .10 .04 .35 (.264 / .264 / .165) | .51 4.03 .15 .31 .10 (1.021 / .344 / .189) | .12 .40 .12 .17 .50 (.259 / .256 / .134) |
 | zh, en voice | CER | .25 .13 .49 .07 .44 (.274 / .274 / .125) | .15 .20 .14 .37 .23 (.219 / .219 / .195) | .34 .23 .10 .35 .25 (.253 / .253 / .318) |
+
+Stop decision, F16 codec, same 5 seeds (durations: mean / >20 s clips of 20; the
+reference's in the first column):
+
+| Set | Reference | drawn in the library (this PR) | host-sampled, logits scaled 1.7/1.5 | argmax stop |
+|---|---|---|---|---|
+| zh CER | .131 · 9.1 s / 0 | .283 (capped .142) · 9.4 s / 0 | .071 · 9.9 s / 0 | .049 · 9.4 s / 0 |
+| ja CER | .692 (capped .513) · 11.7 s / 1 | .492 · 12.8 s / 3 | .451 · 20.8 s / 11 | .534 (capped .438) · 20.0 s / 10 |
+| en WER | .264 · 8.6 s / 0 | .259 · 7.4 s / 0 | .200 · 8.7 s / 1 | .213 · 8.7 s / 1 |
+| zh, en voice CER | .274 · 12.7 s / 1 | .253 · 12.9 s / 1 | .191 · 13.7 s / 1 | .170 · 13.7 s / 1 |
+
+The later stop costs no read-back accuracy (the scorer counts words, not
+trailing audio) but the Japanese clips run long: 11 of 20 past 20 s, up to 42 s,
+against 1 at 22 s for the reference. The library draw matches the reference's
+lengths.
 
 A single unseeded reference run (zh .042, ja .43, en .115, zh/en voice .085;
 with this scorer zh .042, ja .406, en .115, zh/en voice .085) is one draw of

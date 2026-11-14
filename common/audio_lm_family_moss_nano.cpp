@@ -189,12 +189,15 @@ private:
         return true;
     }
 
-    // The text slot is the stop decision: the reference samples it between the
-    // assistant slot and the audio end at its own temperature (1.5, top_p 1),
-    // apart from the codebooks' settings (1.7 / top_k 25 / top_p 0.8) the host
-    // applies to every head; under those, the end could not be drawn below
-    // p = 0.2 and generations ran on.  So the model draws it here, like a stop
-    // head, with its own seeded stream, and hands the host a one-hot head.
+    // The text slot is the stop decision. The reference (modeling_moss_tts_nano.py,
+    // _sample_next_assistant_text_token) keeps two text_lm_head logits, the assistant slot (continue) and the audio
+    // end (stop), and samples them at text_temperature 1.5 / top_p 1.0; the 16 codebooks use 1.7 / top_k 25 /
+    // top_p 0.8. The host samples every head with one llama.cpp chain, which applies top_p before the temperature,
+    // so no logit scaling here can give the 1.5 / no-truncation draw: under top_p 0.8 the end is dropped while its
+    // reference probability is below ~0.31, and generations run long (docs/models/moss_tts_nano.md, measured). So
+    // the family draws the decision from its two logits with a stream seeded by the host's seed (as the continuous
+    // and flow families draw their noise) and hands the host a one-hot head. A per-head-group sampler setting would
+    // move it to the host (docs/proposals/head-group-sampling.md).
     // codec.lm.moss_tts_nano.text_temperature <= 0: argmax (greedy).
     void decide_text_slot() {
         const int32_t n = (int32_t) logits_.size(), end = mi_->audio_end, slot = mi_->assistant_slot;

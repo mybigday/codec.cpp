@@ -9,6 +9,9 @@
 
 namespace codec_common {
 
+// Declared here, not in audio_lm_family.h (a header hosts include): the only caller is the dispatch below.
+std::unique_ptr<alm_family> alm_family_moss_nano(audio_lm_context * alm, struct codec_lm * lm);
+
 // ── alm_vocab ────────────────────────────────────────────────────────
 
 std::vector<int32_t> alm_vocab::tokenize(const std::string & text, bool add_special, bool parse_special) const {
