@@ -1,4 +1,5 @@
 #include "codec_internal.h"
+#include "codec_stream.h"
 
 #include <cstdio>
 
@@ -702,6 +703,66 @@ enum codec_status codec_decode(
     }
 
     return codec_dispatch_decode(ctx, tokens, out_pcm, params);
+}
+
+// ─── Incremental decode (internal, src/codec_stream.h) ──────────────
+
+struct codec_decode_stream {
+    codec_context * ctx = nullptr;
+    void * state = nullptr;
+    int64_t n_frames = 0;
+};
+
+bool codec_model_has_decode_stream(const codec_model * model) {
+    return model != nullptr && model->vtable != nullptr && model->vtable->decode_stream_new != nullptr &&
+           model->vtable->decode_stream_push != nullptr && model->vtable->decode_stream_clone != nullptr &&
+           model->vtable->decode_stream_free != nullptr && model->has_decoder;
+}
+
+codec_decode_stream * codec_decode_stream_new(codec_context * ctx, int32_t n_q) {
+    if (ctx == nullptr || !codec_model_has_decode_stream(ctx->model)) return nullptr;
+    void * st = ctx->model->vtable->decode_stream_new(ctx, n_q);
+    if (st == nullptr) return nullptr;
+    auto * s = new (std::nothrow) codec_decode_stream();
+    if (s == nullptr) { ctx->model->vtable->decode_stream_free(st); return nullptr; }
+    s->ctx = ctx;
+    s->state = st;
+    return s;
+}
+
+codec_decode_stream * codec_decode_stream_clone(const codec_decode_stream * stream) {
+    if (stream == nullptr || stream->ctx == nullptr) return nullptr;
+    void * st = stream->ctx->model->vtable->decode_stream_clone(stream->state);
+    if (st == nullptr) return nullptr;
+    auto * s = new (std::nothrow) codec_decode_stream(*stream);
+    if (s == nullptr) { stream->ctx->model->vtable->decode_stream_free(st); return nullptr; }
+    s->state = st;
+    return s;
+}
+
+void codec_decode_stream_free(codec_decode_stream * stream) {
+    if (stream == nullptr) return;
+    if (stream->ctx != nullptr && stream->state != nullptr) stream->ctx->model->vtable->decode_stream_free(stream->state);
+    delete stream;
+}
+
+int64_t codec_decode_stream_n_frames(const codec_decode_stream * stream) {
+    return stream != nullptr ? stream->n_frames : 0;
+}
+
+enum codec_status codec_decode_stream_push(
+    codec_decode_stream * stream, const codec_token_buffer * tokens, codec_pcm_buffer * out_pcm) {
+    CODEC_PERF_SCOPE("decode_stream");
+    if (stream == nullptr || stream->ctx == nullptr || tokens == nullptr || out_pcm == nullptr) {
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    codec_context * ctx = stream->ctx;
+    codec_pcm_buffer_free(out_pcm);
+    codec_context_set_error(ctx, "");
+    ctx->n_threads = std::max(1, ctx->model->n_threads);
+    const enum codec_status rc = ctx->model->vtable->decode_stream_push(ctx, stream->state, tokens, out_pcm);
+    if (rc == CODEC_STATUS_SUCCESS) stream->n_frames += tokens->n_frames;
+    return rc;
 }
 
 enum codec_status codec_decode_quantized_representation(

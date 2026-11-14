@@ -196,6 +196,17 @@ struct codec_model_vtable {
         const std::vector<float> & pcm,
         int32_t sample_rate,
         struct codec_speaker * out);
+    // Exact incremental decode for strictly causal decoders (src/codec_stream.h): the arch keeps the decoder's
+    // state (conv tails, attention KV) between pushes, so decoding frames [0, n) in pieces gives the samples of
+    // one decode of [0, n). nullptr = unsupported (streaming re-decodes a window instead).
+    void * (*decode_stream_new)(struct codec_context * ctx, int32_t n_q);
+    void * (*decode_stream_clone)(const void * state);
+    void (*decode_stream_free)(void * state);
+    enum codec_status (*decode_stream_push)(
+        struct codec_context * ctx,
+        void * state,
+        const struct codec_token_buffer * tokens,
+        struct codec_pcm_buffer * out_pcm);
 };
 
 // Loads `spk.<name>.<slot>` tensors + `<arch>.spk.*` metadata from the model

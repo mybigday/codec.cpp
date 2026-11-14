@@ -166,7 +166,59 @@ struct q3t_decode_build {
     int32_t upsampling_ratios[CODEC_Q3T_MAX_UPSAMPLE];
     int32_t decoder_dim;
     const codec_model * model;
+    // Incremental decode (codec_stream.h): every stateful site reads its state from "q3t.st.<i>.in" and writes the
+    // next one to "q3t.st.<i>.out"; attention takes absolute positions "q3t.st.pos" and the window mask
+    // "q3t.st.mask" over [kv_len cached frames + t new ones].
+    bool stream;
+    int32_t kv_len;
+    int32_t n_sites;  // counted while building
 };
+
+// Stream state site: [state frames ; x] along time (dim 0, x is [t, c]); the last n frames are the next state.
+static ggml_tensor * codec_q3t_st_cat(ggml_context * ctx, q3t_decode_build * p, ggml_tensor * x, int32_t n, int dim) {
+    const int32_t i = p->n_sites++;
+    int64_t ne[4] = { x->ne[0], x->ne[1], x->ne[2], x->ne[3] };
+    ne[dim] = n;
+    ggml_tensor * in = ggml_new_tensor(ctx, GGML_TYPE_F32, ggml_n_dims(x) > 2 ? 3 : 2, ne);
+    ggml_set_name(in, ("q3t.st." + std::to_string(i) + ".in").c_str());
+    ggml_set_input(in);
+    ggml_tensor * cat = ggml_concat(ctx, in, ggml_cont(ctx, x), dim);
+    const size_t off = (size_t) (cat->ne[dim] - n) * cat->nb[dim];
+    ggml_tensor * tail = dim == 0 ? ggml_view_3d(ctx, cat, n, cat->ne[1], cat->ne[2], cat->nb[1], cat->nb[2], off)
+                                  : ggml_view_3d(ctx, cat, cat->ne[0], n, cat->ne[2], cat->nb[1], cat->nb[2], off);
+    tail = ggml_cont(ctx, tail);
+    ggml_set_name(tail, ("q3t.st." + std::to_string(i) + ".out").c_str());
+    ggml_set_output(tail);
+    return cat;
+}
+
+// Causal conv (stride 1); in stream mode the left context comes from the state instead of zero padding.
+static ggml_tensor * codec_q3t_conv(ggml_context * ctx, q3t_decode_build * p, ggml_tensor * x, ggml_tensor * w,
+                                    ggml_tensor * b, int32_t dilation, bool depthwise) {
+    if (!p->stream) {
+        return depthwise ? codec_conv1d_depthwise_causal(ctx, x, w, b, 1, dilation)
+                         : codec_conv1d_causal(ctx, x, w, b, 1, dilation);
+    }
+    const int32_t k = depthwise ? (int32_t) w->ne[0] : (int32_t) codec_conv1d_kernel_size(w, x->ne[1]);
+    const int32_t pad = (k - 1) * dilation;
+    if (pad <= 0) return codec_conv1d_causal(ctx, x, w, b, 1, dilation);
+    ggml_tensor * cat = codec_q3t_st_cat(ctx, p, x, pad, 0);
+    ggml_tensor * y = depthwise ? codec_conv1d_depthwise_causal(ctx, cat, w, b, 1, dilation)
+                                : codec_conv1d_causal(ctx, cat, w, b, 1, dilation);
+    return y == nullptr ? nullptr : ggml_cont(ctx, codec_op_crop_1d(ctx, y, pad, 0));
+}
+
+// Causal ConvTranspose (right-cropped); in stream mode the previous input frames come from the state.
+static ggml_tensor * codec_q3t_convtr(ggml_context * ctx, q3t_decode_build * p, ggml_tensor * x, ggml_tensor * w,
+                                      ggml_tensor * b, int32_t stride) {
+    if (!p->stream) return codec_convtr1d_causal(ctx, x, w, b, stride, 1);
+    const int32_t k = (int32_t) codec_convtr1d_kernel_size(w, x->ne[1]);
+    const int32_t n_prev = std::max(0, (k + stride - 1) / stride - 1);
+    if (n_prev == 0) return codec_convtr1d_causal(ctx, x, w, b, stride, 1);
+    ggml_tensor * cat = codec_q3t_st_cat(ctx, p, x, n_prev, 0);
+    ggml_tensor * y = codec_convtr1d_causal(ctx, cat, w, b, stride, 1);
+    return y == nullptr ? nullptr : ggml_cont(ctx, codec_op_crop_1d(ctx, y, n_prev * stride, 0));
+}
 
 // Add bias broadcast over channels; no-op when bias is null. Used for
 // attention q/k/v/o biases which are optional in some Qwen3 checkpoints.
@@ -179,6 +231,7 @@ static ggml_tensor * codec_q3t_add_bias_ct(ggml_context * ctx_eval, ggml_tensor 
 
 static ggml_tensor * codec_q3t_convnext_block(
     ggml_context * ctx_eval,
+    q3t_decode_build * p,
     ggml_tensor * x_tc,
     ggml_tensor * dw_w,
     ggml_tensor * dw_b,
@@ -195,7 +248,7 @@ static ggml_tensor * codec_q3t_convnext_block(
     }
 
     ggml_tensor * res = x_tc;
-    ggml_tensor * h = codec_conv1d_depthwise_causal(ctx_eval, x_tc, dw_w, dw_b, 1, 1);
+    ggml_tensor * h = codec_q3t_conv(ctx_eval, p, x_tc, dw_w, dw_b, 1, true);
     if (h == nullptr) {
         return nullptr;
     }
@@ -350,7 +403,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     if (t_pre_w == nullptr || t_pre_b == nullptr) {
         return false;
     }
-    x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_pre_w, t_pre_b, 1, 1);
+    x_tc = codec_q3t_conv(ctx_eval, p, x_tc, t_pre_w, t_pre_b, 1, false);
     if (x_tc == nullptr) {
         return false;
     }
@@ -370,6 +423,17 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     x_ct = codec_mul_mat(ctx_eval, t_in_w, x_ct);
     ggml_tensor * in_b2 = ggml_reshape_2d(ctx_eval, t_in_b, t_in_w->ne[1], 1);
     x_ct = ggml_add(ctx_eval, x_ct, in_b2);
+
+    ggml_tensor * t_pos = nullptr;
+    ggml_tensor * t_mask = nullptr;
+    if (p->stream) {
+        t_pos = ggml_new_tensor_1d(ctx_eval, GGML_TYPE_I32, p->t);
+        ggml_set_name(t_pos, "q3t.st.pos");
+        ggml_set_input(t_pos);
+        t_mask = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_F32, p->kv_len + p->t, p->t);
+        ggml_set_name(t_mask, "q3t.st.mask");
+        ggml_set_input(t_mask);
+    }
 
     for (int32_t li = 0; li < p->transformer_layers; ++li) {
         ggml_tensor * inln_w = W(codec_q3t_decode_pt_layer_name(li, "inln.w"));
@@ -413,8 +477,25 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
         ggml_tensor * k_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, k, p->transformer_head_dim, p->transformer_kv_heads, t_cur), 0, 2, 1, 3);
         ggml_tensor * v_dth = ggml_permute(ctx_eval, ggml_reshape_3d(ctx_eval, v, p->transformer_head_dim, p->transformer_kv_heads, t_cur), 0, 2, 1, 3);
 
-        ggml_tensor * q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer_head_dim, p->rope_theta, 1.0f, CODEC_ROPE_MODE_NEOX);
-        ggml_tensor * k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer_head_dim, p->rope_theta, 1.0f, CODEC_ROPE_MODE_NEOX);
+        ggml_tensor * q_rope = nullptr;
+        ggml_tensor * k_rope = nullptr;
+        if (!p->stream) {
+            q_rope = codec_op_rope(ctx_eval, q_dth, p->transformer_head_dim, p->rope_theta, 1.0f, CODEC_ROPE_MODE_NEOX);
+            k_rope = codec_op_rope(ctx_eval, k_dth, p->transformer_head_dim, p->rope_theta, 1.0f, CODEC_ROPE_MODE_NEOX);
+        } else {
+            // absolute positions of the new frames (the whole generation's, as in one decode)
+            auto rope_at = [&](ggml_tensor * x_dth) {
+                ggml_tensor * x_dht = ggml_permute(ctx_eval, x_dth, 0, 2, 1, 3);
+                ggml_tensor * y = ggml_rope_ext(ctx_eval, x_dht, t_pos, nullptr, p->transformer_head_dim, CODEC_ROPE_MODE_NEOX,
+                                                0, p->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                return ggml_cont(ctx_eval, ggml_permute(ctx_eval, y, 0, 2, 1, 3));
+            };
+            q_rope = rope_at(q_dth);
+            k_rope = rope_at(k_dth);
+            // [kv_len cached frames ; new frames]; the last kv_len are the next state
+            k_rope = codec_q3t_st_cat(ctx_eval, p, k_rope, p->kv_len, 1);
+            v_dth = codec_q3t_st_cat(ctx_eval, p, v_dth, p->kv_len, 1);
+        }
         if (q_rope == nullptr || k_rope == nullptr) {
             return false;
         }
@@ -427,7 +508,11 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
         ggml_tensor * attn_scores = codec_mul_mat(ctx_eval, ggml_cont(ctx_eval, k_rope), q_rope); // [t, t, h]
         attn_scores = ggml_scale_inplace(ctx_eval, attn_scores, 1.0f / std::sqrt((float) p->transformer_head_dim));
-        attn_scores = codec_q3t_apply_sliding_mask(ctx_eval, attn_scores, p->sliding_window);
+        if (!p->stream) {
+            attn_scores = codec_q3t_apply_sliding_mask(ctx_eval, attn_scores, p->sliding_window);
+        } else {
+            attn_scores = ggml_add(ctx_eval, attn_scores, t_mask);  // causal + window + unfilled cache slots
+        }
         ggml_tensor * attn_probs = ggml_soft_max(ctx_eval, attn_scores);
 
         ggml_tensor * v_tdh = ggml_permute(ctx_eval, v_rep, 1, 0, 2, 3);
@@ -482,8 +567,8 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
             t_pw2_w == nullptr || t_pw2_b == nullptr || t_gamma == nullptr) {
             return false;
         }
-        x_tc = codec_convtr1d_causal(ctx_eval, x_tc, t_up_w, t_up_b, p->upsampling_ratios[ui], 1);
-        x_tc = codec_q3t_convnext_block(ctx_eval, x_tc, t_dw_w, t_dw_b, t_ln_w, t_ln_b, t_pw1_w, t_pw1_b, t_pw2_w, t_pw2_b, t_gamma);
+        x_tc = codec_q3t_convtr(ctx_eval, p, x_tc, t_up_w, t_up_b, p->upsampling_ratios[ui]);
+        x_tc = codec_q3t_convnext_block(ctx_eval, p, x_tc, t_dw_w, t_dw_b, t_ln_w, t_ln_b, t_pw1_w, t_pw1_b, t_pw2_w, t_pw2_b, t_gamma);
         ggml_set_name(x_tc, (base + ".out").c_str());
     }
 
@@ -493,7 +578,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     if (t_dec0_w == nullptr || t_dec0_b == nullptr) {
         return false;
     }
-    x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_dec0_w, t_dec0_b, 1, 1);
+    x_tc = codec_q3t_conv(ctx_eval, p, x_tc, t_dec0_w, t_dec0_b, 1, false);
 
     int32_t cur_dim = p->decoder_dim;
     for (int32_t bi = 0; bi < p->n_upsample_rates; ++bi) {
@@ -509,7 +594,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
             return false;
         }
         x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_s0_a, t_s0_b, 1e-9f);
-        x_tc = codec_convtr1d_causal(ctx_eval, x_tc, t_tr_w, t_tr_b, up_rate, 1);
+        x_tc = codec_q3t_convtr(ctx_eval, p, x_tc, t_tr_w, t_tr_b, up_rate);
 
         for (int32_t ri = 0; ri < CODEC_Q3T_RES_UNITS; ++ri) {
             const std::string rbase = base + ".r" + std::to_string(ri);
@@ -528,9 +613,9 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
 
             ggml_tensor * res = x_tc;
             x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_s1_a, t_s1_b, 1e-9f);
-            x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_c1_w, t_c1_b, 1, CODEC_Q3T_RES_DILATIONS[ri]);
+            x_tc = codec_q3t_conv(ctx_eval, p, x_tc, t_c1_w, t_c1_b, CODEC_Q3T_RES_DILATIONS[ri], false);
             x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_s2_a, t_s2_b, 1e-9f);
-            x_tc = codec_conv1d_causal(ctx_eval, x_tc, t_c2_w, t_c2_b, 1, 1);
+            x_tc = codec_q3t_conv(ctx_eval, p, x_tc, t_c2_w, t_c2_b, 1, false);
             x_tc = ggml_add(ctx_eval, res, x_tc);
         }
         cur_dim = out_dim;
@@ -546,7 +631,7 @@ static bool codec_q3t_build_decode(ggml_context * ctx_eval, void * user_data, gg
     }
     x_tc = codec_op_snake_beta(ctx_eval, x_tc, t_fs_a, t_fs_b, 1e-9f);
 
-    ggml_tensor * t_out = codec_conv1d_causal(ctx_eval, x_tc, t_out_final_w, t_out_final_b, 1, 1);
+    ggml_tensor * t_out = codec_q3t_conv(ctx_eval, p, x_tc, t_out_final_w, t_out_final_b, 1, false);
     if (t_out == nullptr) {
         return false;
     }
@@ -712,6 +797,149 @@ enum codec_status codec_qwen3_tts_tokenizer_decode(
     out_pcm->sample_rate = q3.sample_rate;
     out_pcm->n_channels = 1;
 
+    return CODEC_STATUS_SUCCESS;
+}
+
+// ─── Incremental decode (codec_stream.h) ────────────────────────────
+// The decoder is strictly causal: left-padded convs, right-cropped ConvTranspose (kernel 2x stride), attention
+// with a sliding window and RoPE positions. So the state between pushes is: every conv's last (k-1)*dilation input
+// frames, every ConvTranspose's previous input frame, and per attention layer the last sliding_window-1 K (after
+// RoPE) and V frames plus the position count.
+
+struct q3t_stream_state {
+    int32_t n_q = 0;
+    int64_t n_past = 0;
+    std::vector<std::vector<float>> st;  // per state site, in build order
+};
+
+static void * codec_q3t_stream_new(codec_context * ctx, int32_t n_q) {
+    if (ctx == nullptr || ctx->model == nullptr) return nullptr;
+    const auto & q3 = static_cast<codec_qwen3_tts_tokenizer_impl *>(ctx->model->impl)->q3;
+    if (!q3.has_decoder || q3.sliding_window <= 0) return nullptr;  // full causal attention: no bounded state
+    const int32_t model_n_q = std::max(1, q3.n_q);
+    if (n_q < 0 || n_q > model_n_q) return nullptr;
+    auto * s = new (std::nothrow) q3t_stream_state();
+    if (s != nullptr) s->n_q = n_q == 0 ? model_n_q : n_q;
+    return s;
+}
+
+static void * codec_q3t_stream_clone(const void * state) {
+    return state == nullptr ? nullptr : new (std::nothrow) q3t_stream_state(*static_cast<const q3t_stream_state *>(state));
+}
+
+static void codec_q3t_stream_free(void * state) { delete static_cast<q3t_stream_state *>(state); }
+
+static enum codec_status codec_q3t_stream_push(
+    codec_context * ctx, void * state, const codec_token_buffer * tokens, codec_pcm_buffer * out_pcm) {
+    auto * s = static_cast<q3t_stream_state *>(state);
+    if (ctx == nullptr || s == nullptr || tokens == nullptr || out_pcm == nullptr || tokens->data == nullptr ||
+        tokens->n_frames <= 0 || tokens->n_q < s->n_q) {
+        codec_context_set_error(ctx, "invalid Qwen3 stream push");
+        return CODEC_STATUS_INVALID_ARG;
+    }
+    auto & q3 = static_cast<codec_qwen3_tts_tokenizer_impl *>(ctx->model->impl)->q3;
+    const int32_t t = tokens->n_frames;
+    const int32_t q = s->n_q;
+    const int32_t kv_len = q3.sliding_window - 1;
+
+    codec_graph_eval_guard eval_guard(ctx);
+    q3t_decode_build build = {};
+    std::string err;
+    if (!codec_q3t_init_decode_build(ctx, t, q, &build, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    build.stream = true;
+    build.kv_len = kv_len;
+    build.n_sites = 0;
+    codec_graph_cache_entry * entry = nullptr;
+    if (!codec_graph_cache_get_or_build(
+            ctx, { CODEC_GRAPH_Q3T_DECODE_STREAM, t, q, build.codebook_dim, kv_len, build.latent_dim },
+            codec_q3t_build_decode, &build, sizeof(build), &entry, &err) ||
+        !codec_graph_prepare_io(ctx, entry, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    ggml_tensor * t_out = codec_graph_get_tensor(ctx, entry, "q3t.dec.out");
+    ggml_tensor * t_pos = codec_graph_get_tensor(ctx, entry, "q3t.st.pos");
+    ggml_tensor * t_mask = codec_graph_get_tensor(ctx, entry, "q3t.st.mask");
+    if (t_out == nullptr || t_pos == nullptr || t_mask == nullptr) {
+        codec_context_set_error(ctx, "cached Qwen3 stream graph is invalid");
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    // codes
+    for (int32_t qi = 0; qi < q; ++qi) {
+        std::vector<int32_t> idx((size_t) t);
+        for (int32_t ti = 0; ti < t; ++ti) {
+            idx[(size_t) ti] = std::max(0, std::min(build.codebook_size - 1, tokens->data[(size_t) ti * tokens->n_q + qi]));
+        }
+        ggml_tensor * t_idx = codec_graph_get_tensor(ctx, entry, codec_q3t_decode_idx_tensor_name(qi).c_str());
+        if (t_idx == nullptr || !codec_runtime_write_tensor(t_idx, idx.data(), idx.size() * sizeof(int32_t), &err)) {
+            codec_context_set_error(ctx, err.empty() ? "cached Qwen3 stream graph is invalid" : err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+    // positions and the window mask over [kv_len cached ; t new]
+    std::vector<int32_t> pos((size_t) t);
+    for (int32_t i = 0; i < t; ++i) pos[(size_t) i] = (int32_t) (s->n_past + i);
+    const int32_t n_k = kv_len + t;
+    std::vector<float> mask((size_t) n_k * t);
+    for (int32_t i = 0; i < t; ++i) {
+        const int64_t aq = s->n_past + i;
+        for (int32_t j = 0; j < n_k; ++j) {
+            const int64_t ak = s->n_past - kv_len + j;
+            const bool ok = ak >= 0 && ak <= aq && aq - ak <= (int64_t) kv_len;
+            mask[(size_t) i * n_k + j] = ok ? 0.0f : -INFINITY;
+        }
+    }
+    if (!codec_runtime_write_tensor(t_pos, pos.data(), pos.size() * sizeof(int32_t), &err) ||
+        !codec_runtime_write_tensor(t_mask, mask.data(), mask.size() * sizeof(float), &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    // state in (zeros before the first push = the zero left padding of one decode)
+    std::vector<ggml_tensor *> outs;
+    for (int32_t i = 0;; ++i) {
+        const std::string base = "q3t.st." + std::to_string(i);
+        ggml_tensor * tin = codec_graph_get_tensor(ctx, entry, (base + ".in").c_str());
+        ggml_tensor * tout = codec_graph_get_tensor(ctx, entry, (base + ".out").c_str());
+        if (tin == nullptr) break;
+        if (tout == nullptr || ggml_nelements(tin) != ggml_nelements(tout)) {
+            codec_context_set_error(ctx, "cached Qwen3 stream graph is invalid");
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        if ((size_t) i >= s->st.size()) s->st.emplace_back((size_t) ggml_nelements(tin), 0.0f);
+        if (s->st[(size_t) i].size() != (size_t) ggml_nelements(tin) ||
+            !codec_runtime_write_tensor(tin, s->st[(size_t) i].data(), s->st[(size_t) i].size() * sizeof(float), &err)) {
+            codec_context_set_error(ctx, err.empty() ? "Qwen3 stream state does not match the graph" : err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+        outs.push_back(tout);
+    }
+    if (!codec_graph_compute(ctx, entry, ctx->n_threads, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    const int32_t n_samples = (int32_t) t_out->ne[0];
+    float * data = static_cast<float *>(std::malloc((size_t) n_samples * sizeof(float)));
+    if (data == nullptr || !codec_runtime_read_tensor(t_out, data, (size_t) n_samples * sizeof(float), &err)) {
+        std::free(data);
+        codec_context_set_error(ctx, err.empty() ? "failed to allocate output PCM" : err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < outs.size(); ++i) {
+        if (!codec_runtime_read_tensor(outs[i], s->st[i].data(), s->st[i].size() * sizeof(float), &err)) {
+            std::free(data);
+            codec_context_set_error(ctx, err);
+            return CODEC_STATUS_INTERNAL_ERROR;
+        }
+    }
+    s->n_past += t;
+    codec_pcm_buffer_reset(out_pcm);
+    out_pcm->data = data;
+    out_pcm->n_samples = n_samples;
+    out_pcm->sample_rate = q3.sample_rate;
+    out_pcm->n_channels = 1;
     return CODEC_STATUS_SUCCESS;
 }
 
@@ -901,6 +1129,10 @@ const struct codec_model_vtable * codec_qwen3_tts_tokenizer_vtable() {
         nullptr,
         codec_qwen3_tts_tokenizer_speaker_validate,
         codec_qwen3_tts_tokenizer_speaker_from_audio,
+        codec_q3t_stream_new,
+        codec_q3t_stream_clone,
+        codec_q3t_stream_free,
+        codec_q3t_stream_push,
     };
     return &vtable;
 }
