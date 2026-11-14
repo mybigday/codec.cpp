@@ -15,6 +15,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 // =====================================================================
@@ -62,6 +63,16 @@ struct rda_layer_w {
     ggml_tensor * ffn_down;
     ggml_tensor * q_norm;   // optional (Qwen3 family)
     ggml_tensor * k_norm;   // optional
+    // GPT-2 depth blocks (`codec.lm.depth.arch = "gpt2"`, MOSS-TTS-Nano): LayerNorm
+    // shifts and linear biases; ffn_gate is absent (non-gated gelu_new FFN).
+    ggml_tensor * attn_norm_b = nullptr;
+    ggml_tensor * q_b = nullptr;
+    ggml_tensor * k_b = nullptr;
+    ggml_tensor * v_b = nullptr;
+    ggml_tensor * o_b = nullptr;
+    ggml_tensor * ffn_norm_b = nullptr;
+    ggml_tensor * ffn_up_b = nullptr;
+    ggml_tensor * ffn_down_b = nullptr;
 };
 
 struct rda_impl {
@@ -101,6 +112,11 @@ struct rda_impl {
     int32_t cb0_suppress_from = -1;    // cb0 ids >= this (bar eos_code_c0) are
                                        // never sampled; -1 = none.  Qwen3-TTS:
                                        // vocab - 1024 (its control tags).
+    std::vector<int32_t> cb0_allowed;  // when set, the only cb0 ids ever sampled
+                                       // (MOSS-TTS-Nano: assistant slot / audio end)
+    bool    depth_gpt2       = false;  // `codec.lm.depth.arch = "gpt2"`: LayerNorm (+bias),
+                                       // biased q/k/v/o, gelu_new FFN (MOSS-TTS-Nano)
+    bool    heads_tied       = false;  // depth head i = audio_embds[i] (tied embeddings)
 
     // Tensor handles (live in codec->weights).  One uniform layout —
     // the per-pos linear inside `codec_op_lm_per_pos_linear` handles
@@ -138,6 +154,7 @@ struct rda_impl {
     ggml_tensor * in_proj           = nullptr; // 2D (shared) or 3D (per-pos)
     ggml_tensor * in_proj_bias      = nullptr; // 1D (Qwen3-TTS) or 2D (LFM2)
     ggml_tensor * depth_output_norm = nullptr; // present except Moshi/LFM2
+    ggml_tensor * depth_output_norm_b = nullptr; // gpt2: the final LayerNorm's shift
     ggml_tensor * rope_freq_factors = nullptr; // llama3 RoPE scaling
     std::vector<rda_layer_w> layers;           // per-layer weights (2D or 3D)
 
@@ -385,6 +402,14 @@ bool rda_build_c0(ggml_context * ctx_eval, void * ud, ggml_tensor ** out) {
 // RMSNorm before the logits matmul.  Head storage picks one of:
 //   - 3D `lm.depth.heads.weight` slice (Moshi) — `flex_heads != nullptr`
 //   - 2D `lm.depth.heads_{i}.weight`             — `depth_heads[head_idx]`
+ggml_tensor * rda_depth_layer_kv(
+    ggml_context * ctx, ggml_tensor * x_ht, const rda_layer_w & w,
+    ggml_tensor * t_pos, ggml_tensor * freq_factors,
+    int32_t head_dim, int32_t n_heads, int32_t n_kv_heads,
+    float rope_theta, float rms_eps, bool has_qk_norm, int32_t rope_mode, bool use_rope,
+    ggml_tensor * k_cache_l, ggml_tensor * v_cache_l, int32_t kv_pos_start, int32_t kv_total,
+    bool gpt2 = false);
+
 struct rda_depth_build {
     rda_impl * impl;
     int32_t    T;          // prefix length (= current_k + 1)
@@ -473,17 +498,27 @@ bool rda_build_depth_step(ggml_context * ctx_eval, void * ud, ggml_tensor ** out
     std::vector<rda_layer_w> & layers = impl->layers;
 
     for (int32_t l = 0; l < impl->depth_layers; ++l) {
-        x = rda_depth_layer(
-            ctx_eval, x, layers[(size_t) l], t_pos, freqs,
-            impl->depth_head_dim, impl->depth_n_heads, impl->depth_n_kv_heads,
-            impl->depth_rope_theta, impl->depth_rms_eps,
-            impl->has_qk_norm, rope_mode, impl->use_rope);
+        x = impl->depth_gpt2
+            // The KV path's block without a cache: causal attention over the T rows.
+            ? rda_depth_layer_kv(
+                ctx_eval, x, layers[(size_t) l], t_pos, freqs,
+                impl->depth_head_dim, impl->depth_n_heads, impl->depth_n_kv_heads,
+                impl->depth_rope_theta, impl->depth_rms_eps,
+                impl->has_qk_norm, rope_mode, impl->use_rope,
+                nullptr, nullptr, 0, T, /*gpt2=*/true)
+            : rda_depth_layer(
+                ctx_eval, x, layers[(size_t) l], t_pos, freqs,
+                impl->depth_head_dim, impl->depth_n_heads, impl->depth_n_kv_heads,
+                impl->depth_rope_theta, impl->depth_rms_eps,
+                impl->has_qk_norm, rope_mode, impl->use_rope);
     }
 
     // ---- Optional output norm ------------------------------------------
     if (impl->has_output_norm && impl->depth_output_norm != nullptr) {
         ggml_tensor * onorm = codec_graph_cast_f32(ctx_eval, impl->depth_output_norm);
-        x = codec_op_rms_norm_ct(ctx_eval, x, impl->depth_rms_eps, onorm);
+        x = impl->depth_gpt2
+            ? codec_op_layer_norm_ct(ctx_eval, x, impl->depth_rms_eps, onorm, impl->depth_output_norm_b)
+            : codec_op_rms_norm_ct(ctx_eval, x, impl->depth_rms_eps, onorm);
     }
 
     // ---- Per-cb head at the last position ------------------------------
@@ -564,18 +599,29 @@ ggml_tensor * rda_depth_layer_kv(
     ggml_tensor * k_cache_l,
     ggml_tensor * v_cache_l,
     int32_t kv_pos_start,
-    int32_t kv_total) {
+    int32_t kv_total,
+    bool    gpt2) {
 
     const int64_t T_new  = x_ht->ne[1];
     const int32_t q_dim  = n_heads    * head_dim;
     const int32_t kv_dim = n_kv_heads * head_dim;
 
-    // ── Attention pre-norm + projections (T_new positions) ─────────
-    ggml_tensor * h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, w.attn_norm);
+    // Llama: RMSNorm, bias-free linears, SwiGLU.  GPT-2 (gpt2 = true): LayerNorm
+    // with shift, linears with biases, gelu_new.  `rms_eps` is the norm's eps.
+    auto norm = [&](ggml_tensor * x, ggml_tensor * g, ggml_tensor * b) {
+        return gpt2 ? codec_op_layer_norm_ct(ctx, x, rms_eps, g, b) : codec_op_rms_norm_ct(ctx, x, rms_eps, g);
+    };
+    auto linear = [&](ggml_tensor * wt, ggml_tensor * b, ggml_tensor * x, int32_t out_dim) {
+        ggml_tensor * y = codec_op_lm_per_pos_linear(ctx, wt, x, out_dim, (int32_t) T_new);
+        return b != nullptr ? ggml_add(ctx, y, codec_graph_cast_f32(ctx, b)) : y;
+    };
 
-    ggml_tensor * q     = codec_op_lm_per_pos_linear(ctx, w.q, h, q_dim,  (int32_t) T_new);
-    ggml_tensor * k_new = codec_op_lm_per_pos_linear(ctx, w.k, h, kv_dim, (int32_t) T_new);
-    ggml_tensor * v_new = codec_op_lm_per_pos_linear(ctx, w.v, h, kv_dim, (int32_t) T_new);
+    // ── Attention pre-norm + projections (T_new positions) ─────────
+    ggml_tensor * h = norm(x_ht, w.attn_norm, w.attn_norm_b);
+
+    ggml_tensor * q     = linear(w.q, w.q_b, h, q_dim);
+    ggml_tensor * k_new = linear(w.k, w.k_b, h, kv_dim);
+    ggml_tensor * v_new = linear(w.v, w.v_b, h, kv_dim);
 
     q     = ggml_reshape_3d(ctx, q,     head_dim, n_heads,    T_new);
     k_new = ggml_reshape_3d(ctx, k_new, head_dim, n_kv_heads, T_new);
@@ -601,7 +647,7 @@ ggml_tensor * rda_depth_layer_kv(
     // ── Build the full K/V for attention via concat with cache ─────
     ggml_tensor * k_all;
     ggml_tensor * v_all;
-    if (kv_pos_start > 0) {
+    if (kv_pos_start > 0 && k_cache_l != nullptr) {
         // Cache view (positions 0 .. kv_pos_start) → concat with new.
         ggml_tensor * k_old = ggml_view_3d(ctx, k_cache_l,
             head_dim, n_kv_heads, (int64_t) kv_pos_start,
@@ -637,13 +683,15 @@ ggml_tensor * rda_depth_layer_kv(
     attn = ggml_reshape_2d(ctx, attn, (int64_t) q_dim, T_new);
 
     const int32_t hidden = (int32_t) x_ht->ne[0];
-    ggml_tensor * o = codec_op_lm_per_pos_linear(ctx, w.o, attn, hidden, (int32_t) T_new);
+    ggml_tensor * o = linear(w.o, w.o_b, attn, hidden);
     x_ht = ggml_add(ctx, x_ht, o);
 
     // ── Cache writes (side-effect roots) ────────────────────────────
     // ggml_cpy(src, dst) returns a view of dst; flag both with
     // ggml_set_output so the codec.cpp graph framework expands them as
     // separate roots, guaranteeing they're executed in this compute.
+    // No cache (the prefix-recompute path): attention over the new rows only.
+    if (k_cache_l != nullptr && v_cache_l != nullptr) {
     ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache_l,
         head_dim, n_kv_heads, T_new,
         k_cache_l->nb[1], k_cache_l->nb[2],
@@ -656,9 +704,15 @@ ggml_tensor * rda_depth_layer_kv(
     ggml_tensor * v_cpy = ggml_cpy(ctx, v_new, v_dst);
     ggml_set_output(k_cpy);
     ggml_set_output(v_cpy);
+    }
 
-    // ── FFN (SwiGLU) ────────────────────────────────────────────────
-    h = codec_op_rms_norm_ct(ctx, x_ht, rms_eps, w.ffn_norm);
+    // ── FFN (SwiGLU, or GPT-2's gelu_new MLP) ───────────────────────
+    h = norm(x_ht, w.ffn_norm, w.ffn_norm_b);
+    if (gpt2) {
+        const int32_t inter = (int32_t) w.ffn_up->ne[1];
+        ggml_tensor * up = ggml_gelu(ctx, linear(w.ffn_up, w.ffn_up_b, h, inter));   // tanh form = gelu_new
+        return ggml_add(ctx, x_ht, linear(w.ffn_down, w.ffn_down_b, up, hidden));
+    }
     const int32_t inter = (int32_t) w.ffn_gate->ne[1];
     ggml_tensor * gate = codec_op_lm_per_pos_linear(ctx, w.ffn_gate, h, inter,  (int32_t) T_new);
     ggml_tensor * up   = codec_op_lm_per_pos_linear(ctx, w.ffn_up,   h, inter,  (int32_t) T_new);
@@ -729,11 +783,13 @@ bool rda_build_depth_step_kv(ggml_context * ctx_eval, void * ud, ggml_tensor ** 
             impl->depth_rope_theta, impl->depth_rms_eps,
             impl->has_qk_norm, rope_mode, impl->use_rope,
             b->k_cache[(size_t) l], b->v_cache[(size_t) l],
-            kv_pos_start, kv_total);
+            kv_pos_start, kv_total, impl->depth_gpt2);
     }
 
     if (impl->has_output_norm && impl->depth_output_norm != nullptr) {
-        x = codec_op_rms_norm_ct(ctx_eval, x, impl->depth_rms_eps, impl->depth_output_norm);
+        x = impl->depth_gpt2
+            ? codec_op_layer_norm_ct(ctx_eval, x, impl->depth_rms_eps, impl->depth_output_norm, impl->depth_output_norm_b)
+            : codec_op_rms_norm_ct(ctx_eval, x, impl->depth_rms_eps, impl->depth_output_norm);
     }
 
     // Pick last position.
@@ -837,6 +893,16 @@ bool init(codec_lm * lm) {
     impl->has_pre_head_norm = codec_read_bool_kv(gf, "codec.lm.residual.depth_has_pre_head_norm", false);
     impl->depth_emits_c0   = codec_read_bool_kv(gf, "codec.lm.residual.depth_emits_c0", false);
     impl->rope_interleaved = codec_read_bool_kv(gf, "codec.lm.residual.depth_rope_interleaved", false);
+    impl->heads_tied       = codec_read_bool_kv(gf, "codec.lm.residual.heads_tied_to_embd", false);
+    impl->depth_gpt2       = codec_lm_read_string_kv(lm->codec, "codec.lm.depth.arch") == "gpt2";
+    codec_read_i32_array_kv_vec(gf, "codec.lm.cb0_allowed", &impl->cb0_allowed);
+    for (int32_t id : impl->cb0_allowed) {
+        if (lm->codebook_sizes_buf.empty() || id < 0 || id >= lm->codebook_sizes_buf[0]) {
+            lm->last_error = "codec.lm.cb0_allowed holds an id outside codebook 0";
+            delete impl;
+            return false;
+        }
+    }
 
     {
         std::string m = codec_lm_read_string_kv(
@@ -915,6 +981,14 @@ bool init(codec_lm * lm) {
                 if (t == nullptr) break;
                 impl->depth_heads.push_back(t);
             }
+            // Tied heads: head i is embedding table i (same (dim, vocab) layout).
+            if (impl->depth_heads.empty() && impl->heads_tied) {
+                if ((int32_t) impl->audio_embds.size() != impl->n_codebook) {
+                    lm->last_error = "heads_tied_to_embd needs one lm.depth.audio_embd_{i} per codebook";
+                    delete impl; return false;
+                }
+                impl->depth_heads = impl->audio_embds;
+            }
         }
         if (impl->flex_heads == nullptr && impl->depth_heads.empty()) {
             lm->last_error = "no depth heads found "
@@ -958,6 +1032,10 @@ bool init(codec_lm * lm) {
     if (impl->has_output_norm) {
         impl->depth_output_norm = find_required(lm, "lm.depth.output_norm.weight");
         if (!impl->depth_output_norm) { delete impl; return false; }
+        if (impl->depth_gpt2) {
+            impl->depth_output_norm_b = find_required(lm, "lm.depth.output_norm.bias");
+            if (!impl->depth_output_norm_b) { delete impl; return false; }
+        }
     }
 
     // Optional llama3 RoPE freq factors.
@@ -999,8 +1077,23 @@ bool init(codec_lm * lm) {
         w.o = find_required(lm, buf); if (!w.o) { delete impl; return false; }
         std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.ffn_norm.weight", l);
         w.ffn_norm = find_required(lm, buf); if (!w.ffn_norm) { delete impl; return false; }
-        std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.ffn_gate.weight", l);
-        w.ffn_gate = find_required(lm, buf); if (!w.ffn_gate) { delete impl; return false; }
+        if (!impl->depth_gpt2) {
+            std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.ffn_gate.weight", l);
+            w.ffn_gate = find_required(lm, buf); if (!w.ffn_gate) { delete impl; return false; }
+        } else {
+            w.ffn_gate = nullptr;
+            // GPT-2: every norm has a shift and every linear a bias.
+            const std::pair<const char *, ggml_tensor **> biases[] = {
+                {"attn_norm.bias", &w.attn_norm_b}, {"q.bias", &w.q_b}, {"k.bias", &w.k_b}, {"v.bias", &w.v_b},
+                {"o.bias", &w.o_b}, {"ffn_norm.bias", &w.ffn_norm_b}, {"ffn_up.bias", &w.ffn_up_b},
+                {"ffn_down.bias", &w.ffn_down_b},
+            };
+            for (const auto & b : biases) {
+                std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.%s", l, b.first);
+                *b.second = find_required(lm, buf);
+                if (*b.second == nullptr) { delete impl; return false; }
+            }
+        }
         std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.ffn_up.weight", l);
         w.ffn_up = find_required(lm, buf); if (!w.ffn_up) { delete impl; return false; }
         std::snprintf(buf, sizeof(buf), "lm.depth.blk_%d.ffn_down.weight", l);
@@ -1551,6 +1644,14 @@ const float * step_logits(codec_lm_state * st, int32_t * out_cb_idx, int32_t * o
         if (rc != CODEC_STATUS_SUCCESS) {
             return nullptr;
         }
+    }
+    if (k == 0 && !impl->cb0_allowed.empty()) {
+        // Only these ids are candidates (the reference samples from their logits alone).
+        std::vector<float> & lg = sst->logits_buf[0];
+        std::vector<float> keep(impl->cb0_allowed.size());
+        for (size_t i = 0; i < keep.size(); ++i) keep[i] = lg[(size_t) impl->cb0_allowed[i]];
+        std::fill(lg.begin(), lg.end(), -INFINITY);
+        for (size_t i = 0; i < keep.size(); ++i) lg[(size_t) impl->cb0_allowed[i]] = keep[i];
     }
     if (out_cb_idx) *out_cb_idx = k;
     if (out_n)      *out_n      = st->lm->info.codebook_sizes[k];

@@ -13,28 +13,24 @@ Covers two MOSS architectures that share the same shape:
                      (text embed added externally by the driver)
 
   - `MossTTSNanoForCausalLM` (OpenMOSS-Team/MOSS-TTS-Nano-100M, ~100M):
-      backbone     = GPT-2 12L (`transformer`)
-      depth        = 4-layer GPT-2-style local_transformer
-      per-step     = 17 channels (cb-0 = text via text_lm_head, cb-1..16 = audio)
-      cb-0 input   = backbone hidden (no embed at depth pos 0)
-      cb-0 head    = text_lm_head(depth_pos_0_hidden)   (text vocab)
-      cb-i head (i≥1) = audio_lm_heads.{i-1}(depth_pos_i_hidden)
-      compose      = transformer.wte(text_token) + sum_i audio_embeddings.{i}(c_i)
+      backbone     = GPT-2 + RoPE 12L (`transformer`, llama.cpp starcoder2)
+      depth        = 1-layer GPT-2 local_transformer over 17 positions
+      per-step     = 17 channels (cb-0 = text slot via the tied wte head,
+                     cb-1..16 = audio)
+      cb-0 input   = backbone hidden
+      cb-i input (i≥1) = wte(text slot) for i = 1, audio_embeddings.{i-2} after
+      heads        = tied to the input tables (wte, audio_embeddings.*)
+      compose      = wte(text slot) + sum_i audio_embeddings.{i}(c_i)
+                     (the sum over all 17 tables)
 
 Both fit the `residual_depth_ar` kind with `depth_emits_c0 = true`
-(`c0_input_modality = "none"`).  The differences land in metadata
-(`codec.lm.depth.arch ∈ {"qwen3", "gpt2"}`, `codec.lm.residual.cb0_vocab`)
-and in two extra Nano-only tensors (`lm.depth.heads_0` = text head,
-`lm.depth.cb0_input_embd.weight` = wte for compose).
-
-NOT yet covered: GPT-2 depth-block runtime support (Nano) — landing
-in a follow-up commit.  This file already emits the GGUF in a shape
-the runtime can consume once the gpt2 depth block ships; until then,
-only `MossTTSRealtime` is exposed via the dispatcher.
+(`c0_input_modality = "none"`); `codec.lm.depth.arch` picks the block
+("qwen3" / "gpt2").
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -273,12 +269,156 @@ def _dump_realtime(writer, sd: Dict[str, np.ndarray],
 
 
 # ---------------------------------------------------------------------
-# MOSS-TTS-Nano-100M (stub for now — GPT-2 depth-block runtime pending)
+# MOSS-TTS-Nano-100M
 # ---------------------------------------------------------------------
 
+# prompting.py (MOSS-TTS-Nano-100M @ 44502f80).  Each piece is SentencePiece-
+# encoded on its own (add_dummy_prefix every time), so joint tokenization of
+# the template differs; the GGUF carries the token ids.
+_NANO_USER_ROLE_PREFIX = "user\n"
+_NANO_REFERENCE_PREFIX = "<user_inst>\n- Reference(s):\n"
+_NANO_AFTER_REFERENCE = ("\n- Instruction:\nNone\n"
+                         "- Tokens:\nNone\n"
+                         "- Quality:\nNone\n"
+                         "- Sound Event:\nNone\n"
+                         "- Ambient Sound:\nNone\n"
+                         "- Language:\nNone\n"
+                         "- Text:\n")
+_NANO_USER_SUFFIX = "\n</user_inst>"
+_NANO_ASSISTANT_TURN_PREFIX = "\n"
+_NANO_ASSISTANT_ROLE_PREFIX = "assistant\n"
+# The text slot keeps the control-token rows of wte: the depth decoder only
+# ever reads the assistant slot (and the backbone the user slot) and only
+# chooses between the assistant slot and the audio end.
+_NANO_TEXT_ROWS = 16
+
+
 def _dump_nano(writer, sd, cfg, *, verbose: bool) -> None:
-    raise NotImplementedError(
-        "MOSS-TTS-Nano dump: pending `codec.lm.depth.arch=gpt2` runtime "
-        "(LayerNorm + GELU + fused c_attn split + absolute wpe).  Will "
-        "land in a follow-up commit."
-    )
+    """MossTTSNanoForCausalLM: GPT-2 global transformer (the llama.cpp backbone,
+    convert-backbone-to-gguf.py) + a 1-layer GPT-2 local transformer over 17
+    positions per 12.5 Hz frame:
+
+        pos 0      input = backbone hidden          → text_lm_head  (wte, tied)
+        pos 1      input = wte[text token]          → audio_lm_heads.0 (= audio_embeddings.0)
+        pos k+1    input = audio_embeddings.{k-1}   → audio_lm_heads.k (= audio_embeddings.k)
+
+    As residual_depth_ar with depth_emits_c0: n_codebook = 17, codebook 0 the
+    text slot (only the assistant slot / audio end may be sampled), 1..16 the
+    RVQ codes.  Heads are tied to the depth input tables, which are also the
+    compose tables: the backbone input of a frame is wte[text] + Σ audio rows,
+    i.e. the sum over all 17 tables."""
+    from sentencepiece import SentencePieceProcessor
+    from sentencepiece import sentencepiece_model_pb2 as spm_pb2
+
+    g = cfg["gpt2_config"]
+    n_vq = int(cfg["n_vq"])
+    sizes = [int(x) for x in cfg["audio_codebook_sizes"]]
+    hidden = int(cfg.get("hidden_size", g["n_embd"]))
+    n_head = int(g["n_head"])
+    head_dim = hidden // n_head
+    inter = int(g.get("n_inner") or 4 * hidden)
+    n_layers = int(cfg.get("local_transformer_layers", 1))
+    eps = float(g.get("layer_norm_epsilon", 1e-5))
+    if str(g.get("position_embedding_type", "absolute")).lower() != "rope":
+        raise NotImplementedError("MOSS-TTS-Nano local transformer without RoPE")
+    if g.get("activation_function") != "gelu_new":
+        raise NotImplementedError(f"MOSS-TTS-Nano activation {g.get('activation_function')!r}")
+    pad = int(cfg["audio_pad_token_id"])
+    ids = {k: int(cfg[k + "_token_id"]) for k in ("audio_start", "audio_end", "audio_user_slot",
+                                                   "audio_assistant_slot", "im_start", "im_end")}
+    if max(ids.values()) >= _NANO_TEXT_ROWS:
+        raise RuntimeError(f"control token ids {ids} beyond the {_NANO_TEXT_ROWS} kept wte rows")
+    wte = sd["transformer.wte.weight"]
+    for i in range(n_vq):
+        if not np.array_equal(sd.get(f"audio_lm_heads.{i}.weight", sd[f"audio_embeddings.{i}.weight"]),
+                              sd[f"audio_embeddings.{i}.weight"]):
+            raise RuntimeError(f"audio_lm_heads.{i} is not tied to audio_embeddings.{i}")
+
+    n_codebook = 1 + n_vq
+    writer.add_bool   ("codec.lm.has_adaptor",     True)
+    writer.add_string ("codec.lm.kind",            "residual_depth_ar")
+    writer.add_string ("codec.lm.host_arch",       "starcoder2")
+    writer.add_uint32 ("codec.lm.hidden_dim",      hidden)
+    writer.add_uint32 ("codec.lm.audio_embed_dim", hidden)
+    writer.add_uint32 ("codec.lm.n_codebook",      n_codebook)
+    writer.add_array  ("codec.lm.codebook_sizes",  [_NANO_TEXT_ROWS] + sizes)
+    writer.add_array  ("codec.lm.delay_pattern",   [0] * n_codebook)
+    writer.add_int32  ("codec.lm.eos_code_c0",     ids["audio_end"])
+    writer.add_int32  ("codec.lm.eos_min_step",    0)
+    writer.add_array  ("codec.lm.cb0_allowed",     [ids["audio_assistant_slot"], ids["audio_end"]])
+    writer.add_uint32 ("codec.lm.audio_cb_offset", 1)   # codebook 0 is text, dropped before decode
+    writer.add_bool   ("codec.lm.modality.input_text",  True)
+    writer.add_bool   ("codec.lm.modality.input_audio", True)
+    writer.add_bool   ("codec.lm.modality.output_audio", True)
+
+    writer.add_uint32 ("codec.lm.residual.depth_layers",       n_layers)
+    writer.add_uint32 ("codec.lm.residual.depth_hidden",       hidden)
+    writer.add_uint32 ("codec.lm.residual.depth_n_heads",      n_head)
+    writer.add_uint32 ("codec.lm.residual.depth_n_kv_heads",   n_head)
+    writer.add_uint32 ("codec.lm.residual.depth_head_dim",     head_dim)
+    writer.add_uint32 ("codec.lm.residual.depth_intermediate", inter)
+    writer.add_uint32 ("codec.lm.residual.depth_max_position", n_codebook)
+    writer.add_float32("codec.lm.residual.depth_rms_norm_eps", eps)   # the LayerNorm eps
+    writer.add_float32("codec.lm.residual.depth_rope_theta",   float(g.get("rope_base", 10000.0)))
+    writer.add_bool   ("codec.lm.residual.depth_has_in_proj",  False)
+    writer.add_bool   ("codec.lm.residual.depth_has_qk_norm",  False)
+    writer.add_bool   ("codec.lm.residual.depth_use_rope",     True)
+    writer.add_bool   ("codec.lm.residual.depth_rope_interleaved", True)   # rotate_half on (2i, 2i+1)
+    writer.add_bool   ("codec.lm.residual.depth_emits_c0",     True)
+    writer.add_bool   ("codec.lm.residual.heads_tied_to_embd", True)
+    writer.add_string ("codec.lm.residual.weight_layout",      "shared")
+    writer.add_string ("codec.lm.residual.c0_input_modality",  "none")
+    writer.add_string ("codec.lm.depth.arch",                  "gpt2")
+
+    # Depth input / head / compose tables: wte's control rows, then the codebooks.
+    writer.add_tensor("lm.depth.audio_embd_0.weight", wte[:_NANO_TEXT_ROWS].astype(np.float32), st_dtype="F16")
+    for i in range(n_vq):
+        arr = sd[f"audio_embeddings.{i}.weight"]
+        if arr.shape != (sizes[i], hidden):
+            raise RuntimeError(f"audio_embeddings.{i} shape {arr.shape} != ({sizes[i]}, {hidden})")
+        writer.add_tensor(f"lm.depth.audio_embd_{i + 1}.weight", arr.astype(np.float32), st_dtype="F16")
+
+    for l in range(n_layers):
+        p, o = f"local_transformer.h.{l}.", f"lm.depth.blk_{l}."
+        qkv_w = sd[p + "attn.c_attn.weight"]
+        qkv_b = sd[p + "attn.c_attn.bias"]
+        if qkv_w.shape != (3 * hidden, hidden):
+            raise RuntimeError(f"{p}attn.c_attn.weight shape {qkv_w.shape}")
+        for name, w, b in zip(("q", "k", "v"), np.split(qkv_w, 3, axis=0), np.split(qkv_b, 3, axis=0)):
+            writer.add_tensor(o + name + ".weight", w.astype(np.float32), st_dtype="F16")
+            writer.add_tensor(o + name + ".bias", b.astype(np.float32), st_dtype="F32")
+        for src, dst in (("attn.c_proj", "o"), ("mlp.fc_in", "ffn_up"), ("mlp.fc_out", "ffn_down")):
+            writer.add_tensor(o + dst + ".weight", sd[p + src + ".weight"].astype(np.float32), st_dtype="F16")
+            writer.add_tensor(o + dst + ".bias", sd[p + src + ".bias"].astype(np.float32), st_dtype="F32")
+        for src, dst in (("ln_1", "attn_norm"), ("ln_2", "ffn_norm")):
+            writer.add_tensor(o + dst + ".weight", sd[p + src + ".weight"].astype(np.float32), st_dtype="F32")
+            writer.add_tensor(o + dst + ".bias", sd[p + src + ".bias"].astype(np.float32), st_dtype="F32")
+    writer.add_tensor("lm.depth.output_norm.weight", sd["local_transformer.ln_f.weight"].astype(np.float32),
+                      st_dtype="F32")
+    writer.add_tensor("lm.depth.output_norm.bias", sd["local_transformer.ln_f.bias"].astype(np.float32),
+                      st_dtype="F32")
+
+    # Prompt template (token ids) + the tokenizer's normalizer for the host.
+    tok_path = Path(cfg["_source_dir"]) / "tokenizer.model"
+    sp = SentencePieceProcessor(model_file=str(tok_path))
+    enc = lambda t: [int(x) for x in sp.encode(t)]
+    pre = "codec.lm.moss_tts_nano."
+    writer.add_array(pre + "user_prefix", [ids["im_start"]] + enc(_NANO_USER_ROLE_PREFIX) + enc(_NANO_REFERENCE_PREFIX))
+    writer.add_array(pre + "no_reference", enc("None"))
+    writer.add_array(pre + "after_reference", enc(_NANO_AFTER_REFERENCE))
+    writer.add_array(pre + "assistant_prefix", enc(_NANO_USER_SUFFIX) + [ids["im_end"]] +
+                     enc(_NANO_ASSISTANT_TURN_PREFIX) + [ids["im_start"]] + enc(_NANO_ASSISTANT_ROLE_PREFIX))
+    for k in ("audio_start", "audio_end", "audio_user_slot", "audio_assistant_slot"):
+        writer.add_uint32(pre + k, ids[k])
+    writer.add_uint32(pre + "audio_pad", pad)
+    m = spm_pb2.ModelProto()
+    m.ParseFromString(tok_path.read_bytes())
+    ns = m.normalizer_spec
+    if not (ns.add_dummy_prefix and ns.remove_extra_whitespaces and ns.escape_whitespaces):
+        raise NotImplementedError("MOSS-TTS-Nano tokenizer normalizer flags changed")
+    writer.add_string(pre + "text_norm", ns.name)
+    writer.add_uint8_array(pre + "text_norm_charsmap", ns.precompiled_charsmap)
+
+    if verbose:
+        print(f"[lm_adaptor:moss_tts_local:nano] residual_depth_ar gpt2: n_codebook={n_codebook} "
+              f"hidden={hidden} depth={n_layers}L heads={n_head} ffn={inter}")
