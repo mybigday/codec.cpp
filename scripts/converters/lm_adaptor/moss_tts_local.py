@@ -411,6 +411,9 @@ def _dump_nano(writer, sd, cfg, *, verbose: bool) -> None:
     for k in ("audio_start", "audio_end", "audio_user_slot", "audio_assistant_slot"):
         writer.add_uint32(pre + k, ids[k])
     writer.add_uint32(pre + "audio_pad", pad)
+    # inference(text_temperature): the text slot (the stop decision) is drawn at
+    # its own temperature, model-side (the family); <= 0 = argmax.
+    writer.add_float32(pre + "text_temperature", 1.5)
     m = spm_pb2.ModelProto()
     m.ParseFromString(tok_path.read_bytes())
     ns = m.normalizer_spec

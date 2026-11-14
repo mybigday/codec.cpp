@@ -21,7 +21,9 @@
 #include "lm/lm_models.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 
 namespace codec_common {
 namespace {
@@ -81,6 +83,7 @@ public:
         if (n_cb_ != mi_->n_codebook) return fail("codebook count mismatch");
         frames_ = 0;
         min_frames_ = std::max(0, req.min_frames);
+        set_seed(CODEC_AUDIO_LM_DEFAULT_SEED);   // random unless the host sets one (codec_audio_lm_set_seed)
         stop_reason_ = "max_frames";
         audio_lm_set_uses_embed_override(alm_, true, 1);
 
@@ -161,6 +164,8 @@ public:
 
     const float * next_embd(int32_t) const override { return audio_lm_get_next_embed(alm_, nullptr); }
 
+    void set_seed(uint32_t seed) override { rng_.seed(alm_resolve_seed(seed)); }
+
 private:
     bool next_head(codec_audio_lm_verdict * v) {
         if (cb_ < n_cb_) {
@@ -168,9 +173,7 @@ private:
             const float * lg = audio_lm_step_logits(alm_, &idx, &n);
             if (lg == nullptr) return fail_alm("step logits");
             logits_.assign(lg, lg + n);
-            if (cb_ == 0 && frames_ < min_frames_ && mi_->audio_end < n) {
-                logits_[(size_t) mi_->audio_end] = -INFINITY;   // min_frames not reached
-            }
+            if (cb_ == 0) decide_text_slot();
             *v = {CODEC_AUDIO_LM_SAMPLE_HEAD, false, true, false, -1, 0, n};
             return true;
         }
@@ -184,6 +187,35 @@ private:
         ++frames_;
         *v = {CODEC_AUDIO_LM_FEED_EMBD, false, true, true, -1, 0, 0};
         return true;
+    }
+
+    // The text slot is the stop decision: the reference samples it between the
+    // assistant slot and the audio end at its own temperature (1.5, top_p 1),
+    // apart from the codebooks' settings (1.7 / top_k 25 / top_p 0.8) the host
+    // applies to every head; under those, the end could not be drawn below
+    // p = 0.2 and generations ran on.  So the model draws it here, like a stop
+    // head, with its own seeded stream, and hands the host a one-hot head.
+    // codec.lm.moss_tts_nano.text_temperature <= 0: argmax (greedy).
+    void decide_text_slot() {
+        const int32_t n = (int32_t) logits_.size(), end = mi_->audio_end, slot = mi_->assistant_slot;
+        if (end < 0 || end >= n || slot < 0 || slot >= n) return;
+        bool stop;
+        if (frames_ < min_frames_) {
+            stop = false;   // min_frames not reached
+        } else {
+            const char * tv = audio_lm_meta_str(alm_, "codec.lm.moss_tts_nano.text_temperature");
+            const float temp = tv ? std::strtof(tv, nullptr) : 1.5f;
+            const float d = logits_[(size_t) end] - logits_[(size_t) slot];
+            if (temp <= 0.0f) {
+                stop = d > 0.0f;
+            } else {
+                const double p_end = 1.0 / (1.0 + std::exp(-(double) d / temp));
+                stop = std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < p_end;
+            }
+        }
+        for (int32_t i = 0; i < n; ++i) {
+            if (i != (stop ? end : slot)) logits_[(size_t) i] = -INFINITY;
+        }
     }
 
     // The voice's reference codes: I32 [n_q, T] with n_q = n_codebook - 1.
@@ -210,6 +242,7 @@ private:
     codec_lm * lm_;
     const codec_lm_moss_nano_info * mi_;
     std::vector<float> hidden_frame_, logits_;
+    std::mt19937 rng_;
     int32_t hidden_ = 0, n_cb_ = 0, cb_ = 0, frames_ = 0, min_frames_ = 0;
 };
 
