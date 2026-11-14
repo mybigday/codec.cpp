@@ -149,11 +149,8 @@ The host samples every token with llama.cpp's sampler: the backbone's, and
 each codec-side head's (`SAMPLE_HEAD` verdicts: `codec_audio_lm_head_logits`
 gives the head's logits, the model's constraints already applied as -inf and
 guidance already combined; `codec_audio_lm_head_token` takes the id back and
-gives the next verdict). codec_audio_lm holds no token sampler and no sampling
-settings (one exception: MOSS-TTS-Nano's text slot, a two-way stop decision the
-reference draws at its own temperature, is drawn by the family from its own
-stream seeded by `codec_audio_lm_set_seed`, and the host gets a one-hot head;
-see models/moss_tts_nano.md); it only suggests constraints: `grammar` / `allowed` /
+gives the next verdict). codec_audio_lm holds no sampler and no sampling
+settings; it only suggests constraints: `grammar` / `allowed` /
 `penalty_exempt` for the backbone, and `head_groups` for the heads. Build one
 host sampler per group (one random stream and penalty history; seed group `g`
 with seed + 1 + g), with the same llama.cpp settings as the backbone; a group
@@ -255,7 +252,7 @@ A family that needs something else entirely can still override both.
 |---|---|---|---|
 | `codebook` | CSM, Qwen3-TTS, MOSS-TTSD | CODEC_HEAD | depth decoder or delayed parallel heads; MOSS-TTSD samples codebook 0 from the backbone under a grammar |
 | `realtime` | MOSS-TTS-Realtime | CODEC_HEAD | text lane from the backbone's embedding table (`params.backbone_path`) |
-| `moss_tts_nano` | MOSS-TTS-Nano | CODEC_HEAD | starcoder2 backbone; reference codes as voice rows; the depth decoder's text slot (drawn model-side) stops it |
+| `moss_tts_nano` | MOSS-TTS-Nano | CODEC_HEAD | starcoder2 backbone; reference codes as voice rows; the depth decoder's text slot (continue / audio end, sampled by the host; requires top_p 1.0) stops it |
 | `lfm2` | LFM2-Audio | CODEC_HEAD | text warm-up from the tied embedding head (`verdict.token`), then audio frames |
 | `chatterbox` | Chatterbox T3, Turbo, Multilingual | CODEC_HEAD | guidance pair (`n_seq` 2) for T3 |
 | `cosyvoice` | CosyVoice 1/2/3, BreezyVoice | CODEC_HEAD | SFT / zero-shot / cross-lingual / instruct modes; v1 disables flash attention |
