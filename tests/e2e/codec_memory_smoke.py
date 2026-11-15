@@ -17,10 +17,12 @@ Tolerances. Chunked compute reorders float reductions (attention rows of
 cache + chunk keys), so streamed output equals batch to rounding, not bit for
 bit; these models amplify rounding to ~1e-4..1e-3 (the batch graph itself
 differs that much between clip lengths). Decode: relative RMS <= 1e-3.
-Encode: codes are argmaxes at near-ties in the deep RVQ levels; <= 3 % flips.
+Encode: codes are argmaxes at near-ties, and in the deep RVQ levels rounding
+flips some (batch itself flips ~1 % between clip lengths on Mimi): the first
+8 levels <= 0.5 % flips, all levels <= 5 %.
 Convolution-only models (NeMo) are bit-exact.
 
-Usage: codec_memory_smoke.py [model ...]   (default: every model found)
+Usage: codec_memory_smoke.py [--seconds S] [model ...]   (default: 24 s, every model found)
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ MODELS = {
 NON_CAUSAL = REPO / "models" / "dac" / "dac.gguf"
 SECONDS = 24.0          # longer than every window but MOSS's (whose windows exceed any test clip)
 DEC_REL_RMS = 1e-3
-ENC_FLIPS = 0.03
+ENC_FLIPS = 0.05
+ENC_FLIPS_TOP = 0.005   # first 8 RVQ levels
 
 
 def resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
@@ -165,13 +168,28 @@ def test_model(name: str) -> None:
         sc = stream_encode(codec_cpp.Context(m, encoder_memory=True), x, hop, sr, sizes)
         must(sc.shape == codes.shape, f"{name} encode: shape {sc.shape} vs {codes.shape}")
         flips = float((sc != codes).mean())
-        print(f"  encode stream vs batch: {flips * 100:.2f} % codes differ")
-        must(flips <= ENC_FLIPS, f"{name} encode: {flips * 100:.2f} % codes differ")
+        top = float((sc[:, :8] != codes[:, :8]).mean())
+        print(f"  encode stream vs batch: {flips * 100:.2f} % codes differ (first 8 levels {top * 100:.2f} %)")
+        must(flips <= ENC_FLIPS and top <= ENC_FLIPS_TOP, f"{name} encode: {flips * 100:.2f} % / {top * 100:.2f} % codes differ")
 
         def run_enc(ctx, lo, hi):
             if ctx is None:
                 return T
             return stream_encode(ctx, x[lo * hop:], hop, sr, plan(hi - lo, seed=lo))
+        # a final chunk that is not a whole hop (the end of a microphone stream):
+        # processed as batch processes its clip's end
+        n = (T - 1) * hop + hop // 3
+        xu = x[:n]
+        ref_u = c.encode(xu, sr)
+        su = codec_cpp.Context(m, encoder_memory=True)
+        full = n // hop
+        cu = np.concatenate([stream_encode(su, xu, hop, sr, plan(full)), su.encode(xu[full * hop:], sr)])
+        must(cu.shape == ref_u.shape, f"{name} encode (unaligned tail): shape {cu.shape} vs {ref_u.shape}")
+        last = float((cu[-1] != ref_u[-1]).mean())
+        top_u = float((cu[:, :8] != ref_u[:, :8]).mean())
+        print(f"  encode with an unaligned last chunk: last frame {last * 100:.0f} % differ, first 8 levels {top_u * 100:.2f} %")
+        must(top_u <= ENC_FLIPS_TOP and last <= 0.25, f"{name} encode (unaligned tail) differs from batch")
+
         check_state(name, m, "encoder", run_enc, BLOBS.get("encoder", b""))
         BLOBS["encoder"] = codec_cpp.Context(m, encoder_memory=True).encoder_memory.get_state()
 
@@ -219,7 +237,12 @@ def test_look_keys() -> None:
 
 
 def main() -> int:
-    names = sys.argv[1:] or list(MODELS)
+    global SECONDS
+    args = sys.argv[1:]
+    if args[:1] == ["--seconds"]:
+        SECONDS = float(args[1])
+        args = args[2:]
+    names = args or list(MODELS)
     for n in names:
         test_model(n)
     test_non_causal()
