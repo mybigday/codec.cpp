@@ -408,7 +408,8 @@ ggml_tensor * codec_conv1d_causal_ctx(
     int32_t stride,
     int32_t dilation,
     bool depthwise,
-    ggml_tensor ** x_cat) {
+    ggml_tensor ** x_cat,
+    bool replicate) {
 
     if (ctx == nullptr || x == nullptr || w == nullptr || stride <= 0 || dilation <= 0) {
         return nullptr;
@@ -425,7 +426,9 @@ ggml_tensor * codec_conv1d_causal_ctx(
     }
     const int32_t t_in = (int32_t) x->ne[0];
     const int32_t extra_pad = t_in > 0 ? (((t_in + stride - 1) / stride) * stride - t_in) : 0;
-    ggml_tensor * x_pad = extra_pad > 0 ? codec_op_pad_1d(ctx, xc, 0, extra_pad) : xc;
+    ggml_tensor * x_pad = extra_pad <= 0 ? xc
+                        : replicate  ? codec_op_pad_1d_replicate(ctx, xc, 0, extra_pad)
+                                     : codec_op_pad_1d(ctx, xc, 0, extra_pad);
     if (x_pad == nullptr) {
         return nullptr;
     }

@@ -320,7 +320,7 @@ static ggml_tensor * codec_memory_conv_common(ggml_context * ctx, codec_memory *
         }
     }
     ggml_tensor * x_cat = nullptr;
-    ggml_tensor * y = codec_conv1d_causal_ctx(ctx, x, prev, w, b, stride, dilation, depthwise, &x_cat);
+    ggml_tensor * y = codec_conv1d_causal_ctx(ctx, x, prev, w, b, stride, dilation, depthwise, &x_cat, replicate);
     if (y == nullptr) return nullptr;
     if (pad_left > 0) {
         ggml_tensor * tail = ggml_view_2d(ctx, x_cat, pad_left, x_cat->ne[1], x_cat->nb[1],

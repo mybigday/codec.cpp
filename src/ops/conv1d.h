@@ -55,7 +55,8 @@ int32_t codec_conv1d_causal_pad_left(const ggml_tensor * w, int64_t c_in, int32_
 
 // Causal conv whose left padding is `prev` ([pad_left, C_in], the cached tail
 // of the previous input) instead of zeros. The right padding to a stride
-// multiple is the batch op's. *x_cat = concat(prev, x), for the next tail.
+// multiple is the batch op's (zeros, or the last value when `replicate`).
+// *x_cat = concat(prev, x), for the next tail.
 ggml_tensor * codec_conv1d_causal_ctx(
     ggml_context * ctx,
     ggml_tensor * x,
@@ -65,6 +66,7 @@ ggml_tensor * codec_conv1d_causal_ctx(
     int32_t stride,
     int32_t dilation,
     bool depthwise,
-    ggml_tensor ** x_cat);
+    ggml_tensor ** x_cat,
+    bool replicate = false);
 
 #endif
