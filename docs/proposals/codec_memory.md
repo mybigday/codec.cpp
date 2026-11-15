@@ -179,8 +179,10 @@ the converters:
   covers its reach.
 * **On a causal side, `look_back` is the cached context length**: the number
   of past frames the memory keeps.
-  * For an attention layer that is its sliding window, so the cache holds
-    `look_back` frames of K/V per layer.
+  * For an attention layer that is its sliding window, converted to codec
+    frames: the cache holds that window, minus the current step, of K/V per
+    layer, at the layer's own rate. Mimi's transformers run at twice the
+    codec frame rate, so their 250-step window is 125 codec frames.
   * Convolution tails are shorter than one look-back and are kept per layer as
     the kernel needs.
   * Memory size is therefore about `n_layers × look_back × kv_dim × 2 ×
@@ -199,8 +201,8 @@ Per-arch values (these become the defaults; frames at each model's own rate):
 
 | Arch | Encoder look_back / look_ahead | Decoder look_back / look_ahead | Source |
 |---|---|---|---|
-| Mimi (12.5 Hz) | 250 / 0 | 250 / 0 | transformer sliding window (HF `sliding_window` 250), causal convs |
-| Qwen3-TTS tokenizer (12.5 Hz) | 250 / 0 (Mimi encoder) | 72 / 0 | decoder `qwen3.decoder.sliding_window` 72 |
+| Mimi (12.5 Hz) | 125 / 0 | 125 / 0 | transformer sliding window: 250 steps (HF `sliding_window`) at the transformer's 25 Hz = 125 codec frames; causal convs |
+| Qwen3-TTS tokenizer (12.5 Hz) | 125 / 0 (Mimi encoder, same 250-step window at 25 Hz) | 72 / 0 | decoder `qwen3.decoder.sliding_window` 72 (its transformer runs at 12.5 Hz) |
 | MOSS-Audio | per-stage `context_duration` in frames / 0 | same / 0 | converter computes it from the stage windows |
 | NeMo nano codec | (no encoder streaming) | 27 / 0 | conv receptive field (impulse: 2.2 s) |
 | DAC 16 kHz (50 Hz) | n/a | 16 / 16 | #6 window 0.32 s / 0.32 s (reach ±10 frames) |
