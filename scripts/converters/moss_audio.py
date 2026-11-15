@@ -81,6 +81,15 @@ def _load_state_dict(path: Path) -> Dict[str, np.ndarray]:
     return OrderedDict((k, _to_numpy(v)) for k, v in state.items())
 
 
+def _lm_source_arch(lm_source) -> str:
+    p = Path(str(lm_source))
+    cfg = p / "config.json" if p.is_dir() else p.parent / "config.json"
+    if not cfg.is_file():
+        return ""
+    archs = json.loads(cfg.read_text()).get("architectures") or []
+    return archs[0] if archs else ""
+
+
 class MossAudioConverter(BaseConverter):
     """MOSS-Audio-Tokenizer (Nano + full) converter.
 
@@ -355,6 +364,16 @@ class MossAudioConverter(BaseConverter):
         if self.lm_source is not None:
             from .lm_adaptor import dump_lm_into
             dump_lm_into(writer, self.lm_source, verbose=self.verbose)
+            if _lm_source_arch(self.lm_source) == "MossTTSNanoForCausalLM":
+                # Voices of MOSS-TTS-Nano are the reference clip's codes (`ref_codes`,
+                # codec_speaker_from_audio: resample to the codec rate, mono copied to
+                # every channel, encode).  The hash covers the encoder + quantizer.
+                from .speaker import encoder_hash
+                enc = [(k, np.asarray(v, dtype=np.float32)) for k, v in sd.items()
+                       if k.startswith(("encoder.", "quantizer."))]
+                params = (f"moss_audio ref_codes: sinc_hann resample to {sr} Hz, mono x{n_channels} channels, "
+                          f"whole clip, floor(n / {downsample}) frames, {n_q} codebooks")
+                writer.add_string(f"{self.architecture}.spk.encoder_hash", encoder_hash(enc, params))
 
         self._warn_if_no_quantized()
         writer.write()

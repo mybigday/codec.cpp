@@ -111,6 +111,7 @@ model, so a speaker may hold that backbone's token ids.
 | Pocket-Mimi | `latents` F32 [T, 32] (Mimi encoder latent of the first 30 s; the FlowLM applies `speaker_proj`) | Pocket-TTS ([pocket_tts.md](models/pocket_tts.md)) |
 | Qwen3-TTS-Tokenizer | `spk_id` I32 [1] (talker codec-vocab row used as the speaker row) + optional `language_id` I32 [1] (dialect tag) | Qwen3-TTS CustomVoice ([qwen3_tts.md](models/qwen3_tts.md)) |
 | Qwen3-TTS-Tokenizer + ECAPA-TDNN | `xvector` F32 [hidden] (speaker row) + `ref_codes` I32 [16, T] + `ref_text` (in-context prompt) | Qwen3-TTS Base, cloned |
+| MOSS-Audio-Tokenizer-Nano | `ref_codes` I32 [16, T] (the clip's codes: resampled to 48 kHz, mono on both channels, `floor(n / 3840)` frames) | MOSS-TTS-Nano ([moss_tts_nano.md](models/moss_tts_nano.md)) |
 
 `scripts/bake-speakers.py` writes them into a copy of a codec GGUF (or a
 speaker file). OuteTTS speakers cannot be derived from audio;

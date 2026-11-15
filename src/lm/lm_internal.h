@@ -20,6 +20,8 @@ struct codec_lm_kind_vtable;
 void codec_lm_chatterbox_free_state(struct codec_lm * lm);
 // Free the lazily-created CosyVoice helper state (cosyvoice_lm.cpp).
 void codec_lm_cosyvoice_free_state(struct codec_lm * lm);
+// Free the lazily-created MOSS-TTS-Nano helper state (moss_tts_nano.cpp).
+void codec_lm_moss_nano_free_state(struct codec_lm * lm);
 
 struct codec_lm {
     // Borrowed; not freed by codec_lm_free.  All weights and the
@@ -39,6 +41,8 @@ struct codec_lm {
 
     // CosyVoice helper state (codec_lm_cosyvoice_*), created on first use.
     void * cosyvoice = nullptr;
+    // MOSS-TTS-Nano helper state (codec_lm_moss_nano_*), created on first use.
+    void * moss_nano = nullptr;
 
     // Speaker-conditioning encoder info, populated from `codec.speaker.*`
     // GGUF metadata at create time.  `has_speaker_encoder = false` when
