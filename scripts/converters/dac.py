@@ -18,7 +18,7 @@ try:
 except ImportError:
     AutoModel = None
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from utils.gguf_writer import GGUFWriter
 
 MAX_TENSOR_NAME = 63
@@ -481,6 +481,9 @@ class DacConverter(BaseConverter):
         writer.add_uint32("codec.codebook_dim", int(self.config["codebook_dim"]))
         writer.add_bool("codec.has_encoder", bool(self.config["has_encoder"]))
         writer.add_bool("codec.has_decoder", bool(self.config["has_decoder"]))
+        # non-causal decoder: the window a host re-decodes around a chunk (0.32 s each side)
+        fps = int(self.config["sample_rate"]) / int(self.config["hop_size"])
+        write_look(writer, "decoder", round(0.32 * fps), round(0.32 * fps))
 
         mapped = OrderedDict()
         for raw_key, value in self.state_dict.items():

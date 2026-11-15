@@ -16,6 +16,15 @@ except ImportError:  # pragma: no cover - fallback for package-style imports
     from ..utils import GGUFWriter
 
 
+def write_look(writer, side: str, look_back: int, look_ahead: int) -> None:
+    """codec.<side>.look_back / look_ahead (side: "encoder" / "decoder"), in
+    codec frames: the past context the side uses (on a causal side, the
+    context codec memory caches) and the future frames its output depends on
+    (0 = causal, -1 = unbounded). See docs/proposals/codec_memory.md."""
+    writer.add_int32(f"codec.{side}.look_back", int(look_back))
+    writer.add_int32(f"codec.{side}.look_ahead", int(look_ahead))
+
+
 class BaseConverter(ABC):
     """
     Abstract base class for audio codec GGUF converters.

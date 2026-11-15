@@ -20,6 +20,7 @@ converter handles either by reading `config.json`.
 from __future__ import annotations
 
 import json
+import math
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -31,7 +32,7 @@ try:
 except ImportError:
     torch = None
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from utils.gguf_writer import GGUFWriter
 
 
@@ -182,6 +183,12 @@ class MossAudioConverter(BaseConverter):
         writer.add_uint32("codec.latent_dim", latent_dim)
         writer.add_bool("codec.has_encoder", True)
         writer.add_bool("codec.has_decoder", True)
+        # causal both ways; look_back = the longest per-block attention context, in codec frames
+        fps = sr / downsample
+        for side, key in (("encoder", "encoder_kwargs"), ("decoder", "decoder_kwargs")):
+            ctx_s = max([float(m.get("context_duration", 10.0)) for m in cfg.get(key, [])
+                         if m.get("module_type") != "PatchedPretransform"] or [0.0])
+            write_look(writer, side, int(math.ceil(ctx_s * fps)), 0)
 
         writer.add_uint32("moss.number_channels", n_channels)
         writer.add_bool("moss.channel_interleave", interleave)

@@ -18,7 +18,7 @@ except ImportError:
 
 import yaml
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from utils.gguf_writer import GGUFWriter
 
 
@@ -264,6 +264,7 @@ class NemoNanoCodecConverter(BaseConverter):
         writer.add_uint32("codec.latent_dim", num_groups * codebook_dim)
         writer.add_bool("codec.has_encoder", True)
         writer.add_bool("codec.has_decoder", True)
+        write_look(writer, "decoder", 27, 0)   # causal conv decoder, receptive field ~2.2 s
 
         state = self.state_dict
         mapped: Dict[str, np.ndarray] = {}

@@ -12,7 +12,7 @@ try:
 except ImportError:
     torch = None
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from utils.gguf_writer import GGUFWriter
 
 MAX_TENSOR_NAME = 63
@@ -441,6 +441,9 @@ class WavTokenizerConverter(BaseConverter):
         writer.add_uint32("codec.hop_size", int(self.config["hop_size"]))
         writer.add_bool("codec.has_encoder", bool(self.config["has_encoder"]))
         writer.add_bool("codec.has_decoder", bool(self.config["has_decoder"]))
+        # global attention: no window covers its reach; the accepted streaming window (1.28 s / 0.32 s)
+        fps = int(self.config["sample_rate"]) / int(self.config["hop_size"])
+        write_look(writer, "decoder", round(1.28 * fps), round(0.32 * fps))
 
         used_names = set()
         handled = set()
