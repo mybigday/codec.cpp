@@ -5,6 +5,7 @@
 #include "../ops/lm_attn.h"
 #include "../ops/rope.h"
 #include "../runtime/graph.h"
+#include "../runtime/memory.h"
 #include "../runtime/gguf_kv.h"
 #include "../runtime/tensor_utils.h"
 
@@ -101,7 +102,8 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     int32_t n_heads,
     float rope_theta,
     int32_t window,
-    int32_t n_valid) {
+    int32_t n_valid,
+    codec_memory * mem) {
 
     if (ctx == nullptr || x_tc == nullptr) return nullptr;
     const int64_t t = x_tc->ne[0];
@@ -122,36 +124,52 @@ ggml_tensor * codec_moss_transformer_layer_tc(
     ggml_tensor * q_dht = ggml_reshape_3d(ctx, q, head_dim, n_heads, t);    // [d, h, t]
     ggml_tensor * k_dht = ggml_reshape_3d(ctx, k, head_dim, n_heads, t);
     ggml_tensor * v_dht = ggml_reshape_3d(ctx, v, head_dim, n_heads, t);
-    // MOSS RoPE: rotate pairs (q[2k], q[2k+1]) along head_dim per token
-    // position.  We bypass codec_op_rope (which assumes a (d, t, h) input
-    // ordering) and call ggml_rope_ext directly with the natural (d, h, t)
-    // layout — that matches ggml's expected (n_embd_per_head, n_head,
-    // n_tokens) shape and uses NEOX-mode for interleaved pairs.
-    ggml_tensor * t_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) t, 1.0f), GGML_TYPE_I32);
-    // ggml NEOX = half-split pairs (k, k+D/2); NORMAL = interleaved (2k, 2k+1).
-    // MOSS does `q.view(..., D//2, 2)` which is interleaved → NORMAL mode.
-    ggml_tensor * q_rope_dht = ggml_rope_ext(ctx, q_dht, t_pos, nullptr,
-                                             head_dim, GGML_ROPE_TYPE_NORMAL, 0,
-                                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    ggml_tensor * k_rope_dht = ggml_rope_ext(ctx, k_dht, t_pos, nullptr,
-                                             head_dim, GGML_ROPE_TYPE_NORMAL, 0,
-                                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    if (q_rope_dht == nullptr || k_rope_dht == nullptr) return nullptr;
-    // Permute (d, h, t) → (d, t, h) for the attention helper.
-    ggml_tensor * q_dth = ggml_cont(ctx, ggml_permute(ctx, q_rope_dht, 0, 2, 1, 3));   // [d, t, h]
-    ggml_tensor * k_dth = ggml_cont(ctx, ggml_permute(ctx, k_rope_dht, 0, 2, 1, 3));
-    ggml_tensor * v_dth = ggml_cont(ctx, ggml_permute(ctx, v_dht,      0, 2, 1, 3));
+    ggml_tensor * attn_ct = nullptr;
+    if (mem != nullptr) {
+        codec_memory_attn_params ap;
+        ap.head_dim = head_dim;
+        ap.n_heads = n_heads;
+        ap.n_kv_heads = n_heads;
+        ap.window = window;
+        ap.rope_theta = rope_theta;
+        ap.rope_freq_scale = 1.0f;
+        ap.rope_mode = GGML_ROPE_TYPE_NORMAL;
+        ap.scale = 1.0f / std::sqrt((float) head_dim);
+        ap.n_valid = n_valid;
+        attn_ct = codec_memory_attn(ctx, mem, q_dht, k_dht, v_dht, ap);
+        if (attn_ct == nullptr) return nullptr;
+    } else {
+        // MOSS RoPE: rotate pairs (q[2k], q[2k+1]) along head_dim per token
+        // position.  We bypass codec_op_rope (which assumes a (d, t, h) input
+        // ordering) and call ggml_rope_ext directly with the natural (d, h, t)
+        // layout — that matches ggml's expected (n_embd_per_head, n_head,
+        // n_tokens) shape and uses NEOX-mode for interleaved pairs.
+        ggml_tensor * t_pos = ggml_cast(ctx, codec_op_arange(ctx, 0.0f, (float) t, 1.0f), GGML_TYPE_I32);
+        // ggml NEOX = half-split pairs (k, k+D/2); NORMAL = interleaved (2k, 2k+1).
+        // MOSS does `q.view(..., D//2, 2)` which is interleaved → NORMAL mode.
+        ggml_tensor * q_rope_dht = ggml_rope_ext(ctx, q_dht, t_pos, nullptr,
+                                                 head_dim, GGML_ROPE_TYPE_NORMAL, 0,
+                                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * k_rope_dht = ggml_rope_ext(ctx, k_dht, t_pos, nullptr,
+                                                 head_dim, GGML_ROPE_TYPE_NORMAL, 0,
+                                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        if (q_rope_dht == nullptr || k_rope_dht == nullptr) return nullptr;
+        // Permute (d, h, t) → (d, t, h) for the attention helper.
+        ggml_tensor * q_dth = ggml_cont(ctx, ggml_permute(ctx, q_rope_dht, 0, 2, 1, 3));   // [d, t, h]
+        ggml_tensor * k_dth = ggml_cont(ctx, ggml_permute(ctx, k_rope_dht, 0, 2, 1, 3));
+        ggml_tensor * v_dth = ggml_cont(ctx, ggml_permute(ctx, v_dht,      0, 2, 1, 3));
 
-    codec_lm_attn_params attn_p = {};
-    attn_p.scale = 1.0f / std::sqrt((float) head_dim);
-    attn_p.causal = true;
-    attn_p.window = window;
-    attn_p.n_valid = n_valid;
-    ggml_tensor * attn_dth = codec_op_lm_attn_ctx_dth(ctx, q_dth, k_dth, v_dth, &attn_p);
-    if (attn_dth == nullptr) return nullptr;
-    // Permute back (d, t, h) → (d, h, t) → reshape (hidden, t).
-    ggml_tensor * attn_dht = ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3));
-    ggml_tensor * attn_ct = ggml_reshape_2d(ctx, attn_dht, hidden, t);
+        codec_lm_attn_params attn_p = {};
+        attn_p.scale = 1.0f / std::sqrt((float) head_dim);
+        attn_p.causal = true;
+        attn_p.window = window;
+        attn_p.n_valid = n_valid;
+        ggml_tensor * attn_dth = codec_op_lm_attn_ctx_dth(ctx, q_dth, k_dth, v_dth, &attn_p);
+        if (attn_dth == nullptr) return nullptr;
+        // Permute back (d, t, h) → (d, h, t) → reshape (hidden, t).
+        ggml_tensor * attn_dht = ggml_cont(ctx, ggml_permute(ctx, attn_dth, 0, 2, 1, 3));
+        attn_ct = ggml_reshape_2d(ctx, attn_dht, hidden, t);
+    }
     ggml_tensor * out_ct = codec_mul_mat(ctx, out_w, attn_ct);                            // [hidden, t]
     if (out_ct == nullptr) return nullptr;
     ggml_tensor * out_tc = ggml_cont(ctx, ggml_transpose(ctx, out_ct));                   // [t, hidden]
@@ -198,7 +216,8 @@ ggml_tensor * codec_moss_projected_transformer_ct(
     int32_t n_layers,
     int32_t window,
     float rope_theta,
-    int32_t n_valid) {
+    int32_t n_valid,
+    codec_memory * mem) {
 
     auto W = [&](const std::string & name) -> ggml_tensor * {
         return codec_graph_weight(ctx, model, name);
@@ -229,7 +248,7 @@ ggml_tensor * codec_moss_projected_transformer_ct(
             W(lp + ".ffn.fc2.w"),
             W(lp + ".ls1"),
             W(lp + ".ls2"),
-            head_dim, n_heads, rope_theta, window, n_valid);
+            head_dim, n_heads, rope_theta, window, n_valid, mem);
         if (h_tc == nullptr) return nullptr;
     }
 
@@ -257,6 +276,7 @@ struct moss_encode_build {
     int32_t n_codes     = 0;          // T_audio_total / hop
     const codec_moss_audio * cfg = nullptr;
     const codec_model * model    = nullptr;
+    codec_memory * mem           = nullptr;   // encoder memory, nullptr = batch graph
 };
 
 static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
@@ -266,6 +286,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
     auto W = [&](const std::string & name) -> ggml_tensor * {
         return codec_graph_weight(ctx_eval, p->model, name);
     };
+    codec_memory_begin_build(p->mem);
 
     // Input PCM laid out as a single mono-equivalent stream.  When
     // interleaving is on the prep step has already woven channels together,
@@ -312,7 +333,7 @@ static bool codec_moss_build_encode(ggml_context * ctx_eval, void * user_data, g
                 ctx_eval, x_ct, p->model, base,
                 cfg.enc_in_dim[mi], cfg.enc_out_dim[mi],
                 cfg.enc_d_model[mi], cfg.enc_n_heads[mi], cfg.enc_n_layers[mi],
-                win_tokens, cfg.enc_max_period[mi], n_valid_block);
+                win_tokens, cfg.enc_max_period[mi], n_valid_block, p->mem);
             if (x_ct == nullptr) return false;
             x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct));
         }
@@ -401,6 +422,7 @@ struct moss_decode_build {
     int32_t cb_dim      = 0;
     const codec_moss_audio * cfg = nullptr;
     const codec_model * model    = nullptr;
+    codec_memory * mem           = nullptr;   // decoder memory, nullptr = batch graph
 };
 
 static bool codec_moss_build_decode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
@@ -410,6 +432,7 @@ static bool codec_moss_build_decode(ggml_context * ctx_eval, void * user_data, g
     auto W = [&](const std::string & name) -> ggml_tensor * {
         return codec_graph_weight(ctx_eval, p->model, name);
     };
+    codec_memory_begin_build(p->mem);
 
     // Input codes — laid out as ne=(t, n_q) int32; each row q holds one
     // codebook's per-frame indices.
@@ -464,7 +487,7 @@ static bool codec_moss_build_decode(ggml_context * ctx_eval, void * user_data, g
                 ctx_eval, x_ct, p->model, base,
                 cfg.dec_in_dim[mi], cfg.dec_out_dim[mi],
                 cfg.dec_d_model[mi], cfg.dec_n_heads[mi], cfg.dec_n_layers[mi],
-                win_tokens, cfg.dec_max_period[mi], /*n_valid=*/0);
+                win_tokens, cfg.dec_max_period[mi], /*n_valid=*/0, p->mem);
             if (x_ct == nullptr) return false;
             x_tc = ggml_cont(ctx_eval, ggml_transpose(ctx_eval, x_ct));
         }
@@ -533,16 +556,20 @@ static enum codec_status codec_moss_run_encode(
     build.n_codes    = n_codes;
     build.cfg        = &cfg;
     build.model      = ctx->model;
+    codec_memory * mem = codec_memory_active(ctx, CODEC_MEMORY_ENCODER);
+    build.mem        = mem;
 
-    codec_graph_eval_guard guard(ctx);
+    codec_graph_eval_guard guard(ctx, /*persist=*/mem != nullptr);
     std::string err;
 
+    codec_graph_cache_key key = { CODEC_GRAPH_MOSS_AUDIO_ENCODE,
+              /*n_frames=*/n_codes, /*n_q=*/cfg.n_q, /*hop=*/cfg.hop_size,
+              /*n_in=*/n_total, /*latent_dim=*/cfg.latent_dim };
+    key.mem = mem != nullptr ? 1 : 0;
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
             ctx,
-            { CODEC_GRAPH_MOSS_AUDIO_ENCODE,
-              /*n_frames=*/n_codes, /*n_q=*/cfg.n_q, /*hop=*/cfg.hop_size,
-              /*n_in=*/n_total, /*latent_dim=*/cfg.latent_dim },
+            key,
             codec_moss_build_encode,
             &build,
             sizeof(build),
@@ -565,11 +592,16 @@ static enum codec_status codec_moss_run_encode(
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
+    if (!codec_memory_set_inputs(ctx, entry, mem, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
     const int32_t n_threads = ctx->n_threads;
     if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
+    codec_memory_commit(mem, n_codes);
 
     if (t_codes->type != GGML_TYPE_I32 ||
         t_codes->ne[0] != n_codes || t_codes->ne[1] != cfg.n_q) {
@@ -647,16 +679,20 @@ static enum codec_status codec_moss_run_decode(
     build.cb_dim     = cfg.codebook_dim;
     build.cfg        = &cfg;
     build.model      = ctx->model;
+    codec_memory * mem = codec_memory_active(ctx, CODEC_MEMORY_DECODER);
+    build.mem        = mem;
 
-    codec_graph_eval_guard guard(ctx);
+    codec_graph_eval_guard guard(ctx, /*persist=*/mem != nullptr);
     std::string err;
 
+    codec_graph_cache_key key = { CODEC_GRAPH_MOSS_AUDIO_DECODE,
+              /*n_frames=*/n_codes, /*n_q=*/n_q_dec, /*hop=*/cfg.hop_size,
+              /*n_in=*/0, /*latent_dim=*/cfg.latent_dim };
+    key.mem = mem != nullptr ? 1 : 0;
     codec_graph_cache_entry * entry = nullptr;
     if (!codec_graph_cache_get_or_build(
             ctx,
-            { CODEC_GRAPH_MOSS_AUDIO_DECODE,
-              /*n_frames=*/n_codes, /*n_q=*/n_q_dec, /*hop=*/cfg.hop_size,
-              /*n_in=*/0, /*latent_dim=*/cfg.latent_dim },
+            key,
             codec_moss_build_decode,
             &build,
             sizeof(build),
@@ -692,11 +728,16 @@ static enum codec_status codec_moss_run_decode(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
+    if (!codec_memory_set_inputs(ctx, entry, mem, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
     const int32_t n_threads = ctx->n_threads;
     if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
+    codec_memory_commit(mem, n_codes);
 
     const int32_t n_total = (int32_t) t_audio->ne[0];
     std::vector<float> raw((size_t) n_total, 0.0f);
@@ -815,7 +856,51 @@ enum codec_status codec_moss_audio_init(struct codec_model * model) {
     model->codebook_size      = cfg.codebook_size;
     model->latent_dim         = cfg.latent_dim;
     model->expected_channels  = cfg.number_channels;
+    // causal both ways; look_back = the longest per-stage attention context, in codec frames
+    {
+        const double fps = cfg.hop_size > 0 ? (double) cfg.sample_rate / (double) cfg.hop_size : 0.0;
+        float enc_ctx = 0.0f, dec_ctx = 0.0f;
+        for (int32_t i = 0; i < cfg.enc_n_modules; ++i) enc_ctx = std::max(enc_ctx, cfg.enc_context_duration[i]);
+        for (int32_t i = 0; i < cfg.dec_n_modules; ++i) dec_ctx = std::max(dec_ctx, cfg.dec_context_duration[i]);
+        model->enc_look_back = (int32_t) std::ceil(enc_ctx * fps);
+        model->enc_look_ahead = 0;
+        model->dec_look_back = (int32_t) std::ceil(dec_ctx * fps);
+        model->dec_look_ahead = 0;
+    }
     return CODEC_STATUS_SUCCESS;
+}
+
+// Codec memory plan: build each side's graph for one code frame.
+static bool codec_moss_memory_plan(codec_context * ctx, int32_t side, codec_memory * mem, std::string * err) {
+    codec_moss_audio & cfg = *static_cast<codec_moss_audio *>(ctx->model->impl);
+    if (side == CODEC_MEMORY_ENCODER) {
+        moss_encode_build build = {};
+        build.n_in       = cfg.hop_size;
+        build.n_in_valid = cfg.hop_size;
+        build.n_channels = cfg.number_channels;
+        build.interleave = cfg.channel_interleave;
+        build.latent_dim = cfg.latent_dim;
+        build.rvq_dim    = cfg.rvq_dim;
+        build.cb_dim     = cfg.codebook_dim;
+        build.n_q        = cfg.n_q;
+        build.n_codes    = 1;
+        build.cfg        = &cfg;
+        build.model      = ctx->model;
+        build.mem        = mem;
+        return codec_memory_plan_build(ctx, mem, codec_moss_build_encode, &build, err);
+    }
+    moss_decode_build build = {};
+    build.n_codes    = 1;
+    build.n_channels = cfg.number_channels;
+    build.interleave = cfg.channel_interleave;
+    build.n_q        = cfg.n_q;
+    build.latent_dim = cfg.latent_dim;
+    build.rvq_dim    = cfg.rvq_dim;
+    build.cb_dim     = cfg.codebook_dim;
+    build.cfg        = &cfg;
+    build.model      = ctx->model;
+    build.mem        = mem;
+    return codec_memory_plan_build(ctx, mem, codec_moss_build_decode, &build, err);
 }
 
 static void * codec_moss_create_impl() { return new (std::nothrow) codec_moss_audio(); }
@@ -848,6 +933,10 @@ const struct codec_model_vtable * codec_moss_audio_vtable() {
         codec_graph_size_exact,
         codec_moss_encode_wrap,
         codec_moss_decode_wrap,
+        nullptr,
+        nullptr,
+        nullptr,
+        codec_moss_memory_plan,
     };
     return &vtable;
 }

@@ -4,6 +4,7 @@
 #include "../ops/convtr1d.h"
 #include "../ops/ggml_ops.h"
 #include "../runtime/graph.h"
+#include "../runtime/memory.h"
 #include "../runtime/tensor_utils.h"
 
 #include <ggml-cpu.h>
@@ -91,6 +92,7 @@ struct nemo_decode_build {
     int32_t codebook_dim = 0;
     int32_t codebook_size = 0;
     const codec_model * model = nullptr;
+    codec_memory * mem = nullptr;   // decoder memory, nullptr = batch graph
 };
 
 static bool nemo_build_encode(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out) {
@@ -239,6 +241,8 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
     auto W = [&](const std::string & name) -> ggml_tensor * {
         return codec_graph_weight(ctx_eval, p->model, name);
     };
+    codec_memory * mem = p->mem;
+    codec_memory_begin_build(mem);
 
     ggml_tensor * t_tok = ggml_new_tensor_2d(ctx_eval, GGML_TYPE_I32, p->t, p->q);
     ggml_set_name(t_tok, "nemo.decode.tok");
@@ -263,7 +267,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
     if (t_pre_w == nullptr || t_pre_b == nullptr) {
         return false;
     }
-    x = codec_conv1d_causal(ctx_eval, x, t_pre_w, t_pre_b, 1, 1);
+    x = codec_memory_conv1d_causal(ctx_eval, mem, x, t_pre_w, t_pre_b, 1, 1);
     if (x == nullptr) {
         return false;
     }
@@ -291,7 +295,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
         if (t_up_w == nullptr || t_up_b == nullptr) {
             return false;
         }
-        x = codec_convtr1d_causal(ctx_eval, x, t_up_w, t_up_b, stride, 1);
+        x = codec_memory_convtr1d_causal(ctx_eval, mem, x, t_up_w, t_up_b, stride);
         if (x == nullptr) {
             return false;
         }
@@ -320,7 +324,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
                 ggml_tensor * x_lr_r = codec_op_leaky_relu(ctx_eval, x_right_r, 0.01f);
                 ggml_tensor * x_act = ggml_concat(ctx_eval, x_snake_r, x_lr_r, 1);
 
-                ggml_tensor * h = codec_conv1d_causal(ctx_eval, x_act, t_in_w, t_in_b, 1, dilations[ri]);
+                ggml_tensor * h = codec_memory_conv1d_causal(ctx_eval, mem, x_act, t_in_w, t_in_b, 1, dilations[ri]);
                 if (h == nullptr) {
                     return false;
                 }
@@ -331,7 +335,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
                 ggml_tensor * h_lr = codec_op_leaky_relu(ctx_eval, h_right, 0.01f);
                 ggml_tensor * h_act = ggml_concat(ctx_eval, h_snake, h_lr, 1);
 
-                h = codec_conv1d_causal(ctx_eval, h_act, t_sk_w, t_sk_b, 1, 1);
+                h = codec_memory_conv1d_causal(ctx_eval, mem, h_act, t_sk_w, t_sk_b, 1, 1);
                 if (h == nullptr) {
                     return false;
                 }
@@ -360,7 +364,7 @@ static bool nemo_build_decode(ggml_context * ctx_eval, void * user_data, ggml_te
     if (t_post_w == nullptr || t_post_b == nullptr) {
         return false;
     }
-    ggml_tensor * t_pcm = codec_conv1d_causal(ctx_eval, x, t_post_w, t_post_b, 1, 1);
+    ggml_tensor * t_pcm = codec_memory_conv1d_causal(ctx_eval, mem, x, t_post_w, t_post_b, 1, 1);
     if (t_pcm == nullptr) {
         return false;
     }
@@ -468,14 +472,17 @@ static enum codec_status nemo_decode_graph(
     const int32_t q = use_n_q;
     const int32_t codebook_dim = std::max(1, nemo.codebook_dim);
     const int32_t codebook_size = std::max(2, nemo.codebook_size);
-    codec_graph_eval_guard eval_guard(ctx);
+    codec_memory * mem = codec_memory_active(ctx, CODEC_MEMORY_DECODER);
+    codec_graph_eval_guard eval_guard(ctx, /*persist=*/mem != nullptr);
 
-    nemo_decode_build build = { t, q, codebook_dim, codebook_size, ctx->model };
+    nemo_decode_build build = { t, q, codebook_dim, codebook_size, ctx->model, mem };
+    codec_graph_cache_key key = { CODEC_GRAPH_NEMO_NANO_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop_size, /*n_in=*/0, /*latent_dim=*/0 };
+    key.mem = mem != nullptr ? 1 : 0;
     codec_graph_cache_entry * entry = nullptr;
     std::string err;
     if (!codec_graph_cache_get_or_build(
             ctx,
-            { CODEC_GRAPH_NEMO_NANO_DECODE, /*n_frames=*/t, /*n_q=*/q, /*hop=*/hop_size, /*n_in=*/0, /*latent_dim=*/0 },
+            key,
             nemo_build_decode,
             &build,
             sizeof(build),
@@ -513,11 +520,16 @@ static enum codec_status nemo_decode_graph(
         return CODEC_STATUS_INTERNAL_ERROR;
     }
 
+    if (!codec_memory_set_inputs(ctx, entry, mem, &err)) {
+        codec_context_set_error(ctx, err);
+        return CODEC_STATUS_INTERNAL_ERROR;
+    }
     const int32_t n_threads = ctx->n_threads;
     if (!codec_graph_compute(ctx, entry, n_threads, &err)) {
         codec_context_set_error(ctx, err);
         return CODEC_STATUS_INTERNAL_ERROR;
     }
+    codec_memory_commit(mem, t);
 
     const int32_t n_pcm = (int32_t) t_out->ne[0];
     std::vector<float> pcm((size_t) n_pcm, 0.0f);
@@ -643,6 +655,16 @@ static enum codec_status nemo_decode_wrap(
     return codec_nemo_nano_codec_decode(ctx, tokens, out_pcm, params);
 }
 
+// Codec memory plan: the decoder graph for one frame (all convolutions).
+static bool nemo_memory_plan(codec_context * ctx, int32_t side, codec_memory * mem, std::string * err) {
+    if (side != CODEC_MEMORY_DECODER) {
+        return true;
+    }
+    codec_nemo_nano_codec & nemo = *static_cast<codec_nemo_nano_codec *>(ctx->model->impl);
+    nemo_decode_build build = { 1, std::max(1, nemo.n_q), std::max(1, nemo.codebook_dim), std::max(2, nemo.codebook_size), ctx->model, mem };
+    return codec_memory_plan_build(ctx, mem, nemo_build_decode, &build, err);
+}
+
 const struct codec_model_vtable * codec_nemo_nano_codec_vtable() {
     static codec_model_vtable vtable = {
         CODEC_ARCH_NEMO_NANO_CODEC,
@@ -654,6 +676,9 @@ const struct codec_model_vtable * codec_nemo_nano_codec_vtable() {
         nemo_encode_wrap,
         nemo_decode_wrap,
         nullptr,
+        nullptr,
+        nullptr,
+        nemo_memory_plan,
     };
     return &vtable;
 }
