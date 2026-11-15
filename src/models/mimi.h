@@ -59,11 +59,14 @@ struct mimi_encode_downsample_build {
 };
 
 constexpr int32_t CODEC_MIMI_MAX_RVQ_LAYERS = 32;
-// The transformers' sliding window in 25 Hz steps (Kyutai's `context: 250`,
-// HF MimiConfig.sliding_window): the context codec memory caches.
-constexpr int32_t CODEC_MIMI_SLIDING_WINDOW = 250;
-// Window the batch graphs apply (0 = unbounded, as HF's eager / sdpa path).
-constexpr int32_t CODEC_MIMI_BATCH_WINDOW = 0;
+// The transformers' sliding window, in transformer steps, from a side's
+// look_back (codec frames; GGUF codec.<side>.look_back or the per-arch default
+// 125): the transformers run at `steps_per_frame` (2) times the frame rate, so
+// Mimi's trained 250-step window (Kyutai's `context: 250`, HF
+// MimiConfig.sliding_window). Batch and memory both apply it; 0 = unbounded.
+inline int32_t codec_mimi_window_steps(int32_t look_back, int32_t steps_per_frame) {
+    return look_back > 0 ? look_back * steps_per_frame : 0;
+}
 constexpr int32_t CODEC_MIMI_RVQ_GROUP_SEMANTIC = 0;
 constexpr int32_t CODEC_MIMI_RVQ_GROUP_ACOUSTIC = 1;
 
@@ -82,10 +85,9 @@ struct mimi_encode_build {
     std::array<mimi_encode_rvq_layer_desc, CODEC_MIMI_MAX_RVQ_LAYERS> rvq_layers = {};
     const codec_model * model = nullptr;
     // codec memory (nullptr = batch graph) and the transformer's sliding window
-    // in steps (25 Hz); the batch graph applies `batch_window` (0 = unbounded).
+    // in steps (codec_mimi_window_steps; 0 = unbounded), batch and memory alike.
     struct codec_memory * mem = nullptr;
     int32_t window = 0;
-    int32_t batch_window = 0;
 };
 
 bool codec_mimi_init_encode_build(

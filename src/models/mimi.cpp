@@ -84,8 +84,7 @@ struct mimi_decode_build {
     int32_t dec_l14_out;
     const codec_model * model;
     codec_memory * mem;      // decoder memory, nullptr = batch graph
-    int32_t window;          // transformer sliding window (25 Hz steps), for memory
-    int32_t batch_window;    // window of the batch graph (0 = unbounded)
+    int32_t window;          // transformer sliding window in steps (0 = unbounded), batch and memory
 };
 
 
@@ -291,8 +290,7 @@ bool codec_mimi_init_encode_build(
         return false;
     }
 
-    build->window = CODEC_MIMI_SLIDING_WINDOW;
-    build->batch_window = CODEC_MIMI_BATCH_WINDOW;
+    build->window = codec_mimi_window_steps(ctx->model->enc_look_back, build->downsample.stride);
     build->n_q = std::max(1, std::min(mm.n_q, CODEC_MIMI_MAX_RVQ_LAYERS));
     build->codebook_dim = std::max(1, mm.codebook_dim);
     build->codebook_size = std::max(2, mm.codebook_size);
@@ -463,7 +461,7 @@ bool codec_mimi_build_encode_from(ggml_context * ctx_eval, const mimi_encode_bui
             codec_lm_attn_params attn_p = {};
             attn_p.scale = 1.0f / std::sqrt((float) p->transformer.head_dim);
             attn_p.causal = true;
-            attn_p.window = p->batch_window;
+            attn_p.window = p->window;
             ggml_tensor * attn_ctx = codec_op_lm_attn_ctx_dth(ctx_eval, q_rope, k_rope, v_dth, &attn_p);
             if (attn_ctx == nullptr) {
                 return false;
@@ -767,7 +765,7 @@ static bool codec_mimi_build_decode(ggml_context * ctx_eval, void * user_data, g
             codec_lm_attn_params attn_p = {};
             attn_p.scale = 1.0f / std::sqrt((float) p->transformer_head_dim);
             attn_p.causal = true;
-            attn_p.window = p->batch_window;
+            attn_p.window = p->window;
             ggml_tensor * ctx_3d = codec_op_lm_attn_ctx_dth(ctx_eval, q_rope, k_rope, v_dth, &attn_p);
             if (ctx_3d == nullptr) {
                 return false;
@@ -1019,8 +1017,7 @@ static bool codec_mimi_init_decode_build(
 
     build->model = ctx->model;
     build->mem = nullptr;
-    build->window = CODEC_MIMI_SLIDING_WINDOW;
-    build->batch_window = CODEC_MIMI_BATCH_WINDOW;
+    build->window = codec_mimi_window_steps(ctx->model->dec_look_back, build->upsample_stride);
     return true;
 }
 
