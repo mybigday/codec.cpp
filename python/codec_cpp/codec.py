@@ -258,6 +258,10 @@ class Model:
     @property
     def has_decoder(self) -> bool: return bool(lib().codec_model_has_decoder(self.ptr))
     @property
+    def encoder_is_causal(self) -> bool: return bool(lib().codec_model_encoder_is_causal(self.ptr))
+    @property
+    def decoder_is_causal(self) -> bool: return bool(lib().codec_model_decoder_is_causal(self.ptr))
+    @property
     def n_q(self) -> int: return int(lib().codec_model_n_q(self.ptr))
     @property
     def codebook_size(self) -> int: return int(lib().codec_model_codebook_size(self.ptr))
@@ -354,19 +358,67 @@ class Model:
     def __exit__(self, *a): self.close()
 
 
-class Context:
-    """Inference context (codec_context): encode / decode against a Model."""
+class Memory:
+    """One side's codec memory (codec_memory_t): the cached context of a
+    context's encoder or decoder. Valid while its Context lives."""
 
-    def __init__(self, model: Model, *, seed: int | None = None):
+    def __init__(self, ptr: int, owner: "Context"):
+        self.ptr = ptr
+        self._owner = owner
+
+    def clear(self) -> None:
+        lib().codec_memory_clear(self.ptr)
+
+    def state_size(self) -> int:
+        return int(lib().codec_memory_state_get_size(self.ptr))
+
+    def get_state(self) -> bytes:
+        n = self.state_size()
+        if n == 0:
+            return b""
+        buf = (ctypes.c_uint8 * n)()
+        got = int(lib().codec_memory_state_get_data(self.ptr, buf, n))
+        if got != n:
+            raise CodecError("codec_memory_state_get_data")
+        return bytes(buf)
+
+    def set_state(self, blob: bytes) -> int:
+        """Restores a blob from get_state; returns the bytes read (0 = rejected,
+        cache unchanged; also 0 for an empty blob on a size-0 memory)."""
+        buf = (ctypes.c_uint8 * max(1, len(blob))).from_buffer_copy(blob or b"\0")
+        return int(lib().codec_memory_state_set_data(self.ptr, buf, len(blob)))
+
+
+class Context:
+    """Inference context (codec_context): encode / decode against a Model.
+
+    ``encoder_memory`` / ``decoder_memory``: cache that side's context across
+    calls (docs/proposals/codec_memory.md); see ``encoder_memory`` /
+    ``decoder_memory`` properties."""
+
+    def __init__(self, model: Model, *, seed: int | None = None,
+                 encoder_memory: bool = False, decoder_memory: bool = False):
         self.model = model
         L = lib()
         cp = L.codec_context_default_params()
         if seed is not None:
             cp.seed = int(seed)
+        cp.encoder_memory = bool(encoder_memory)
+        cp.decoder_memory = bool(decoder_memory)
         self.ptr = L.codec_init_from_model(model.ptr, cp)
         if not self.ptr:
             raise CodecError("codec_init_from_model failed")
         model._contexts.add(self)
+
+    @property
+    def encoder_memory(self) -> Memory | None:
+        p = lib().codec_get_encoder_memory(self.ptr)
+        return Memory(p, self) if p else None
+
+    @property
+    def decoder_memory(self) -> Memory | None:
+        p = lib().codec_get_decoder_memory(self.ptr)
+        return Memory(p, self) if p else None
 
     @property
     def last_error(self) -> str:

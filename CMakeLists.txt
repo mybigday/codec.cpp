@@ -52,6 +52,7 @@ set(CODEC_SOURCES
     src/runtime/audio_dsp.cpp
     src/runtime/graph.cpp
     src/runtime/graph_exec.cpp
+    src/runtime/memory.cpp
     src/runtime/perf_log.cpp
     src/runtime/log.cpp
     src/runtime/speaker.cpp

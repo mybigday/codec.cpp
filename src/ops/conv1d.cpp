@@ -391,3 +391,55 @@ ggml_tensor * codec_conv1d_depthwise_causal(
     }
     return ggml_cont(ctx, y);
 }
+
+int32_t codec_conv1d_causal_pad_left(const ggml_tensor * w, int64_t c_in, int32_t stride, int32_t dilation, bool depthwise) {
+    if (w == nullptr || stride <= 0 || dilation <= 0) return -1;
+    const int32_t kernel = depthwise ? (int32_t) w->ne[0] : (int32_t) codec_conv1d_kernel_size(w, c_in);
+    if (kernel < stride) return -1;
+    return (kernel - 1) * dilation + 1 - stride;
+}
+
+ggml_tensor * codec_conv1d_causal_ctx(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * prev,
+    ggml_tensor * w,
+    ggml_tensor * b,
+    int32_t stride,
+    int32_t dilation,
+    bool depthwise,
+    ggml_tensor ** x_cat,
+    bool replicate) {
+
+    if (ctx == nullptr || x == nullptr || w == nullptr || stride <= 0 || dilation <= 0) {
+        return nullptr;
+    }
+    const int32_t pad_left = codec_conv1d_causal_pad_left(w, x->ne[1], stride, dilation, depthwise);
+    if (pad_left < 0 || (pad_left > 0 && (prev == nullptr || prev->ne[0] != pad_left || prev->ne[1] != x->ne[1]))) {
+        return nullptr;
+    }
+    b = codec_graph_cast_f32(ctx, b);
+
+    ggml_tensor * xc = pad_left > 0 ? ggml_concat(ctx, prev, x, 0) : x;
+    if (x_cat != nullptr) {
+        *x_cat = xc;
+    }
+    const int32_t t_in = (int32_t) x->ne[0];
+    const int32_t extra_pad = t_in > 0 ? (((t_in + stride - 1) / stride) * stride - t_in) : 0;
+    ggml_tensor * x_pad = extra_pad <= 0 ? xc
+                        : replicate  ? codec_op_pad_1d_replicate(ctx, xc, 0, extra_pad)
+                                     : codec_op_pad_1d(ctx, xc, 0, extra_pad);
+    if (x_pad == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * y = depthwise ? codec_conv1d_depthwise_impl(ctx, x_pad, w, stride, 0, dilation)
+                                : codec_conv1d_impl(ctx, x_pad, w, stride, 0, dilation);
+    if (y == nullptr) {
+        return nullptr;
+    }
+    if (b != nullptr) {
+        ggml_tensor * b2 = ggml_reshape_2d(ctx, b, 1, y->ne[1]);
+        y = ggml_add(ctx, y, b2);
+    }
+    return ggml_cont(ctx, y);
+}

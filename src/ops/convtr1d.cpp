@@ -150,3 +150,46 @@ ggml_tensor * codec_convtr1d_causal(
     const int32_t crop_right = std::max(0, kernel - stride);
     return codec_op_crop_1d(ctx, y, 0, crop_right);
 }
+
+int32_t codec_convtr1d_causal_overlap(const ggml_tensor * w, int64_t c_in, int32_t stride) {
+    if (w == nullptr || stride <= 0) return -1;
+    return std::max(0, (int32_t) codec_convtr1d_kernel_size(w, c_in) - stride);
+}
+
+ggml_tensor * codec_convtr1d_causal_ctx(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * prev,
+    ggml_tensor * w,
+    ggml_tensor * b,
+    int32_t stride,
+    ggml_tensor ** next) {
+
+    if (ctx == nullptr || x == nullptr || w == nullptr || stride <= 0) {
+        return nullptr;
+    }
+    const int32_t o = codec_convtr1d_causal_overlap(w, x->ne[1], stride);
+    ggml_tensor * y = codec_convtr1d(ctx, x, w, nullptr, stride, 0, 1);   // [(T-1)*s + K, C_out]
+    if (y == nullptr) {
+        return nullptr;
+    }
+    const int64_t n_out = x->ne[0] * stride;
+    if (y->ne[0] != n_out + o) {
+        return nullptr;
+    }
+    if (o > 0) {
+        if (prev == nullptr || prev->ne[0] != o || prev->ne[1] != y->ne[1]) {
+            return nullptr;
+        }
+        y = ggml_add(ctx, y, ggml_pad(ctx, prev, (int) (y->ne[0] - o), 0, 0, 0));
+        if (next != nullptr) {
+            *next = ggml_view_2d(ctx, y, o, y->ne[1], y->nb[1], (size_t) n_out * y->nb[0]);
+        }
+    }
+    ggml_tensor * out = o > 0 ? ggml_view_2d(ctx, y, n_out, y->ne[1], y->nb[1], 0) : y;
+    b = codec_graph_cast_f32(ctx, b);
+    if (b != nullptr) {
+        out = ggml_add(ctx, out, ggml_reshape_2d(ctx, b, 1, y->ne[1]));
+    }
+    return ggml_cont(ctx, out);
+}

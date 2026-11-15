@@ -13,7 +13,8 @@ static bool codec_graph_key_equal(const codec_graph_cache_key & a, const codec_g
            a.n_q == b.n_q &&
            a.hop == b.hop &&
            a.n_in == b.n_in &&
-           a.latent_dim == b.latent_dim;
+           a.latent_dim == b.latent_dim &&
+           a.mem == b.mem;
 }
 
 struct codec_graph_count_state {
@@ -452,4 +453,31 @@ ggml_tensor * codec_graph_get_tensor(codec_context * ctx, codec_graph_cache_entr
         return nullptr;
     }
     return ggml_get_tensor(ctx->eval_ctx, name);
+}
+
+bool codec_graph_build_scratch(codec_context * ctx, codec_graph_build_fn build_fn, void * user_data, std::string * error) {
+    if (ctx == nullptr || build_fn == nullptr) {
+        if (error != nullptr) *error = "invalid scratch build arguments";
+        return false;
+    }
+    codec_graph_release(ctx);
+    if (!codec_graph_ensure_eval_arena(ctx, kCodecGraphDefaultArenaBytes, error)) {
+        return false;
+    }
+    ggml_init_params p = { ctx->eval_arena_size, ctx->eval_arena_buf, true };
+    ctx->eval_ctx = ggml_init(p);
+    if (ctx->eval_ctx == nullptr) {
+        if (error != nullptr) *error = "failed to create scratch eval context";
+        return false;
+    }
+    ggml_tensor * out = nullptr;
+    t_building_ctx = ctx;
+    const bool ok = build_fn(ctx->eval_ctx, user_data, &out);
+    t_building_ctx = nullptr;
+    codec_graph_release(ctx);
+    if (!ok || out == nullptr) {
+        if (error != nullptr) *error = "failed to build graph";
+        return false;
+    }
+    return true;
 }

@@ -15,7 +15,7 @@ try:
 except ImportError:
     snapshot_download = None
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from utils.gguf_writer import GGUFWriter
 from utils import quantization as quant_utils
 
@@ -372,6 +372,10 @@ class MimiConverter(BaseConverter):
         writer.add_uint32("codec.intermediate_size", int(self.config.get("intermediate_size", 2048)))
         writer.add_bool("codec.has_encoder", True)
         writer.add_bool("codec.has_decoder", True)
+        # transformers: a sliding window of `sliding_window` steps at twice the frame rate
+        look = int(self.config.get("sliding_window", 250)) // 2
+        write_look(writer, "encoder", look, 0)
+        write_look(writer, "decoder", look, 0)
 
         used_names: set[str] = set()
         for key in keys:

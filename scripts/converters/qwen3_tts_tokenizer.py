@@ -14,7 +14,7 @@ try:
 except ImportError:
     snapshot_download = None
 
-from .base import BaseConverter
+from .base import BaseConverter, write_look
 from .mimi import (
     build_weight_transforms as mimi_build_weight_transforms,
     map_tensor_names as mimi_map_tensor_names,
@@ -447,6 +447,10 @@ class Qwen3TTSTokenizerConverter(BaseConverter):
         writer.add_uint32("codec.latent_dim", dec_latent_dim)
         writer.add_bool("codec.has_encoder", True)
         writer.add_bool("codec.has_decoder", True)
+        # encoder: the Mimi encoder (window at twice the frame rate); decoder: window at the frame rate
+        enc_cfg = self.config.get("encoder_config", {})
+        write_look(writer, "encoder", int(enc_cfg.get("sliding_window", 250)) // 2, 0)
+        write_look(writer, "decoder", int(dec.get("sliding_window", 72)), 0)
 
         # Encoder metadata (Mimi-compatible) for codec_mimi_encode.
         writer.add_uint32("qwen3.encoder.codebook_size", int(enc.get("codebook_size", dec_codebook_size)))

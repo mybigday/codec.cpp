@@ -59,6 +59,14 @@ struct mimi_encode_downsample_build {
 };
 
 constexpr int32_t CODEC_MIMI_MAX_RVQ_LAYERS = 32;
+// The transformers' sliding window, in transformer steps, from a side's
+// look_back (codec frames; GGUF codec.<side>.look_back or the per-arch default
+// 125): the transformers run at `steps_per_frame` (2) times the frame rate, so
+// Mimi's trained 250-step window (Kyutai's `context: 250`, HF
+// MimiConfig.sliding_window). Batch and memory both apply it; 0 = unbounded.
+inline int32_t codec_mimi_window_steps(int32_t look_back, int32_t steps_per_frame) {
+    return look_back > 0 ? look_back * steps_per_frame : 0;
+}
 constexpr int32_t CODEC_MIMI_RVQ_GROUP_SEMANTIC = 0;
 constexpr int32_t CODEC_MIMI_RVQ_GROUP_ACOUSTIC = 1;
 
@@ -76,10 +84,16 @@ struct mimi_encode_build {
     int32_t codebook_size = 0;
     std::array<mimi_encode_rvq_layer_desc, CODEC_MIMI_MAX_RVQ_LAYERS> rvq_layers = {};
     const codec_model * model = nullptr;
+    // codec memory (nullptr = batch graph) and the transformer's sliding window
+    // in steps (codec_mimi_window_steps; 0 = unbounded), batch and memory alike.
+    struct codec_memory * mem = nullptr;
+    int32_t window = 0;
 };
 
 bool codec_mimi_init_encode_build(
     codec_context * ctx, const codec_mimi * mimi, int32_t n_in, mimi_encode_build * build, std::string * err);
+// Codec memory plan of the Mimi encoder (also the Qwen3-TTS tokenizer's).
+bool codec_mimi_memory_plan_encoder(codec_context * ctx, const codec_mimi * mimi, struct codec_memory * mem, std::string * err);
 // pcm: F32 [n_in, 1] at the model rate -> *out: I32 codes [t, n_q].
 bool codec_mimi_build_encode_from(ggml_context * ctx_eval, const mimi_encode_build * build, ggml_tensor * pcm,
                                   ggml_tensor ** out);
