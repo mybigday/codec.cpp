@@ -22,11 +22,13 @@
 #include "models/pocket_mimi.h"
 #include "ops/safe_math.h"
 #include "runtime/graph.h"
+#include "runtime/memory.h"
 #include "runtime/gguf_kv.h"
 #include "runtime/tensor_utils.h"
 
 #include <ggml-backend.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -225,6 +227,49 @@ const char * codec_arch_name(enum codec_arch arch) {
     }
 }
 
+// Per-arch defaults of codec.{encoder,decoder}.{look_back,look_ahead} (codec
+// frames; look_ahead 0 = causal, -1 = unbounded) for GGUFs without the keys.
+// See docs/proposals/codec_memory.md. Arch init may already have set them
+// from its own config (MOSS-Audio's context durations).
+static void codec_model_look_defaults(codec_model * model) {
+    auto frames = [&](double seconds) {
+        return model->hop_size > 0 && model->sample_rate > 0
+            ? (int32_t) std::lround(seconds * model->sample_rate / model->hop_size) : -1;
+    };
+    switch (model->arch) {
+        case CODEC_ARCH_MIMI:
+            // transformer: 250-step sliding window at 25 Hz = 125 codec frames
+            model->enc_look_back = 125; model->enc_look_ahead = 0;
+            model->dec_look_back = 125; model->dec_look_ahead = 0;
+            break;
+        case CODEC_ARCH_QWEN3_TTS_TOKENIZER:
+            model->enc_look_back = 125; model->enc_look_ahead = 0;   // Mimi encoder
+            if (model->dec_look_back < 0) model->dec_look_back = 72;
+            model->dec_look_ahead = 0;
+            break;
+        case CODEC_ARCH_NEMO_NANO_CODEC:
+            model->dec_look_back = 27; model->dec_look_ahead = 0;    // causal conv receptive field
+            break;
+        case CODEC_ARCH_DAC:
+            // non-causal: the window a host re-decodes around a chunk (0.32 s each side)
+            model->dec_look_back = frames(0.32); model->dec_look_ahead = frames(0.32);
+            break;
+        case CODEC_ARCH_WAVTOKENIZER_LARGE:
+            model->dec_look_back = frames(1.28); model->dec_look_ahead = frames(0.32);
+            break;
+        default:
+            break;
+    }
+}
+
+static void codec_model_load_look(codec_model * model) {
+    codec_model_look_defaults(model);
+    model->enc_look_back  = codec_read_i32_kv(model->gguf, "codec.encoder.look_back",  model->enc_look_back);
+    model->enc_look_ahead = codec_read_i32_kv(model->gguf, "codec.encoder.look_ahead", model->enc_look_ahead);
+    model->dec_look_back  = codec_read_i32_kv(model->gguf, "codec.decoder.look_back",  model->dec_look_back);
+    model->dec_look_ahead = codec_read_i32_kv(model->gguf, "codec.decoder.look_ahead", model->dec_look_ahead);
+}
+
 enum codec_status codec_model_init_arch(struct codec_model * model) {
     if (model == nullptr) {
         return CODEC_STATUS_INVALID_ARG;
@@ -233,7 +278,11 @@ enum codec_status codec_model_init_arch(struct codec_model * model) {
         model->vtable = codec_model_vtable_for_arch(model->arch);
     }
     if (model->vtable != nullptr && model->vtable->init != nullptr) {
-        return model->vtable->init(model);
+        const enum codec_status st = model->vtable->init(model);
+        if (st == CODEC_STATUS_SUCCESS) {
+            codec_model_load_look(model);
+        }
+        return st;
     }
     model->sample_rate = codec_read_i32_kv(model->gguf, "codec.sample_rate", 0);
     model->encode_sample_rate = codec_read_i32_kv(model->gguf, "codec.encode_sample_rate", 0);
@@ -246,6 +295,7 @@ enum codec_status codec_model_init_arch(struct codec_model * model) {
     model->win_length = codec_read_i32_kv(model->gguf, "codec.win_length", -1);
     model->n_mels = codec_read_i32_kv(model->gguf, "codec.n_mels", -1);
     model->latent_dim = codec_read_i32_kv(model->gguf, "codec.latent_dim", -1);
+    codec_model_load_look(model);
     return CODEC_STATUS_SUCCESS;
 }
 static enum codec_status codec_dispatch_encode(
@@ -286,7 +336,9 @@ struct codec_model_params codec_model_default_params(void) {
 
 struct codec_context_params codec_context_default_params(void) {
     struct codec_context_params result = {
-        /*.seed =*/ CODEC_DEFAULT_SEED,
+        /*.seed           =*/ CODEC_DEFAULT_SEED,
+        /*.encoder_memory =*/ false,
+        /*.decoder_memory =*/ false,
     };
 
     return result;
@@ -581,10 +633,26 @@ struct codec_context * codec_init_from_model(struct codec_model * model, struct 
         return nullptr;
     }
 
+    // Codec memory: slots are planned and allocated now, so a saved state can
+    // be restored before the first call. A non-causal side gets an empty one.
+    if ((params.encoder_memory && !codec_memory_create(ctx, CODEC_MEMORY_ENCODER, &ctx->enc_mem, &err)) ||
+        (params.decoder_memory && !codec_memory_create(ctx, CODEC_MEMORY_DECODER, &ctx->dec_mem, &err))) {
+        codec_log(CODEC_LOG_LEVEL_ERROR, "codec_init_from_model: codec memory: %s\n", err.c_str());
+        codec_free(ctx);
+        return nullptr;
+    }
+
     return ctx;
 }
 
 void codec_free(struct codec_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    codec_graph_release(ctx);
+    codec_memory_free(ctx->enc_mem);
+    codec_memory_free(ctx->dec_mem);
+    ctx->enc_mem = ctx->dec_mem = nullptr;
     codec_runtime_free(ctx);
     delete ctx;
 }
@@ -775,6 +843,15 @@ enum codec_status codec_decode_batch(
 
     enum codec_status status = CODEC_STATUS_SUCCESS;
     int32_t n_done = 0;
+
+    // A batch holds several independent sequences and memory holds one: batch
+    // decode neither reads nor updates it.
+    struct memory_bypass_guard {
+        codec_context * c;
+        bool prev;
+        ~memory_bypass_guard() { c->memory_bypass = prev; }
+    } bypass_guard{ctx, ctx->memory_bypass};
+    ctx->memory_bypass = true;
 
     int32_t i = 0;
     for (; i < batch->n_seq; ++i) {

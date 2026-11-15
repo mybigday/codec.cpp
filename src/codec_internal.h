@@ -74,6 +74,13 @@ struct codec_model {
     int32_t encode_sample_rate;
     bool has_encoder;
     bool has_decoder;
+    // Context reach per side in codec frames (GGUF codec.{encoder,decoder}.
+    // look_back / look_ahead, else per-arch defaults); look_ahead 0 = causal,
+    // -1 = unbounded. See docs/proposals/codec_memory.md.
+    int32_t enc_look_back = -1;
+    int32_t enc_look_ahead = -1;
+    int32_t dec_look_back = -1;
+    int32_t dec_look_ahead = -1;
     int32_t hop_size;
     int32_t n_q;
     int32_t codebook_size;
@@ -110,6 +117,9 @@ struct codec_graph_cache_key {
 
     // Latent decode shapes
     int32_t latent_dim = 0; // DAC latent dimension
+
+    // 1 when the graph reads / writes codec memory (docs/proposals/codec_memory.md)
+    int32_t mem = 0;
 };
 
 typedef bool (*codec_graph_build_fn)(ggml_context * ctx_eval, void * user_data, ggml_tensor ** out);
@@ -153,6 +163,10 @@ struct codec_context {
     std::unordered_map<const ggml_tensor *, ggml_tensor *> eval_weight_casts; // weight -> its F32 cast in this graph
     bool eval_graph_allocated = false; // sched_alloc_graph done for current eval_ctx
     int32_t sched_reserved_graph_size = 0;
+    // Codec memory (params.encoder_memory / decoder_memory); nullptr when off.
+    struct codec_memory * enc_mem = nullptr;
+    struct codec_memory * dec_mem = nullptr;
+    bool memory_bypass = false;   // codec_decode_batch: stateless
 };
 
 struct codec_model_vtable {
@@ -196,6 +210,10 @@ struct codec_model_vtable {
         const std::vector<float> & pcm,
         int32_t sample_rate,
         struct codec_speaker * out);
+    // Codec memory: records the cache slots of `side` (0 = encoder, 1 =
+    // decoder) by building that side's graph in planning mode
+    // (codec_memory_plan_build). nullptr = no memory for this arch (size 0).
+    bool (*memory_plan)(struct codec_context * ctx, int32_t side, struct codec_memory * mem, std::string * err);
 };
 
 // Loads `spk.<name>.<slot>` tensors + `<arch>.spk.*` metadata from the model

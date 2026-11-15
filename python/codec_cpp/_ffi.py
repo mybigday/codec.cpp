@@ -86,6 +86,8 @@ class codec_model_kv_override(Structure):
 class codec_context_params(Structure):
     _fields_ = [
         ("seed", c_int32),
+        ("encoder_memory", c_bool),
+        ("decoder_memory", c_bool),
     ]
 
 
@@ -445,6 +447,15 @@ PROTOTYPES: dict[str, tuple[object, list[object]]] = {
     "codec_pcm_buffer_free": (None, [POINTER(codec_pcm_buffer)]),
     "codec_latent_buffer_free": (None, [POINTER(codec_latent_buffer)]),
     "codec_get_last_error": (c_char_p, [c_void_p]),
+    # codec.h — codec memory
+    "codec_model_encoder_is_causal": (c_bool, [c_void_p]),
+    "codec_model_decoder_is_causal": (c_bool, [c_void_p]),
+    "codec_get_encoder_memory": (c_void_p, [c_void_p]),
+    "codec_get_decoder_memory": (c_void_p, [c_void_p]),
+    "codec_memory_clear": (None, [c_void_p]),
+    "codec_memory_state_get_size": (c_size_t, [c_void_p]),
+    "codec_memory_state_get_data": (c_size_t, [c_void_p, c_void_p, c_size_t]),
+    "codec_memory_state_set_data": (c_size_t, [c_void_p, c_void_p, c_size_t]),
     # codec.h — model info
     "codec_model_arch": (c_int, [c_void_p]),
     "codec_model_name": (c_char_p, [c_void_p]),

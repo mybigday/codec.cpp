@@ -87,6 +87,11 @@ bool codec_graph_prepare_io(
 
 void codec_graph_release(codec_context * ctx);
 
+// Runs `build_fn` in a throw-away eval context (nothing is allocated or
+// computed): lets a builder report shapes it records while building
+// (codec memory slot planning).
+bool codec_graph_build_scratch(codec_context * ctx, codec_graph_build_fn build_fn, void * user_data, std::string * error);
+
 // A constant input of the graph being built (call from a build_fn only):
 // creates `name` in `ctx_eval` with a copy of `data`, written automatically by
 // codec_graph_prepare_io. Lets reusable blocks carry their own lookup tables.

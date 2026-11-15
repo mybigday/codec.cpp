@@ -53,6 +53,7 @@ enum codec_batch_mode {
 
 struct codec_model;
 struct codec_context;
+typedef struct codec_memory * codec_memory_t;
 
 struct codec_model_params {
     bool use_gpu;
@@ -82,6 +83,9 @@ struct codec_model_kv_override {
 
 struct codec_context_params {
     int32_t seed;
+    // Cache context across calls (default false: every call independent, as today).
+    bool encoder_memory;   // codec_encode / codec_encode_latent
+    bool decoder_memory;   // codec_decode / codec_decode_quantized_representation
 };
 
 struct codec_encode_params {
@@ -219,6 +223,27 @@ void codec_pcm_buffer_free(struct codec_pcm_buffer * pcm);
 void codec_latent_buffer_free(struct codec_latent_buffer * latent);
 
 const char * codec_get_last_error(const struct codec_context * ctx);
+
+// True when that side's output for a frame depends only on the current and
+// earlier input: its look_ahead (GGUF codec.<side>.look_ahead) is 0. Memory
+// then makes streamed output equal batch output; a non-causal side's memory
+// has size 0.
+bool codec_model_encoder_is_causal(const struct codec_model * model);
+bool codec_model_decoder_is_causal(const struct codec_model * model);
+
+// NULL when that memory is not enabled in the context params.
+codec_memory_t codec_get_encoder_memory(const struct codec_context * ctx);
+codec_memory_t codec_get_decoder_memory(const struct codec_context * ctx);
+
+// Empty the cache: the next call behaves as on a fresh context.
+void codec_memory_clear(codec_memory_t mem);
+
+// Save / restore the cache. get_data returns the bytes written (0 = dst
+// too small); set_data returns the bytes read, or 0 when the blob does not fit
+// this model and side, leaving the cache unchanged.
+size_t codec_memory_state_get_size(codec_memory_t mem);
+size_t codec_memory_state_get_data(codec_memory_t mem, uint8_t * dst, size_t size);
+size_t codec_memory_state_set_data(codec_memory_t mem, const uint8_t * src, size_t size);
 
 enum codec_arch codec_model_arch(const struct codec_model * model);
 const char * codec_model_name(const struct codec_model * model);
