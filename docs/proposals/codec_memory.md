@@ -77,12 +77,12 @@ All additions go in `include/codec.h`. Nothing changes in `common/*.h`,
 
 ```diff
 @@ include/codec.h
-+// Which parts of a context's memory: a bit set.
-+enum codec_memory_type {
-+    CODEC_MEMORY_NONE   = 0,
-+    CODEC_MEMORY_ENCODE = 1,
-+    CODEC_MEMORY_DECODE = 2,
-+    CODEC_MEMORY_BOTH   = 3,   // ENCODE | DECODE
++// Parts of a codec: a bit set.
++enum codec_part {
++    CODEC_PART_NONE    = 0,
++    CODEC_PART_ENCODER = 1,
++    CODEC_PART_DECODER = 2,
++    CODEC_PART_ALL     = 3,   // ENCODER | DECODER
 +};
 +
 +typedef struct codec_memory * codec_memory_t;
@@ -90,33 +90,37 @@ All additions go in `include/codec.h`. Nothing changes in `common/*.h`,
  struct codec_context_params {
      int32_t seed;
 +    // Parts that cache context across codec_encode / codec_decode calls.
-+    // Default CODEC_MEMORY_NONE: every call is independent, as today.
-+    enum codec_memory_type memory;
++    // Default CODEC_PART_NONE: every call is independent, as today.
++    enum codec_part memory;
  };
 @@
-+// True when `part` (ENCODE or DECODE) of this model has context to cache
-+// (non-zero memory). False for models whose output depends on no earlier input
-+// beyond the call's own, or that look ahead; enabling memory on them is a no-op.
-+bool codec_model_has_memory(const struct codec_model * model, enum codec_memory_type part);
++// True when `part`'s (ENCODER or DECODER) output for a frame depends only on the
++// current and earlier input (no look-ahead). Then memory makes streamed output
++// equal batch output. A non-causal part has memory size 0.
++bool codec_model_is_causal(const struct codec_model * model, enum codec_part part);
 +
-+// NULL when the context was created with memory == CODEC_MEMORY_NONE.
++// NULL when the context was created with memory == CODEC_PART_NONE.
 +codec_memory_t codec_get_memory(const struct codec_context * ctx);
 +
-+// Empty the cache of the parts in `which`. The other part is untouched.
-+void codec_memory_clear(codec_memory_t mem, enum codec_memory_type which);
++// Empty the cache of `parts`. Other parts are untouched.
++void codec_memory_clear(codec_memory_t mem, enum codec_part parts);
 +
-+// Save / restore the cache of the parts in `which` (§6). get_data returns the
-+// bytes written (0 = dst too small); set_data returns the bytes read, or 0 when
-+// the blob does not fit this model / part, leaving the memory unchanged.
-+size_t codec_memory_state_get_size(codec_memory_t mem, enum codec_memory_type which);
-+size_t codec_memory_state_get_data(codec_memory_t mem, enum codec_memory_type which, uint8_t * dst, size_t size);
-+size_t codec_memory_state_set_data(codec_memory_t mem, enum codec_memory_type which, const uint8_t * src, size_t size);
++// Save / restore the cached context of `parts` (§6), as llama_state_*.
++// get_data returns the bytes written (0 = dst too small); set_data returns the
++// bytes read, or 0 when the blob does not fit this model / parts, leaving the
++// cache unchanged.
++size_t codec_state_get_size(struct codec_context * ctx, enum codec_part parts);
++size_t codec_state_get_data(struct codec_context * ctx, enum codec_part parts, uint8_t * dst, size_t size);
++size_t codec_state_set_data(struct codec_context * ctx, enum codec_part parts, const uint8_t * src, size_t size);
 ```
 
-* **`codec_model_has_memory` is kept** and means "this part has non-zero
-  memory". A host such as the #6 streamer needs that answer before it creates a
-  context, to choose its path. A state size is only available from an existing
-  context.
+* **`codec_model_is_causal`** is a model property. A host such as the #6
+  streamer needs the answer before it creates a context, to choose its path.
+  For a causal part, memory makes streamed output equal batch output. A
+  non-causal part has memory size 0.
+* **`enum codec_part`** names a codec's parts. It is shared by the `memory`
+  field, `codec_memory_clear`, the state functions and `codec_model_is_causal`,
+  so it is not memory-specific.
 * The `codec_encode` / `codec_decode` signatures, their parameter structs and
   the status codes are unchanged.
 * `python/codec_cpp/_ffi.py` mirrors the new field and functions in the same
@@ -128,8 +132,8 @@ All additions go in `include/codec.h`. Nothing changes in `common/*.h`,
 |---|---|
 | `llama_context_params` (KV types, `n_ctx`) | `codec_context_params.memory` |
 | `llama_get_memory(ctx)` | `codec_get_memory(ctx)` |
-| `llama_memory_clear(mem, data)` | `codec_memory_clear(mem, which)` |
-| `llama_state_seq_get_size / get_data / set_data` (on ctx, per seq) | `codec_memory_state_*` (on mem, per part) |
+| `llama_memory_clear(mem, data)` | `codec_memory_clear(mem, parts)` |
+| `llama_state_get_size / get_data / set_data(ctx, …)` | `codec_state_get_size / get_data / set_data(ctx, parts, …)` |
 | `llama_memory_seq_rm / cp / keep / add` | none (one sequence) |
 
 **ABI.** `codec_context_params` grows from 4 to 8 bytes and is passed by value
@@ -152,8 +156,8 @@ code, llama.rn) need no source change. Everything else is additive.
   the previous input. One case is the caller's responsibility: after a chunk
   the call padded (not a whole number of hops), the cache ends in padding, so
   clear before continuing.
-* **Models without memory.** When `codec_model_has_memory` is false for a part,
-  enabling it is valid and changes nothing:
+* **Non-causal parts.** When `codec_model_is_causal` is false for a part, its
+  memory size is 0, and enabling memory on it is valid and changes nothing:
   * the state size is 0;
   * get and set of the empty blob succeed;
   * clear does nothing.
@@ -171,13 +175,13 @@ Reach is from an impulse test on the host: one frame's codes changed, and the
 change in output measured before ("look-ahead") and after ("memory") that frame,
 at −40 dB.
 
-| Family (archs) | Encode memory | Decode memory | What the cache holds |
+| Family (archs) | Encoder causal (memory) | Decoder causal (memory) | What the cache holds |
 |---|---|---|---|
 | **Mimi** (`MIMI`; LFM2-Audio, Moshi; `POCKET_MIMI` decoder) | yes: causal SEANet convs, stride-2 downsample, causal transformer with a 250-frame window | yes: mirror image, causal, −40 dB memory 0.24 s (Moshi's Mimi 2.0 s) | conv tails (< 1 MB); K/V 8 layers × 250 frames × 512 × 2 ≈ 8 MB F32 per part; position |
 | **Qwen3-TTS 12 Hz tokenizer** (`QWEN3_TTS_TOKENIZER`) | yes: Mimi encoder (`qwen3.encoder.*`) | yes: causal convs, 8 transformer layers with a 72-frame window, causal upsampling convtr | K/V 8 × 71 frames × 1024 × 2 ≈ 4.6 MB F32; conv tails and convtr overlaps; position. The same contents as upstream llama.cpp's `mtmd_gen_state` |
 | **MOSS-Audio** (`MOSS_AUDIO`; Nano, full, TTS-Realtime) | yes: causal sliding-window transformers per stage | yes: mirror image, −40 dB memory 17–24 s | K/V per stage, window = `context_duration × stage frame rate`; conv tails; position |
 | **NeMo nano codec** | | yes: causal conv, memory 2.2 s | conv tails |
-| **DAC, SNAC, WavTokenizer**, XCodec2, NeuCodec, Chatterbox S3G, latent decoders, CosyVoice, XY-Tokenizer, Whisper-style encoders | no (size 0) | no (size 0) | nothing |
+| **DAC, SNAC, WavTokenizer**, XCodec2, NeuCodec, Chatterbox S3G, latent decoders, CosyVoice, XY-Tokenizer, Whisper-style encoders | no (memory 0) | no (memory 0) | nothing |
 
 * **Models that look ahead** (non-causal convs, global attention) produce
   output that depends on later input. They have no earlier context to remember,
@@ -198,8 +202,8 @@ header   char[4]  "CDCM"
          u32      arch                  (enum codec_arch)
          u8[32]   model_fingerprint     (SHA-256 over tensor names, types, shapes and the
                                          graph-relevant GGUF keys; computed once at load)
-         u32      parts                 (codec_memory_type bits present)
-per part u32      part                  (ENCODE / DECODE)
+         u32      parts                 (codec_part bits present)
+per part u32      part                  (ENCODER / DECODER)
          u32      impl_version          (per-arch cache layout version)
          i64      position
          u32      n_sections
@@ -235,9 +239,10 @@ section  u32 tag, u32 ggml_type, i64 ne[4], u64 nbytes, u8 data[nbytes]   (8-byt
 #6 merges first, on its own terms: it changes no public header beyond a comment
 and needs nothing from this RFC. Afterwards:
 
-* For a codec where `codec_model_has_memory(model, DECODE)` is true,
-  `alm_streamer` (`common/audio_lm_c.cpp`) opens its codec context with DECODE
-  memory and decodes only the new frames each poll. Consecutive outputs then
+* When `codec_model_is_causal(model, CODEC_PART_DECODER)` is true,
+  `alm_streamer` (`common/audio_lm_c.cpp`) takes the incremental path: it opens
+  its codec context with `memory = CODEC_PART_DECODER` and decodes only the new
+  frames each poll. Consecutive outputs then
   join exactly, so the left window and crossfade are unnecessary.
   * Expected win on the phone: Qwen3 streaming goes from RTF 6.2 to the batch
     RTF of about 1.5.
