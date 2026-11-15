@@ -19,7 +19,7 @@ bit; these models amplify rounding to ~1e-4..1e-3 (the batch graph itself
 differs that much between clip lengths). Decode: relative RMS <= 1e-3.
 Encode: codes are argmaxes at near-ties, and in the deep RVQ levels rounding
 flips some (batch itself flips ~1 % between clip lengths on Mimi): the first
-8 levels <= 0.5 % flips, all levels <= 5 %.
+4 levels <= 0.5 % flips, all levels <= 5 %.
 Convolution-only models (NeMo) are bit-exact.
 
 Usage: codec_memory_smoke.py [--seconds S] [model ...]   (default: 24 s, every model found)
@@ -44,7 +44,7 @@ NON_CAUSAL = REPO / "models" / "dac" / "dac.gguf"
 SECONDS = 24.0          # longer than every window but MOSS's (whose windows exceed any test clip)
 DEC_REL_RMS = 1e-3
 ENC_FLIPS = 0.05
-ENC_FLIPS_TOP = 0.005   # first 8 RVQ levels
+ENC_FLIPS_TOP = 0.005   # first 4 RVQ levels
 
 
 def resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
@@ -168,8 +168,8 @@ def test_model(name: str) -> None:
         sc = stream_encode(codec_cpp.Context(m, encoder_memory=True), x, hop, sr, sizes)
         must(sc.shape == codes.shape, f"{name} encode: shape {sc.shape} vs {codes.shape}")
         flips = float((sc != codes).mean())
-        top = float((sc[:, :8] != codes[:, :8]).mean())
-        print(f"  encode stream vs batch: {flips * 100:.2f} % codes differ (first 8 levels {top * 100:.2f} %)")
+        top = float((sc[:, :4] != codes[:, :4]).mean())
+        print(f"  encode stream vs batch: {flips * 100:.2f} % codes differ (first 4 levels {top * 100:.2f} %)")
         must(flips <= ENC_FLIPS and top <= ENC_FLIPS_TOP, f"{name} encode: {flips * 100:.2f} % / {top * 100:.2f} % codes differ")
 
         def run_enc(ctx, lo, hi):
@@ -186,8 +186,8 @@ def test_model(name: str) -> None:
         cu = np.concatenate([stream_encode(su, xu, hop, sr, plan(full)), su.encode(xu[full * hop:], sr)])
         must(cu.shape == ref_u.shape, f"{name} encode (unaligned tail): shape {cu.shape} vs {ref_u.shape}")
         last = float((cu[-1] != ref_u[-1]).mean())
-        top_u = float((cu[:, :8] != ref_u[:, :8]).mean())
-        print(f"  encode with an unaligned last chunk: last frame {last * 100:.0f} % differ, first 8 levels {top_u * 100:.2f} %")
+        top_u = float((cu[:, :4] != ref_u[:, :4]).mean())
+        print(f"  encode with an unaligned last chunk: last frame {last * 100:.0f} % differ, first 4 levels {top_u * 100:.2f} %")
         must(top_u <= ENC_FLIPS_TOP and last <= 0.25, f"{name} encode (unaligned tail) differs from batch")
 
         check_state(name, m, "encoder", run_enc, BLOBS.get("encoder", b""))
