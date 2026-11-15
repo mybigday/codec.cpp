@@ -5,10 +5,10 @@ changes until this document is approved.
 
 ## 1. Summary
 
-Minimal change: a `codec_context` can optionally own *memory*, which is three
-things:
+Minimal change: a `codec_context` can optionally own an encoder memory and a
+decoder memory. Each is three things:
 
-1. a cache of the context a model needs from earlier input, as a
+1. a cache of the context that side needs from earlier input, as a
    `llama_context` caches K/V;
 2. a clear;
 3. state save and restore.
@@ -20,8 +20,8 @@ What the cache holds:
   convolutions;
 * the position counter.
 
-With memory on, each `codec_encode` / `codec_decode` call uses the cached
-context of the previous calls instead of starting from silence.
+With a memory on, each `codec_encode` / `codec_decode` call on that side uses
+the cached context of the previous calls instead of starting from silence.
 
 Nothing else changes:
 
@@ -30,17 +30,16 @@ Nothing else changes:
 * each call returns the same output shape as today;
 * the caller decides what to emit, trim or crossfade.
 
-For a causal model, consecutive calls then produce the matching slices of the
-batch output.
+For a causal side, consecutive calls produce the matching slices of the batch
+output.
 
-Encoder memory and decoder memory are separate parts, enabled, cleared and
-saved independently. One sequence per context. Naming follows llama.cpp's
-`llama_memory_t`.
+Each side's context reach is recorded in the GGUF as `look_back` /
+`look_ahead` frames (§5).
 
 Out of scope:
 
 * the LLM's own context (its KV cache) stays in llama.cpp;
-* reference-voice decoder state (§5).
+* reference-voice decoder state (§6).
 
 ## 2. Motivation
 
@@ -77,180 +76,221 @@ All additions go in `include/codec.h`. Nothing changes in `common/*.h`,
 
 ```diff
 @@ include/codec.h
-+// Parts of a codec: a bit set.
-+enum codec_part {
-+    CODEC_PART_NONE    = 0,
-+    CODEC_PART_ENCODER = 1,
-+    CODEC_PART_DECODER = 2,
-+    CODEC_PART_ALL     = 3,   // ENCODER | DECODER
-+};
-+
 +typedef struct codec_memory * codec_memory_t;
 +
  struct codec_context_params {
      int32_t seed;
-+    // Parts that cache context across codec_encode / codec_decode calls.
-+    // Default CODEC_PART_NONE: every call is independent, as today.
-+    enum codec_part memory;
++    // Cache context across calls (default false: every call independent, as today).
++    bool encoder_memory;   // codec_encode / codec_encode_latent
++    bool decoder_memory;   // codec_decode / codec_decode_quantized_representation
  };
 @@
-+// True when `part`'s (ENCODER or DECODER) output for a frame depends only on the
-+// current and earlier input (no look-ahead). Then memory makes streamed output
-+// equal batch output. A non-causal part has memory size 0.
-+bool codec_model_is_causal(const struct codec_model * model, enum codec_part part);
++// True when that side's output for a frame depends only on the current and
++// earlier input: its look_ahead (GGUF codec.<side>.look_ahead) is 0. Memory
++// then makes streamed output equal batch output; a non-causal side's memory
++// has size 0.
++bool codec_model_encoder_is_causal(const struct codec_model * model);
++bool codec_model_decoder_is_causal(const struct codec_model * model);
 +
-+// NULL when the context was created with memory == CODEC_PART_NONE.
-+codec_memory_t codec_get_memory(const struct codec_context * ctx);
++// NULL when that memory is not enabled in the context params.
++codec_memory_t codec_get_encoder_memory(const struct codec_context * ctx);
++codec_memory_t codec_get_decoder_memory(const struct codec_context * ctx);
 +
-+// Empty the cache of `parts`. Other parts are untouched.
-+void codec_memory_clear(codec_memory_t mem, enum codec_part parts);
++// Empty the cache: the next call behaves as on a fresh context.
++void codec_memory_clear(codec_memory_t mem);
 +
-+// Save / restore the cached context of `parts` (§6), as llama_state_*.
-+// get_data returns the bytes written (0 = dst too small); set_data returns the
-+// bytes read, or 0 when the blob does not fit this model / parts, leaving the
-+// cache unchanged.
-+size_t codec_state_get_size(struct codec_context * ctx, enum codec_part parts);
-+size_t codec_state_get_data(struct codec_context * ctx, enum codec_part parts, uint8_t * dst, size_t size);
-+size_t codec_state_set_data(struct codec_context * ctx, enum codec_part parts, const uint8_t * src, size_t size);
++// Save / restore the cache (§7). get_data returns the bytes written (0 = dst
++// too small); set_data returns the bytes read, or 0 when the blob does not fit
++// this model and side, leaving the cache unchanged.
++size_t codec_memory_state_get_size(codec_memory_t mem);
++size_t codec_memory_state_get_data(codec_memory_t mem, uint8_t * dst, size_t size);
++size_t codec_memory_state_set_data(codec_memory_t mem, const uint8_t * src, size_t size);
 ```
 
-* **`codec_model_is_causal`** is a model property. A host such as the #6
+* **One handle per side.** There is no part selector: a context has an
+  encoder memory, a decoder memory, both or neither, and every memory call acts
+  on the one handle it is given.
+* **State lives on the memory handle, not on the context.** This deliberately
+  departs from `llama_state_*(ctx, …)`, so that it is always clear which side's
+  state is saved.
+* **`codec_model_*_is_causal`** is a model property. A host such as the #6
   streamer needs the answer before it creates a context, to choose its path.
-  For a causal part, memory makes streamed output equal batch output. A
-  non-causal part has memory size 0.
-* **`enum codec_part`** names a codec's parts. It is shared by the `memory`
-  field, `codec_memory_clear`, the state functions and `codec_model_is_causal`,
-  so it is not memory-specific.
 * The `codec_encode` / `codec_decode` signatures, their parameter structs and
   the status codes are unchanged.
-* `python/codec_cpp/_ffi.py` mirrors the new field and functions in the same
+* `python/codec_cpp/_ffi.py` mirrors the new fields and functions in the same
   commit.
 
 **Mapping to llama.cpp**
 
 | llama.cpp | codec.cpp |
 |---|---|
-| `llama_context_params` (KV types, `n_ctx`) | `codec_context_params.memory` |
-| `llama_get_memory(ctx)` | `codec_get_memory(ctx)` |
-| `llama_memory_clear(mem, data)` | `codec_memory_clear(mem, parts)` |
-| `llama_state_get_size / get_data / set_data(ctx, …)` | `codec_state_get_size / get_data / set_data(ctx, parts, …)` |
+| `llama_context_params` (KV settings) | `codec_context_params.encoder_memory` / `decoder_memory` |
+| `llama_get_memory(ctx)` | `codec_get_encoder_memory(ctx)` / `codec_get_decoder_memory(ctx)` |
+| `llama_memory_clear(mem, data)` | `codec_memory_clear(mem)` |
+| `llama_state_get_size / get_data / set_data(ctx, …)` | `codec_memory_state_get_size / get_data / set_data(mem, …)` (on the handle, by design) |
 | `llama_memory_seq_rm / cp / keep / add` | none (one sequence) |
 
-**ABI.** `codec_context_params` grows from 4 to 8 bytes and is passed by value
-to `codec_init_from_model`, so binaries built against the old header must be
-rebuilt. Hosts that start from `codec_context_default_params()` (all in-tree
-code, llama.rn) need no source change. Everything else is additive.
+**ABI.** `codec_context_params` grows (two `bool`s; 8 bytes with padding) and is
+passed by value to `codec_init_from_model`, so binaries built against the old
+header must be rebuilt. Hosts that start from `codec_context_default_params()`
+(all in-tree code, llama.rn) need no source change. Everything else is
+additive.
 
 ## 4. Semantics
 
-* **Calls.** With a part enabled, `codec_encode` / `codec_encode_latent` or
-  `codec_decode` / `codec_decode_quantized_representation` reads that part's
-  cache in place of the zero history a fresh call starts from. It updates the
+* **Calls.** With a side's memory enabled, that side's calls read its cache in
+  place of the zero history a fresh call starts from. Each call updates the
   cache with the context its input leaves behind, in the same graph. Input
   handling, padding and output shape are exactly as today.
-* **Batch output.** For a model with memory, the outputs of consecutive calls
-  equal the matching slices of the batch output on the concatenated input, to
-  rounding (§7).
-* **Clear.** `codec_memory_clear` empties the cache, so the next call behaves
-  like a call on a fresh context. Use it before input that does not continue
-  the previous input. One case is the caller's responsibility: after a chunk
-  the call padded (not a whole number of hops), the cache ends in padding, so
-  clear before continuing.
-* **Non-causal parts.** When `codec_model_is_causal` is false for a part, its
-  memory size is 0, and enabling memory on it is valid and changes nothing:
+* **Batch output.** On a causal side, the outputs of consecutive calls equal
+  the matching slices of the batch output on the concatenated input, to rounding
+  (§8).
+* **Clear.** `codec_memory_clear` empties one side's cache. Use it before input
+  that does not continue the previous input. One case is the caller's
+  responsibility: after a chunk the call padded (not a whole number of hops),
+  the cache ends in padding, so clear before continuing.
+* **Non-causal sides.** On a side with `look_ahead > 0`, enabling memory is
+  valid and changes nothing:
   * the state size is 0;
   * get and set of the empty blob succeed;
   * clear does nothing.
 * **One required restriction.** `codec_decode_batch` neither reads nor updates
-  the memory. A batch holds several independent sequences, and memory holds
-  one.
+  the decoder memory. A batch holds several independent sequences, and memory
+  holds one.
 
 Implementation note: the cache tensors are graph inputs, and the updated cache
 is written back in the same graph, as llama.cpp writes its KV cache. That keeps
 *one model = one graph per public call*.
 
-## 5. Per codec family
+## 5. GGUF metadata: look_back / look_ahead
 
-Reach is from an impulse test on the host: one frame's codes changed, and the
-change in output measured before ("look-ahead") and after ("memory") that frame,
-at −40 dB.
+Four keys, in frames of that side (codec frames, at the hop rate), written by
+the converters:
 
-| Family (archs) | Encoder causal (memory) | Decoder causal (memory) | What the cache holds |
+| Key | Type | Meaning |
+|---|---|---|
+| `codec.encoder.look_back` | i32 | past frames of context the encoder uses |
+| `codec.encoder.look_ahead` | i32 | future frames the encoder's output for a frame depends on |
+| `codec.decoder.look_back` | i32 | as above, for the decoder |
+| `codec.decoder.look_ahead` | i32 | as above, for the decoder |
+
+* **Causality.** `is_causal` ⇔ `look_ahead == 0`. The value −1 means
+  unbounded (global attention, flow): the side is non-causal and no window
+  covers its reach.
+* **On a causal side, `look_back` is the cached context length**: the number
+  of past frames the memory keeps.
+  * For an attention layer that is its sliding window, so the cache holds
+    `look_back` frames of K/V per layer.
+  * Convolution tails are shorter than one look-back and are kept per layer as
+    the kernel needs.
+  * Memory size is therefore about `n_layers × look_back × kv_dim × 2 ×
+    sizeof(type)` plus small conv tails. Caching that window exactly reproduces
+    batch output, even where the impulse response reaches further, because each
+    layer's cached K/V already folds in what came before.
+* **On a non-causal side**, `look_back` / `look_ahead` are the left and right
+  windows a host re-decodes around each chunk without memory: #6's `left` /
+  `right`, in frames instead of seconds. Memory size is 0.
+* **Loading old GGUFs.** When the keys are missing, the loader falls back to
+  per-arch defaults. New code must load old GGUFs. #6's hard-coded table in
+  `src/audio_lm_window.h` becomes those defaults (for non-causal sides), and
+  the streamer reads the metadata first.
+
+Per-arch values (these become the defaults; frames at each model's own rate):
+
+| Arch | Encoder look_back / look_ahead | Decoder look_back / look_ahead | Source |
 |---|---|---|---|
-| **Mimi** (`MIMI`; LFM2-Audio, Moshi; `POCKET_MIMI` decoder) | yes: causal SEANet convs, stride-2 downsample, causal transformer with a 250-frame window | yes: mirror image, causal, −40 dB memory 0.24 s (Moshi's Mimi 2.0 s) | conv tails (< 1 MB); K/V 8 layers × 250 frames × 512 × 2 ≈ 8 MB F32 per part; position |
-| **Qwen3-TTS 12 Hz tokenizer** (`QWEN3_TTS_TOKENIZER`) | yes: Mimi encoder (`qwen3.encoder.*`) | yes: causal convs, 8 transformer layers with a 72-frame window, causal upsampling convtr | K/V 8 × 71 frames × 1024 × 2 ≈ 4.6 MB F32; conv tails and convtr overlaps; position. The same contents as upstream llama.cpp's `mtmd_gen_state` |
-| **MOSS-Audio** (`MOSS_AUDIO`; Nano, full, TTS-Realtime) | yes: causal sliding-window transformers per stage | yes: mirror image, −40 dB memory 17–24 s | K/V per stage, window = `context_duration × stage frame rate`; conv tails; position |
-| **NeMo nano codec** | | yes: causal conv, memory 2.2 s | conv tails |
-| **DAC, SNAC, WavTokenizer**, XCodec2, NeuCodec, Chatterbox S3G, latent decoders, CosyVoice, XY-Tokenizer, Whisper-style encoders | no (memory 0) | no (memory 0) | nothing |
+| Mimi (12.5 Hz) | 250 / 0 | 250 / 0 | transformer sliding window (HF `sliding_window` 250), causal convs |
+| Qwen3-TTS tokenizer (12.5 Hz) | 250 / 0 (Mimi encoder) | 72 / 0 | decoder `qwen3.decoder.sliding_window` 72 |
+| MOSS-Audio | per-stage `context_duration` in frames / 0 | same / 0 | converter computes it from the stage windows |
+| NeMo nano codec | (no encoder streaming) | 27 / 0 | conv receptive field (impulse: 2.2 s) |
+| DAC 16 kHz (50 Hz) | n/a | 16 / 16 | #6 window 0.32 s / 0.32 s (reach ±10 frames) |
+| WavTokenizer large (75 Hz) | n/a | 96 / 24 | #6's accepted window 1.28 s / 0.32 s |
+| SNAC | n/a | 16 / 16 (proposed) | reach ±9 frames; not yet in #6 |
+| XCodec2, NeuCodec, Chatterbox S3G, latent decoders | n/a | −1 / −1 | global attention or flow |
 
-* **Models that look ahead** (non-causal convs, global attention) produce
-  output that depends on later input. They have no earlier context to remember,
-  so their memory is 0 and the caller's windowed re-decode (#6) remains how they
-  stream.
-* **Reference voices** (Qwen3-TTS ICL): the decoder state for a reference voice
-  belongs to `codec_speaker`. It would be precomputed when the speaker GGUF is
-  built and applied internally when a decode uses that speaker. That is a future
-  `codec_speaker` proposal.
+* "n/a" encoder entries: the converter writes the measured reach of the
+  encoder when that side is converted. Until then, a missing encoder key on a
+  non-causal arch defaults to −1 / −1.
+* #6's 1.28 s windows for Mimi and Qwen3 decoders do not carry over: those
+  decoders are causal, so the streamer takes the memory path (§9) and needs no
+  window.
+* DAC is per file: the 24 kHz and 44 kHz variants have other frame rates, so
+  their converter writes their own frame counts.
 
-## 6. State save / restore
+## 6. Reference voices
 
-The blob is little-endian and self-describing:
+The decoder state for a reference voice (Qwen3-TTS ICL) belongs to
+`codec_speaker`. It would be precomputed when the speaker GGUF is built and
+applied internally when a decode uses that speaker. That is a future
+`codec_speaker` proposal.
+
+## 7. State save / restore
+
+Per memory handle, the blob is little-endian and self-describing:
 
 ```
 header   char[4]  "CDCM"
          u32      format_version        (1)
          u32      arch                  (enum codec_arch)
+         u32      side                  (0 = encoder, 1 = decoder)
          u8[32]   model_fingerprint     (SHA-256 over tensor names, types, shapes and the
                                          graph-relevant GGUF keys; computed once at load)
-         u32      parts                 (codec_part bits present)
-per part u32      part                  (ENCODER / DECODER)
          u32      impl_version          (per-arch cache layout version)
          i64      position
          u32      n_sections
 section  u32 tag, u32 ggml_type, i64 ne[4], u64 nbytes, u8 data[nbytes]   (8-byte aligned)
 ```
 
-* For a part with no memory, the size is 0 and no bytes are written. Setting a
+* A non-causal side's memory has size 0: nothing is written, and setting a
   0-byte blob succeeds.
 * Section tags name the cached tensors: `conv_tail[i]`, `convtr_overlap[i]`,
   `k[l]`, `v[l]`, `ring_head`.
 * Data is copied with `ggml_backend_tensor_get`, so a blob saved on the GPU
-  restores on the CPU and the other way round. It is tied to the model file
-  through the fingerprint.
+  restores on the CPU and the other way round. It is tied to the model file and
+  the side through the fingerprint and the `side` field.
 * `set_data` validates the blob before touching the cache. A mismatch returns 0
   and leaves the cache unchanged.
 * **Versioning**: no migration. The cache can always be rebuilt by re-feeding
   the input. Old `format_version` / `impl_version` blobs are rejected.
 
-## 7. Thread safety and numerics
+## 8. Thread safety and numerics
 
 * Thread rules are unchanged: one `codec_context` is used by one thread at a
-  time, and its memory is part of it.
+  time, and its memories are part of it.
 * Contexts of one model are independent, since each has its own backend
   instance. Full duplex uses two contexts, one per thread.
-* The memory handle is valid until `codec_free`.
+* A memory handle is valid until `codec_free`.
 * **Numerics.** Chunked compute changes matmul tiling, so streamed output
   matches batch to rounding, not bit for bit. Smokes assert:
   * PCM: max |Δ| ≤ 1e-4;
   * codes: at most 0.1 % flipped, and only at quantizer ties.
 
-## 8. Relation to #6 (windowed stateless streamer)
+## 9. Relation to #6 (windowed stateless streamer)
 
 #6 merges first, on its own terms: it changes no public header beyond a comment
 and needs nothing from this RFC. Afterwards:
 
-* When `codec_model_is_causal(model, CODEC_PART_DECODER)` is true,
-  `alm_streamer` (`common/audio_lm_c.cpp`) takes the incremental path: it opens
-  its codec context with `memory = CODEC_PART_DECODER` and decodes only the new
-  frames each poll. Consecutive outputs then
-  join exactly, so the left window and crossfade are unnecessary.
+* When `codec_model_decoder_is_causal(model)` is true, `alm_streamer`
+  (`common/audio_lm_c.cpp`) takes the incremental path: it opens its codec
+  context with `decoder_memory = true` and decodes only the new frames each
+  poll. Consecutive outputs join exactly, so no window or crossfade is needed.
   * Expected win on the phone: Qwen3 streaming goes from RTF 6.2 to the batch
     RTF of about 1.5.
-* For every other codec, #6's host-side windowing stays unchanged as the
-  fallback.
+* Otherwise it keeps #6's windowed path. The window becomes the decoder's
+  `look_back` / `look_ahead`, from metadata or the per-arch default. With −1, it
+  decodes from frame 0 as today.
 * Emission, trimming and crossfading stay with the streamer in both paths.
 
-## 9. Test plan
+## 10. Rollout
+
+1. Approve this RFC.
+2. Implement the API, the loader keys with per-arch defaults, and the cache for
+   the causal archs. Old GGUFs keep working through the defaults.
+3. Update the converters to write the four keys.
+4. Update the published GGUFs in place with the new metadata, which changes no
+   weights. Each upload is approved separately.
+
+## 11. Test plan
 
 * **Stream vs batch** on random hop-aligned chunk sizes down to one frame:
   * Mimi encode and decode;
@@ -258,11 +298,14 @@ and needs nothing from this RFC. Afterwards:
   * MOSS-Audio-Nano encode and decode;
   * NeMo decode.
 
-  Tolerances are those of §7.
+  Tolerances are those of §8.
 * **`set_data(get_data())` round trip**: the continuation is identical to an
-  uninterrupted stream. A blob from another model or part is rejected and the
+  uninterrupted stream. A blob from another model or side is rejected and the
   cache is unchanged.
-* **`clear`** equals a fresh context, and the other part is untouched.
-* **No-memory model** (DAC) with memory on: output is byte-identical to memory
-  off, the state size is 0, and an empty get/set succeeds.
+* **`clear`** on one side equals a fresh context for that side, and the other
+  side is untouched.
+* **Non-causal side** (DAC decoder) with memory on: output is byte-identical to
+  memory off, the state size is 0, and an empty get/set succeeds.
+* **Old GGUF** (no look keys): the loader gives the per-arch defaults, and the
+  #6 smoke output is unchanged.
 * **Phone** (Pixel 7 Pro): streaming RTF vs batch for Qwen3 and Mimi decode.
