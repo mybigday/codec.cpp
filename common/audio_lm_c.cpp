@@ -4,6 +4,8 @@
 #include "audio_lm_family.h"
 #include "codec_audio_lm.h"
 #include "codec_common.h"
+#include "audio_lm_window.h"
+#include "audio_lm_stream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,10 +21,15 @@ using namespace codec_common;
 
 namespace {
 
-// Frame-level streaming over the current generation: re-decodes [0, avail)
-// once enough new frames exist (causal decoders need the whole left
-// context), holds back the right edge the decoder may still revise, and
-// cross-fades the joins.
+// Frame-level streaming over the current generation.
+//  * Causal decoders with codec memory (src/audio_lm_stream.h): each poll decodes only the new frames, in whole
+//    chunk_ms pieces, through the carried decoder state; pieces join as one decode would (no hold-back, no
+//    cross-fade). An in-context reference voice is decoded into the memory first (once per voice).
+//  * Otherwise each poll decodes a window statelessly: [committed - left, avail) with the decoder's look_back /
+//    look_ahead (src/audio_lm_window.h), so the cost per poll is bounded, or [0, avail) when they are unbounded
+//    (exact, quadratic). It holds back the right edge (frames the decoder may still revise) and the last
+//    cross-fade span before the commit point; the next window decodes that span again and the two are
+//    cross-faded (20 ms).
 class alm_streamer {
 public:
     explicit alm_streamer(audio_lm_context * alm) : alm_(alm) {}
@@ -31,12 +38,21 @@ public:
     bool poll(int32_t chunk_ms, std::vector<float> * piece, int32_t * sr, int32_t * nch) {
         chunk_ms_ = chunk_ms;
         const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (avail > 0 && !opened_ && !open()) return false;
+        if (memory_) {
+            // whole chunks once the rate is known (few graph shapes); the first piece as soon as a frame exists
+            const int32_t step = chunk_ > 0 ? chunk_ : 1;
+            const int32_t end = committed_ + (avail - committed_) / step * step;
+            return (end <= committed_ || memory_piece(end, piece)) && out(piece, sr, nch);
+        }
         if (spf_ == 0 ? avail < k_probe_frames : avail < committed_ + chunk_ + right_) return out(piece, sr, nch);
         return window(avail, false, piece) && out(piece, sr, nch);
     }
 
     bool finish(std::vector<float> * piece, int32_t * sr, int32_t * nch) {
         const int32_t avail = audio_lm_decodable_frames(alm_);
+        if (avail > 0 && !opened_ && !open()) return false;
+        if (memory_) return (avail <= committed_ || memory_piece(avail, piece)) && out(piece, sr, nch);
         if (avail > committed_ && !window(avail, true, piece)) return false;
         return out(piece, sr, nch);
     }
@@ -45,7 +61,7 @@ public:
 
 private:
     static constexpr int32_t k_probe_frames = 8;
-    static constexpr double  k_right_s = 0.32;
+    static constexpr double  k_right_s = 0.32;   // codecs with an unbounded look_ahead
     static constexpr double  k_xfade_s = 0.02;
 
     bool out(std::vector<float> *, int32_t * sr, int32_t * nch) const {
@@ -55,52 +71,85 @@ private:
     }
 
     bool window(int32_t avail, bool final, std::vector<float> * piece) {
+        if (spf_ == 0) {
+            spf_ = audio_lm_codec_hop(alm_);
+            if (spf_ <= 0) return fail("streaming: the codec reports no hop size");
+            bounded_ = audio_lm_stream_window(alm_, &look_back_, &look_ahead_);
+        }
+        // first frame of the window: enough left context, and the held-back span must be in it
+        const int32_t w0 = !bounded_ ? 0 : std::max(0, committed_ - left_);
         audio_lm_audio_output w;
-        if (!audio_lm_decode_audio_range(alm_, 0, avail, &w)) {
+        if (!audio_lm_decode_audio_range(alm_, w0, avail, &w)) {
             return fail(std::string("streaming decode failed: ") + audio_lm_last_error(alm_));
         }
         const int32_t nch = std::max(1, w.n_channels);
         const int64_t len = (int64_t) (w.pcm.size() / (size_t) nch);
-        if (spf_ == 0) {
-            spf_ = audio_lm_codec_hop(alm_);
-            if (spf_ <= 0) return fail("streaming: the codec reports no hop size");
+        if (sr_ == 0) {
             sr_  = w.sample_rate;
             nch_ = nch;
             const double frames_per_s = (double) sr_ / spf_;
             chunk_ = std::max(1, (int32_t) std::lround(chunk_ms_ * frames_per_s / 1000.0));
-            right_ = std::max(1, (int32_t) std::lround(k_right_s * frames_per_s));
-            xfade_ = std::min((int32_t) std::lround(k_xfade_s * sr_), right_ * spf_);
+            right_ = bounded_ ? look_ahead_ : std::max(1, (int32_t) std::lround(k_right_s * frames_per_s));
+            xfade_ = (int32_t) std::lround(k_xfade_s * sr_);
+            left_  = std::max(look_back_, (xfade_ + spf_ - 1) / spf_ + 1);
         }
-        if (nch != nch_ || std::llabs(len - (int64_t) avail * spf_) > spf_) {
-            return fail("streaming: a window of " + std::to_string(avail) + " frames decoded to " +
-                        std::to_string(len) + " samples, not about " + std::to_string((int64_t) avail * spf_));
+        if (nch != nch_ || std::llabs(len - (int64_t) (avail - w0) * spf_) > spf_) {
+            return fail("streaming: a window of " + std::to_string(avail - w0) + " frames decoded to " +
+                        std::to_string(len) + " samples, not about " + std::to_string((int64_t) (avail - w0) * spf_));
         }
         const int32_t commit = final ? avail : std::max(committed_, avail - right_);
-        const size_t  base   = (size_t) committed_ * spf_;
-        if ((int64_t) base > len) return fail("streaming: decoded window too short");
-        const size_t n_new = final ? (size_t) len - base : (size_t) (commit - committed_) * spf_;
-        piece->assign(w.pcm.begin() + (ptrdiff_t) (base * nch_), w.pcm.begin() + (ptrdiff_t) ((base + n_new) * nch_));
-        const size_t nx = std::min(pending_.size() / nch_, n_new);
-        for (size_t i = 0; i < nx; ++i) {
-            const float g = (float) (i + 1) / (float) (nx + 1);
+        const size_t  held   = pending_.size() / (size_t) nch_;   // samples before `committed_` not emitted yet
+        const int64_t b0     = (int64_t) (committed_ - w0) * spf_ - (int64_t) held;   // in this window
+        const int64_t e0     = final ? len : std::min<int64_t>(len, (int64_t) (commit - w0) * spf_);
+        const int64_t keep   = final ? 0 : std::min<int64_t>(xfade_, std::max<int64_t>(0, e0 - b0 - (int64_t) held));
+        if (b0 < 0 || e0 < b0) return fail("streaming: decoded window too short");
+        piece->assign(w.pcm.begin() + (ptrdiff_t) (b0 * nch_), w.pcm.begin() + (ptrdiff_t) ((e0 - keep) * nch_));
+        for (size_t i = 0; i < held && i < piece->size() / (size_t) nch_; ++i) {   // previous window fades out
+            const float g = (float) (i + 1) / (float) (held + 1);
             for (int32_t c = 0; c < nch_; ++c) {
                 float & v = (*piece)[i * nch_ + c];
                 v = g * v + (1.0f - g) * pending_[i * nch_ + c];
             }
         }
-        const size_t tail = base + n_new;
-        const size_t np = final ? 0 : std::min((size_t) xfade_, (size_t) len - tail);
-        pending_.assign(w.pcm.begin() + (ptrdiff_t) (tail * nch_), w.pcm.begin() + (ptrdiff_t) ((tail + np) * nch_));
+        pending_.assign(w.pcm.begin() + (ptrdiff_t) ((e0 - keep) * nch_), w.pcm.begin() + (ptrdiff_t) (e0 * nch_));
         committed_ = commit;
         return true;
     }
 
     bool fail(const std::string & e) { error_ = e; return false; }
 
+    // The path is chosen once per generation, when its first frame is decodable.
+    bool open() {
+        opened_ = true;
+        const int32_t rc = audio_lm_stream_begin(alm_);
+        if (rc < 0) return fail(std::string("streaming: ") + audio_lm_last_error(alm_));
+        memory_ = rc > 0;
+        return true;
+    }
+
+    bool memory_piece(int32_t end, std::vector<float> * piece) {
+        audio_lm_audio_output w;
+        if (!audio_lm_stream_decode(alm_, committed_, end, &w)) {
+            return fail(std::string("streaming decode failed: ") + audio_lm_last_error(alm_));
+        }
+        sr_  = w.sample_rate;
+        nch_ = std::max(1, w.n_channels);
+        if (chunk_ == 0) {
+            const int32_t hop = audio_lm_codec_hop(alm_);
+            if (hop > 0 && sr_ > 0) chunk_ = std::max(1, (int32_t) std::lround(chunk_ms_ * (double) sr_ / hop / 1000.0));
+        }
+        *piece = std::move(w.pcm);
+        committed_ = end;
+        return true;
+    }
+
     audio_lm_context * alm_;
+    bool opened_ = false, memory_ = false;
     int32_t chunk_ms_ = 0;
     int32_t spf_ = 0, sr_ = 0, nch_ = 1;
-    int32_t chunk_ = 0, right_ = 0, xfade_ = 0;
+    int32_t chunk_ = 0, right_ = 0, left_ = 0, xfade_ = 0;
+    bool    bounded_ = false;
+    int32_t look_back_ = 0, look_ahead_ = 0;
     int32_t committed_ = 0;
     std::vector<float> pending_;
     std::string error_;

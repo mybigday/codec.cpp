@@ -1,4 +1,7 @@
 #include "codec_common.h"
+#include "audio_lm_window.h"
+#include "audio_lm_stream.h"
+#include "codec_look.h"
 
 #include <algorithm>
 #include <cstring>
@@ -45,6 +48,15 @@ struct audio_lm_context {
     // Decoder speaker: a builtin (owned by `model`) or one derived/loaded by
     // the caller (owned here).  NULL = model default.
     const codec_speaker * decode_speaker = nullptr;
+
+    // Streaming decode with codec memory (src/audio_lm_stream.h): a second codec context over `model` whose decoder
+    // memory carries the decoder's state between polls, created at the first stream of a causal codec. The memory
+    // state after the last in-context reference voice is kept, keyed by its codes and the decode speaker.
+    codec_context *       stream_ctx = nullptr;
+    bool                  stream_tried = false;
+    std::vector<int32_t>  prefix_codes;
+    const codec_speaker * prefix_speaker = nullptr;
+    std::vector<uint8_t>  prefix_state;
 
     // Cached capabilities (read once at init).
     uint32_t modality_mask = 0;
@@ -424,6 +436,7 @@ void audio_lm_free(audio_lm_context * ctx) {
     if (ctx->state)     codec_lm_state_free(ctx->state);
     if (ctx->lm)        codec_lm_free(ctx->lm);
     if (ctx->codec_ctx) codec_free(ctx->codec_ctx);
+    if (ctx->stream_ctx) codec_free(ctx->stream_ctx);
     if (ctx->model && ctx->owns_model) codec_model_free(ctx->model);
     delete ctx;
 }
@@ -1772,6 +1785,18 @@ static int32_t audio_lm_max_delay(const audio_lm_context * ctx) {
     return max_delay;
 }
 
+// The codec's decoder look_back / look_ahead (GGUF codec.decoder.look_*, else the per-arch defaults), in codec
+// frames. An unbounded look_back (-1) has no window.
+bool audio_lm_stream_window(const audio_lm_context * ctx, int32_t * left, int32_t * right) {
+    if (ctx == nullptr || ctx->model == nullptr) return false;
+    int32_t back = -1, ahead = -1;
+    codec_model_decoder_look(ctx->model, &back, &ahead);
+    if (back < 0) return false;
+    *left  = back;
+    *right = std::max(0, ahead);
+    return ahead >= 0;
+}
+
 int32_t audio_lm_codec_hop(const audio_lm_context * ctx) {
     return ctx != nullptr && ctx->model != nullptr ? codec_model_hop_size(ctx->model) : 0;
 }
@@ -1903,9 +1928,20 @@ bool audio_lm_codec_codes(audio_lm_context * ctx, const int32_t * lm_codes, int3
     return true;
 }
 
+static bool audio_lm_decode_codes_on(audio_lm_context * ctx, codec_context * cctx, const int32_t * codes,
+                                     int32_t n_frames, int32_t n_q, audio_lm_audio_output * out);
+
 bool audio_lm_decode_codec_codes(audio_lm_context * ctx, const int32_t * codes, int32_t n_frames, int32_t n_q,
                                  audio_lm_audio_output * out) {
-    if (ctx == nullptr || codes == nullptr || out == nullptr) return false;
+    if (ctx == nullptr) return false;
+    return audio_lm_decode_codes_on(ctx, ctx->codec_ctx, codes, n_frames, n_q, out);
+}
+
+// codec_decode of codec codes (n_frames x n_q) on `cctx` (the context's own codec context, or its stream context).
+// out == nullptr: the audio is dropped.
+static bool audio_lm_decode_codes_on(audio_lm_context * ctx, codec_context * cctx, const int32_t * codes,
+                                     int32_t n_frames, int32_t n_q, audio_lm_audio_output * out) {
+    if (ctx == nullptr || cctx == nullptr || codes == nullptr) return false;
     if (n_frames <= 0 || n_q <= 0) {
         ctx->last_error = "audio_lm_decode_audio: no codes";
         return false;
@@ -1933,14 +1969,14 @@ bool audio_lm_decode_codec_codes(audio_lm_context * ctx, const int32_t * codes, 
     dp.n_q = n_q;
     dp.speaker = ctx->decode_speaker;
     const enum codec_status rc =
-        codec_decode(ctx->codec_ctx, &tokens, &pcm, dp);
+        codec_decode(cctx, &tokens, &pcm, dp);
     if (rc != CODEC_STATUS_SUCCESS) {
-        const char * raw = codec_get_last_error(ctx->codec_ctx);
+        const char * raw = codec_get_last_error(cctx);
         ctx->last_error = std::string("audio_lm_decode_audio: codec_decode failed (")
                            + (raw ? raw : "?") + ")";
         return false;
     }
-    audio_lm_take_pcm(&pcm, out);
+    if (out != nullptr) audio_lm_take_pcm(&pcm, out); else codec_pcm_buffer_free(&pcm);
     return true;
 }
 
@@ -1998,6 +2034,91 @@ bool audio_lm_decode_audio_range(audio_lm_context * ctx, int32_t frame_begin, in
         return false;
     }
     return audio_lm_decode_codec_codes(ctx, codes.data(), (int32_t) (codes.size() / (size_t) n_q), n_q, out);
+}
+
+// ─── Streaming decode with codec memory (internal: src/audio_lm_stream.h) ───
+
+// The stream context: a codec context with decoder memory, when the codec's decoder is causal and has state to
+// carry (codec_model_decoder_is_causal, memory size > 0) and the generation is codes.
+static codec_context * audio_lm_stream_ctx(audio_lm_context * ctx) {
+    if (ctx->stream_ctx != nullptr || ctx->stream_tried) return ctx->stream_ctx;
+    ctx->stream_tried = true;
+    if (ctx->is_continuous || !(ctx->modality_mask & OUTPUT_AUDIO) || !codec_model_has_decoder(ctx->model) ||
+        !codec_model_decoder_is_causal(ctx->model)) {
+        return nullptr;
+    }
+    auto cp = codec_context_default_params();
+    cp.decoder_memory = true;
+    codec_context * c = codec_init_from_model(ctx->model, cp);
+    if (c == nullptr) return nullptr;
+    if (codec_memory_state_get_size(codec_get_decoder_memory(c)) == 0) {
+        codec_free(c);
+        return nullptr;
+    }
+    ctx->stream_ctx = c;
+    return c;
+}
+
+// The current voice's in-context reference (Qwen3-TTS ICL: a talker with a text projection, a voice with ref_text
+// and ref_codes), as audio_lm_family_codebook decodes it ahead of the generation.
+static bool audio_lm_icl_prefix(const audio_lm_context * ctx, std::vector<int32_t> * ref) {
+    ref->clear();
+    const codec_speaker * spk = audio_lm_decode_speaker(ctx);
+    if (spk == nullptr || !audio_lm_talker_has_projection(ctx)) return false;
+    codec_speaker_slot_type ty;
+    int64_t ne[4];
+    const void * d = nullptr;
+    const char * text = codec_speaker_ref_text(spk);
+    if (text == nullptr || !*text || !codec_speaker_get_slot(spk, "ref_codes", &ty, ne, &d) ||
+        ty != CODEC_SPEAKER_SLOT_I32 || ne[0] != ctx->n_cb) {
+        return false;
+    }
+    ref->assign(static_cast<const int32_t *>(d), static_cast<const int32_t *>(d) + ne[0] * ne[1]);
+    return true;
+}
+
+int32_t audio_lm_stream_begin(audio_lm_context * ctx) {
+    if (ctx == nullptr) return -1;
+    codec_context * sc = audio_lm_stream_ctx(ctx);
+    if (sc == nullptr) return 0;
+    codec_memory_t mem = codec_get_decoder_memory(sc);
+    std::vector<int32_t> ref;
+    if (!audio_lm_icl_prefix(ctx, &ref) || ctx->audio_cb_offset != 0 || ctx->cb0_speech_offset != 0) {
+        codec_memory_clear(mem);
+        return 1;
+    }
+    // ICL voice: the decoder state after the reference's codes, decoded once per voice.
+    const bool cached = !ctx->prefix_state.empty() && ref == ctx->prefix_codes && ctx->prefix_speaker == ctx->decode_speaker;
+    if (cached && codec_memory_state_set_data(mem, ctx->prefix_state.data(), ctx->prefix_state.size()) ==
+                      ctx->prefix_state.size()) {
+        return 1;
+    }
+    ctx->prefix_state.clear();
+    codec_memory_clear(mem);
+    const int32_t n_ref = (int32_t) (ref.size() / (size_t) ctx->n_cb);
+    if (!audio_lm_decode_codes_on(ctx, sc, ref.data(), n_ref, ctx->n_cb, nullptr)) return -1;
+    std::vector<uint8_t> st(codec_memory_state_get_size(mem));
+    if (st.empty() || codec_memory_state_get_data(mem, st.data(), st.size()) != st.size()) {
+        ctx->last_error = "streaming: could not save the decoder state after the reference voice";
+        return -1;
+    }
+    ctx->prefix_state   = std::move(st);
+    ctx->prefix_codes   = std::move(ref);
+    ctx->prefix_speaker = ctx->decode_speaker;
+    return 1;
+}
+
+bool audio_lm_stream_decode(audio_lm_context * ctx, int32_t frame_begin, int32_t frame_end, audio_lm_audio_output * out) {
+    if (ctx == nullptr || ctx->stream_ctx == nullptr || out == nullptr) return false;
+    if (ctx->codes_n_frames <= 0 || ctx->n_cb <= 0) {
+        ctx->last_error = "audio_lm_decode_audio: no codes accumulated";
+        return false;
+    }
+    std::vector<int32_t> codes;
+    int32_t n_q = 0;
+    return audio_lm_codec_codes(ctx, ctx->codes.data(), ctx->codes_n_frames, ctx->n_cb, frame_begin, frame_end, &codes,
+                                &n_q) &&
+           audio_lm_decode_codes_on(ctx, ctx->stream_ctx, codes.data(), (int32_t) (codes.size() / (size_t) n_q), n_q, out);
 }
 
 // ─── Decoder speaker ────────────────────────────────────────────────
