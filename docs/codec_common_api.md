@@ -193,10 +193,31 @@ does not report the end token.
 
 `codec_audio_lm_decode` returns the generation's audio. For streaming, call
 `codec_audio_lm_stream_poll(alm, chunk_ms, &pcm)` after each `frame_done` step: it
-returns the audio that became final since the last call. Each window is
-re-decoded from the first frame (causal decoders need the whole left context),
-the right edge the decoder may still revise is held back (0.32 s), and the
-joins are crossfaded (20 ms). `codec_audio_lm_stream_finish` returns the rest.
+returns the audio that became final since the last call.
+`codec_audio_lm_stream_finish` returns the rest.
+
+* **Causal decoders** (`codec_model_decoder_is_causal`, with memory state:
+  Qwen3-TTS-Tokenizer-12Hz, Mimi, NeMo, MOSS-Audio): each poll decodes only the
+  new frames, in whole `chunk_ms` pieces, on a second codec context with
+  decoder memory (`docs/proposals/codec_memory.md`). The pieces join as one
+  decode would, with no hold-back and no cross-fade, and the stream equals the
+  batch decode to float rounding. An in-context (ICL) reference voice is decoded
+  into the memory once per voice. The state after it is kept and restored for
+  the next generation with that voice.
+* **Other decoders** decode a window statelessly on each poll. The window is
+  `[committed - look_back, avail)`, from the decoder's `codec.decoder.look_back`
+  / `look_ahead` (GGUF keys, else per-arch defaults), at a linear total cost.
+  The `look_ahead` frames the decoder may still revise are held back, and the
+  joins are cross-faded (20 ms). An unbounded `look_back` or `look_ahead` (-1)
+  decodes from the first frame instead (exact, quadratic) and holds back 0.32 s.
+
+| Codec | path | stream vs batch |
+|---|---|---|
+| Qwen3-TTS-Tokenizer-12Hz | memory | rel. RMS 8e-4 (ICL voice) |
+| Mimi (CSM) | memory | rel. RMS 5e-5 |
+| DAC | window 0.32 s / 0.32 s | identical |
+| WavTokenizer | window 1.28 s / 0.32 s | log-mel 1.8 dB (codec's own error 4.8 dB) |
+| others | from the first frame / 0.32 s | exact |
 `decodable_frames` says how many frames are decodable so far.
 
 To decode later (out of order, several generations on, more than once),

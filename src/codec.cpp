@@ -1,4 +1,5 @@
 #include "codec_internal.h"
+#include "codec_look.h"
 
 #include <cstdio>
 
@@ -260,6 +261,11 @@ static void codec_model_look_defaults(codec_model * model) {
         default:
             break;
     }
+}
+
+void codec_model_decoder_look(const codec_model * model, int32_t * look_back, int32_t * look_ahead) {
+    *look_back  = model != nullptr ? model->dec_look_back  : -1;
+    *look_ahead = model != nullptr ? model->dec_look_ahead : -1;
 }
 
 static void codec_model_load_look(codec_model * model) {
