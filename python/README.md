@@ -26,7 +26,7 @@ fetches submodules). ggml is built with `GGML_NATIVE` on, so the wheel is
 tuned to the machine that builds it.
 
 **From a source checkout, with no install.** Build the library the usual way
-(`cmake --build build -j`) and put `python/` on `sys.path`. The loader finds
+(`cmake --build build -j 4`) and put `python/` on `sys.path`. The loader finds
 `build/libcodec.so` on its own. This is how `tests/e2e` runs.
 
 The loader looks for the library in this order:

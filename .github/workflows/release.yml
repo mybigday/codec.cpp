@@ -1,0 +1,232 @@
+name: Release
+
+# Prebuilt libraries + tools (codec-cli, tts-cli, tts-server).
+#   - push a tag v<version>  -> build every package, then a DRAFT GitHub release
+#                               (publish it by hand after a look)
+#   - workflow_dispatch, or a PR that touches this recipe
+#                            -> build every package as workflow artifacts only
+# Cutting a release: bump `project(codec VERSION ...)` in CMakeLists.txt and
+# `__version__` in python/codec_cpp/__init__.py, merge, push the tag.
+#
+# Budget: standard GitHub-hosted runners only (free on a public repo), never on
+# a plain push.  No CUDA / ROCm / SYCL packages: Vulkan covers those GPUs, and
+# their builds are the slow, large ones.
+# Windows: clang-cl against the MSVC runtime (/MD); the VC++ runtime DLLs ship
+# app-local in bin/, so a clean machine needs no redistributable installed.
+#
+# CPU baseline: one fixed ISA for both ggml copies (codec.cpp's and the
+# llama.cpp backbone's; SetupTtsBackbone.cmake forwards every GGML_* option):
+# x86-64 AVX2 (Haswell / Zen 1 and newer), arm64 armv8.2-a+fp16+dotprod.
+# OpenMP off, so the binaries need no libgomp.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+  pull_request:
+    paths: [ '.github/workflows/release.yml', '.github/scripts/release-smoke.sh' ]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_COMMON: -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DCMAKE_INSTALL_PREFIX=stage
+  VULKAN_SDK_TAG: vulkan-sdk-1.4.363.0   # Vulkan-Headers / SPIRV-Headers for the Android cross build
+  VULKAN_SDK_WIN: 1.4.313.2              # LunarG SDK for the Windows Vulkan package
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      name: ${{ steps.v.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Version name (tags must match CMakeLists.txt and the Python package)
+        run: |
+          cmake_v=$(sed -nE 's/^project\(codec VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          py_v=$(sed -nE 's/^__version__ = "([^"]+)"/\1/p' python/codec_cpp/__init__.py)
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tag_v=${GITHUB_REF_NAME#v}
+            if [ "$tag_v" != "$cmake_v" ] || [ "$tag_v" != "$py_v" ]; then
+              echo "::error::tag $GITHUB_REF_NAME, CMakeLists.txt $cmake_v, python $py_v: bump both before tagging"
+              exit 1
+            fi
+            echo "name=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=v$cmake_v-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    timeout-minutes: 60   # longest job (Android) takes ~16 min; a stuck runner stops here
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-cpu
+            os: ubuntu-22.04   # glibc 2.35
+            defines: -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF
+            smoke_images: archlinux:latest ubuntu:22.04
+          - name: linux-x64-vulkan
+            os: ubuntu-22.04
+            defines: -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF -DGGML_VULKAN=ON
+            smoke_images: ubuntu:22.04
+            smoke_prep: apt-get update -qq && apt-get install -y -qq libvulkan1 >/dev/null &&
+          - name: linux-arm64-cpu
+            os: ubuntu-22.04-arm
+            defines: -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod
+            smoke_images: ubuntu:22.04 debian:12
+          - name: macos-arm64-metal
+            os: macos-15
+            defines: -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+          - name: android-arm64-vulkan
+            os: ubuntu-24.04
+            android: true
+            defines: -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod -DGGML_VULKAN=ON -DCODEC_TTS_SERVER=OFF
+          - name: windows-x64-cpu
+            os: windows-2022
+            defines: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF
+          - name: windows-x64-vulkan
+            os: windows-2022
+            defines: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF -DGGML_VULKAN=ON
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux' && !matrix.android
+        run: |
+          if [[ "${{ matrix.name }}" == *vulkan ]]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y ninja-build vulkan-sdk
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y ninja-build
+          fi
+
+      - name: Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Dependencies (Android)
+        if: matrix.android
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build glslc
+          # The NDK ships libvulkan but not vulkan.hpp / SPIRV-Headers.  SPIRV-Headers
+          # installs into the Vulkan-Headers tree: ggml includes spirv.hpp but takes
+          # its include path from Vulkan only.
+          vk="$RUNNER_TEMP/Vulkan-Headers"
+          git clone -q --depth 1 -b "$VULKAN_SDK_TAG" https://github.com/KhronosGroup/Vulkan-Headers "$vk"
+          git clone -q --depth 1 -b "$VULKAN_SDK_TAG" https://github.com/KhronosGroup/SPIRV-Headers "$RUNNER_TEMP/SPIRV-Headers"
+          cmake -S "$RUNNER_TEMP/SPIRV-Headers" -B "$RUNNER_TEMP/spirv-build" -DSPIRV_HEADERS_ENABLE_TESTS=OFF \
+                -DCMAKE_INSTALL_PREFIX="$vk"
+          cmake --install "$RUNNER_TEMP/spirv-build"
+          echo "ANDROID_DEFINES=-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DVulkan_INCLUDE_DIR=$vk/include -DVulkan_GLSLC_EXECUTABLE=$(command -v glslc) \
+            -DSPIRV-Headers_DIR=$vk/share/cmake/SPIRV-Headers" >> "$GITHUB_ENV"
+
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # vcvars64 into the job environment, so the bash steps below build with
+        # the MSVC SDK, its Ninja and the LLVM clang-cl on the runner.
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
+          }
+
+      - name: Dependencies (Windows Vulkan)
+        if: runner.os == 'Windows' && endsWith(matrix.name, 'vulkan')
+        shell: pwsh
+        run: |
+          curl.exe -sSLo "$env:RUNNER_TEMP\vulkansdk.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_WIN/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_WIN.exe"
+          & "$env:RUNNER_TEMP\vulkansdk.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_SDK_WIN"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_SDK_WIN\bin"
+
+      - name: Configure
+        run: cmake -S . -B build $CMAKE_COMMON ${{ matrix.defines }} ${ANDROID_DEFINES:-}
+
+      - name: Build
+        # The env var also caps the nested llama.cpp backbone build.
+        run: |
+          export CMAKE_BUILD_PARALLEL_LEVEL=${NUMBER_OF_PROCESSORS:-$(getconf _NPROCESSORS_ONLN)}
+          cmake --build build
+
+      - name: Install
+        run: cmake --install build --strip
+
+      - name: VC++ runtime, app-local (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT\*.dll" stage\bin\
+
+      - name: Smoke test (host)
+        if: ${{ !matrix.android }}
+        run: sh .github/scripts/release-smoke.sh "$PWD/stage"
+
+      - name: Smoke test (clean containers)
+        if: matrix.smoke_images
+        run: |
+          for img in ${{ matrix.smoke_images }}; do
+            echo "::group::$img"
+            docker run --rm -v "$PWD/stage:/opt/codec:ro" -v "$PWD/.github/scripts:/s:ro" "$img" \
+              sh -c '${{ matrix.smoke_prep }} sh /s/release-smoke.sh /opt/codec'
+            echo "::endgroup::"
+          done
+
+      - name: Package
+        run: |
+          pkg="codec-${{ needs.version.outputs.name }}-bin-${{ matrix.name }}"
+          mv stage "$pkg"
+          cp LICENSE README.md "$pkg/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -bd "$pkg.zip" "$pkg" >/dev/null
+            echo "PKG=$pkg.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$pkg.tar.gz" "$pkg"
+            echo "PKG=$pkg.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.PKG }}
+          retention-days: 7
+          compression-level: 0   # already compressed
+
+  release:
+    needs: [ version, build ]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "$GITHUB_REF_NAME" --generate-notes *.tar.gz *.zip SHA256SUMS
