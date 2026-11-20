@@ -63,6 +63,7 @@ jobs:
 
   build:
     needs: version
+    timeout-minutes: 60   # longest job (Android) takes ~16 min; a stuck runner stops here
     defaults:
       run:
         shell: bash
