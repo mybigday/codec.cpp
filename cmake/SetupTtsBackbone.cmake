@@ -24,6 +24,13 @@ include(ExternalProject)
 set(_ll_dir "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp")
 set(TTS_BACKBONE_SO
     "${CMAKE_BINARY_DIR}/ttsbackbone/${CMAKE_SHARED_LIBRARY_PREFIX}ttsbackbone${CMAKE_SHARED_LIBRARY_SUFFIX}")
+# What consumers link: the import library on Windows, the library elsewhere.
+if(WIN32)
+    set(TTS_BACKBONE_LIB
+        "${CMAKE_BINARY_DIR}/ttsbackbone/${CMAKE_IMPORT_LIBRARY_PREFIX}ttsbackbone${CMAKE_IMPORT_LIBRARY_SUFFIX}")
+else()
+    set(TTS_BACKBONE_LIB "${TTS_BACKBONE_SO}")
+endif()
 
 # Every GGML_* cache option, at the value codec.cpp's ggml sees.  Left out:
 # the ones the isolation fixes (static, no backend DL), install paths and
@@ -85,7 +92,7 @@ ExternalProject_Add(ttsbackbone
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target ttsbackbone --config Release
     # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
     BUILD_ALWAYS    ON
-    BUILD_BYPRODUCTS "${TTS_BACKBONE_SO}"
+    BUILD_BYPRODUCTS "${TTS_BACKBONE_SO}" "${TTS_BACKBONE_LIB}"
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""
 )

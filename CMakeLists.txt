@@ -17,6 +17,9 @@ endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES)   # M_PI, as glibc / libc++ give it
+endif()
 
 # GGML Backend Options (pass-through to ggml subproject)
 # Goal: allow building with any ggml-native accelerator backend on other machines.
@@ -163,6 +166,13 @@ target_include_directories(codec_audio_lm_objs
 add_library(codec        STATIC $<TARGET_OBJECTS:codec_objs>)
 add_library(codec_shared SHARED $<TARGET_OBJECTS:codec_objs> $<TARGET_OBJECTS:codec_audio_lm_objs>)
 set_target_properties(codec_shared PROPERTIES OUTPUT_NAME codec)
+if(WIN32)
+    # codec.dll's import library is codec.lib; the static one needs another
+    # name.  No export macros in the headers: export every symbol, as the
+    # default visibility does elsewhere.
+    set_target_properties(codec PROPERTIES OUTPUT_NAME codec_static)
+    set_target_properties(codec_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 target_include_directories(codec_objs
     PUBLIC
@@ -285,11 +295,11 @@ if(CODEC_BUILD_TTS_CLI)
         target_include_directories(codec_tts_runner
             PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/common
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${TTS_BACKBONE_INCLUDE_DIRS})
-        target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE "${TTS_BACKBONE_SO}")
+        target_link_libraries(codec_tts_runner PUBLIC codec_common PRIVATE "${TTS_BACKBONE_LIB}")
 
         add_dependencies(tts-cli ttsbackbone)
         target_compile_definitions(tts-cli PRIVATE TTS_CLI_HAVE_BACKBONE=1)
-        target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}")
+        target_link_libraries(tts-cli PRIVATE codec_tts_runner "${TTS_BACKBONE_LIB}")
         set_target_properties(tts-cli PROPERTIES
             BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
 
@@ -306,7 +316,7 @@ if(CODEC_BUILD_TTS_CLI)
                 tools/server/audio_encode.cpp
                 ${_ll_vendor}/cpp-httplib/httplib.cpp)
             target_include_directories(tts-server PRIVATE ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
-            target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}" Threads::Threads)
+            target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_LIB}" Threads::Threads)
             target_compile_definitions(tts-server PRIVATE
                 CODEC_VERSION="${PROJECT_VERSION}" CODEC_BUILD_COMMIT="${CODEC_BUILD_COMMIT}")
             add_dependencies(tts-server ttsbackbone)
@@ -372,6 +382,7 @@ if(NOT SKBUILD)
 
     install(TARGETS codec_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}    # codec.lib, the DLL's import library
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES include/codec.h include/codec_speaker.h include/codec_lm.h include/codec_audio_lm.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
@@ -388,7 +399,13 @@ if(NOT SKBUILD)
         endif()
     endforeach()
     if(TARGET ttsbackbone)
-        install(FILES "${TTS_BACKBONE_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        # Windows has no rpath: DLLs load from the executable's directory, where
+        # ggml and libcodec install theirs too (RUNTIME → bin).
+        if(WIN32)
+            install(FILES "${TTS_BACKBONE_SO}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+        else()
+            install(FILES "${TTS_BACKBONE_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        endif()
     endif()
 endif()
 # Wheels: the bundled llama.cpp backbone goes next to libcodec in the package

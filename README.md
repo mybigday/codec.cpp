@@ -62,12 +62,13 @@ bundled llama.cpp) plus a codec GGUF (run by codec.cpp). Ready-made GGUFs are
 on [Hugging Face](https://huggingface.co/BricksDisplay); each model card lists
 which two files to download. Supported models: [docs/model_status.md](docs/model_status.md#tts-tts-cli-synthesize).
 
-Prebuilt packages for Linux (x64 CPU / Vulkan, arm64), macOS (arm64, Metal)
-and Android (arm64, Vulkan) are attached to each
+Prebuilt packages for Linux (x64 CPU / Vulkan, arm64), Windows (x64 CPU /
+Vulkan), macOS (arm64, Metal) and Android (arm64, Vulkan) are attached to each
 [release](https://github.com/mybigday/codec.cpp/releases): unpack and run
-`bin/tts-cli` (libraries are found in `lib/`). They need an AVX2 CPU on x86-64
-and armv8.2-a with dotprod on arm64 (e.g. not a Raspberry Pi 4); Linux packages
-need glibc 2.35 or newer, Vulkan packages the system Vulkan loader. Other
+`bin/tts-cli` (libraries are found in `lib/`; on Windows every DLL sits next to
+`tts-cli.exe`). They need an AVX2 CPU on x86-64 and armv8.2-a with dotprod on
+arm64 (e.g. not a Raspberry Pi 4); Linux packages need glibc 2.35 or newer,
+Vulkan packages the system Vulkan loader (part of the GPU driver). Other
 platforms, older CPUs and CUDA / ROCm / SYCL build from source.
 
 Build (clone with `--recursive`: it fetches the llama.cpp that runs the

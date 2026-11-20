@@ -23,7 +23,24 @@ target_link_libraries(ttsbackbone PRIVATE llama llama-common)
 # Nothing in the wrapper references llama / common, so their archives go in
 # whole; ggml's objects are pulled by their references (static backend
 # registry, GGML_BACKEND_DL=OFF).
-if(APPLE)
+if(WIN32)
+    # A PE image binds each import to a named DLL, so the two ggml copies
+    # cannot clash; the export list is a .def file taken from the llama /
+    # common objects (llama.cpp built static has no dllexport).
+    set_target_properties(ttsbackbone PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${TTSBACKBONE_OUTPUT_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY "${TTSBACKBONE_OUTPUT_DIR}")
+    set(_objs "${CMAKE_CURRENT_BINARY_DIR}/ttsbackbone.objs")
+    set(_def  "${CMAKE_CURRENT_BINARY_DIR}/ttsbackbone.def")
+    file(GENERATE OUTPUT "${_objs}"
+         CONTENT "$<JOIN:$<TARGET_OBJECTS:llama>;$<TARGET_OBJECTS:llama-common>,\n>\n")
+    add_custom_command(TARGET ttsbackbone PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -DOBJS=${_objs} -DDEF=${_def}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/windows-def.cmake"
+        VERBATIM)
+    target_link_options(ttsbackbone PRIVATE
+        "/WHOLEARCHIVE:$<TARGET_FILE:llama>" "/WHOLEARCHIVE:$<TARGET_FILE:llama-common>" "/DEF:${_def}")
+elseif(APPLE)
     target_link_options(ttsbackbone PRIVATE
         "LINKER:-force_load,$<TARGET_FILE:llama>"
         "LINKER:-force_load,$<TARGET_FILE:llama-common>")

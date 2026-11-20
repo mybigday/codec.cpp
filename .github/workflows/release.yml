@@ -10,7 +10,9 @@ name: Release
 #
 # Budget: standard GitHub-hosted runners only (free on a public repo), never on
 # a plain push.  No CUDA / ROCm / SYCL packages: Vulkan covers those GPUs, and
-# their builds are the slow, large ones.  Windows: the build does not support it yet.
+# their builds are the slow, large ones.
+# Windows: clang-cl against the MSVC runtime (/MD); the VC++ runtime DLLs ship
+# app-local in bin/, so a clean machine needs no redistributable installed.
 #
 # CPU baseline: one fixed ISA for both ggml copies (codec.cpp's and the
 # llama.cpp backbone's; SetupTtsBackbone.cmake forwards every GGML_* option):
@@ -34,6 +36,7 @@ permissions:
 env:
   CMAKE_COMMON: -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DCMAKE_INSTALL_PREFIX=stage
   VULKAN_SDK_TAG: vulkan-sdk-1.4.363.0   # Vulkan-Headers / SPIRV-Headers for the Android cross build
+  VULKAN_SDK_WIN: 1.4.313.2              # LunarG SDK for the Windows Vulkan package
 
 jobs:
   version:
@@ -60,6 +63,9 @@ jobs:
 
   build:
     needs: version
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -84,6 +90,12 @@ jobs:
             os: ubuntu-24.04
             android: true
             defines: -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod -DGGML_VULKAN=ON -DCODEC_TTS_SERVER=OFF
+          - name: windows-x64-cpu
+            os: windows-2022
+            defines: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF
+          - name: windows-x64-vulkan
+            os: windows-2022
+            defines: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF -DGGML_VULKAN=ON
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -127,17 +139,42 @@ jobs:
             -DVulkan_INCLUDE_DIR=$vk/include -DVulkan_GLSLC_EXECUTABLE=$(command -v glslc) \
             -DSPIRV-Headers_DIR=$vk/share/cmake/SPIRV-Headers" >> "$GITHUB_ENV"
 
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # vcvars64 into the job environment, so the bash steps below build with
+        # the MSVC SDK, its Ninja and the LLVM clang-cl on the runner.
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
+          }
+
+      - name: Dependencies (Windows Vulkan)
+        if: runner.os == 'Windows' && endsWith(matrix.name, 'vulkan')
+        shell: pwsh
+        run: |
+          curl.exe -sSLo "$env:RUNNER_TEMP\vulkansdk.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_WIN/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_WIN.exe"
+          & "$env:RUNNER_TEMP\vulkansdk.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_SDK_WIN"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_SDK_WIN\bin"
+
       - name: Configure
         run: cmake -S . -B build $CMAKE_COMMON ${{ matrix.defines }} ${ANDROID_DEFINES:-}
 
       - name: Build
         # The env var also caps the nested llama.cpp backbone build.
         run: |
-          export CMAKE_BUILD_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)
+          export CMAKE_BUILD_PARALLEL_LEVEL=${NUMBER_OF_PROCESSORS:-$(getconf _NPROCESSORS_ONLN)}
           cmake --build build
 
       - name: Install
         run: cmake --install build --strip
+
+      - name: VC++ runtime, app-local (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT\*.dll" stage\bin\
 
       - name: Smoke test (host)
         if: ${{ !matrix.android }}
@@ -158,15 +195,20 @@ jobs:
           pkg="codec-${{ needs.version.outputs.name }}-bin-${{ matrix.name }}"
           mv stage "$pkg"
           cp LICENSE README.md "$pkg/"
-          tar -czf "$pkg.tar.gz" "$pkg"
-          echo "PKG=$pkg.tar.gz" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -bd "$pkg.zip" "$pkg" >/dev/null
+            echo "PKG=$pkg.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$pkg.tar.gz" "$pkg"
+            echo "PKG=$pkg.tar.gz" >> "$GITHUB_ENV"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ env.PKG }}
           retention-days: 7
-          compression-level: 0   # already gzipped
+          compression-level: 0   # already compressed
 
   release:
     needs: [ version, build ]
@@ -184,6 +226,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
-            --title "$GITHUB_REF_NAME" --generate-notes *.tar.gz SHA256SUMS
+            --title "$GITHUB_REF_NAME" --generate-notes *.tar.gz *.zip SHA256SUMS
