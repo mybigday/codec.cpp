@@ -48,6 +48,7 @@
 #include <random>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -308,6 +309,10 @@ private:
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("%s %s (%s)\n", argv[0], CODEC_VERSION, CODEC_BUILD_COMMIT);
+        return 0;
+    }
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // runner progress lines show up as they happen in a log file

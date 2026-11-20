@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
-project(codec C CXX)
+project(codec VERSION 0.1.0 LANGUAGES C CXX)
+
+# Release tags are v<PROJECT_VERSION>; the commit lets a build from any
+# checkout say what it is (`tts-cli --version`).
+set(CODEC_BUILD_COMMIT "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE _codec_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_codec_commit)
+        set(CODEC_BUILD_COMMIT "${_codec_commit}")
+    endif()
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -254,6 +267,8 @@ if(CODEC_BUILD_TTS_CLI)
         tools/cli/main.cpp
     )
     target_link_libraries(tts-cli PRIVATE codec_common codec_utils)
+    target_compile_definitions(tts-cli PRIVATE
+        CODEC_VERSION="${PROJECT_VERSION}" CODEC_BUILD_COMMIT="${CODEC_BUILD_COMMIT}")
 
     # Optional isolated llama.cpp backbone → enables the full `synthesize`
     # reference loop.  The loop itself lives in codec_tts_runner (common/
@@ -292,6 +307,8 @@ if(CODEC_BUILD_TTS_CLI)
                 ${_ll_vendor}/cpp-httplib/httplib.cpp)
             target_include_directories(tts-server PRIVATE ${_ll_vendor} ${_ll_vendor}/cpp-httplib)
             target_link_libraries(tts-server PRIVATE codec_tts_runner "${TTS_BACKBONE_SO}" Threads::Threads)
+            target_compile_definitions(tts-server PRIVATE
+                CODEC_VERSION="${PROJECT_VERSION}" CODEC_BUILD_COMMIT="${CODEC_BUILD_COMMIT}")
             add_dependencies(tts-server ttsbackbone)
             set_target_properties(tts-server PROPERTIES
                 BUILD_RPATH "${CMAKE_BINARY_DIR}/ttsbackbone;${CMAKE_BINARY_DIR}/ggml/src")
@@ -359,9 +376,14 @@ if(NOT SKBUILD)
     install(FILES include/codec.h include/codec_speaker.h include/codec_lm.h include/codec_audio_lm.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-    foreach(_tool tts-cli tts-server)
+    foreach(_tool codec-cli tts-cli tts-server)
         if(TARGET ${_tool})
             set_target_properties(${_tool} PROPERTIES INSTALL_RPATH "${_codec_origin}/${_codec_bin_to_lib}")
+            if(ANDROID)
+                # CMake's Android platform drops every RPATH; bionic honours a
+                # $ORIGIN DT_RUNPATH since API 24, so link it in directly.
+                target_link_options(${_tool} PRIVATE "LINKER:-rpath,\$ORIGIN/${_codec_bin_to_lib}")
+            endif()
             install(TARGETS ${_tool} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()
     endforeach()

@@ -55,7 +55,7 @@ foreach(_v CMAKE_TOOLCHAIN_FILE CMAKE_C_COMPILER CMAKE_CXX_COMPILER
            ANDROID_ABI ANDROID_PLATFORM ANDROID_NDK ANDROID_STL
            CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER CMAKE_CUDA_ARCHITECTURES
            CMAKE_HIP_COMPILER CMAKE_HIP_ARCHITECTURES AMDGPU_TARGETS
-           Vulkan_INCLUDE_DIR Vulkan_LIBRARY Vulkan_GLSLC_EXECUTABLE)
+           Vulkan_INCLUDE_DIR Vulkan_LIBRARY Vulkan_GLSLC_EXECUTABLE SPIRV-Headers_DIR)
     if(DEFINED ${_v} AND NOT "${${_v}}" STREQUAL "")
         string(REPLACE ";" "|" _val "${${_v}}")
         list(APPEND _ll_args "-D${_v}=${_val}")
@@ -89,6 +89,12 @@ ExternalProject_Add(ttsbackbone
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""
 )
+
+# Build it after codec.cpp's own libraries, not beside them: the nested build
+# runs its own parallelism (Ninja: every core, whatever the outer -j), so side
+# by side the two compile loads add up and a 16 GB machine runs out of memory.
+# One after the other takes about as long, both being CPU-bound.
+add_dependencies(ttsbackbone codec_shared)
 
 # Exported for the tts-cli target.  `common` is added so the runner can
 # include common.h / sampling.h (the common_sampler API).
