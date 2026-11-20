@@ -31,6 +31,8 @@ if(WIN32)
 else()
     set(TTS_BACKBONE_LIB "${TTS_BACKBONE_SO}")
 endif()
+set(_ll_byproducts "${TTS_BACKBONE_SO}" "${TTS_BACKBONE_LIB}")
+list(REMOVE_DUPLICATES _ll_byproducts)
 
 # Every GGML_* cache option, at the value codec.cpp's ggml sees.  Left out:
 # the ones the isolation fixes (static, no backend DL), install paths and
@@ -92,7 +94,7 @@ ExternalProject_Add(ttsbackbone
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target ttsbackbone --config Release
     # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
     BUILD_ALWAYS    ON
-    BUILD_BYPRODUCTS "${TTS_BACKBONE_SO}" "${TTS_BACKBONE_LIB}"
+    BUILD_BYPRODUCTS ${_ll_byproducts}
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""
 )
