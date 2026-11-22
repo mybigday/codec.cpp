@@ -22,13 +22,28 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential pkg-config
-    
+        sudo apt-get install -y cmake build-essential pkg-config ninja-build ccache
+
+    # Both ggml copies (codec.cpp's and the llama.cpp backbone's) compile
+    # through ccache once it is installed.  A PR reads its own and main's caches.
+    - name: ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-ci-${{ github.run_id }}
+        restore-keys: ccache-ci-
+
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
-    
+      run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+      env:
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
+        CCACHE_MAXSIZE: 400M
+      run: |
+        export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)   # also caps the nested backbone build
+        cmake --build build
+        ccache -s
     
     - name: Test CLI exists
       run: |

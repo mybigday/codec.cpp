@@ -67,6 +67,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Both ggml copies compile through ccache once it is on PATH (ggml's
+      # GGML_CCACHE).  A PR run reads its own earlier caches and main's.
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +109,13 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-release-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: ccache-release-${{ matrix.name }}-
+
       - name: Dependencies (Linux)
         if: runner.os == 'Linux' && !matrix.android
         run: |
@@ -111,21 +123,21 @@ jobs:
             wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
             sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
             sudo apt-get update -y
-            sudo apt-get install -y ninja-build vulkan-sdk
+            sudo apt-get install -y ninja-build ccache vulkan-sdk
           else
             sudo apt-get update -y
-            sudo apt-get install -y ninja-build
+            sudo apt-get install -y ninja-build ccache
           fi
 
       - name: Dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja
+        run: brew install ninja ccache
 
       - name: Dependencies (Android)
         if: matrix.android
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ninja-build glslc
+          sudo apt-get install -y ninja-build ccache glslc
           # The NDK ships libvulkan but not vulkan.hpp / SPIRV-Headers.  SPIRV-Headers
           # installs into the Vulkan-Headers tree: ggml includes spirv.hpp but takes
           # its include path from Vulkan only.
@@ -151,6 +163,10 @@ jobs:
             if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
           }
 
+      - name: Dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y --no-progress ccache
+
       - name: Dependencies (Windows Vulkan)
         if: runner.os == 'Windows' && endsWith(matrix.name, 'vulkan')
         shell: pwsh
@@ -168,6 +184,7 @@ jobs:
         run: |
           export CMAKE_BUILD_PARALLEL_LEVEL=${NUMBER_OF_PROCESSORS:-$(getconf _NPROCESSORS_ONLN)}
           cmake --build build
+          ccache -s
 
       - name: Install
         run: cmake --install build --strip

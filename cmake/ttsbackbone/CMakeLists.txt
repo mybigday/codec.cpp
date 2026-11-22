@@ -13,6 +13,13 @@ set(TTSBACKBONE_OUTPUT_DIR "${CMAKE_BINARY_DIR}" CACHE PATH "where libttsbackbon
 
 add_subdirectory("${LLAMA_DIR}" llama EXCLUDE_FROM_ALL)
 
+# ggml-vulkan.cpp at -O3: LLVM's register coalescer takes ~14 minutes on it
+# (NDK clang 21, 822 of 880 s); -O2 compiles it in under a minute.  It is
+# host-side dispatch code, so the GPU kernels run as fast either way.
+if(TARGET ggml-vulkan AND NOT MSVC)
+    target_compile_options(ggml-vulkan PRIVATE -O2)
+endif()
+
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ttsbackbone.c" "")
 add_library(ttsbackbone SHARED "${CMAKE_CURRENT_BINARY_DIR}/ttsbackbone.c")
 set_target_properties(ttsbackbone PROPERTIES
