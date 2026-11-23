@@ -24,6 +24,15 @@ include(ExternalProject)
 set(_ll_dir "${CMAKE_CURRENT_SOURCE_DIR}/common/third-party/llama.cpp")
 set(TTS_BACKBONE_SO
     "${CMAKE_BINARY_DIR}/ttsbackbone/${CMAKE_SHARED_LIBRARY_PREFIX}ttsbackbone${CMAKE_SHARED_LIBRARY_SUFFIX}")
+# What consumers link: the import library on Windows, the library elsewhere.
+if(WIN32)
+    set(TTS_BACKBONE_LIB
+        "${CMAKE_BINARY_DIR}/ttsbackbone/${CMAKE_IMPORT_LIBRARY_PREFIX}ttsbackbone${CMAKE_IMPORT_LIBRARY_SUFFIX}")
+else()
+    set(TTS_BACKBONE_LIB "${TTS_BACKBONE_SO}")
+endif()
+set(_ll_byproducts "${TTS_BACKBONE_SO}" "${TTS_BACKBONE_LIB}")
+list(REMOVE_DUPLICATES _ll_byproducts)
 
 # Every GGML_* cache option, at the value codec.cpp's ggml sees.  Left out:
 # the ones the isolation fixes (static, no backend DL), install paths and
@@ -55,7 +64,7 @@ foreach(_v CMAKE_TOOLCHAIN_FILE CMAKE_C_COMPILER CMAKE_CXX_COMPILER
            ANDROID_ABI ANDROID_PLATFORM ANDROID_NDK ANDROID_STL
            CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER CMAKE_CUDA_ARCHITECTURES
            CMAKE_HIP_COMPILER CMAKE_HIP_ARCHITECTURES AMDGPU_TARGETS
-           Vulkan_INCLUDE_DIR Vulkan_LIBRARY Vulkan_GLSLC_EXECUTABLE)
+           Vulkan_INCLUDE_DIR Vulkan_LIBRARY Vulkan_GLSLC_EXECUTABLE SPIRV-Headers_DIR)
     if(DEFINED ${_v} AND NOT "${${_v}}" STREQUAL "")
         string(REPLACE ";" "|" _val "${${_v}}")
         list(APPEND _ll_args "-D${_v}=${_val}")
@@ -85,10 +94,16 @@ ExternalProject_Add(ttsbackbone
     BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --target ttsbackbone --config Release
     # Rebuild on every build: the patched sources change outside ExternalProject's stamps.
     BUILD_ALWAYS    ON
-    BUILD_BYPRODUCTS "${TTS_BACKBONE_SO}"
+    BUILD_BYPRODUCTS ${_ll_byproducts}
     INSTALL_COMMAND ""
     UPDATE_COMMAND  ""
 )
+
+# Build it after codec.cpp's own libraries, not beside them: the nested build
+# runs its own parallelism (Ninja: every core, whatever the outer -j), so side
+# by side the two compile loads add up and a 16 GB machine runs out of memory.
+# One after the other takes about as long, both being CPU-bound.
+add_dependencies(ttsbackbone codec_shared)
 
 # Exported for the tts-cli target.  `common` is added so the runner can
 # include common.h / sampling.h (the common_sampler API).

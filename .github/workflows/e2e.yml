@@ -48,7 +48,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential pkg-config python3-pip ffmpeg sox
+        sudo apt-get install -y cmake build-essential pkg-config python3-pip ffmpeg sox ninja-build ccache
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -62,10 +62,22 @@ jobs:
         python3 -m pip install --upgrade pip
         python3 -m pip install -r requirements-e2e.txt
 
+    - name: ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-e2e-${{ github.run_id }}
+        restore-keys: ccache-e2e-
+
+    # The codec smokes drive codec-cli and libcodec only: no llama.cpp backbone.
     - name: Build C++
+      env:
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
+        CCACHE_MAXSIZE: 200M
       run: |
-        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
-        cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
+        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCODEC_TTS_BACKBONE=OFF
+        cmake --build build --target codec-cli codec_shared -j$(nproc)
+        ccache -s
 
     - name: Verify CLI
       run: |

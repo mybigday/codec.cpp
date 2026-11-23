@@ -48,6 +48,7 @@
 #include <random>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -308,9 +309,19 @@ private:
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("%s %s (%s)\n", argv[0], CODEC_VERSION, CODEC_BUILD_COMMIT);
+        return 0;
+    }
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // runner progress lines show up as they happen in a log file
+    // Runner progress lines show up as they happen in a log file.  The MSVC CRT
+    // has no line buffering (_IOLBF is full buffering) and aborts on size 0.
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
     if (a.segment_bytes <= 0 && a.stream_chunk_ms > 0) {
         std::fprintf(stderr, "warning: --segment-bytes 0 with frame streaming re-decodes the whole growing clip "
                              "every chunk; long inputs get slow\n");

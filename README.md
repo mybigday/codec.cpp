@@ -62,6 +62,15 @@ bundled llama.cpp) plus a codec GGUF (run by codec.cpp). Ready-made GGUFs are
 on [Hugging Face](https://huggingface.co/BricksDisplay); each model card lists
 which two files to download. Supported models: [docs/model_status.md](docs/model_status.md#tts-tts-cli-synthesize).
 
+Prebuilt packages for Linux (x64 CPU / Vulkan, arm64), Windows (x64 CPU /
+Vulkan), macOS (arm64, Metal) and Android (arm64, Vulkan) are attached to each
+[release](https://github.com/mybigday/codec.cpp/releases): unpack and run
+`bin/tts-cli` (libraries are found in `lib/`; on Windows every DLL sits next to
+`tts-cli.exe`). They need an AVX2 CPU on x86-64 and armv8.2-a with dotprod on
+arm64 (e.g. not a Raspberry Pi 4); Linux packages need glibc 2.35 or newer,
+Vulkan packages the system Vulkan loader (part of the GPU driver). Other
+platforms, older CPUs and CUDA / ROCm / SYCL build from source.
+
 Build (clone with `--recursive`: it fetches the llama.cpp that runs the
 text-side model; codec.cpp adds the architectures upstream llama.cpp lacks):
 
@@ -69,8 +78,13 @@ text-side model; codec.cpp adds the architectures upstream llama.cpp lacks):
 git clone --recursive https://github.com/mybigday/codec.cpp
 cd codec.cpp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # GPU: add -DGGML_CUDA=ON / -DGGML_VULKAN=ON / -DGGML_METAL=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
+
+Give `-j` a number: a bare `-j` starts every compile at once and exhausts
+memory. Each job takes up to about 1 GB; four jobs fit in 8 GB. With Ninja
+(`-G Ninja`), also set `CMAKE_BUILD_PARALLEL_LEVEL=4`: the bundled llama.cpp
+builds as a nested project that otherwise uses every core.
 
 Synthesize:
 
@@ -179,81 +193,81 @@ when streaming: with `0`, each chunk re-decodes everything generated so far.
 ### CUDA (NVIDIA)
 ```bash
 cmake -B build -DGGML_CUDA=ON
-cmake --build build -j
+cmake --build build -j 4
 codec-cli --model model.gguf --codes in.npy --out out.wav --use-gpu
 ```
 
 ### Vulkan (Cross-platform)
 ```bash
 cmake -B build -DGGML_VULKAN=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### Metal (macOS)
 ```bash
 cmake -B build -DGGML_METAL=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### SYCL (Intel GPUs)
 ```bash
 cmake -B build -DGGML_SYCL=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### OpenCL
 ```bash
 cmake -B build -DGGML_OPENCL=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### CANN (Ascend)
 ```bash
 cmake -B build -DGGML_CANN=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### HIP/ROCm (AMD GPUs)
 ```bash
 cmake -B build -DGGML_HIP=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### MUSA
 ```bash
 cmake -B build -DGGML_MUSA=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### WebGPU
 ```bash
 cmake -B build -DGGML_WEBGPU=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### zDNN
 ```bash
 cmake -B build -DGGML_ZDNN=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### VirtGPU
 ```bash
 cmake -B build -DGGML_VIRTGPU=ON
-cmake --build build -j
+cmake --build build -j 4
 ```
 
 ### Multiple backends (fallback chain)
 ```bash
 cmake -B build -DGGML_CUDA=ON -DGGML_VULKAN=ON
-cmake --build build -j
+cmake --build build -j 4
 # Runtime auto-selects: CUDA > Vulkan > CPU
 ```
 
 ### CPU-only (default)
 ```bash
 cmake -B build
-cmake --build build -j
+cmake --build build -j 4
 codec-cli --model model.gguf --codes in.npy --out out.wav
 ```
 

@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -478,6 +479,10 @@ int cmd_synthesize(args a) {  // note: args by value so we can mutate text/ref_t
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("%s %s (%s)\n", argv[0], CODEC_VERSION, CODEC_BUILD_COMMIT);
+        return 0;
+    }
     args a;
     if (!parse_args(argc, argv, &a)) { print_usage(argv[0]); return 1; }
 
