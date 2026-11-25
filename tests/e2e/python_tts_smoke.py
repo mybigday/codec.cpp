@@ -59,6 +59,9 @@ CASES = [
           "The birch canoe slid on the smooth planks.", "outetts_1_0", 1),
     _case("soprano", M / "soprano/soprano.gguf", M / "soprano/backbone-f16.gguf",
           "The birch canoe slid on the smooth planks.", "soprano", 42),
+    _case("moss_tts_nano", M / "moss_tts_nano/moss_tts_nano_codec.gguf", M / "moss_tts_nano/backbone-bf16.gguf",
+          "The birch canoe slid on the smooth planks.", "moss_tts_nano", 3,
+          ["--ref-audio", str(REF / "jfk_en.wav")], dict(ref_audio=REF / "jfk_en.wav")),
     _case("pocket_tts", M / "pocket_tts/pocket_tts_en.gguf", M / "pocket_tts/backbone-f16.gguf",
           "Hello world. This is a small text to speech model.", "pocket_tts", 11,
           ["--max-frames", "80", "--min-len", "24", "--ref-audio", str(REF / "jfk_en.wav")],   # needs a voice

@@ -233,6 +233,38 @@ enum codec_status codec_lm_flow_speaker_rows(
     int32_t           out_cap_rows,
     int32_t *         n_out);
 
+// ─── MOSS-TTS-Nano prompt helpers (residual_depth_ar, gpt2 depth) ───
+// The backbone sequence (prompting.py, voice clone):
+//   user_prefix  <|audio_start|>  [reference rows]  <|audio_end|>  after_reference
+//   text  assistant_prefix  <|audio_start|>
+// Template spans are token ids (each piece is SentencePiece-encoded on its
+// own by the reference); a reference row is the composed embedding of
+// [user_slot, codes...]; without a voice "None" (no_reference) stands in for
+// <|audio_start|> rows <|audio_end|>.  Each generated frame's row is
+// [assistant_slot, codes...]; codebook 0 = audio_end stops the generation.
+// Returns NULL when the model is not MOSS-TTS-Nano (no codec.lm.moss_tts_nano.*).
+struct codec_lm_moss_nano_info {
+    int32_t hidden_dim;
+    int32_t n_codebook;              // 17: the text slot + 16 RVQ codebooks
+    int32_t audio_start;
+    int32_t audio_end;               // codebook-0 id that ends the generation
+    int32_t user_slot;               // codebook 0 of reference rows
+    int32_t assistant_slot;          // codebook 0 of generated rows
+    const int32_t * user_prefix;      int32_t n_user_prefix;
+    const int32_t * no_reference;     int32_t n_no_reference;
+    const int32_t * after_reference;  int32_t n_after_reference;
+    const int32_t * assistant_prefix; int32_t n_assistant_prefix;
+    int32_t has_text_norm;           // 1: codec_lm_moss_nano_normalize_text applies the charsmap
+};
+
+const struct codec_lm_moss_nano_info * codec_lm_moss_nano_get_info(struct codec_lm * lm);
+
+// The tokenizer's normalization (nmt_nfkc charsmap + remove_extra_whitespaces)
+// of `text`, to tokenize with the backbone's SPM vocab.  Writes it NUL-terminated
+// to `out` when it fits `cap` bytes; returns its length (bytes, without the
+// NUL), or -1 when the model is not MOSS-TTS-Nano.
+int32_t codec_lm_moss_nano_normalize_text(struct codec_lm * lm, const char * text, char * out, int32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

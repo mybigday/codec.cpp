@@ -144,6 +144,15 @@ encoded via `codebook_sizes[0] = text_vocab` and `c0_input_modality = "text"`
 metadata — and a dual-stream backbone audio embed split (user + model) that
 the caller composes outside codec_lm.
 
+MOSS-TTS-Realtime and MOSS-TTS-Nano fit with `depth_emits_c0` (no c0_head:
+the depth decoder's position 0 reads the backbone hidden and emits codebook 0
+too). Nano's depth decoder is a GPT-2 block (`codec.lm.depth.arch = "gpt2"`:
+LayerNorm with shift, biased q/k/v/o, gelu_new FFN, interleaved RoPE) whose
+codebook 0 is a text slot: the depth decoder chooses the assistant slot or the
+audio end (`codec.lm.cb0_allowed`), with heads tied to the input tables
+(`heads_tied_to_embd`); `codec.lm.audio_cb_offset = 1` drops the slot before
+the codec decodes.
+
 LFM2-Audio is conjectured to fit `shared` based on the published
 config (depthformer = 6 layers, dim 1024, tied embeds), but the actual
 modeling code is not in HF transformers; tensor names are pending a
@@ -187,6 +196,11 @@ codec.lm.residual.depth_has_qk_norm:      bool       # Qwen3-style per-head RMSN
 codec.lm.residual.depth_has_in_proj:      bool       # true → lm.depth.in_proj.weight present
 codec.lm.residual.weight_layout:          string     # "shared" / "flexible"
 codec.lm.residual.c0_input_modality:      string     # "audio" / "text" — Moshi has "text"
+codec.lm.residual.depth_emits_c0:         bool       # no c0_head; depth position 0 emits codebook 0
+codec.lm.residual.heads_tied_to_embd:     bool       # depth head i = input table i (no lm.depth.heads_*)
+codec.lm.depth.arch:                      string     # block: "llama" family (default) / "gpt2"
+codec.lm.cb0_allowed:                     array<i32> # the only codebook-0 ids ever sampled (optional)
+codec.lm.audio_cb_offset:                 i32        # leading non-audio codebooks dropped before decode
 
 ```
 
@@ -228,6 +242,10 @@ lm.depth.blk_{l}.ffn_up.weight        # mlp.up_proj
 lm.depth.blk_{l}.ffn_down.weight      # mlp.down_proj
 lm.depth.output_norm.weight           # final RMSNorm
 ```
+
+`codec.lm.depth.arch = "gpt2"` blocks have no `ffn_gate` (`ffn_up` → gelu_new
+→ `ffn_down`) and add a `.bias` to `attn_norm`, `q`, `k`, `v`, `o`,
+`ffn_norm`, `ffn_up`, `ffn_down` and `output_norm` (LayerNorms with shift).
 
 For `weight_layout = "flexible"` (Moshi), every `lm.depth.blk_{l}.*`
 weight gains a leading dimension `[n_codebook, ...]`; the runtime gathers

@@ -5,6 +5,7 @@ Single entry point for all backbones we currently support:
     sesame/csm-1b                          (CSM, Llama-3.2-1B)
     Qwen/Qwen3-TTS-12Hz-*                  (Qwen3 talker)
     fnlp/MOSS-TTSD-v0.5                    (Qwen3 language_model)
+    OpenMOSS-Team/MOSS-TTS-Nano-100M       (GPT-2 + RoPE → starcoder2, written directly)
     LiquidAI/LFM2-Audio-1.5B               (Lfm2 hybrid conv+attn)
     kmhf/hf-moshiko, kmhf/hf-moshika       (Helium = Llama-style)
 
@@ -889,6 +890,135 @@ def write_cosyvoice1_backbone(src: Path, output: Path, outtype: str) -> None:
     w.close()
 
 
+def _write_spm_bpe_vocab(w, tok_path: Path, n_vocab: int) -> None:
+    """A SentencePiece BPE model as llama.cpp's SPM ("llama") vocab: merges by
+    piece score, byte fallback through the <0xXX> pieces, a space prefix per
+    tokenize call (add_dummy_prefix).  llama.cpp's SPM path has no normalizer,
+    so a model with a non-identity normalizer needs its text normalized before
+    tokenizing (MOSS-TTS-Nano: the codec_audio_lm family applies nmt_nfkc)."""
+    import gguf
+    from sentencepiece import sentencepiece_model_pb2 as spm_pb2
+    if not tok_path.is_file():
+        raise SystemExit(f"missing {tok_path}")
+    m = spm_pb2.ModelProto()
+    m.ParseFromString(tok_path.read_bytes())
+    if m.trainer_spec.model_type != spm_pb2.TrainerSpec.BPE:
+        raise SystemExit(f"{tok_path}: expected a SentencePiece BPE model")
+    if len(m.pieces) != n_vocab:
+        raise SystemExit(f"tokenizer has {len(m.pieces)} pieces, the embedding {n_vocab} rows")
+    ttype = {1: gguf.TokenType.NORMAL, 2: gguf.TokenType.UNKNOWN, 3: gguf.TokenType.CONTROL,
+             4: gguf.TokenType.USER_DEFINED, 5: gguf.TokenType.UNUSED, 6: gguf.TokenType.BYTE}
+    w.add_tokenizer_model("llama")
+    w.add_tokenizer_pre("default")
+    w.add_token_list([p.piece for p in m.pieces])
+    w.add_token_scores([p.score for p in m.pieces])
+    w.add_token_types([ttype.get(p.type, gguf.TokenType.NORMAL) for p in m.pieces])
+    w.add_add_space_prefix(m.normalizer_spec.add_dummy_prefix)
+    w.add_remove_extra_whitespaces(m.normalizer_spec.remove_extra_whitespaces)
+    for setter, idx in ((w.add_unk_token_id, m.trainer_spec.unk_id), (w.add_bos_token_id, m.trainer_spec.bos_id),
+                        (w.add_eos_token_id, m.trainer_spec.eos_id), (w.add_pad_token_id, m.trainer_spec.pad_id)):
+        if idx >= 0:
+            setter(idx)
+    w.add_add_bos_token(False)
+    w.add_add_eos_token(False)
+
+
+def moss_tts_nano_checkpoint(src: Path) -> bool:
+    cfg = src / "config.json"
+    return cfg.is_file() and "MossTTSNanoForCausalLM" in (json.loads(cfg.read_text()).get("architectures") or [])
+
+
+def write_moss_tts_nano_backbone(src: Path, output: Path, outtype: str) -> None:
+    """MOSS-TTS-Nano global transformer (`transformer.*`, a GPT-2 with RoPE)
+    → stock GGUF arch `starcoder2`: pre-LN affine LayerNorm, q/k/v/o with
+    biases, non-gated gelu_new (ggml_gelu, the tanh form) FFN with biases,
+    final LayerNorm, full-width RoPE (base `rope_base`) and no position table.
+    The fused `c_attn` (nn.Linear, [3 * n_embd, n_embd]) splits into q/k/v.
+    MOSS rotates interleaved pairs (2i, 2i+1); starcoder2 is NEOX (i, i + d/2),
+    so each head's q/k rows AND biases are reordered to [even, odd]: the same
+    permutation on q and k leaves q·k unchanged.  `wte` is `token_embd`
+    (text positions go in as `b.token`, audio rows as `b.embd`); the output
+    head is tied to it, as in the checkpoint.  The checkpoint is BF16, so
+    F32 is capped at BF16."""
+    import gguf
+    cfg = json.loads((src / "config.json").read_text())
+    g = cfg["gpt2_config"]
+    if str(g.get("position_embedding_type", "absolute")).lower() != "rope":
+        raise SystemExit("MOSS-TTS-Nano: only the RoPE global transformer is supported")
+    if g.get("activation_function") != "gelu_new":
+        raise SystemExit(f"MOSS-TTS-Nano: activation {g.get('activation_function')!r} is not gelu_new")
+    if g.get("scale_attn_by_inverse_layer_idx") or not g.get("scale_attn_weights", True):
+        raise SystemExit("MOSS-TTS-Nano: unsupported attention scaling")
+    sd_t = torch.load(str(src / "pytorch_model.bin"), map_location="cpu", weights_only=True)
+    sd = {k[len("transformer."):]: v.float().numpy() for k, v in sd_t.items() if k.startswith("transformer.")}
+    if "text_lm_head.weight" in sd_t and not torch.equal(sd_t["text_lm_head.weight"], sd_t["transformer.wte.weight"]):
+        raise SystemExit("MOSS-TTS-Nano: text_lm_head is not tied to transformer.wte")
+    src_bf16 = sd_t["transformer.wte.weight"].dtype == torch.bfloat16
+    del sd_t
+
+    n_embd, n_head, n_layer = int(g["n_embd"]), int(g["n_head"]), int(g["n_layer"])
+    n_ff = int(g.get("n_inner") or 4 * n_embd)
+    n_vocab = sd["wte.weight"].shape[0]
+    head_dim = n_embd // n_head
+    qtype = {"f16": gguf.GGMLQuantizationType.F16, "bf16": gguf.GGMLQuantizationType.BF16,
+             "f32": gguf.GGMLQuantizationType.BF16 if src_bf16 else gguf.GGMLQuantizationType.F32}[outtype.lower()]
+
+    w = gguf.GGUFWriter(str(output), "starcoder2")
+    w.add_name("MOSS-TTS-Nano global transformer")
+    w.add_context_length(int(g.get("n_positions", 32768)))
+    w.add_embedding_length(n_embd)
+    w.add_block_count(n_layer)
+    w.add_feed_forward_length(n_ff)
+    w.add_head_count(n_head)
+    w.add_head_count_kv(n_head)
+    w.add_rope_freq_base(float(g.get("rope_base", 10000.0)))
+    w.add_layer_norm_eps(float(g.get("layer_norm_epsilon", 1e-5)))
+    w.add_vocab_size(n_vocab)
+    w.add_file_type({gguf.GGMLQuantizationType.BF16: gguf.LlamaFileType.MOSTLY_BF16,
+                     gguf.GGMLQuantizationType.F16: gguf.LlamaFileType.MOSTLY_F16,
+                     gguf.GGMLQuantizationType.F32: gguf.LlamaFileType.ALL_F32}[qtype])
+    _write_spm_bpe_vocab(w, src / "tokenizer.model", n_vocab)
+
+    def add(name: str, arr) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if arr.ndim >= 2 and qtype != gguf.GGMLQuantizationType.F32:
+            w.add_tensor(name, gguf.quants.quantize(arr, qtype), raw_dtype=qtype)
+        else:
+            w.add_tensor(name, arr)
+
+    def neox(m: np.ndarray) -> np.ndarray:   # rows (or bias entries) of q / k, per head [even, odd]
+        tail = m.shape[1:]
+        return m.reshape(n_head, head_dim // 2, 2, *tail).swapaxes(1, 2).reshape(n_embd, *tail)
+
+    add("token_embd.weight", sd["wte.weight"])
+    add("output_norm.weight", sd["ln_f.weight"])
+    add("output_norm.bias", sd["ln_f.bias"])
+    for i in range(n_layer):
+        p, d = f"h.{i}.", f"blk.{i}."
+        qw, kw, vw = np.split(sd[p + "attn.c_attn.weight"], 3, axis=0)
+        qb, kb, vb = np.split(sd[p + "attn.c_attn.bias"], 3, axis=0)
+        add(d + "attn_norm.weight", sd[p + "ln_1.weight"])
+        add(d + "attn_norm.bias", sd[p + "ln_1.bias"])
+        add(d + "attn_q.weight", neox(qw))
+        add(d + "attn_q.bias", neox(qb))
+        add(d + "attn_k.weight", neox(kw))
+        add(d + "attn_k.bias", neox(kb))
+        add(d + "attn_v.weight", vw)
+        add(d + "attn_v.bias", vb)
+        add(d + "attn_output.weight", sd[p + "attn.c_proj.weight"])
+        add(d + "attn_output.bias", sd[p + "attn.c_proj.bias"])
+        add(d + "ffn_norm.weight", sd[p + "ln_2.weight"])
+        add(d + "ffn_norm.bias", sd[p + "ln_2.bias"])
+        add(d + "ffn_up.weight", sd[p + "mlp.fc_in.weight"])
+        add(d + "ffn_up.bias", sd[p + "mlp.fc_in.bias"])
+        add(d + "ffn_down.weight", sd[p + "mlp.fc_out.weight"])
+        add(d + "ffn_down.bias", sd[p + "mlp.fc_out.bias"])
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 def pocket_tts_checkpoint(src: Path) -> Path | None:
     """kyutai/pocket-tts `model.safetensors` (local dir, or the HF repo's
     languages/english/), or None when `src` is not a Pocket-TTS checkpoint."""
@@ -1128,6 +1258,7 @@ _ARCH_SAMPLING = {
     "MossTTSDForCausalLM": "moss_ttsd",
     "AsteroidTTSModel": "moss_ttsd",
     "MossTTSRealtime": "moss_tts_realtime",
+    "MossTTSNanoForCausalLM": "moss_tts_nano",
     "Lfm2AudioForConditionalGeneration": "lfm2_audio",
     "KittenTTS2": "kitten_tts2",
     "CosyVoice": "cosyvoice",
@@ -1190,6 +1321,12 @@ def main() -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_cosyvoice1_backbone(src, args.output, args.outtype)
         write_sampling(args.output, sampling_model("CosyVoice1", src, args.model_id))
+        print(f"[bb] wrote {args.output}", flush=True)
+        return 0
+    if moss_tts_nano_checkpoint(src):         # MOSS-TTS-Nano: stock starcoder2, written directly
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        write_moss_tts_nano_backbone(src, args.output, args.outtype)
+        write_sampling(args.output, sampling_model("MossTTSNanoForCausalLM", src, args.model_id))
         print(f"[bb] wrote {args.output}", flush=True)
         return 0
     pocket = pocket_tts_checkpoint(src)
